@@ -8,13 +8,14 @@ using SharpTicker.Utilities.Interfaces.Managers;
 var builder = WebApplication.CreateBuilder(args);
 
 // SharpTicker setup with MongoDB operational store.
-// Start a local Mongo with: docker run -d -p 27017:27017 mongo:7
+// Start a local Mongo on a non-default port, so it does not clash with other MongoDB instances:
+//   docker run -d --name sharpticker-mongo -p 127.0.0.1:27117:27017 mongo:7
 builder.Services.AddSharpTicker(options =>
 {
     options.AddOperationalStore(mongoOptions =>
     {
         mongoOptions.UseSharpTickerMongoClient(
-            connectionString: builder.Configuration["Mongo:ConnectionString"] ?? "mongodb://localhost:27017",
+            connectionString: builder.Configuration["Mongo:ConnectionString"] ?? "mongodb://localhost:27117",
             databaseName: builder.Configuration["Mongo:Database"] ?? "sharpticker");
     });
     options.AddDashboard();
