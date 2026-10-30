@@ -261,6 +261,12 @@ namespace SharpTicker.Utilities
                 var internalTickerManager = context.ServiceScope.ServiceProvider.GetService<IInternalTickerManager>();
                 return await internalTickerManager.GetRequestAsync<T>(context.Id, context.Type, cancellationToken);
             }
+            // A cancelled read is not a request that cannot be read. Returning nothing would run the job with an empty
+            // request, so the cancellation goes on to the job, which ends as cancelled.
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception e)
             {
                 var logger = context.ServiceScope.ServiceProvider.GetService<ISharpTickerInstrumentation>();
@@ -283,6 +289,12 @@ namespace SharpTicker.Utilities
             {
                 var internalTickerManager = context.ServiceScope.ServiceProvider.GetService<IInternalTickerManager>();
                 return await internalTickerManager.GetRequestAsync(context.Id, context.Type, typeInfo, cancellationToken);
+            }
+            // A cancelled read is not a request that cannot be read. Returning nothing would run the job with an empty
+            // request, so the cancellation goes on to the job, which ends as cancelled.
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception e)
             {

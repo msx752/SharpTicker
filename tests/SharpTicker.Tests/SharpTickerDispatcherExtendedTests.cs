@@ -254,8 +254,10 @@ public class SharpTickerDispatcherExtendedTests
     }
 
     [Fact]
-    public async Task DispatchAsync_CancellationToken_IsPassedToQueueAsync()
+    public async Task DispatchAsync_CallersCancellationToken_IsNotGivenToTheJob()
     {
+        // The caller is usually a request that ends before the job does. Giving the job its token would cancel the job,
+        // or make the scheduler drop it, once the request is over.
         using var cts = new CancellationTokenSource();
         var token = cts.Token;
 
@@ -272,7 +274,7 @@ public class SharpTickerDispatcherExtendedTests
         await _taskScheduler.Received(1).QueueAsync(
             Arg.Any<Func<CancellationToken, Task>>(),
             Arg.Any<TickerTaskPriority>(),
-            Arg.Is(token));
+            Arg.Is<CancellationToken>(given => given != token && !given.CanBeCanceled));
     }
 
     [Fact]
