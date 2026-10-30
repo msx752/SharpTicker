@@ -1,6 +1,6 @@
 {
   "profiles": {
-    "SharpTicker.Sample.WebApi": {
+    "Development": {
       "commandName": "Project",
       "launchBrowser": true,
       "environmentVariables": {
