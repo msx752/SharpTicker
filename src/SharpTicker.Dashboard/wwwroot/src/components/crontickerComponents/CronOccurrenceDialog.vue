@@ -4,6 +4,7 @@ import { cronTickerOccurrenceService } from '@/http/services/cronTickerOccurrenc
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
 import { tickerService } from '@/http/services/tickerService'
 import { sleep } from '@/utilities/sleep'
+import { debounce } from '@/utilities/debounce'
 import { useDialog } from '@/composables/useDialog'
 import { methodName, type TickerNotificationHubType } from '@/hub/tickerNotificationHub'
 import type { GetCronTickerOccurrenceResponse } from '@/http/services/types/cronTickerOccurrenceService.types'
@@ -59,6 +60,10 @@ const emit = defineEmits<{
   (e: 'close'): void
 }>()
 
+// The full-screen spinner is for the first load of a ticker only. Later loads (a page change, a
+// refresh after a hub event) keep the table on screen and swap the rows when they arrive.
+const hasLoaded = ref(false)
+
 // Load page data with pagination
 const loadPageData = async () => {
   if (props.dialogProps.id != undefined) {
@@ -66,6 +71,7 @@ const loadPageData = async () => {
       const response = await getByCronTickerIdPaginated.requestAsync(props.dialogProps.id, currentPage.value, pageSize.value)
       if (response) {
         totalCount.value = response.totalCount || 0
+        hasLoaded.value = true
       }
     } catch (error) {
       console.error('Failed to load paginated data:', error)
@@ -85,6 +91,11 @@ const handlePageSizeChange = async (size: number) => {
   currentPage.value = 1  // Reset to first page when changing page size
   await loadPageData()
 }
+
+// A frequent cron can produce many events in a row; one reload is enough for all of them.
+const reloadSoon = debounce(() => {
+  void loadPageData()
+}, 300)
 
 const addHubListeners = async () => {
   props.tickerNotificationHub.onReceiveUpdateCronTickerOccurrence((val:GetCronTickerOccurrenceResponse) => {
@@ -107,17 +118,17 @@ const addHubListeners = async () => {
         };
       } else {
         // Item not found in current page, reload
-        loadPageData();
+        reloadSoon();
       }
     } else {
       // No data loaded yet, reload
-      loadPageData();
+      reloadSoon();
     }
   });
 
   props.tickerNotificationHub.onReceiveAddCronTickerOccurrence((val:GetCronTickerOccurrenceResponse) => {
     // Reload current page when new item is added
-    loadPageData();
+    reloadSoon();
   });
 }
 
@@ -128,24 +139,38 @@ onMounted(() => {
 onUnmounted(() => {
   props.tickerNotificationHub.stopReceiver(methodName.onReceiveUpdateCronTickerOccurrence)
   props.tickerNotificationHub.stopReceiver(methodName.onReceiveAddCronTickerOccurrence)
+  void syncGroup(undefined)
 })
 
-watch(
-  () => props.isOpen,
-  () => {
-    if (props.isOpen && props.dialogProps.id != undefined)
-      props.tickerNotificationHub.joinGroup(props.dialogProps.id)
-    else if (!props.isOpen && props.dialogProps.id != undefined)
-      props.tickerNotificationHub.leaveGroup(props.dialogProps.id)
+// The group that tells this dialog about occurrence updates. Join it first and load afterwards, so an
+// update that lands between the two cannot be missed; every open loads again because the ticker
+// may have run while the dialog was closed.
+let joinedGroup: string | undefined
+
+const syncGroup = async (id: string | undefined) => {
+  if (joinedGroup !== undefined && joinedGroup !== id) {
+    const previous = joinedGroup
+    joinedGroup = undefined
+    await props.tickerNotificationHub.leaveGroup(previous)
   }
-)
+  if (id !== undefined && joinedGroup !== id) {
+    joinedGroup = id
+    await props.tickerNotificationHub.joinGroup(id)
+  }
+}
 
 watch(
-  () => props.dialogProps.id,
-  async () => {
-    if (props.dialogProps.id != undefined){
-      currentPage.value = 1 // Reset to first page when id changes
+  () => [props.isOpen, props.dialogProps.id] as const,
+  async ([isOpen, id], [, previousId]) => {
+    if (isOpen && id != undefined) {
+      if (id !== previousId) {
+        currentPage.value = 1 // Reset to first page when id changes
+        hasLoaded.value = false
+      }
+      await syncGroup(id)
       await loadPageData()
+    } else {
+      await syncGroup(undefined)
     }
   },
 )
@@ -283,7 +308,7 @@ const setRowProp = (propContext: any) => {
 
       <!-- Content -->
       <v-card-text class="dialog-content">
-        <div v-if="getByCronTickerIdPaginated.loader.value" class="loading-container">
+        <div v-if="getByCronTickerIdPaginated.loader.value && !hasLoaded" class="loading-container">
           <v-progress-circular indeterminate color="primary" size="64"></v-progress-circular>
           <p class="loading-text">Loading occurrences...</p>
         </div>

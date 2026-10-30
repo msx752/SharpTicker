@@ -4,8 +4,29 @@ import { getBasePath, getBackendUrl } from '@/utilities/pathResolver';
 class BaseHub {
     public connection: signalR.HubConnection;
 
+    // SignalR group membership belongs to one connection. After a reconnect the server has forgotten
+    // it, so the groups the page asked for are kept here and joined again.
+    private readonly joinedGroups = new Set<string>();
+
     constructor() {
         this.connection = this.createConnection();
+        this.rejoinGroupsOnReconnect();
+    }
+
+    private rejoinGroupsOnReconnect(): void {
+        this.connection.onreconnected(() => {
+            void this.rejoinGroups();
+        });
+    }
+
+    private async rejoinGroups(): Promise<void> {
+        for (const groupName of this.joinedGroups) {
+            try {
+                await this.connection.invoke("JoinGroup", groupName);
+            } catch (err) {
+                console.error(`🚨 SignalR: could not rejoin group ${groupName}`, err);
+            }
+        }
     }
 
     private createConnection(): signalR.HubConnection {
@@ -128,6 +149,7 @@ class BaseHub {
             this.connection.stop();
         }
         this.connection = this.createConnection();
+        this.rejoinGroupsOnReconnect();
     }
 
     // Send a message to the server
@@ -157,6 +179,7 @@ class BaseHub {
             console.log('🔗 SignalR: Starting connection...');
             await this.connection.start();
             console.log('✅ SignalR: Connection established successfully');
+            await this.rejoinGroups();
         } catch (err: any) {
             console.error('🚨 SignalR Connection Error:', err);
             
@@ -182,12 +205,31 @@ class BaseHub {
         }
     }
 
-    joinGroup(groupName: string): void {
-        this.connection.invoke("JoinGroup", groupName);
+    // Resolves once the server has added this connection to the group, so callers can load data
+    // afterwards without missing an update. If the connection is down the group is remembered and
+    // joined when it comes back.
+    async joinGroup(groupName: string): Promise<void> {
+        this.joinedGroups.add(groupName);
+        if (this.connection.state !== signalR.HubConnectionState.Connected) {
+            return;
+        }
+        try {
+            await this.connection.invoke("JoinGroup", groupName);
+        } catch (err) {
+            console.error(`🚨 SignalR: could not join group ${groupName}`, err);
+        }
     }
 
-    leaveGroup(groupName: string): void {
-        this.connection.invoke("LeaveGroup", groupName);
+    async leaveGroup(groupName: string): Promise<void> {
+        this.joinedGroups.delete(groupName);
+        if (this.connection.state !== signalR.HubConnectionState.Connected) {
+            return;
+        }
+        try {
+            await this.connection.invoke("LeaveGroup", groupName);
+        } catch (err) {
+            console.error(`🚨 SignalR: could not leave group ${groupName}`, err);
+        }
     }
 
     // Subscribe to messages from the server
