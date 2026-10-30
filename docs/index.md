@@ -2,9 +2,16 @@
 _layout: landing
 ---
 
+<div class="hero">
+  <img src="../assets/logo.svg" alt="" width="96" height="96" />
+  <div>
+
 # SharpTicker
 
 Background job scheduling for .NET: one-off and cron jobs with source-generated registration, pluggable persistence and a built-in dashboard.
+
+  </div>
+</div>
 
 ```bash
 dotnet add package SharpTicker
@@ -20,13 +27,13 @@ dotnet add package SharpTicker
 
 ## Where to start
 
-- [Getting started](getting-started.md): install, register, write and schedule a first job.
-- [Defining jobs](jobs.md): job methods, payloads, dependency injection and code-first registration.
-- [Scheduling](scheduling.md): time jobs, cron jobs, retries and chains.
-- [Storage](storage.md) and [Dashboard](dashboard.md) for persistence and the UI.
-- [Running in production](operations.md): several nodes, start modes, error handling and tracing.
+- [Getting started](guide/getting-started.md): install, register, write and schedule a first job.
+- [Defining jobs](guide/jobs.md): job methods, payloads, dependency injection and code-first registration.
+- [Scheduling](guide/scheduling.md): time jobs, cron jobs, retries and chains.
+- [Storage](guide/storage.md) and [Dashboard](guide/dashboard.md) for persistence and the UI.
+- [Running in production](guide/operations.md): several nodes, start modes, error handling and tracing.
 - [API reference](api/index.md), generated from the source.
 
-Moving an existing application to SharpTicker? See the [migration guide](migrating.md).
+Moving an existing application to SharpTicker? See the [migration guide](guide/migrating.md).
 
 SharpTicker is open source under MIT or Apache-2.0. The source, issues and samples are on [GitHub](https://github.com/msx752/SharpTicker).

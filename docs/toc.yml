@@ -1,16 +1,6 @@
-- name: Getting started
-  href: getting-started.md
-- name: Jobs
-  href: jobs.md
-- name: Scheduling
-  href: scheduling.md
-- name: Storage
-  href: storage.md
-- name: Dashboard
-  href: dashboard.md
-- name: Production
-  href: operations.md
-- name: Migration
-  href: migrating.md
+- name: Docs
+  href: guide/
 - name: API
   href: api/
+- name: GitHub
+  href: https://github.com/msx752/SharpTicker
