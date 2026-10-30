@@ -9,7 +9,8 @@ import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import ChainJobsModal from '@/components/ChainJobsModal.vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
-import { formatDate, parseDuration } from '@/utilities/dateTimeParser'
+import { formatDate } from '@/utilities/dateTimeParser'
+import { buildRunAgainRequest } from '@/utilities/runAgain'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
@@ -95,13 +96,7 @@ const runAgain = async (item: GetTimeTickerResponse) => {
   try {
     const stored = await getTickerRequest.requestAsync(item.id, 1)
     await addTimeTicker.requestAsync(
-      {
-        function: item.function,
-        request: stored?.result ?? '',
-        retries: parseInt(`${item.retries}`),
-        description: item.description,
-        intervals: Array.isArray(item.retryIntervals) ? item.retryIntervals.map(parseDuration) : undefined,
-      },
+      buildRunAgainRequest(item, stored?.result),
       timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone,
     )
     await loadPageData()
