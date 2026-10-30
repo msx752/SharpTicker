@@ -30,7 +30,7 @@
 ## Quick start
 
 ```bash
-dotnet add package SharpTicker
+dotnet add package SharpTicker --version 1.0.0-rc.1
 ```
 
 ### 1. Register the scheduler
