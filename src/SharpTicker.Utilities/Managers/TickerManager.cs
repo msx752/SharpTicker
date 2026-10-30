@@ -353,6 +353,9 @@ namespace SharpTicker.Utilities.Managers
             DateTime earliestForNonImmediate = default;
             foreach (var entity in entities)
             {
+                if (entity is null)
+                    return new TickerResult<List<TTimeTicker>>(new TickerValidatorException("Ticker must not be null!"));
+
                 if (entity.Id == Guid.Empty)
                     entity.Id = Guid.NewGuid();
 
@@ -409,12 +412,21 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TCronTicker>>> AddCronTickersBatchAsync(List<TCronTicker> entities, CancellationToken cancellationToken = default)
         {
+            if (entities == null || entities.Count == 0)
+                return new TickerResult<List<TCronTicker>>(entities ?? new List<TCronTicker>());
+
             var validEntities = new List<TCronTicker>();
             var errors = new List<Exception>();
             var nextOccurrences = new List<DateTime>();
             
             foreach (var entity in entities)
             {
+                if (entity is null)
+                {
+                    errors.Add(new TickerValidatorException("Ticker must not be null!"));
+                    continue;
+                }
+
                 if (entity.Id == Guid.Empty)
                     entity.Id = Guid.NewGuid();
 
@@ -467,6 +479,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TTimeTicker>>> UpdateTimeTickersBatchAsync(List<TTimeTicker> timeTickers, CancellationToken cancellationToken = default)
         {
+            if (timeTickers == null || timeTickers.Count == 0)
+                return new TickerResult<List<TTimeTicker>>(timeTickers ?? new List<TTimeTicker>());
+
             var validTickers = new List<TTimeTicker>();
             var errors = new List<Exception>();
             var needsRestart = false;
@@ -519,6 +534,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TCronTicker>>> UpdateCronTickersBatchAsync(List<TCronTicker> cronTickers, CancellationToken cancellationToken = default)
         {
+            if (cronTickers == null || cronTickers.Count == 0)
+                return new TickerResult<List<TCronTicker>>(cronTickers ?? new List<TCronTicker>());
+
             var validTickers = new List<TCronTicker>();
             var errors = new List<Exception>();
             var nextOccurrences = new List<DateTime>();
@@ -529,7 +547,7 @@ namespace SharpTicker.Utilities.Managers
             {
                 if (cronTicker is null)
                 {
-                    errors.Add(new Exception("Cron ticker must not be null!"));
+                    errors.Add(new TickerValidatorException("Cron ticker must not be null!"));
                     continue;
                 }
 
@@ -591,6 +609,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<TTimeTicker>> DeleteTimeTickersBatchAsync(List<Guid> ids, CancellationToken cancellationToken = default)
         {
+            if (ids == null || ids.Count == 0)
+                return new TickerResult<TTimeTicker>(0);
+
             var affectedRows = await _persistenceProvider.RemoveTimeTickers(ids.ToArray(), cancellationToken: cancellationToken);
             
             if (affectedRows > 0 && _executionContext.Functions.Any(x => ids.Contains(x.TickerId)))
@@ -601,6 +622,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<TCronTicker>> DeleteCronTickersBatchAsync(List<Guid> ids, CancellationToken cancellationToken = default)
         {
+            if (ids == null || ids.Count == 0)
+                return new TickerResult<TCronTicker>(0);
+
             var affectedRows = await _persistenceProvider.RemoveCronTickers(ids.ToArray(), cancellationToken: cancellationToken);
             
             if (affectedRows > 0 && _executionContext.Functions.Any(x => ids.Contains(x.ParentId ?? Guid.Empty)))

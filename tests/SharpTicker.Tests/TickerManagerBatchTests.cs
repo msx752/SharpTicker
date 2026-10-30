@@ -254,7 +254,7 @@ public class TickerManagerBatchTests : IAsyncLifetime
         Assert.Empty(await Store.GetCronTickers(null, default));
     }
 
-    [Fact(Skip = "Known bug: adding a null cron ticker batch throws NullReferenceException, while the time ticker batch returns a successful empty result.")]
+    [Fact]
     public async Task AddingAMissingCronTickerBatch_SucceedsWithNothingToDo_LikeTimeTickers()
     {
         var result = await Crons.AddBatchAsync(null!);
@@ -332,6 +332,56 @@ public class TickerManagerBatchTests : IAsyncLifetime
         Assert.True(result.IsSucceeded);
         Assert.Equal(2, result.AffectedRows);
         Assert.Equal(added[2].Id, Assert.Single(await Store.GetCronTickers(null, default)).Id);
+    }
+
+    #endregion
+
+    #region Missing input
+
+    [Fact]
+    public async Task EveryBatchMethod_TreatsAMissingOrEmptyListAsNothingToDo()
+    {
+        var results = new object[]
+        {
+            await Times.AddBatchAsync(null!), await Times.AddBatchAsync(new List<TimeTickerEntity>()),
+            await Times.UpdateBatchAsync(null!), await Times.UpdateBatchAsync(new List<TimeTickerEntity>()),
+            await Times.DeleteBatchAsync(null!), await Times.DeleteBatchAsync(new List<Guid>()),
+            await Crons.AddBatchAsync(null!), await Crons.AddBatchAsync(new List<CronTickerEntity>()),
+            await Crons.UpdateBatchAsync(null!), await Crons.UpdateBatchAsync(new List<CronTickerEntity>()),
+            await Crons.DeleteBatchAsync(null!), await Crons.DeleteBatchAsync(new List<Guid>()),
+        };
+
+        Assert.All(results, r => Assert.True((bool)r.GetType().GetField("IsSucceeded")!.GetValue(r)!));
+        Assert.All(results, r => Assert.Equal(0, (int)r.GetType().GetField("AffectedRows")!.GetValue(r)!));
+    }
+
+    [Fact]
+    public async Task AddingATimeTickerBatchWithANullTicker_FailsInsteadOfThrowing_AndStoresNothing()
+    {
+        var result = await Times.AddBatchAsync(new List<TimeTickerEntity> { Time(), null! });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Empty(await Store.GetTimeTickers(null, default));
+    }
+
+    [Fact]
+    public async Task AddingACronTickerBatchWithANullTicker_FailsInsteadOfThrowing_AndStoresNothing()
+    {
+        var result = await Crons.AddBatchAsync(new List<CronTickerEntity> { Cron(), null! });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Empty(await Store.GetCronTickers(null, default));
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerBatchWithANullTicker_FailsWithAValidatorException()
+    {
+        var result = await Crons.UpdateBatchAsync(new List<CronTickerEntity> { null! });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
     }
 
     #endregion
