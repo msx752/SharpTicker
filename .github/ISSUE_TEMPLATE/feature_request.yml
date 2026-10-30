@@ -1,0 +1,72 @@
+name: Feature request
+description: Suggest a new capability or an improvement to existing behavior
+title: "[Feature]: "
+labels: ["type:feature", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first, then the solution you have in mind. A clear problem statement helps us find the best fit, even if it ends up looking different from your proposal.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the [existing issues](https://github.com/msx752/SharpTicker/issues?q=is%3Aissue) and this has not been requested yet.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Scheduling (run order, timing, repetition)
+        - Storage providers (EF Core, MongoDB, Redis)
+        - Dashboard
+        - Access control
+        - Observability (logging, metrics, tracing)
+        - Extensibility (hooks for host code)
+        - Testing support
+        - Deployment and hosting
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what makes it hard or impossible today?
+      placeholder: "When a job fails I want to ..., but currently I have to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it work? Describe the behavior, not only the API.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Usage example
+      description: Show how you would like to use it from your code.
+      render: csharp
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use today or other designs you thought about.
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to work on this myself.

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<PackageId>SharpTicker.MongoDB</PackageId>
+		<Description>MongoDB persistence provider for SharpTicker. Uses the official MongoDB.Driver — no EF Core, no ODM.</Description>
+		<PackageTags>$(PackageTags);mongodb;mongo</PackageTags>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="MongoDB.Driver" Version="3.9.0" />
+		<ProjectReference Include="../SharpTicker.Utilities/SharpTicker.Utilities.csproj" />
+	</ItemGroup>
+</Project>

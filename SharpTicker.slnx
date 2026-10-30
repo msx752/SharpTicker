@@ -1,0 +1,42 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/.Solution Items/">
+    <File Path="Directory.Build.props" />
+  </Folder>
+  <Folder Name="/.Solution Items/workflows/">
+    <File Path=".github/workflows/ci.yml" />
+    <File Path=".github/workflows/release.yml" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/SharpTicker.Benchmarks/SharpTicker.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/SharpTicker.Sample.ApplicationDbContext/SharpTicker.Sample.ApplicationDbContext.csproj" />
+    <Project Path="samples/SharpTicker.Sample.Console/SharpTicker.Sample.Console.csproj" />
+    <Project Path="samples/SharpTicker.Sample.MongoDB/SharpTicker.Sample.MongoDB.csproj" />
+    <Project Path="samples/SharpTicker.Sample.WebApi/SharpTicker.Sample.WebApi.csproj" />
+    <Project Path="samples/SharpTicker.Sample.WorkerService/SharpTicker.Sample.WorkerService.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <File Path="src/Directory.Build.props" />
+    <Project Path="src/SharpTicker.Caching.StackExchangeRedis/SharpTicker.Caching.StackExchangeRedis.csproj" />
+    <Project Path="src/SharpTicker.Dashboard/SharpTicker.Dashboard.csproj" />
+    <Project Path="src/SharpTicker.EntityFrameworkCore/SharpTicker.EntityFrameworkCore.csproj" />
+    <Project Path="src/SharpTicker.Instrumentation.OpenTelemetry/SharpTicker.Instrumentation.OpenTelemetry.csproj" />
+    <Project Path="src/SharpTicker.MongoDB/SharpTicker.MongoDB.csproj" />
+    <Project Path="src/SharpTicker.SourceGenerator/SharpTicker.SourceGenerator.csproj" />
+    <Project Path="src/SharpTicker.Utilities/SharpTicker.Utilities.csproj" />
+    <Project Path="src/SharpTicker/SharpTicker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SharpTicker.Caching.StackExchangeRedis.Tests/SharpTicker.Caching.StackExchangeRedis.Tests.csproj" />
+    <Project Path="tests/SharpTicker.EntityFrameworkCore.Tests/SharpTicker.EntityFrameworkCore.Tests.csproj" />
+    <Project Path="tests/SharpTicker.MongoDB.Tests/SharpTicker.MongoDB.Tests.csproj" />
+    <Project Path="tests/SharpTicker.SourceGenerator.Tests/SharpTicker.SourceGenerator.Tests.csproj" />
+    <Project Path="tests/SharpTicker.Tests/SharpTicker.Tests.csproj" />
+  </Folder>
+</Solution>

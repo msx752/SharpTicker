@@ -1,0 +1,302 @@
+using Microsoft.Extensions.DependencyInjection;
+using System;
+using System.Collections.Frozen;
+using System.Collections.Generic;
+using System.Text.Json.Serialization.Metadata;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using SharpTicker.Utilities.Base;
+using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Instrumentation;
+using SharpTicker.Utilities.Interfaces.Managers;
+
+namespace SharpTicker.Utilities
+{
+    public delegate Task TickerFunctionDelegate(CancellationToken cancellationToken, IServiceProvider serviceProvider, TickerFunctionContext context);
+
+    /// <summary>
+    /// Provider for managing ticker functions and their request types using FrozenDictionary.
+    /// Uses a callback-based approach to collect all registrations and create a single optimized FrozenDictionary.
+    /// </summary>
+    public static class TickerFunctionProvider
+    {
+        private static readonly object _buildLock = new();
+
+        // Callback actions to collect registrations
+        private static Action<Dictionary<string, (string, Type)>> _requestTypeRegistrations;
+        private static Action<Dictionary<string, (string RequestType, string RequestExampleJson)>> _requestInfoRegistrations;
+        private static Action<Dictionary<string, (string cronExpression, TickerTaskPriority Priority, TickerFunctionDelegate Delegate, int MaxConcurrency)>> _functionRegistrations;
+
+        // Type → function name mapping for manager.AddAsync<T>() lookups
+        private static readonly Dictionary<Type, string> _typeMappings = new();
+
+        // Final frozen dictionaries
+        public static FrozenDictionary<string, (string, Type)> TickerFunctionRequestTypes = FrozenDictionary<string, (string, Type)>.Empty;
+        public static FrozenDictionary<string, (string RequestType, string RequestExampleJson)> TickerFunctionRequestInfos = FrozenDictionary<string, (string RequestType, string RequestExampleJson)>.Empty;
+        public static FrozenDictionary<string, (string cronExpression, TickerTaskPriority Priority, TickerFunctionDelegate Delegate, int MaxConcurrency)> TickerFunctions = FrozenDictionary<string, (string cronExpression, TickerTaskPriority Priority, TickerFunctionDelegate Delegate, int MaxConcurrency)>.Empty;
+
+        public static bool IsBuilt { get; private set; }
+
+        /// <summary>
+        /// Registers a Type → function name mapping for type-safe manager lookups.
+        /// Called by MapTicker&lt;T&gt;() at registration time.
+        /// </summary>
+        public static void RegisterTypeMapping(Type type, string functionName)
+        {
+            _typeMappings[type] = functionName;
+        }
+
+        /// <summary>
+        /// Gets the function name registered for a type, or falls back to Type.Name.
+        /// Used by manager.AddAsync&lt;T&gt;() to resolve function names without strings.
+        /// </summary>
+        public static string GetFunctionName<T>()
+        {
+            return _typeMappings.TryGetValue(typeof(T), out var name) ? name : typeof(T).Name;
+        }
+
+        /// <summary>
+        /// Registers ticker functions during application startup by adding to the callback chain.
+        /// This method should only be called during application startup before Build() is called.
+        /// </summary>
+        /// <param name="functions">The functions to register. Cannot be null.</param>
+        /// <exception cref="ArgumentNullException">Thrown when functions parameter is null.</exception>
+        public static void RegisterFunctions(IDictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)> functions)
+        {
+            if (functions == null)
+                throw new ArgumentNullException(nameof(functions));
+            
+            if (functions.Count == 0)
+                return;
+
+            lock (_buildLock)
+            {
+                _functionRegistrations += dict =>
+                {
+                    foreach (var (key, value) in functions)
+                    {
+                        dict.TryAdd(key, value); // Preserves existing entries
+                    }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Registers ticker functions with capacity hint during application startup by adding to the callback chain.
+        /// This method should only be called during application startup before Build() is called.
+        /// </summary>
+        /// <param name="functions">The functions to register. Cannot be null.</param>
+        /// <param name="_">The total expected capacity (ignored - capacity calculated automatically).</param>
+        /// <exception cref="ArgumentNullException">Thrown when functions parameter is null.</exception>
+        public static void RegisterFunctions(IDictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)> functions, int _)
+        {
+            // For callback approach, capacity is calculated automatically in Build()
+            RegisterFunctions(functions);
+        }
+
+        /// <summary>
+        /// Registers request types during application startup by adding to the callback chain.
+        /// This method should only be called during application startup before Build() is called.
+        /// </summary>
+        /// <param name="requestTypes">The request types to register. Cannot be null.</param>
+        /// <exception cref="ArgumentNullException">Thrown when requestTypes parameter is null.</exception>
+        public static void RegisterRequestType(IDictionary<string, (string, Type)> requestTypes)
+        {
+            if (requestTypes == null)
+                throw new ArgumentNullException(nameof(requestTypes));
+            
+            if (requestTypes.Count == 0)
+                return;
+
+            lock (_buildLock)
+            {
+                _requestTypeRegistrations += dict =>
+                {
+                    foreach (var (key, value) in requestTypes)
+                    {
+                        dict.TryAdd(key, value); // Preserves existing entries
+                    }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Registers request types with capacity hint during application startup by adding to the callback chain.
+        /// This method should only be called during application startup before Build() is called.
+        /// </summary>
+        /// <param name="requestTypes">The request types to register. Cannot be null.</param>
+        /// <param name="_">The total expected capacity (ignored - capacity calculated automatically).</param>
+        /// <exception cref="ArgumentNullException">Thrown when requestTypes parameter is null.</exception>
+        public static void RegisterRequestType(IDictionary<string, (string, Type)> requestTypes, int _)
+        {
+            // For callback approach, capacity is calculated automatically in Build()
+            RegisterRequestType(requestTypes);
+        }
+
+        /// <summary>
+        /// Registers request type metadata (string type + example JSON) for functions.
+        /// </summary>
+        /// <param name="requestInfos">The request info entries to register. Cannot be null.</param>
+        /// <exception cref="ArgumentNullException">Thrown when requestInfos parameter is null.</exception>
+        public static void RegisterRequestInfo(IDictionary<string, (string RequestType, string RequestExampleJson)> requestInfos)
+        {
+            if (requestInfos == null)
+                throw new ArgumentNullException(nameof(requestInfos));
+
+            if (requestInfos.Count == 0)
+                return;
+
+            lock (_buildLock)
+            {
+                _requestInfoRegistrations += dict =>
+                {
+                    foreach (var (key, value) in requestInfos)
+                    {
+                        dict.TryAdd(key, value);
+                    }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Configures an already-registered function's settings (cron, priority, concurrency).
+        /// Called by MapTicker&lt;T&gt;() at runtime to override source-generator defaults.
+        /// Must be called before Build().
+        /// </summary>
+        public static void Configure(string functionName, string cronExpression = null, TickerTaskPriority? priority = null, int? maxConcurrency = null)
+        {
+            _functionRegistrations += dict =>
+            {
+                if (!dict.TryGetValue(functionName, out var existing))
+                    return;
+
+                dict[functionName] = (
+                    cronExpression ?? existing.cronExpression,
+                    priority ?? existing.Priority,
+                    existing.Delegate,
+                    maxConcurrency ?? existing.MaxConcurrency
+                );
+            };
+        }
+
+        /// <summary>
+        /// Updates cron expressions for registered functions by adding to the callback chain.
+        /// This method should only be called during application startup before Build() is called.
+        /// </summary>
+        /// <param name="configuration">IConfiguration to update based on path</param>
+        /// <exception cref="ArgumentNullException">Thrown when cronUpdates parameter is null.</exception>
+        internal static void UpdateCronExpressionsFromIConfiguration(IConfiguration configuration)
+        {
+            lock (_buildLock)
+            {
+                _functionRegistrations += dict =>
+                {
+                    foreach (var (key, value) in dict)
+                    {
+                        if (value.cronExpression.StartsWith('%'))
+                        {
+                            var configKey = value.cronExpression.Trim('%');
+                            var mappedCronExpression = configuration[configKey];
+
+                            if (!string.IsNullOrEmpty(mappedCronExpression))
+                            {
+                                dict[key] = (mappedCronExpression, value.Priority, value.Delegate,
+                                             value.MaxConcurrency);
+                            }
+                        }
+                    }
+                };
+            }
+        }
+
+        /// <summary>
+        /// Builds the final FrozenDictionaries by executing all callbacks with optimal capacity.
+        /// Uses a single-pass approach: directly creates optimally-sized dictionaries and populates them.
+        /// This method should be called once after all registration is complete.
+        /// After calling this method, no more registrations should be made.
+        /// </summary>
+        public static void Build()
+        {
+            lock (_buildLock)
+            {
+                // Build functions dictionary
+                if (_functionRegistrations != null)
+                {
+                    var functionsDict = new Dictionary<string, (string cronExpression, TickerTaskPriority Priority, TickerFunctionDelegate Delegate, int MaxConcurrency)>(TickerFunctions);
+                    _functionRegistrations(functionsDict);
+                    TickerFunctions = functionsDict.ToFrozenDictionary();
+                    _functionRegistrations = null;
+                }
+
+                // Build request types dictionary
+                if (_requestTypeRegistrations != null)
+                {
+                    var requestTypesDict = new Dictionary<string, (string, Type)>(TickerFunctionRequestTypes);
+                    _requestTypeRegistrations(requestTypesDict);
+                    TickerFunctionRequestTypes = requestTypesDict.ToFrozenDictionary();
+                    _requestTypeRegistrations = null;
+                }
+
+                // Build request info dictionary (string type + example JSON)
+                if (_requestInfoRegistrations != null)
+                {
+                    var requestInfoDict = new Dictionary<string, (string RequestType, string RequestExampleJson)>(TickerFunctionRequestInfos);
+                    _requestInfoRegistrations(requestInfoDict);
+                    TickerFunctionRequestInfos = requestInfoDict.ToFrozenDictionary();
+                    _requestInfoRegistrations = null;
+                }
+
+                IsBuilt = true;
+            }
+        }
+    }
+
+    public static class TickerRequestProvider
+    {
+        public static async Task<T> GetRequestAsync<T>(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var internalTickerManager = context.ServiceScope.ServiceProvider.GetService<IInternalTickerManager>();
+                return await internalTickerManager.GetRequestAsync<T>(context.Id, context.Type, cancellationToken);
+            }
+            catch (Exception e)
+            {
+                var logger = context.ServiceScope.ServiceProvider.GetService<ISharpTickerInstrumentation>();
+
+                logger.LogRequestDeserializationFailure(typeof(T).FullName, context.FunctionName, context.Id, context.Type, e);
+            }
+
+            return default;
+        }
+
+        public static async Task<TickerFunctionContext<T>> ToGenericContextAsync<T>(TickerFunctionContext context, CancellationToken cancellationToken)
+        {
+            var request = await GetRequestAsync<T>(context, cancellationToken);
+            return new TickerFunctionContext<T>(context, request);
+        }
+
+        public static async Task<T> GetRequestAsync<T>(TickerFunctionContext context, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
+        {
+            try
+            {
+                var internalTickerManager = context.ServiceScope.ServiceProvider.GetService<IInternalTickerManager>();
+                return await internalTickerManager.GetRequestAsync(context.Id, context.Type, typeInfo, cancellationToken);
+            }
+            catch (Exception e)
+            {
+                var logger = context.ServiceScope.ServiceProvider.GetService<ISharpTickerInstrumentation>();
+                logger.LogRequestDeserializationFailure(typeof(T).FullName, context.FunctionName, context.Id, context.Type, e);
+            }
+
+            return default;
+        }
+
+        public static async Task<TickerFunctionContext<T>> ToGenericContextAsync<T>(TickerFunctionContext context, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
+        {
+            var request = await GetRequestAsync(context, typeInfo, cancellationToken);
+            return new TickerFunctionContext<T>(context, request);
+        }
+    }
+}

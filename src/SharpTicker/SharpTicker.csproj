@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <Description>A lightweight, developer-friendly library for queuing and executing cron and time-based jobs in the background.</Description>
+        <PackageTags>$(PackageTags);background-jobs;task-scheduling</PackageTags>
+        <PackageId>SharpTicker</PackageId>
+        <LangVersion>latest</LangVersion>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <IsAotCompatible>true</IsAotCompatible>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="..\..\README.md" Pack="true" PackagePath="" />
+    </ItemGroup>
+
+   <ItemGroup>
+       <ProjectReference Include="../SharpTicker.Utilities/SharpTicker.Utilities.csproj" />
+   </ItemGroup>
+
+    <Target Name="CopyAnalyzer" AfterTargets="Build">
+        <MakeDir Directories="$(OutputPath)analyzers/dotnet/cs" />
+    </Target>
+
+    <ItemGroup>
+        <None Include="..\SharpTicker.SourceGenerator\bin\$(Configuration)\netstandard2.0\SharpTicker.SourceGenerator.dll"
+              Pack="true"
+              PackagePath="analyzers/dotnet/cs" />
+    </ItemGroup>
+</Project>

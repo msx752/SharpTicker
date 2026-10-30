@@ -1,0 +1,45 @@
+name: Latest patches
+
+# The libraries depend on version ranges such as [8.0.0,9.0.0), and NuGet resolves a range to its
+# lowest version. Regular CI therefore tests against the oldest supported patches. This weekly run
+# floats every Microsoft.Extensions / EF Core dependency to the newest release of its major version,
+# which is what most users actually run, to catch regressions in newer patches early.
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # Mondays 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  test:
+    name: Test latest patches (${{ matrix.tfm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tfm: net8.0
+            runtime: 8.0.x
+          - tfm: net9.0
+            runtime: 9.0.x
+          - tfm: net10.0
+            runtime: 10.0.x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          dotnet-version: ${{ matrix.runtime }}
+
+      - name: Test
+        run: bash .github/scripts/test.sh "${{ matrix.tfm }}" -p:LatestPatchDependencies=true

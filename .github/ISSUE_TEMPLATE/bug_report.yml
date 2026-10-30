@@ -1,0 +1,125 @@
+name: Bug report
+description: Something does not work as documented or expected
+title: "[Bug]: "
+labels: ["type:bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. A small, runnable reproduction is the fastest way to a fix.
+        **Security problems must not be reported here.** Use [private vulnerability reporting](https://github.com/msx752/SharpTicker/security/advisories/new) instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the [existing issues](https://github.com/msx752/SharpTicker/issues?q=is%3Aissue) and this has not been reported yet.
+          required: true
+        - label: I can reproduce this on the latest released version.
+          required: false
+
+  - type: dropdown
+    id: packages
+    attributes:
+      label: Affected packages
+      multiple: true
+      options:
+        - SharpTicker
+        - SharpTicker.EntityFrameworkCore
+        - SharpTicker.MongoDB
+        - SharpTicker.Caching.StackExchangeRedis
+        - SharpTicker.Dashboard
+        - SharpTicker.Instrumentation.OpenTelemetry
+        - SharpTicker.Utilities
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: SharpTicker version
+      placeholder: "e.g. 1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: framework
+    attributes:
+      label: Target framework
+      options:
+        - net10.0
+        - net9.0
+        - net8.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Storage
+      options:
+        - In-memory (default)
+        - Entity Framework Core
+        - MongoDB
+        - Not relevant
+    validations:
+      required: true
+
+  - type: input
+    id: database
+    attributes:
+      label: Database and provider
+      description: Only if you use EF Core or MongoDB.
+      placeholder: "e.g. PostgreSQL 16 with Npgsql.EntityFrameworkCore.PostgreSQL 9.0.4"
+
+  - type: dropdown
+    id: hosting
+    attributes:
+      label: Instances
+      description: How many application instances run the scheduler against the same storage?
+      options:
+        - Single instance
+        - Multiple instances (load balanced, Kubernetes, ...)
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened?
+      description: Describe the bug. Include ticker IDs, statuses or timestamps if they help.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: |
+        The smallest code that shows the problem: registration (`AddSharpTicker(...)`), the job function and how it is scheduled.
+        A link to a minimal repository works too.
+      render: csharp
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and stack trace
+      description: Paste relevant log output or the exception. It is formatted as code automatically.
+      render: text
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Operating system, container image, workarounds you tried, when it started happening.

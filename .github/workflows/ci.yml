@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new commit on the same branch or pull request cancels the run that is still in progress for the older one
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build and pack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The SDK version comes from global.json; one SDK builds all target frameworks
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: src/SharpTicker.Dashboard/wwwroot/package-lock.json
+
+      # The dashboard UI is embedded into SharpTicker.Dashboard, so it has to be built first
+      - name: Build and test dashboard UI
+        working-directory: src/SharpTicker.Dashboard/wwwroot
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: Restore
+        run: dotnet restore SharpTicker.slnx
+
+      - name: Build
+        run: dotnet build SharpTicker.slnx --configuration Release --no-restore
+
+      - name: Pack (with package validation)
+        run: dotnet pack SharpTicker.slnx --configuration Release --no-build --output nupkgs
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs
+          path: nupkgs/
+          if-no-files-found: error
+
+  # One job per target framework, so a failure shows which runtime it belongs to
+  test:
+    name: Test (${{ matrix.tfm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tfm: net8.0
+            runtime: 8.0.x
+          - tfm: net9.0
+            runtime: 9.0.x
+          - tfm: net10.0
+            runtime: 10.0.x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+          dotnet-version: ${{ matrix.runtime }}
+
+      - name: Test
+        run: bash .github/scripts/test.sh "${{ matrix.tfm }}"

@@ -1,0 +1,32 @@
+name: Question
+description: Ask how to use SharpTicker or how something works
+title: "[Question]: "
+labels: ["type:question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the [documentation](https://github.com/msx752/SharpTicker/wiki) and the [samples](https://github.com/msx752/SharpTicker/tree/main/samples) first.
+        If you think you found a bug, use the bug report template instead.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What do you want to know or achieve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Code, configuration or documentation pages you already looked at.
+      render: csharp
+
+  - type: input
+    id: setup
+    attributes:
+      label: Setup
+      description: Optional. Version, target framework and storage.
+      placeholder: "e.g. SharpTicker 1.0.0, net9.0, EF Core with SQL Server"

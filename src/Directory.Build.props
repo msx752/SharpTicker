@@ -1,0 +1,74 @@
+﻿<Project>
+
+    <PropertyGroup>
+        <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+        <Version>1.0.0</Version>
+        <RepositoryUrl>https://github.com/msx752/SharpTicker</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/msx752/SharpTicker</PackageProjectUrl>
+        <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+        <PackageTags>ticker;queue;cron;time;scheduler;fire-and-forget</PackageTags>
+        <PackageIcon>icon.png</PackageIcon>
+        <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+        <!-- Check on every pack that the net8.0 / net9.0 / net10.0 assets stay API-compatible -->
+        <EnablePackageValidation>true</EnablePackageValidation>
+        <LangVersion>default</LangVersion>
+
+        <!-- Source Link -->
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    </PropertyGroup>
+
+    <!-- Pin Microsoft.* / EF Core dependencies to the major version matching each target framework -->
+    <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0'">
+        <DotNetVersion>[8.0.0,9.0.0)</DotNetVersion>
+        <DotNetAbstractionsVersion>[8.0.0,9.0.0)</DotNetAbstractionsVersion>
+        <!-- EF Core 8.0.10 is the first 8.0 patch that pulls a non-vulnerable Microsoft.Extensions.Caching.Memory (8.0.1) -->
+        <EfCoreVersion>[8.0.10,9.0.0)</EfCoreVersion>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(TargetFramework)' == 'net9.0'">
+        <DotNetVersion>[9.0.0,10.0.0)</DotNetVersion>
+        <DotNetAbstractionsVersion>[9.0.0,10.0.0)</DotNetAbstractionsVersion>
+        <EfCoreVersion>$(DotNetVersion)</EfCoreVersion>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'">
+        <DotNetVersion>[10.0.0,11.0.0)</DotNetVersion>
+        <DotNetAbstractionsVersion>[10.0.0,11.0.0)</DotNetAbstractionsVersion>
+        <EfCoreVersion>$(DotNetVersion)</EfCoreVersion>
+    </PropertyGroup>
+
+    <!-- Opt-in for the weekly "Latest patches" workflow: float the dependencies above to the newest release of the
+         same major version (ranges otherwise resolve to their lowest version). Never used for packing. -->
+    <PropertyGroup Condition="'$(LatestPatchDependencies)' == 'true' And '$(TargetFramework)' == 'net8.0'">
+        <DotNetVersion>8.*</DotNetVersion>
+        <DotNetAbstractionsVersion>8.*</DotNetAbstractionsVersion>
+        <EfCoreVersion>8.*</EfCoreVersion>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(LatestPatchDependencies)' == 'true' And '$(TargetFramework)' == 'net9.0'">
+        <DotNetVersion>9.*</DotNetVersion>
+        <DotNetAbstractionsVersion>9.*</DotNetAbstractionsVersion>
+        <EfCoreVersion>9.*</EfCoreVersion>
+    </PropertyGroup>
+    <PropertyGroup Condition="'$(LatestPatchDependencies)' == 'true' And '$(TargetFramework)' == 'net10.0'">
+        <DotNetVersion>10.*</DotNetVersion>
+        <DotNetAbstractionsVersion>10.*</DotNetAbstractionsVersion>
+        <EfCoreVersion>10.*</EfCoreVersion>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="..\..\icon.png" Pack="true" PackagePath="\" />
+        <!-- Ship the license text so the copyright and permission notices travel with every package -->
+        <None Include="..\..\LICENSE" Pack="true" PackagePath="\" />
+    </ItemGroup>
+
+    <!-- Not for the netstandard2.0 source generator: it ships inside the main package as an analyzer and must keep
+         System.Memory 4.5.5 (loads in the compiler host), which newer Source Link versions would force up -->
+    <ItemGroup Condition="'$(TargetFramework)' != 'netstandard2.0'">
+        <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.403" PrivateAssets="All" />
+    </ItemGroup>
+
+    <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+</Project>

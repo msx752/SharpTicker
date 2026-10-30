@@ -1,0 +1,11 @@
+﻿<Project>
+
+    <PropertyGroup>
+        <Authors>msx752</Authors>
+        <!-- No company: otherwise the SDK fills the assembly's Company attribute with Authors -->
+        <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+        <!-- The original copyright notice is kept as required by the MIT / Apache-2.0 licenses -->
+        <Copyright>Copyright (c) 2025-present Arcenox LLC; Copyright (c) 2026-present SharpTicker contributors</Copyright>
+    </PropertyGroup>
+
+</Project>

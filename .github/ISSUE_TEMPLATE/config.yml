@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/msx752/SharpTicker/wiki
+    about: Guides and configuration reference. Please check here before opening an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/msx752/SharpTicker/security/advisories/new
+    about: Report security problems privately. Do not open a public issue for them.
