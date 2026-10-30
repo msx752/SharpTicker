@@ -146,10 +146,11 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     [Fact]
     public async Task DeleteTimeTicker_IsHarmless_ForATickerThatIsAlreadyGone()
     {
-        var (status, _) = await _api.SendAsync(HttpMethod.Delete, $"/time-ticker/delete?id={Guid.NewGuid()}");
+        var (status, body) = await _api.SendAsync(HttpMethod.Delete, $"/time-ticker/delete?id={Guid.NewGuid()}");
+        var remaining = await TimeTickersAsync();
 
-        Assert.Equal(200, status);
-        Assert.Equal(3, (await TimeTickersAsync()).Length);
+        Assert.True(status == 200, $"status {status}, body {body}");
+        Assert.True(remaining.Length == 3, $"{remaining.Length} time tickers left: {string.Join(", ", remaining.Select(t => t.GetProperty("function").GetString() + ":" + t.GetProperty("id").GetGuid()))}");
     }
 
     [Fact]
