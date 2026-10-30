@@ -270,6 +270,69 @@ public class InternalTickerManagerTests
     }
 
     [Fact]
+    public void EarliestCronTickerGroup_ACronWithDayNames_PicksTheNextWeekday()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            // _now is Sunday 2025-06-15, so the next weekday at 09:00 is Monday 2025-06-16.
+            var cron = MakeCron(Guid.NewGuid(), "Weekdays", "0 0 9 * * MON-FRI");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Equal(new DateTime(2025, 6, 16, 9, 0, 0, DateTimeKind.Utc), result!.Value.Next);
+            Assert.Equal("0 0 9 * * MON-FRI", Assert.Single(result.Value.Items).Expression);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
+    public void EarliestCronTickerGroup_ANamedCronAndItsNumericForm_FireTogether()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            var named = MakeCron(Guid.NewGuid(), "Named", "0 0 9 * * mon,wed,fri");
+            var numeric = MakeCron(Guid.NewGuid(), "Numeric", "0 0 9 * * 1,3,5");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { named, numeric }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Equal(2, result!.Value.Items.Length);
+            Assert.Equal(new DateTime(2025, 6, 16, 9, 0, 0, DateTimeKind.Utc), result.Value.Next);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
+    public void EarliestCronTickerGroup_ACronWithAMonthName_PicksThatMonth()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            var cron = MakeCron(Guid.NewGuid(), "Quarterly", "0 0 0 1 Jul,Oct *");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.Equal(new DateTime(2025, 7, 1, 0, 0, 0, DateTimeKind.Utc), result!.Value.Next);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
     public void EarliestCronTickerGroup_StoredOccurrenceSameTimeAsCalculated_MergesBoth()
     {
         var origTz = CronScheduleCache.TimeZoneInfo;

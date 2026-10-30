@@ -173,6 +173,34 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.True(added.GetProperty("isEnabled").GetBoolean());
     }
 
+    [Theory]
+    [InlineData("0 0 9 * * MON-FRI")]
+    [InlineData("0 30 8 * * mon,wed,fri")]
+    [InlineData("0 0 0 1 Jan,Jul *")]
+    [InlineData("0 0 9 * * Monday")]
+    [InlineData("0 0 0 1 Sept *")]
+    public async Task AddCronTicker_StoresAndReturnsAnExpressionWithNamesExactlyAsWritten(string expression)
+    {
+        var (status, body) = await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
+            $$"""{"function":"NewCron","expression":"{{expression}}"}""");
+
+        Assert.Equal(200, status);
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var added = (await CronTickersAsync()).Single(c => c.GetProperty("id").GetGuid() == body.Value.GetProperty("tickerId").GetGuid());
+        Assert.Equal(expression, added.GetProperty("expression").GetString());
+    }
+
+    [Fact]
+    public async Task UpdateCronTicker_CanChangeTheExpressionToOneWithNames()
+    {
+        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={DashboardApiFixture.CronId}",
+            """{"function":"SeedCron","expression":"0 0 9 * * MON-FRI"}""");
+
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var cron = (await CronTickersAsync()).Single(c => c.GetProperty("id").GetGuid() == DashboardApiFixture.CronId);
+        Assert.Equal("0 0 9 * * MON-FRI", cron.GetProperty("expression").GetString());
+    }
+
     [Fact]
     public async Task AddCronTicker_IsRefused_ForAnInvalidExpression()
     {

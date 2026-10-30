@@ -99,6 +99,30 @@ public class StartupServicesTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ACronWithDayNames_IsSeededWithTheExpressionAsWritten()
+    {
+        new ServiceCollection().MapTicker("Startup.WeekdayCron", (_, _) => Task.CompletedTask).WithCron("0 0 9 * * MON-FRI");
+        TickerFunctionProvider.Build();
+
+        await StartAsync();
+
+        var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.WeekdayCron");
+        Assert.Equal("0 0 9 * * MON-FRI", cron.Expression);
+    }
+
+    [Fact]
+    public async Task AFiveFieldCronWithNames_IsSeededWithTheSecondsFieldAdded()
+    {
+        new ServiceCollection().MapTicker("Startup.WeekdayCron5", (_, _) => Task.CompletedTask).WithCron("30 8 * * Mon-Fri");
+        TickerFunctionProvider.Build();
+
+        await StartAsync();
+
+        var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.WeekdayCron5");
+        Assert.Equal("0 30 8 * * Mon-Fri", cron.Expression);
+    }
+
+    [Fact]
     public async Task StartingTwice_DoesNotSeedTheSameCronTickerAgain()
     {
         await StartAsync();
