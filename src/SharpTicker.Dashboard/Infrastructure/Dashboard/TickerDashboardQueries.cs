@@ -19,6 +19,9 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
+        /// <summary>Name shown for jobs that are locked but have no lock holder recorded.</summary>
+        private const string UnknownMachine = "unknown";
+
         private readonly ITickerPersistenceProvider<TTimeTicker, TCronTicker> _provider;
 
         public TickerDashboardQueries(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider)
@@ -174,10 +177,10 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
             var combined = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var group in timeTickers.GroupBy(x => x.LockHolder))
+            foreach (var group in timeTickers.GroupBy(x => x.LockHolder ?? UnknownMachine))
                 combined[group.Key] = group.Count();
 
-            foreach (var group in cronOccurrences.GroupBy(x => x.LockHolder))
+            foreach (var group in cronOccurrences.GroupBy(x => x.LockHolder ?? UnknownMachine))
             {
                 if (combined.ContainsKey(group.Key))
                     combined[group.Key] += group.Count();

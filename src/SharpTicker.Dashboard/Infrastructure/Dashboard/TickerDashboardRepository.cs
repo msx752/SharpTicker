@@ -18,6 +18,9 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
+        /// <summary>Name shown for jobs that are locked but have no lock holder recorded.</summary>
+        private const string UnknownMachine = "unknown";
+
         private readonly ITickerPersistenceProvider<TTimeTicker, TCronTicker> _persistenceProvider;
         private readonly ISharpTickerHostScheduler _sharpTickerHostScheduler;
         private readonly ISharpTickerDispatcher _dispatcher;
@@ -366,13 +369,13 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         {
             var timeTickers = await _persistenceProvider.GetTimeTickers(x => x.LockedAt != null, cancellationToken);
             var timeTickerCounts = timeTickers
-                .GroupBy(x => x.LockHolder)
+                .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
                 .ToList();
 
             var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(x => x.LockedAt != null, cancellationToken);
             var cronTickerCounts = cronTickerOccurrences
-                .GroupBy(x => x.LockHolder)
+                .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
                 .ToList();
 

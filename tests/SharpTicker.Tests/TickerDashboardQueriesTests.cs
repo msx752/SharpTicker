@@ -207,8 +207,7 @@ public abstract class TickerDashboardQueriesTests<TFixture> : IClassFixture<TFix
         }
     }
 
-    [Fact(Skip = "Known bug: a locked job without a lock holder makes the machine jobs query throw ArgumentNullException (a null dictionary key). "
-        + "TickerDashboardRepository.GetMachineJobsAsync, which the dashboard uses, has the same code.")]
+    [Fact]
     public async Task MachineJobs_DoNotFail_ForALockedJobWithoutAHolder()
     {
         var ticker = _fixture.Time(Guid.NewGuid(), "SeedJob", TickerStatus.InProgress, _fixture.Today);
@@ -217,7 +216,9 @@ public abstract class TickerDashboardQueriesTests<TFixture> : IClassFixture<TFix
         await _fixture.Store.AddTimeTickers(new[] { ticker });
         try
         {
-            await _queries.GetMachineJobsAsync(Ct);
+            var machines = await _queries.GetMachineJobsAsync(Ct);
+
+            Assert.Equal(("unknown", 1), Assert.Single(machines));
         }
         finally
         {
@@ -232,11 +233,13 @@ public abstract class TickerDashboardQueriesTests<TFixture> : IClassFixture<TFix
     }
 }
 
+[Collection(SharedStaticStateCollection.Name)]
 public class InMemoryTickerDashboardQueriesTests : TickerDashboardQueriesTests<InMemoryDashboardApiFixture>
 {
     public InMemoryTickerDashboardQueriesTests(InMemoryDashboardApiFixture fixture) : base(fixture) { }
 }
 
+[Collection(SharedStaticStateCollection.Name)]
 public class EfCoreTickerDashboardQueriesTests : TickerDashboardQueriesTests<EfCoreDashboardApiFixture>
 {
     public EfCoreTickerDashboardQueriesTests(EfCoreDashboardApiFixture fixture) : base(fixture) { }

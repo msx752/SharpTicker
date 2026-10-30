@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using SharpTicker.Utilities.Enums;
 using Xunit;
 
 namespace SharpTicker.Tests;
@@ -409,6 +410,26 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
         var jobs = await _api.GetAsync("/ticker/machine/jobs");
 
         Assert.Empty(jobs.EnumerateArray());
+    }
+
+    [Fact]
+    public async Task MachineJobs_ShowALockedJobWithoutAHolderAsUnknown_InsteadOfFailing()
+    {
+        var ticker = _api.Time(Guid.NewGuid(), "SeedJob", TickerStatus.InProgress, _api.Today);
+        ticker.LockedAt = DateTime.UtcNow;
+        ticker.LockHolder = null;
+        await _api.Store.AddTimeTickers(new[] { ticker });
+        try
+        {
+            var jobs = await _api.GetAsync("/ticker/machine/jobs");
+
+            var machine = Assert.Single(jobs.EnumerateArray());
+            Assert.Contains("unknown", machine.GetRawText());
+        }
+        finally
+        {
+            await _api.Store.RemoveTimeTickers(new[] { ticker.Id });
+        }
     }
 
     #endregion
