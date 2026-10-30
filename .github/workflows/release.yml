@@ -4,6 +4,10 @@ name: Release
 # The release tag is "v" plus the package version, e.g. "v1.2.3" or "v1.2.3-rc.1". The tag must be on main,
 # and the release is marked as a pre-release exactly when the version has a "-" suffix.
 # See "Releasing" in CONTRIBUTING.md.
+#
+# Publishing uses NuGet Trusted Publishing: no long-lived API key is stored. The publish job trades a
+# GitHub OIDC token for a NuGet API key that is valid for about an hour. The matching trusted publishing
+# policy on nuget.org is bound to this repository, this file and the "nuget" environment.
 on:
   release:
     types: [published]
@@ -69,12 +73,12 @@ jobs:
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  publish:
-    name: Build, test and publish
+  # Runs all third-party code (npm and NuGet restore, build, tests). It has no secrets and cannot request
+  # an OIDC token, so a compromised dependency cannot obtain publishing rights.
+  build:
+    name: Build, test and pack
     needs: validate
     runs-on: ubuntu-latest
-    # Holds the NUGET_API_KEY secret; its required reviewer approves each publish
-    environment: nuget
     env:
       PACKAGE_VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -113,10 +117,42 @@ jobs:
       - name: Pack
         run: dotnet pack SharpTicker.slnx --configuration Release --no-build -p:Version="$PACKAGE_VERSION" --output nupkgs
 
+      - name: Upload packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nupkgs
+          path: nupkgs/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Only downloads the packages built above and pushes them. No checkout and no build tools run here,
+  # because this is the only job that may request an OIDC token.
+  publish:
+    name: Publish to NuGet
+    needs: build
+    runs-on: ubuntu-latest
+    # Its required reviewer approves each publish; the nuget.org trusted publishing policy only accepts it
+    environment: nuget
+    permissions:
+      id-token: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nupkgs
+          path: nupkgs
+
+      # Exchanges the OIDC token for a short-lived API key; the key is masked in the log
+      - name: NuGet login
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: MSAslim # nuget.org profile name, not an e-mail address
+
       # Pushing the .nupkg files also pushes the matching .snupkg symbol packages.
       # --skip-duplicate only matters when re-running this job after a partial push; a new release
       # of an existing version is already rejected by the validate job.
       - name: Publish to NuGet
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: dotnet nuget push "nupkgs/*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
