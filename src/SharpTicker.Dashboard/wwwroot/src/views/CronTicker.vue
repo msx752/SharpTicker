@@ -784,7 +784,7 @@ watch(
 const headersWithoutReadable = computed(() => {
   // Define headers manually for paginated response
   return [
-    { title: 'Function', key: 'function', sortable: true, visibility: true },
+    { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
     { title: 'Expression', key: 'expression', sortable: true, visibility: true },
     { title: 'Request Type', key: 'requestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },

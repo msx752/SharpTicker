@@ -470,7 +470,7 @@ const processedTableData = computed(() => {
 const headersWithSelection = computed(() => {
   // For now, define headers manually since paginated response might not have headers
   const headers = [
-    { title: 'Function', key: 'function', sortable: true, visibility: true },
+    { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
     { title: 'Status', key: 'status', sortable: true, visibility: true },
     { title: 'Request Type', key: 'RequestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },

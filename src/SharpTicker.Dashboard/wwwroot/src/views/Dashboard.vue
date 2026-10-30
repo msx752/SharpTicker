@@ -207,7 +207,7 @@ const availablePageSizes = [5, 10, 20, 50]
 
 // Table headers for Vuetify data table
 const functionHeaders = [
-  { title: 'Function Name', key: 'function', sortable: true },
+  { title: 'Function Name', key: 'function', sortable: true, minWidth: '200px' },
   { title: 'Request Namespace', key: 'request', sortable: true },
   { title: 'Priority', key: 'priority', sortable: true },
 ]
@@ -1539,5 +1539,10 @@ const getVisiblePageNumbers = () => {
 .content-grid > *,
 .bottom-grid > * {
   min-width: 0;
+}
+
+/* A long function name wraps inside its cell instead of pushing the other columns out of view. */
+.function-name {
+  overflow-wrap: anywhere;
 }
 </style>
