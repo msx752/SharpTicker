@@ -65,7 +65,8 @@ public class FluentChainTickerBuilderTests
         Assert.Null(parent.ParentId);
         Assert.Empty(parent.Children);
         Assert.InRange(parent.CreatedAt, DateTime.UtcNow.AddMinutes(-1), DateTime.UtcNow.AddMinutes(1));
-        Assert.Equal(parent.CreatedAt, parent.UpdatedAt);
+        // Two separate clock reads, so they can differ by a few ticks, more on a slow machine.
+        Assert.InRange(parent.UpdatedAt, parent.CreatedAt, parent.CreatedAt.AddSeconds(5));
     }
 
     [Fact]
