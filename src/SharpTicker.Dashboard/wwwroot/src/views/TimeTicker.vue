@@ -9,7 +9,7 @@ import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import ChainJobsModal from '@/components/ChainJobsModal.vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
-import { formatDate } from '@/utilities/dateTimeParser'
+import { formatDate, parseDuration } from '@/utilities/dateTimeParser'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
@@ -46,6 +46,8 @@ const getTimeTickersPaginated = timeTickerService.getTimeTickersPaginated()
 const deleteTimeTicker = timeTickerService.deleteTimeTicker()
 const deleteTimeTickersBatch = timeTickerService.deleteTimeTickersBatch()
 const requestCancelTicker = tickerService.requestCancel()
+const addTimeTicker = timeTickerService.addTimeTicker()
+const getTickerRequest = tickerService.getRequestData()
 const getTimeTickersGraphDataRange = timeTickerService.getTimeTickersGraphDataRange()
 const getTimeTickersGraphData = timeTickerService.getTimeTickersGraphData()
 
@@ -106,6 +108,31 @@ const pieChartKey = ref(0)
 provide(THEME_KEY, 'dark')
 
 const timeZoneStore = useTimeZoneStore()
+
+// Adds a new ticker with the same function, request, retries and description, to run right away.
+// A time ticker runs once, so running it again is a new row.
+const runningAgain = ref(new Set<string>())
+
+const runAgain = async (item: GetTimeTickerResponse) => {
+  if (runningAgain.value.has(item.id)) return
+  runningAgain.value.add(item.id)
+  try {
+    const stored = await getTickerRequest.requestAsync(item.id, 1)
+    await addTimeTicker.requestAsync(
+      {
+        function: item.function,
+        request: stored?.result ?? '',
+        retries: parseInt(`${item.retries}`),
+        description: item.description,
+        intervals: Array.isArray(item.retryIntervals) ? item.retryIntervals.map(parseDuration) : undefined,
+      },
+      timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone,
+    )
+    await loadPageData()
+  } finally {
+    runningAgain.value.delete(item.id)
+  }
+}
 
 onMounted(async () => {
   // Initialize WebSocket connection
@@ -1275,6 +1302,23 @@ const canBeForceDeleted = ref<string[]>([])
                   </v-tooltip>
                 </div>
 
+                <!-- Run Again Button -->
+                <div class="action-btn-wrapper">
+                  <v-tooltip location="top">
+                    <template v-slot:activator="{ props }">
+                      <button
+                        v-bind="props"
+                        @click="runAgain(item)"
+                        class="modern-action-btn run-btn"
+                        :disabled="runningAgain.has(item.id)"
+                      >
+                        <v-icon size="16">mdi-play-outline</v-icon>
+                      </button>
+                    </template>
+                    <span>Run again</span>
+                  </v-tooltip>
+                </div>
+
                 <!-- Delete Button -->
                 <div
                   class="action-btn-wrapper"
@@ -1966,6 +2010,16 @@ const canBeForceDeleted = ref<string[]>([])
   border-color: rgba(100, 181, 246, 0.5);
   box-shadow: none;
   background: rgba(100, 181, 246, 0.15);
+}
+
+.run-btn {
+  color: #4caf50;
+  border-color: rgba(76, 175, 80, 0.2);
+}
+
+.run-btn:hover {
+  border-color: rgba(76, 175, 80, 0.5);
+  background: rgba(76, 175, 80, 0.15);
 }
 
 .duplicate-btn {
