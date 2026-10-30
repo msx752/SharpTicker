@@ -607,6 +607,12 @@ const setRowProp = (propContext: any) => {
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
 }
 
+/* Let cell contents wrap, so the table fits its container instead of scrolling sideways.
+   Header cells share the same class and keep whole words, so only the table body may break inside a word. */
+:deep(.enhanced-table tbody .v-data-table__td) {
+  overflow-wrap: anywhere;
+}
+
 :deep(.enhanced-table .v-data-table__wrapper) {
   overflow: hidden;
 }

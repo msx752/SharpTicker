@@ -6,6 +6,7 @@ import { useForm } from '@/composables/useCustomForm'
 import { tickerService } from '@/http/services/tickerService'
 import { timeTickerService } from '@/http/services/timeTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
+import { copyText } from '@/utilities/clipboard'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 
 const functionNamesStore = useFunctionNameStore()
@@ -370,6 +371,33 @@ const reqyestType = computed(() => {
   return requestType == '' ? 'No request data' : requestType
 })
 
+// The request field is locked only when the selected function takes no request. An example can be
+// missing for a function that does (its type could not be turned into JSON), and the field must
+// stay editable then, as well as for a stored request that is being edited.
+const takesRequest = computed(() => {
+  const requestType = functionNamesStore.data?.find(
+    (x) => x.functionName == getFieldValue('functionName'),
+  )?.functionRequestNamespace
+
+  return !!requestType || !!getFieldValue('requestData')
+})
+const hasExample = computed(() => formatJsonForDisplay(getFieldValue('exampleData'), false) !== undefined)
+const requestHint = computed(() => {
+  if (!getFieldValue('functionName')) return 'Select a function first.'
+  if (!takesRequest.value) return 'This function takes no request data.'
+  if (!hasExample.value) return 'No example is available for this request type. Enter the JSON by hand.'
+  return ''
+})
+
+const exampleCopied = ref(false)
+const copyExample = async () => {
+  const text = formatJsonForDisplay(getFieldValue('exampleData'), false)
+  if (text === undefined || !(await copyText(text))) return
+
+  exampleCopied.value = true
+  setTimeout(() => (exampleCopied.value = false), 1500)
+}
+
 defineExpose({
   resetForm,
 })
@@ -388,7 +416,17 @@ defineExpose({
                 <v-card-item>
                   <template v-slot:append>
                     <v-btn
+                      :icon="exampleCopied ? 'mdi-check' : 'mdi-content-copy'"
+                      :disabled="!hasExample"
+                      title="Copy the example"
+                      variant="text"
+                      @click="copyExample"
+                    ></v-btn>
+                    <v-btn
                       icon="mdi-share-outline"
+                      :disabled="!hasExample"
+                      title="Use the example as the request"
+                      variant="text"
                       @click="setFieldValue('requestData', getFieldValue('exampleData'))"
                     ></v-btn>
                   </template>
@@ -398,7 +436,8 @@ defineExpose({
                 </v-card-item>
 
                 <v-card-text>
-                  <div v-html="formatJsonForDisplay(getFieldValue('exampleData'), true)"></div>
+                  <pre v-if="hasExample" class="example-json">{{ formatJsonForDisplay(getFieldValue('exampleData'), false) }}</pre>
+                  <div v-else class="text-medium-emphasis">No example available.</div>
                 </v-card-text>
               </v-card>
             </v-container>
@@ -519,9 +558,9 @@ defineExpose({
                       v-bind="bindField('requestData')"
                       label="Request Data"
                       variant="outlined"
-                      :disabled="
-                        formatJsonForDisplay(getFieldValue('exampleData'), false) == undefined
-                      "
+                      :disabled="!takesRequest"
+                      :hint="requestHint"
+                      persistent-hint
                     />
                   </v-col>
                   <v-col cols="6" v-if="!getFieldValue('ignoreDateTime')">
@@ -576,6 +615,17 @@ defineExpose({
   </div>
 </template>
 <style scoped>
+.example-json {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 /* For Chrome, Safari, Edge, Opera */
 input::-webkit-outer-spin-button,
 input::-webkit-inner-spin-button {

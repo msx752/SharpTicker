@@ -1972,6 +1972,12 @@ const refreshData = async () => {
   padding: 8px 12px;
 }
 
+/* Let cell contents wrap, so the table fits its container instead of scrolling sideways.
+   Header cells share the same class and keep whole words, so only the table body may break inside a word. */
+:deep(.enhanced-table tbody .v-data-table__td) {
+  overflow-wrap: anywhere;
+}
+
 :deep(.enhanced-table .v-data-table-header__td) {
   padding: 10px 12px;
 }
@@ -2016,6 +2022,8 @@ const refreshData = async () => {
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 76px; /* two buttons per row at the narrowest */
   align-items: center;
   gap: 6px;
   padding: 2px;
