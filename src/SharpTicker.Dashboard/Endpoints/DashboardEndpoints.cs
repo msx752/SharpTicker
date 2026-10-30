@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Dashboard.Authentication;
 using SharpTicker.Dashboard.Hubs;
 using SharpTicker.Dashboard.Infrastructure;
@@ -251,12 +252,26 @@ public static class DashboardEndpoints
     }
 
     /// <summary>
-    /// The text a failed action reports. The reason is added only for a validation error, whose message is written for
-    /// the person who made the request, such as an invalid cron expression. The message of any other exception can hold
-    /// internal details, so it stays out of the response.
+    /// The text a failed action reports, and the log entry that keeps the details on the server. A validation error,
+    /// such as an invalid cron expression, is logged as a warning and its message goes into the response, because it
+    /// is written for the person who made the request. The message of any other exception can hold internal details,
+    /// so it is only logged, as an error with the exception, and stays out of the response.
     /// </summary>
-    private static string FailureMessage(string message, Exception exception)
-        => exception is TickerValidatorException ? $"{message}: {exception.Message}" : message;
+    private static string FailureMessage(HttpContext context, string message, Exception exception)
+    {
+        var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(DashboardEndpoints));
+
+        if (exception is TickerValidatorException)
+        {
+            logger.LogWarning("SharpTicker Dashboard request refused: {Action} - {Error}", message, exception.Message);
+            return $"{message}: {exception.Message}";
+        }
+
+        if (exception != null)
+            logger.LogError(exception, "SharpTicker Dashboard request failed: {Action} - {Error}", message, exception.Message);
+
+        return message;
+    }
 
     private static async Task ValidateAuth(HttpContext context)
     {
@@ -396,7 +411,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Chain jobs created successfully" : FailureMessage("Failed to create chain jobs", result.Exception),
+            Message = result.IsSucceeded ? "Chain jobs created successfully" : FailureMessage(context, "Failed to create chain jobs", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -434,7 +449,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Time ticker updated successfully" : FailureMessage("Failed to update time ticker", result.Exception)
+            Message = result.IsSucceeded ? "Time ticker updated successfully" : FailureMessage(context, "Failed to update time ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -619,7 +634,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker added successfully" : FailureMessage("Failed to add cron ticker", result.Exception),
+            Message = result.IsSucceeded ? "Cron ticker added successfully" : FailureMessage(context, "Failed to add cron ticker", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -648,7 +663,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker updated successfully" : FailureMessage("Failed to update cron ticker", result.Exception)
+            Message = result.IsSucceeded ? "Cron ticker updated successfully" : FailureMessage(context, "Failed to update cron ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 

@@ -1,4 +1,5 @@
 using System;
+using Microsoft.Extensions.Logging;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
@@ -231,6 +232,37 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     }
 
     [Fact]
+    public async Task ARefusedCronTicker_IsLoggedAsAWarningWithTheReason_AndNoException()
+    {
+        await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
+            """{"function":"NewCron","expression":"0 0 22-2 * * *"}""");
+
+        var entry = Assert.Single(_api.Logs.Entries, e => e.Category.EndsWith("DashboardEndpoints") && e.Level == LogLevel.Warning);
+        Assert.Contains("Failed to add cron ticker", entry.Message);
+        Assert.Contains("backwards", entry.Message);
+        Assert.Null(entry.Exception);
+    }
+
+    /// <summary>
+    /// The store fails (adding a cron with an id that exists breaks the primary key). The response says only that the
+    /// action failed, so no table or constraint name reaches the browser, and the details go to the server log.
+    /// </summary>
+    protected async Task AssertAFailureOfTheStoreIsLoggedButNotReturnedAsync()
+    {
+        var (status, body) = await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
+            $$"""{"id":"{{DashboardApiFixture.CronId}}","function":"NewCron","expression":"0 0 * * * *"}""");
+
+        Assert.Equal(200, status);
+        Assert.False(body!.Value.GetProperty("success").GetBoolean());
+        Assert.Equal("Failed to add cron ticker", body.Value.GetProperty("message").GetString());
+
+        var entry = Assert.Single(_api.Logs.Entries, e => e.Category.EndsWith("DashboardEndpoints") && e.Level == LogLevel.Error);
+        Assert.Contains("Failed to add cron ticker", entry.Message);
+        Assert.NotNull(entry.Exception);
+        Assert.Contains("constraint", entry.Exception!.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task AddCronTicker_IsRefused_ForAnInvalidExpression()
     {
         var (_, body) = await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
@@ -390,4 +422,7 @@ public class EfCoreDashboardApiWriteTests : DashboardApiWriteTests<EfCoreDashboa
 
     [Fact]
     public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
+
+    [Fact]
+    public Task AFailureOfTheStore_IsLoggedOnTheServer_ButNotReturnedToTheBrowser() => AssertAFailureOfTheStoreIsLoggedButNotReturnedAsync();
 }

@@ -12,6 +12,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Dashboard;
 using SharpTicker.Dashboard.DependencyInjection;
 using SharpTicker.DependencyInjection;
@@ -50,6 +51,9 @@ public abstract class DashboardApiFixture : IAsyncLifetime
 
     private WebApplication? _app;
 
+    /// <summary>Everything the application logged while the test ran.</summary>
+    public CapturedLogs Logs { get; } = new();
+
     public HttpClient Client { get; private set; } = null!;
     public ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store { get; private set; } = null!;
 
@@ -84,6 +88,7 @@ public abstract class DashboardApiFixture : IAsyncLifetime
 
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
+        builder.Logging.AddProvider(Logs);
         builder.Services.AddSharpTicker(options =>
         {
             options.DisableBackgroundServices();
@@ -242,4 +247,44 @@ public sealed class EfCoreDashboardApiFixture : DashboardApiFixture
     }
 
     protected override void DisposeStore() => _connection?.Dispose();
+}
+
+/// <summary>A logger provider that keeps what was logged, so a test can check which entries a request wrote.</summary>
+public sealed class CapturedLogs : ILoggerProvider
+{
+    public sealed record Entry(string Category, LogLevel Level, string Message, Exception? Exception);
+
+    private readonly object _gate = new();
+    private readonly List<Entry> _entries = new();
+
+    public Entry[] Entries
+    {
+        get { lock (_gate) return _entries.ToArray(); }
+    }
+
+    public ILogger CreateLogger(string categoryName) => new Logger(this, categoryName);
+
+    public void Dispose() { }
+
+    private sealed class Logger : ILogger
+    {
+        private readonly CapturedLogs _owner;
+        private readonly string _category;
+
+        public Logger(CapturedLogs owner, string category)
+        {
+            _owner = owner;
+            _category = category;
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (_owner._gate)
+                _owner._entries.Add(new Entry(_category, logLevel, formatter(state, exception), exception));
+        }
+    }
 }
