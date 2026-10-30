@@ -37,8 +37,8 @@ using (var scope = host.Services.CreateScope())
     db.Database.Migrate();
 }
 
-// Build function metadata so TickerFunctionProvider.TickerFunctions is initialized
-TickerFunctionProvider.Build();
+// Initialize SharpTicker for generic host applications. Function discovery and seeding run when the host starts.
+host.UseSharpTicker();
 
 await host.RunAsync();
 
