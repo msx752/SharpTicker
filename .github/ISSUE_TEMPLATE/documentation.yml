@@ -8,7 +8,7 @@ body:
     attributes:
       label: Location
       description: Link to the page, README section or sample project.
-      placeholder: "e.g. https://msx752.github.io/SharpTicker/scheduling.html"
+      placeholder: "e.g. https://msx752.github.io/SharpTicker/guide/scheduling.html"
     validations:
       required: true
 

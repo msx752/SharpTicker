@@ -1,6 +1,54 @@
+/* SharpTicker brand colors on top of the DocFX modern template (Bootstrap 5.3 variables).
+   Navy #2547B8 and sky #38BDF8 come from the logo (assets/logo.svg). */
+:root,
+[data-bs-theme="light"] {
+  --bs-primary: #2547b8;
+  --bs-primary-rgb: 37, 71, 184;
+  --bs-link-color: #2547b8;
+  --bs-link-color-rgb: 37, 71, 184;
+  --bs-link-hover-color: #1b3488;
+  --bs-link-hover-color-rgb: 27, 52, 136;
+  --sharpticker-accent: #2547b8;
+}
+
+[data-bs-theme="dark"] {
+  --bs-primary: #38bdf8;
+  --bs-primary-rgb: 56, 189, 248;
+  --bs-link-color: #38bdf8;
+  --bs-link-color-rgb: 56, 189, 248;
+  --bs-link-hover-color: #7dd3fc;
+  --bs-link-hover-color-rgb: 125, 211, 252;
+  --sharpticker-accent: #38bdf8;
+}
+
 /* Keep the square logo at navbar height */
 #logo {
   width: 32px;
   height: 32px;
   margin-right: 0.5rem;
+}
+
+/* Active items in the top bar and the sidebar */
+.navbar .nav-link.active,
+.toc a.active {
+  color: var(--sharpticker-accent) !important;
+}
+
+/* Landing page header: logo next to the title */
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.hero h1 {
+  margin-top: 0;
+}
+
+@media (max-width: 576px) {
+  .hero {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 }
