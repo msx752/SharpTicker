@@ -14,6 +14,7 @@ using SharpTicker.Dashboard.Authentication;
 using SharpTicker.Dashboard.Hubs;
 using SharpTicker.Dashboard.Infrastructure;
 using SharpTicker.Utilities;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
@@ -249,6 +250,14 @@ public static class DashboardEndpoints
         await WriteJson(context, response, dashboardOptions.DashboardJsonOptions);
     }
 
+    /// <summary>
+    /// The text a failed action reports. The reason is added only for a validation error, whose message is written for
+    /// the person who made the request, such as an invalid cron expression. The message of any other exception can hold
+    /// internal details, so it stays out of the response.
+    /// </summary>
+    private static string FailureMessage(string message, Exception exception)
+        => exception is TickerValidatorException ? $"{message}: {exception.Message}" : message;
+
     private static async Task ValidateAuth(HttpContext context)
     {
         var authService = context.RequestServices.GetRequiredService<IAuthService>();
@@ -387,7 +396,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Chain jobs created successfully" : "Failed to create chain jobs",
+            Message = result.IsSucceeded ? "Chain jobs created successfully" : FailureMessage("Failed to create chain jobs", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -425,7 +434,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Time ticker updated successfully" : "Failed to update time ticker"
+            Message = result.IsSucceeded ? "Time ticker updated successfully" : FailureMessage("Failed to update time ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -610,7 +619,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker added successfully" : "Failed to add cron ticker",
+            Message = result.IsSucceeded ? "Cron ticker added successfully" : FailureMessage("Failed to add cron ticker", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -639,7 +648,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker updated successfully" : "Failed to update cron ticker"
+            Message = result.IsSucceeded ? "Cron ticker updated successfully" : FailureMessage("Failed to update cron ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 
