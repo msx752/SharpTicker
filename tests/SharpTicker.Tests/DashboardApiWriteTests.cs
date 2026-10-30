@@ -321,11 +321,26 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     }
 
     [Fact]
-    public async Task RunCronTickerOnDemand_IsAccepted()
+    public async Task RunCronTickerOnDemand_IsAccepted_AndAddsAnOccurrence()
     {
+        var before = (await _api.Store.GetAllCronTickerOccurrences(x => x.CronTickerId == DashboardApiFixture.CronId, default)).Length;
+
         var (status, _) = await _api.SendAsync(HttpMethod.Post, $"/cron-ticker/run?id={DashboardApiFixture.CronId}");
 
         Assert.Equal(200, status);
+        var after = (await _api.Store.GetAllCronTickerOccurrences(x => x.CronTickerId == DashboardApiFixture.CronId, default)).Length;
+        Assert.Equal(before + 1, after);
+    }
+
+    [Fact]
+    public async Task RunCronTickerOnDemand_IsNotFound_ForACronTickerThatDoesNotExist_AndStoresNothing()
+    {
+        var before = (await _api.Store.GetAllCronTickerOccurrences(null, default)).Length;
+
+        var (status, _) = await _api.SendAsync(HttpMethod.Post, $"/cron-ticker/run?id={Guid.NewGuid()}");
+
+        Assert.Equal(404, status);
+        Assert.Equal(before, (await _api.Store.GetAllCronTickerOccurrences(null, default)).Length);
     }
 
     #endregion

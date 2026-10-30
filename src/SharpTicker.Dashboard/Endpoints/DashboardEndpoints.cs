@@ -691,8 +691,17 @@ public static class DashboardEndpoints
         where TCronTicker : CronTickerEntity, new()
     {
         var repository = context.RequestServices.GetRequiredService<ITickerDashboardRepository<TTimeTicker, TCronTicker>>();
+        var persistenceProvider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
+
+        // A cron ticker that is gone, for example deleted from another browser tab, has nothing to run. Without this
+        // check an occurrence pointing at nothing would be stored first.
+        if (await persistenceProvider.GetCronTickerById(id, cancellationToken) is null)
+        {
+            context.Response.StatusCode = 404;
+            return;
+        }
 
         await repository.AddOnDemandCronTickerOccurrenceAsync(id, cancellationToken);
         context.Response.StatusCode = 200;
