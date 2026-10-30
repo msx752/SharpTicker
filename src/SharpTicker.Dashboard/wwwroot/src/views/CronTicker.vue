@@ -6,9 +6,6 @@ import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statu
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
-import { use } from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
 import { sleep } from '@/utilities/sleep'
 import {
   GetCronTickerGraphDataRangeResponse,
@@ -17,16 +14,8 @@ import {
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
-import {
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  ToolboxComponent,
-  GridComponent,
-  DataZoomComponent,
-  GraphicComponent,
-} from 'echarts/components'
 import VChart, { THEME_KEY } from 'vue-echarts'
+import '@/utilities/echartsSetup'
 import cronstrue from 'cronstrue'
 
 // Helper function to get readable cron expression
@@ -510,19 +499,6 @@ const addHubListeners = async () => {
     updateChartsAfterDeletion(id)
   })
 }
-
-use([
-  CanvasRenderer,
-  LineChart,
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  ToolboxComponent,
-  GridComponent,
-  PieChart,
-  DataZoomComponent,
-  GraphicComponent,
-])
 
 provide(THEME_KEY, 'dark')
 

@@ -13,33 +13,9 @@ import { formatDate, parseDuration } from '@/utilities/dateTimeParser'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
-import { use } from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
-import {
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  ToolboxComponent,
-  GridComponent,
-  DataZoomComponent,
-  GraphicComponent,
-} from 'echarts/components'
 import VChart, { THEME_KEY } from 'vue-echarts'
+import '@/utilities/echartsSetup'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
-
-use([
-  CanvasRenderer,
-  LineChart,
-  PieChart,
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  GridComponent,
-  ToolboxComponent,
-  DataZoomComponent,
-  GraphicComponent,
-])
 
 // Use paginated service instead of regular one
 const getTimeTickersPaginated = timeTickerService.getTimeTickersPaginated()
