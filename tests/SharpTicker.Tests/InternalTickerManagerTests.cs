@@ -292,6 +292,27 @@ public class InternalTickerManagerTests
     }
 
     [Fact]
+    public void EarliestCronTickerGroup_ACronAlreadyStoredWithABackwardsRange_IsStillScheduled()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            // Refusing new crons with such a range must not stop the ones already in a store from running.
+            var cron = MakeCron(Guid.NewGuid(), "Stored", "0 0 22-2 * * *");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Single(result!.Value.Items);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
     public void EarliestCronTickerGroup_ANamedCronAndItsNumericForm_FireTogether()
     {
         var origTz = CronScheduleCache.TimeZoneInfo;

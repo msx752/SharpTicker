@@ -336,6 +336,67 @@ public class TickerManagerBatchTests : IAsyncLifetime
 
     #endregion
 
+    #region Backwards cron ranges
+
+    [Fact]
+    public async Task AddingACronTickerWithABackwardsRange_IsRefusedAndStoresNothing()
+    {
+        var result = await Crons.AddAsync(Cron(expression: "0 0 22-2 * * *"));
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Contains("backwards", result.Exception.Message);
+        Assert.Empty(await Store.GetCronTickers(null, default));
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerToABackwardsRange_IsRefusedAndKeepsTheStoredExpression()
+    {
+        var added = (await Crons.AddAsync(Cron(expression: "0 0 9 * * MON-FRI"))).Result;
+
+        var result = await Crons.UpdateAsync(new CronTickerEntity { Id = added.Id, Function = CronFunction, Expression = "0 0 0 * * FRI-MON" });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Equal("0 0 9 * * MON-FRI", Assert.Single(await Store.GetCronTickers(null, default)).Expression);
+    }
+
+    [Fact]
+    public async Task AddingACronTickerBatchWithABackwardsRange_IsRefusedAndStoresNothing()
+    {
+        var result = await Crons.AddBatchAsync(new List<CronTickerEntity> { Cron(), Cron(expression: "0 0 0 * 11-2 *") });
+
+        Assert.False(result.IsSucceeded);
+        Assert.Contains("backwards", result.Exception.Message);
+        Assert.Empty(await Store.GetCronTickers(null, default));
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerBatchToABackwardsRange_IsRefusedAndChangesNothing()
+    {
+        var added = (await Crons.AddBatchAsync(new List<CronTickerEntity> { Cron(), Cron() })).Result;
+        var update = new List<CronTickerEntity>
+        {
+            new() { Id = added[0].Id, Function = CronFunction, Expression = "0 5 * * * *" },
+            new() { Id = added[1].Id, Function = CronFunction, Expression = "0 0 22-2 * * *" },
+        };
+
+        var result = await Crons.UpdateBatchAsync(update);
+
+        Assert.False(result.IsSucceeded);
+        Assert.All(await Store.GetCronTickers(null, default), c => Assert.Equal("0 0 * * * *", c.Expression));
+    }
+
+    [Fact]
+    public async Task TwoForwardRanges_AreAcceptedWhereABackwardsOneIsNot()
+    {
+        var result = await Crons.AddAsync(Cron(expression: "0 0 22-23,0-2 * * *"));
+
+        Assert.True(result.IsSucceeded);
+    }
+
+    #endregion
+
     #region Missing input
 
     [Fact]

@@ -201,6 +201,29 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.Equal("0 0 9 * * MON-FRI", cron.GetProperty("expression").GetString());
     }
 
+    [Theory]
+    [InlineData("0 0 22-2 * * *")]
+    [InlineData("0 0 0 * * FRI-MON")]
+    public async Task AddCronTicker_IsRefused_ForABackwardsRange(string expression)
+    {
+        var (_, body) = await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
+            $$"""{"function":"NewCron","expression":"{{expression}}"}""");
+
+        Assert.False(body!.Value.GetProperty("success").GetBoolean());
+        Assert.Equal(2, (await CronTickersAsync()).Length);
+    }
+
+    [Fact]
+    public async Task UpdateCronTicker_IsRefused_ForABackwardsRange_AndKeepsTheStoredExpression()
+    {
+        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={DashboardApiFixture.CronId}",
+            """{"function":"SeedCron","expression":"0 0 22-2 * * *"}""");
+
+        Assert.False(body!.Value.GetProperty("success").GetBoolean());
+        var cron = (await CronTickersAsync()).Single(c => c.GetProperty("id").GetGuid() == DashboardApiFixture.CronId);
+        Assert.Equal("0 * * * * *", cron.GetProperty("expression").GetString());
+    }
+
     [Fact]
     public async Task AddCronTicker_IsRefused_ForAnInvalidExpression()
     {

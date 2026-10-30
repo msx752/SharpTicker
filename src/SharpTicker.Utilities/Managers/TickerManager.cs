@@ -178,6 +178,10 @@ namespace SharpTicker.Utilities.Managers
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
 
+            if (CronRangeCheck.HasBackwardsRange(entity.Expression))
+                return new TickerResult<TCronTicker>(
+                    new TickerValidatorException($"The cron expression {entity.Expression} has a range that runs backwards, which is not supported"));
+
             
             entity.CreatedAt = _clock.UtcNow;
             entity.UpdatedAt = _clock.UtcNow;
@@ -240,6 +244,10 @@ namespace SharpTicker.Utilities.Managers
             if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+
+            if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
+                return new TickerResult<TCronTicker>(
+                    new TickerValidatorException($"The cron expression {cronTicker.Expression} has a range that runs backwards, which is not supported"));
             
             try
             {
@@ -442,6 +450,12 @@ namespace SharpTicker.Utilities.Managers
                     continue;
                 }
 
+                if (CronRangeCheck.HasBackwardsRange(entity.Expression))
+                {
+                    errors.Add(new TickerValidatorException($"The cron expression {entity.Expression} has a range that runs backwards, which is not supported"));
+                    continue;
+                }
+
                 entity.CreatedAt = _clock.UtcNow;
                 entity.UpdatedAt = _clock.UtcNow;
                 
@@ -560,6 +574,12 @@ namespace SharpTicker.Utilities.Managers
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
                     errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    continue;
+                }
+
+                if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
+                {
+                    errors.Add(new TickerValidatorException($"The cron expression {cronTicker.Expression} has a range that runs backwards, which is not supported"));
                     continue;
                 }
                 
