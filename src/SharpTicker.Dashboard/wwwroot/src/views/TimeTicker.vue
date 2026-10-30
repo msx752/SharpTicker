@@ -827,7 +827,6 @@ const canBeForceDeleted = ref<string[]>([])
                     <v-icon size="18">mdi-plus</v-icon>
                   </div>
                   <span class="btn-text">Add Ticker</span>
-                  <div class="btn-shine"></div>
                 </button>
 
                 <button class="premium-action-btn tertiary-action" @click="openChainJobsModal()">
@@ -835,7 +834,6 @@ const canBeForceDeleted = ref<string[]>([])
                     <v-icon size="18">mdi-family-tree</v-icon>
                   </div>
                   <span class="btn-text">Chain Jobs</span>
-                  <div class="btn-shine"></div>
                 </button>
               </div>
             </div>
@@ -1507,7 +1505,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .tree-expand-btn:hover {
   background-color: rgba(100, 181, 246, 0.1) !important;
-  transform: scale(1.1);
 }
 
 .tree-expand-placeholder {
@@ -1530,7 +1527,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .tree-icon-wrapper:hover {
   background: rgba(255, 255, 255, 0.1);
-  transform: translateY(-1px);
 }
 
 .tree-icon {
@@ -1569,7 +1565,6 @@ const canBeForceDeleted = ref<string[]>([])
 @keyframes treeExpand {
   from {
     opacity: 0;
-    transform: translateY(-4px);
   }
   to {
     opacity: 1;
@@ -1672,13 +1667,9 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Dashboard Layout */
 .time-ticker-dashboard {
-  background: linear-gradient(135deg, #212121 0%, #2d2d2d 100%);
+  background: #212121;
   min-height: 100vh;
-  font-family:
-    'Inter',
-    -apple-system,
-    BlinkMacSystemFont,
-    sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   position: relative;
   color: #e0e0e0;
 }
@@ -1692,12 +1683,11 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Table Section */
 .table-section {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
+  box-shadow: none;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .section-header {
@@ -1744,11 +1734,6 @@ const canBeForceDeleted = ref<string[]>([])
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 16px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
 }
 
 .premium-action-btn {
@@ -1784,35 +1769,17 @@ const canBeForceDeleted = ref<string[]>([])
   white-space: nowrap;
 }
 
-.premium-action-btn .btn-shine {
-  position: absolute;
-  top: 0;
-  left: -100%;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-  transition: left 0.5s ease;
-}
 
-.premium-action-btn:hover .btn-shine {
-  left: 100%;
-}
 
 .primary-action {
-  background: linear-gradient(135deg, #64b5f6 0%, #1976d2 100%);
+  background: #1976d2;
   color: #ffffff;
-  box-shadow: 0 4px 20px rgba(100, 181, 246, 0.4);
 }
 
 .primary-action:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(100, 181, 246, 0.6);
-  background: linear-gradient(135deg, #90caf9 0%, #1565c0 100%);
+  background: #1565c0;
 }
 
-.primary-action .btn-icon {
-  background: rgba(255, 255, 255, 0.2);
-}
 
 .secondary-action {
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
@@ -1821,7 +1788,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .secondary-action:hover {
-  transform: translateY(-2px);
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.08) 100%);
   border-color: rgba(255, 255, 255, 0.25);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
@@ -1833,22 +1799,15 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .tertiary-action {
-  background: linear-gradient(135deg, rgba(156, 39, 176, 0.1) 0%, rgba(156, 39, 176, 0.05) 100%);
+  background: transparent;
   color: #e0e0e0;
-  border: 1px solid rgba(156, 39, 176, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.16);
 }
 
 .tertiary-action:hover {
-  transform: translateY(-2px);
-  background: linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.08) 100%);
-  border-color: rgba(156, 39, 176, 0.25);
-  box-shadow: 0 8px 25px rgba(156, 39, 176, 0.2);
+  background: rgba(255, 255, 255, 0.06);
 }
 
-.tertiary-action .btn-icon {
-  background: rgba(156, 39, 176, 0.2);
-  color: #ab47bc;
-}
 
 /* Search and Info Group */
 .search-info-group {
@@ -1860,7 +1819,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .status-chip {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -1872,7 +1830,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .utility-btn {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.05);
   transition: all 0.2s ease;
 }
@@ -1920,7 +1877,6 @@ const canBeForceDeleted = ref<string[]>([])
   border: none;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1945,7 +1901,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .modern-action-btn:hover {
-  transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
   border-color: rgba(255, 255, 255, 0.2);
 }
@@ -2009,7 +1964,7 @@ const canBeForceDeleted = ref<string[]>([])
 
 .edit-btn:hover {
   border-color: rgba(100, 181, 246, 0.5);
-  box-shadow: 0 8px 25px rgba(100, 181, 246, 0.4);
+  box-shadow: none;
   background: rgba(100, 181, 246, 0.15);
 }
 
@@ -2092,7 +2047,7 @@ const canBeForceDeleted = ref<string[]>([])
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 
 /* Enhanced table styles */
@@ -2137,9 +2092,9 @@ const canBeForceDeleted = ref<string[]>([])
   font-weight: 600;
   font-size: 0.75rem;
   color: #ffffff;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.8px;
-  box-shadow: 0 2px 8px rgba(100, 181, 246, 0.1);
+  box-shadow: none;
 }
 
 :deep(.enhanced-table .v-data-table__tr) {
@@ -2266,7 +2221,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .child-jobs-dropdown {
   background: rgba(42, 42, 42, 0.98);
-  backdrop-filter: blur(20px);
   border-radius: 8px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -2466,7 +2420,6 @@ const canBeForceDeleted = ref<string[]>([])
   }
   50% {
     opacity: 0.8;
-    transform: scale(1.05);
     box-shadow: 0 0 0 4px rgba(255, 152, 0, 0.1);
   }
 }
@@ -2568,49 +2521,38 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Analytics Overview Card */
 .analytics-overview {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
-  overflow: visible;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: none;
+  padding: 20px;
+  margin: 0 0 24px;
   position: relative;
-  margin-top: 24px;
 }
 
-.analytics-overview:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.6);
-}
 
 /* Chart Styles */
 .chart-toggle-vertical {
-  position: absolute;
-  top: 12px;
-  right: 16px;
-  z-index: 10;
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 12px;
 }
 
 .chart-switch-vertical {
-  background: rgba(66, 66, 66, 0.95);
-  backdrop-filter: blur(20px);
-  border-radius: 16px;
-  border: 1px solid rgba(100, 181, 246, 0.4);
-  box-shadow: 0 8px 32px rgba(100, 181, 246, 0.2);
-  overflow: hidden;
-  padding: 4px;
-  display: flex;
-  flex-direction: row;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
 }
 
 .chart-switch-vertical .toggle-label {
   font-size: 0.7rem;
   font-weight: 600;
   color: #bdbdbd;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 1px;
   padding: 4px 0;
   text-align: center;
@@ -2634,14 +2576,12 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .chart-btn-vertical.v-btn--active {
-  background: linear-gradient(135deg, #64b5f6, #42a5f5);
-  box-shadow: 0 4px 12px rgba(100, 181, 246, 0.3);
-  border: 1px solid rgba(100, 181, 246, 0.6);
+  background: #1976d2;
+  color: #ffffff;
 }
 
 .chart-btn-vertical:not(.v-btn--active):hover {
-  background: rgba(100, 181, 246, 0.1);
-  border: 1px solid rgba(100, 181, 246, 0.3);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .chart-btn-vertical .chart-icon {
@@ -2672,9 +2612,6 @@ const canBeForceDeleted = ref<string[]>([])
   margin: 0;
   position: relative;
   overflow: hidden;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .chart-compact {
@@ -2695,10 +2632,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Responsive Chart Styles */
 @media (max-width: 1400px) {
-  .chart-toggle-vertical {
-    top: 10px;
-    right: 12px;
-  }
 
   .chart-btn-vertical {
     min-width: 56px;
@@ -2712,10 +2645,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 @media (max-width: 768px) {
-  .chart-toggle-vertical {
-    top: 8px;
-    right: 8px;
-  }
 
   .chart-btn-vertical {
     min-width: 44px;

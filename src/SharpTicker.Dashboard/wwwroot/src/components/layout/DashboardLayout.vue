@@ -559,7 +559,6 @@ const handleForceUIUpdate = () => {
 /* Main Header */
 .main-header {
   background: rgba(33, 33, 33, 0.95) !important;
-  backdrop-filter: blur(20px) !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3) !important;
   transition: all 0.3s ease !important;
@@ -602,7 +601,6 @@ const handleForceUIUpdate = () => {
 }
 
 .logo-container:hover {
-  transform: translateY(-1px);
 }
 
 .logo-image {
@@ -612,7 +610,6 @@ const handleForceUIUpdate = () => {
 }
 
 .logo-container:hover .logo-image {
-  transform: scale(1.05);
 }
 
 .app-title-container {
@@ -626,7 +623,6 @@ const handleForceUIUpdate = () => {
 
 .app-title-container:hover {
   background: rgba(255, 255, 255, 0.1);
-  transform: translateY(-1px);
 }
 
 .clickable {
@@ -704,7 +700,6 @@ const handleForceUIUpdate = () => {
   top: 0;
   z-index: 100;
   background: rgba(33, 33, 33, 0.95);
-  backdrop-filter: blur(20px);
   border-radius: 0;
   padding: 12px 20px;
   margin: 0;
@@ -725,7 +720,6 @@ const handleForceUIUpdate = () => {
   top: 64px; /* Account for the app bar height */
   z-index: 99;
   background: rgba(33, 33, 33, 0.95);
-  backdrop-filter: blur(20px);
   border-radius: 0;
   padding: 0px 20px;
   margin: 0;
@@ -903,7 +897,6 @@ const handleForceUIUpdate = () => {
 }
 
 .action-btn:hover {
-  transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
 }
 
@@ -933,7 +926,6 @@ const handleForceUIUpdate = () => {
 }
 
 .restart-btn:hover {
-  transform: translateY(-2px) scale(1.02);
   box-shadow: 0 8px 25px rgba(255, 152, 0, 0.3);
 }
 
@@ -981,7 +973,6 @@ const handleForceUIUpdate = () => {
     box-shadow: 0 4px 12px rgba(255, 152, 0, 0.3);
   }
   50% {
-    transform: scale(1.05);
     box-shadow: 0 8px 25px rgba(255, 152, 0, 0.5);
   }
 }
@@ -1123,7 +1114,6 @@ const handleForceUIUpdate = () => {
 /* Main Footer */
 .main-footer {
   background: rgba(33, 33, 33, 0.95) !important;
-  backdrop-filter: blur(20px) !important;
   border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
   box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.3) !important;
   padding: 16px 0 !important;

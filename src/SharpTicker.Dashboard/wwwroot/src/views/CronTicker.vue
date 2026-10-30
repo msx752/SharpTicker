@@ -966,7 +966,6 @@ const refreshData = async () => {
                     <v-icon size="18">mdi-plus</v-icon>
                   </div>
                   <span class="btn-text">Add Ticker</span>
-                  <div class="btn-shine"></div>
                 </button>
               </div>
             </div>
@@ -1207,13 +1206,9 @@ const refreshData = async () => {
 <style scoped>
 /* Dashboard Layout */
 .cron-ticker-dashboard {
-  background: linear-gradient(135deg, #212121 0%, #2d2d2d 100%);
+  background: #212121;
   min-height: 100vh;
-  font-family:
-    'Inter',
-    -apple-system,
-    BlinkMacSystemFont,
-    sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   position: relative;
   color: #e0e0e0;
 }
@@ -1227,41 +1222,29 @@ const refreshData = async () => {
 
 /* Analytics Overview Card */
 .analytics-overview {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
+  box-shadow: none;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  transition: all 0.3s ease;
-  margin-bottom: 20px;
+  margin: 0 0 24px;
   position: relative;
 }
 
-.analytics-overview:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.6);
-}
 
 .chart-toggle-vertical {
-  position: absolute;
-  top: 12px;
-  right: 16px;
-  z-index: 10;
+  float: right;
+  margin: 0 0 12px 16px;
 }
 
 .chart-switch-vertical {
-  background: rgba(66, 66, 66, 0.95);
-  backdrop-filter: blur(20px);
-  border-radius: 16px;
-  border: 1px solid rgba(100, 181, 246, 0.4);
-  box-shadow: 0 8px 32px rgba(100, 181, 246, 0.2);
-  overflow: hidden;
-  padding: 4px;
-  display: flex;
-  flex-direction: row;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
 }
 
 .toggle-label {
@@ -1297,18 +1280,16 @@ const refreshData = async () => {
 }
 
 .chart-btn-vertical:hover {
-  transform: translateY(-1px);
   background: rgba(100, 181, 246, 0.2);
   border-color: rgba(100, 181, 246, 0.6);
-  box-shadow: 0 8px 25px rgba(100, 181, 246, 0.3);
+  box-shadow: none;
 }
 
 .chart-btn-vertical.v-btn--active,
 .chart-btn-vertical.v-btn--color-primary {
   background: linear-gradient(135deg, rgba(100, 181, 246, 0.3) 0%, rgba(100, 181, 246, 0.15) 100%);
   border-color: rgba(100, 181, 246, 0.8);
-  box-shadow: 0 4px 20px rgba(100, 181, 246, 0.4);
-  transform: translateY(-1px);
+  box-shadow: none;
 }
 
 .btn-text {
@@ -1328,7 +1309,6 @@ const refreshData = async () => {
 .chart-btn-vertical:hover .chart-icon {
   color: #ffffff;
   filter: drop-shadow(0 4px 8px rgba(100, 181, 246, 0.5));
-  transform: scale(1.1);
 }
 
 .chart-btn-vertical.v-btn--active .chart-icon {
@@ -1344,6 +1324,7 @@ const refreshData = async () => {
   text-align: center;
   width: 100%;
   animation: fadeIn 0.3s ease-in-out;
+  clear: both;
 }
 
 .chart-section .card-header {
@@ -1359,9 +1340,6 @@ const refreshData = async () => {
   margin: 0;
   position: relative;
   overflow: hidden;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 /* Chart Actions */
@@ -1375,7 +1353,6 @@ const refreshData = async () => {
 
 .refresh-chart-btn {
   background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -1415,13 +1392,11 @@ const refreshData = async () => {
 }
 
 .content-card {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
+  box-shadow: none;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  transition: all 0.3s ease;
 }
 
 .card-header {
@@ -1444,7 +1419,7 @@ const refreshData = async () => {
   background: linear-gradient(135deg, rgba(100, 181, 246, 0.3) 0%, rgba(100, 181, 246, 0.1) 100%);
   border-radius: 10px;
   padding: 10px;
-  box-shadow: 0 2px 8px rgba(100, 181, 246, 0.2);
+  box-shadow: none;
 }
 
 .card-subtitle {
@@ -1474,12 +1449,8 @@ const refreshData = async () => {
 
 /* Range Controls */
 .range-controls {
-  background: rgba(0, 0, 0, 0.2);
-  border-radius: 6px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  margin: 0 0 6px 0;
-  width: 100%;
+  overflow: hidden;
+  margin: 0 0 12px 0;
 }
 
 .range-header {
@@ -1564,12 +1535,11 @@ const refreshData = async () => {
 
 /* Table Section */
 .table-section {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
+  box-shadow: none;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .section-header {
@@ -1616,11 +1586,6 @@ const refreshData = async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 16px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
 }
 
 .premium-action-btn {
@@ -1656,35 +1621,17 @@ const refreshData = async () => {
   white-space: nowrap;
 }
 
-.premium-action-btn .btn-shine {
-  position: absolute;
-  top: 0;
-  left: -100%;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-  transition: left 0.5s ease;
-}
 
-.premium-action-btn:hover .btn-shine {
-  left: 100%;
-}
 
 .primary-action {
-  background: linear-gradient(135deg, #64b5f6 0%, #1976d2 100%);
+  background: #1976d2;
   color: #ffffff;
-  box-shadow: 0 4px 20px rgba(100, 181, 246, 0.4);
 }
 
 .primary-action:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(100, 181, 246, 0.6);
-  background: linear-gradient(135deg, #90caf9 0%, #1565c0 100%);
+  background: #1565c0;
 }
 
-.primary-action .btn-icon {
-  background: rgba(255, 255, 255, 0.2);
-}
 
 /* Search and Info Group */
 .search-info-group {
@@ -1696,7 +1643,6 @@ const refreshData = async () => {
 }
 
 .status-chip {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -1708,7 +1654,6 @@ const refreshData = async () => {
 }
 
 .utility-btn {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.05);
   transition: all 0.2s ease;
 }
@@ -1745,7 +1690,7 @@ const refreshData = async () => {
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 
 /* Enhanced table styles */
@@ -1780,9 +1725,9 @@ const refreshData = async () => {
   font-weight: 600;
   font-size: 0.75rem;
   color: #ffffff;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.8px;
-  box-shadow: 0 2px 8px rgba(100, 181, 246, 0.1);
+  box-shadow: none;
 }
 
 :deep(.enhanced-table .v-data-table__tr) {
@@ -1830,7 +1775,6 @@ const refreshData = async () => {
   border: none;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -1855,7 +1799,6 @@ const refreshData = async () => {
 }
 
 .modern-action-btn:hover {
-  transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
   border-color: rgba(255, 255, 255, 0.2);
 }
@@ -1880,7 +1823,7 @@ const refreshData = async () => {
 
 .chart-btn:hover {
   border-color: rgba(100, 181, 246, 0.5);
-  box-shadow: 0 8px 25px rgba(100, 181, 246, 0.4);
+  box-shadow: none;
 }
 
 .loading-spin {
@@ -1903,7 +1846,7 @@ const refreshData = async () => {
 
 .occurrences-btn:hover {
   border-color: rgba(100, 181, 246, 0.5);
-  box-shadow: 0 8px 25px rgba(100, 181, 246, 0.4);
+  box-shadow: none;
   background: rgba(100, 181, 246, 0.15);
 }
 
@@ -2021,10 +1964,6 @@ const refreshData = async () => {
 }
 
 @media (max-width: 1024px) {
-  .chart-toggle-vertical {
-    top: 10px;
-    right: 12px;
-  }
 
   .chart-btn-vertical {
     min-width: 56px;
@@ -2056,10 +1995,6 @@ const refreshData = async () => {
     padding: 20px 16px 16px 16px;
   }
 
-  .chart-toggle-vertical {
-    top: 8px;
-    right: 8px;
-  }
 
   .chart-btn-vertical {
     min-width: 44px;
