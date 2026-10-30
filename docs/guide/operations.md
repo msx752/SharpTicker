@@ -66,6 +66,10 @@ builder.Services.AddSharpTicker(options => options.SetExceptionHandler<AlertingE
 
 The handler is a singleton. Retries are configured per ticker; see [Scheduling](scheduling.md#retries).
 
+### Dashboard failures
+
+When the dashboard refuses an add or update, for example for an invalid cron expression, it logs a warning with the reason. A failure of the store is logged as an error with the exception. Both use the `SharpTicker.Dashboard.Endpoints.DashboardEndpoints` logger category. The browser gets the reason only for a refusal; for a failure of the store it gets a short message, so table and constraint names stay out of the page.
+
 ## Tracing
 
 SharpTicker reports job execution through `System.Diagnostics.ActivitySource` with the source name **`SharpTicker`**.

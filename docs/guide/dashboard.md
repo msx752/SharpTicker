@@ -23,6 +23,13 @@ The dashboard is served by the application at `/ticker/dashboard`. `UseSharpTick
 > [!WARNING]
 > **The dashboard is public unless you choose an authentication mode.** Anyone who can reach it can run, change and cancel jobs and read job payloads. The default CORS policy also allows every origin with credentials. Always call one of the `With...Auth` methods below outside local development, and restrict CORS with `SetCorsPolicy` when the dashboard is reachable from other sites.
 
+## Working with jobs
+
+- **Time tickers:** add one, edit it, duplicate it with the copy icon, cancel one that is running, or use **Run again** to add a new row with the same function, request, retries and description that starts at once.
+- **Cron tickers:** add, edit, duplicate, enable or disable, and **Run Now** to add an occurrence and run it immediately. Each cron has its occurrences and a graph of their results.
+- **Retry intervals** are entered in seconds, one per retry, and are saved with the ticker.
+- **A refused action** keeps its dialog open with what you typed, and a notification shows the reason, such as an invalid cron expression.
+
 ## Authentication
 
 Pick one:

@@ -75,6 +75,12 @@ If the class has several constructors, mark the one to use with `[SharpTickerCon
 | `RequestCancellation()` | Cancels this run. |
 | `CronOccurrenceOperations.SkipIfAlreadyRunning()` | For cron runs: skips this occurrence if the previous one is still running. |
 
+### Cancellation
+
+A run is cancelled by `RequestCancellation()`, by the cancel button in the dashboard, or by the application stopping. Pass the `CancellationToken` on to what the job awaits. When the job then throws `TaskCanceledException`, or `OperationCanceledException` (which is what `cancellationToken.ThrowIfCancellationRequested()` throws), the run is recorded as `Cancelled`, not `Failed`, and is not retried. An `OperationCanceledException` that nobody asked for, such as a timeout inside the job, is an ordinary failure and follows the retry rules.
+
+A job that runs at once, because it was added for now, is not tied to the request that added it: it keeps running after that request has ended and is cancelled only by the cases above.
+
 ## Payloads
 
 A job can take a typed request. Use `TickerFunctionContext<TRequest>` and read the `Request` field:

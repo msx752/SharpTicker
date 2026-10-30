@@ -5,7 +5,7 @@ SharpTicker has two kinds of jobs:
 - **Time tickers** (`TimeTickerEntity`) run once, at a given time.
 - **Cron tickers** (`CronTickerEntity`) run repeatedly on a cron expression. Each run is stored as an occurrence.
 
-Both are managed through injectable managers: `ITimeTickerManager<TimeTickerEntity>` and `ICronTickerManager<CronTickerEntity>`. Their `AddAsync`, `UpdateAsync` and `DeleteAsync` methods, and the `*BatchAsync` variants, return a `TickerResult<T>`.
+Both are managed through injectable managers: `ITimeTickerManager<TimeTickerEntity>` and `ICronTickerManager<CronTickerEntity>`. Their `AddAsync`, `UpdateAsync` and `DeleteAsync` methods, and the `*BatchAsync` variants, return a `TickerResult<T>`. A failed result carries the reason in `Exception`. `UpdateAsync` of a ticker that does not exist fails with a `TickerValidatorException` and creates nothing, on every store; use `AddAsync` to create one. A `*BatchAsync` call with a null or empty list does nothing and succeeds, and a null ticker inside a list is a failed result.
 
 ## Time jobs
 
