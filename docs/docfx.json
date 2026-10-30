@@ -1,0 +1,72 @@
+{
+  "$schema": "https://raw.githubusercontent.com/dotnet/docfx/main/schemas/docfx.schema.json",
+  "metadata": [
+    {
+      "src": [
+        {
+          "src": "../src",
+          "files": [
+            "SharpTicker/SharpTicker.csproj",
+            "SharpTicker.Utilities/SharpTicker.Utilities.csproj",
+            "SharpTicker.EntityFrameworkCore/SharpTicker.EntityFrameworkCore.csproj",
+            "SharpTicker.MongoDB/SharpTicker.MongoDB.csproj",
+            "SharpTicker.Caching.StackExchangeRedis/SharpTicker.Caching.StackExchangeRedis.csproj",
+            "SharpTicker.Dashboard/SharpTicker.Dashboard.csproj",
+            "SharpTicker.Instrumentation.OpenTelemetry/SharpTicker.Instrumentation.OpenTelemetry.csproj"
+          ]
+        }
+      ],
+      "dest": "api",
+      "properties": {
+        "TargetFramework": "net10.0",
+        "NoWarn": "CS8625;CS8632;CS8765"
+      },
+      "namespaceLayout": "flattened",
+      "memberLayout": "samePage"
+    }
+  ],
+  "build": {
+    "content": [
+      {
+        "files": [
+          "**/*.{md,yml}"
+        ],
+        "exclude": [
+          "_site/**",
+          "obj/**",
+          "template/**"
+        ]
+      }
+    ],
+    "resource": [
+      {
+        "files": [
+          "logo.svg"
+        ],
+        "src": "../assets",
+        "dest": "images"
+      }
+    ],
+    "output": "_site",
+    "template": [
+      "default",
+      "modern",
+      "template"
+    ],
+    "globalMetadata": {
+      "_appName": "SharpTicker",
+      "_appTitle": "SharpTicker",
+      "_appLogoPath": "images/logo.svg",
+      "_appFaviconPath": "images/logo.svg",
+      "_appFooter": "SharpTicker is dual-licensed under MIT or Apache-2.0.",
+      "_enableSearch": true,
+      "_gitContribute": {
+        "repo": "https://github.com/msx752/SharpTicker",
+        "branch": "main"
+      }
+    },
+    "sitemap": {
+      "baseUrl": "https://msx752.github.io/SharpTicker/"
+    }
+  }
+}

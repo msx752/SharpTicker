@@ -20,7 +20,7 @@ Closes #
 - [ ] Dashboard changes: `npm run build` and `npm test` pass in `src/SharpTicker.Dashboard/wwwroot`
 - [ ] Storage changes: in-memory, EF Core, MongoDB and Redis providers behave the same
 - [ ] Breaking changes follow [Versioning](https://github.com/msx752/SharpTicker#versioning): APIs are marked `[Obsolete]` first; schema changes only in a major version
-- [ ] Documentation updated where needed (wiki, README, samples)
+- [ ] Documentation updated where needed (docs/, README, samples)
 - [ ] The change is my own work or comes from a compatibly licensed source, noted above (see [CONTRIBUTING](https://github.com/msx752/SharpTicker/blob/main/CONTRIBUTING.md#guidelines))
 
 ## Notes for reviewers

@@ -48,3 +48,9 @@ tmpgen/
 sharpticker_open_issues.md
 
 .claude/
+
+# Documentation site build output
+docs/_site/
+docs/api/*.yml
+docs/api/.manifest
+docs/obj/
