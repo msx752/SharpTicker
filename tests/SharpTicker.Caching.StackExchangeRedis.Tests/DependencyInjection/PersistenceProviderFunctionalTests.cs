@@ -118,7 +118,7 @@ public class PersistenceProviderFunctionalTests : IDisposable
 
             options.AddStackExchangeRedis(redis =>
             {
-                redis.Configuration = "localhost:6379";
+                redis.Configuration = "localhost:16379";
             });
         });
 

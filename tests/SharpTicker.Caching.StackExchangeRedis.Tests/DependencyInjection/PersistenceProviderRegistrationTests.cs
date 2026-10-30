@@ -48,7 +48,7 @@ public class PersistenceProviderRegistrationTests
         {
             options.AddStackExchangeRedis(redis =>
             {
-                redis.Configuration = "localhost:6379,abortConnect=false";
+                redis.Configuration = "localhost:16379,abortConnect=false";
             });
         });
 
@@ -111,7 +111,7 @@ public class PersistenceProviderRegistrationTests
 
             options.AddStackExchangeRedis(redis =>
             {
-                redis.Configuration = "localhost:6379";
+                redis.Configuration = "localhost:16379";
             });
         });
 
@@ -140,7 +140,7 @@ public class PersistenceProviderRegistrationTests
         {
             options.AddStackExchangeRedis(redis =>
             {
-                redis.Configuration = "localhost:6379";
+                redis.Configuration = "localhost:16379";
             });
 
             options.AddOperationalStore(ef =>
