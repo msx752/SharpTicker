@@ -8,6 +8,7 @@ import { cronTickerService } from '@/http/services/cronTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
 import { copyText } from '@/utilities/clipboard'
 import { checkJson } from '@/utilities/jsonText'
+import { requestDataRule } from '@/utilities/requestRule'
 import cronstrue from 'cronstrue'
 const functionNamesStore = useFunctionNameStore()
 const getTickerRequestData = tickerService.getRequestData()
@@ -104,10 +105,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
   },
   validationSchema: (validator) => ({
     functionName: validator.string().required('Function name is required'),
-    requestData: validator.string().defined().test('valid-json', 'Invalid JSON', (value, context) => {
-      const check = checkJson(value)
-      return check.valid || context.createError({ message: check.message })
-    }),
+    requestData: requestDataRule(validator),
     expression: validator
       .string()
       .required('Expression is required')

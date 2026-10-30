@@ -8,6 +8,7 @@ import { timeTickerService } from '@/http/services/timeTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
 import { copyText } from '@/utilities/clipboard'
 import { checkJson } from '@/utilities/jsonText'
+import { requestDataRule } from '@/utilities/requestRule'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 
 const functionNamesStore = useFunctionNameStore()
@@ -131,10 +132,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
   },
   validationSchema: (validator) => ({
     functionName: validator.string().required('Function name is required'),
-    requestData: validator.string().defined().test('valid-json', 'Invalid JSON', (value, context) => {
-      const check = checkJson(value)
-      return check.valid || context.createError({ message: check.message })
-    }),
+    requestData: requestDataRule(validator),
     executionDate: validator.date().when('ignoreDateTime', {
       is: true,
       then: (v) => v.notRequired(),
@@ -208,7 +206,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
       else
         setFieldValue(
           'requestData',
-          formatJsonForDisplay(getTickerRequestData.response.value?.result!, false)!,
+          formatJsonForDisplay(getTickerRequestData.response.value?.result!, false) ?? '',
         )
 
       update(value)
