@@ -47,6 +47,16 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     }
 
     [Fact]
+    public async Task NextTicker_HasNoOccurrence_BeforeTheSchedulerHasPlannedAnything()
+    {
+        var next = await _api.GetAsync("/ticker-host/next-ticker");
+
+        // The scheduler is disabled in this host, so nothing was ever planned.
+        Assert.True(next.ValueKind == System.Text.Json.JsonValueKind.Object);
+        Assert.True(!next.TryGetProperty("nextOccurrence", out var value) || value.ValueKind == System.Text.Json.JsonValueKind.Null, next.ToString());
+    }
+
+    [Fact]
     public async Task TickerFunctions_ListsTheRegisteredFunctions()
     {
         var names = (await _api.GetAsync("/ticker-functions")).EnumerateArray().Select(f => f.GetProperty("functionName").GetString()).ToArray();
