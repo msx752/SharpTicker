@@ -180,19 +180,6 @@ Never rename the database itself as part of this migration.
 - [ ] Tracing dashboards and alerts use the `SharpTicker` source and `sharpticker.*` names.
 - [ ] Existing cron jobs fire and their history shows in the dashboard.
 
-## Changes after 1.0.0
-
-Everything above moves an application from TickerQ 10.4.0 to SharpTicker 1.0.0, which behaves like its origin. The changes below come in the releases after 1.0.0 and apply when you upgrade from 1.0.0, whether you came from TickerQ or started on SharpTicker. Storage is not affected: there is still no database change.
-
-| Area | In 1.0.0 | After | Action |
-|---|---|---|---|
-| Source generator diagnostics | `TQ001` to `TQ011` | `ST001` to `ST011` | Update `NoWarn`, `.editorconfig` severities and `#pragma warning disable` lines that name the old IDs. The IDs keep their numbers. |
-| Cron with a backwards range | Accepted when added or updated, and run as the forward range (`22-2` ran at hours 2 to 22) | Refused when added or updated through the cron manager or the dashboard, and a compile error on an attribute | Only for crons you add or update. Crons already in your store keep running as before. Rewrite a refused one, for example `22-23,0-2`. |
-| Updating a ticker that does not exist | The in-memory, MongoDB and Redis stores created it, or reported success without changing anything; EF Core failed | Fails on every store, with a `TickerValidatorException`, and creates nothing | Only if you relied on an update creating a ticker. Add it with `AddAsync` instead. |
-| A job that throws `OperationCanceledException` after its own cancellation | Recorded as `Failed` and retried, unless it was a `TaskCanceledException` | Recorded as `Cancelled`, whichever of the two it throws | Only if you counted on such a job being retried. An `OperationCanceledException` that nobody asked for, such as a timeout inside the job, is still a failure. |
-
-Several bugs are also fixed without any change to how you use the library. The ones worth knowing about: a job added to run at once is no longer cancelled, or dropped and left `InProgress`, when the request that added it ends; a cancelled job is recorded as `Cancelled` on every store, including EF Core; and the retry intervals set in the dashboard are saved.
-
 ## AI-assisted migration
 
 Copy this prompt into your AI coding assistant, from the root of your repository:
