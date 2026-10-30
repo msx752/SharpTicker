@@ -168,3 +168,14 @@ export function formatExecutedAt(executedAt: string | Date, elapsedTime: number)
     if (isUnset) return ''
     return `${formatTimeAgo(executedAt)} (took ${formatTime(elapsedTime, true)})`
 }
+
+// The inverse of formatTime for whole seconds: "30s", "1m 30s", "2h", "1d 2h" become seconds.
+// formatTime drops the seconds once a duration reaches an hour, so those cannot be recovered.
+export function parseDuration(text: string): number {
+    const unitSeconds: Record<string, number> = { d: 86400, h: 3600, m: 60, s: 1 };
+    let total = 0;
+    for (const [, amount, unit] of text.matchAll(/(\d+)\s*([dhms])/g)) {
+        total += parseInt(amount) * unitSeconds[unit];
+    }
+    return total;
+}
