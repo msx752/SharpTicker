@@ -12,6 +12,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using SharpTicker.Dashboard;
 using SharpTicker.Dashboard.DependencyInjection;
 using SharpTicker.DependencyInjection;
 using SharpTicker.EntityFrameworkCore.DbContextFactory;
@@ -87,7 +88,7 @@ public abstract class DashboardApiFixture : IAsyncLifetime
         {
             options.DisableBackgroundServices();
             ConfigureStore(options);
-            options.AddDashboard(dashboard => dashboard.WithNoAuth());
+            options.AddDashboard(ConfigureDashboard);
         });
 
         _app = builder.Build();
@@ -114,6 +115,9 @@ public abstract class DashboardApiFixture : IAsyncLifetime
         var times = await Store.GetTimeTickers(null, default);
         await Store.RemoveTimeTickers(times.Select(t => t.Id).ToArray());
     }
+
+    /// <summary>Chooses how the dashboard authenticates. The default lets everyone in.</summary>
+    protected virtual void ConfigureDashboard(DashboardOptionsBuilder dashboard) => dashboard.WithNoAuth();
 
     /// <summary>Chooses the store the application runs on. The default is the in-memory store.</summary>
     protected virtual void ConfigureStore(TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity> options) { }
