@@ -96,4 +96,38 @@ public class CronNamesEndToEndTests : IAsyncLifetime
 
         Assert.NotSame(ran.Task, finished);
     }
+
+    [Fact]
+    public async Task ACronAlreadyStoredWithABackwardsRange_KeepsRunning()
+    {
+        // Written straight into the store, the way a cron added before the manager refused such ranges would be.
+        // The scheduler library reads 23-0 as the hours 0 to 23, so this one fires every second.
+        var ran = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        new ServiceCollection().MapTicker("EndToEnd.Stored", (_, _) => { ran.TrySetResult(DateTime.UtcNow); return Task.CompletedTask; });
+        TickerFunctionProvider.Build();
+
+        using (var services = new ServiceCollection().BuildServiceProvider())
+        {
+            var store = new TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity>(services);
+            await store.InsertCronTickers(new[]
+            {
+                new CronTickerEntity
+                {
+                    Id = Guid.NewGuid(), Function = "EndToEnd.Stored", Expression = "* * 23-0 * * *", IsEnabled = true,
+                    CreatedAt = DateTime.UtcNow, UpdatedAt = DateTime.UtcNow,
+                },
+            }, default);
+        }
+
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseTestServer();
+        builder.Services.AddSharpTicker();
+        _app = builder.Build();
+        _app.UseSharpTicker();
+        await _app.StartAsync();
+
+        var finished = await Task.WhenAny(ran.Task, Task.Delay(TimeSpan.FromSeconds(20)));
+
+        Assert.Same(ran.Task, finished);
+    }
 }
