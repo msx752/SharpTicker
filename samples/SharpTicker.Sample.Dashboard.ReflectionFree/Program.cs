@@ -41,4 +41,7 @@ var app = builder.Build();
 
 app.UseSharpTicker();
 
+// The browser opened by launchSettings.json lands on the site root; send it to the dashboard
+app.MapGet("/", () => Results.Redirect("/ticker/dashboard"));
+
 app.Run();

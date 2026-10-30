@@ -25,6 +25,9 @@ var app = builder.Build();
 // Activate SharpTicker job processor (indexes are provisioned automatically by IHostedService)
 app.UseSharpTicker();
 
+// The browser opened by launchSettings.json lands on the site root; send it to the dashboard
+app.MapGet("/", () => Results.Redirect("/ticker/dashboard"));
+
 // Minimal endpoint to schedule the sample job
 app.MapPost("/schedule-sample", async (ITimeTickerManager<TimeTickerEntity> manager) =>
 {
