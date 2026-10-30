@@ -7,7 +7,8 @@
 > - **On TickerQ 10.4.0:** follow this guide directly.
 > - **On an older TickerQ version:** first upgrade to TickerQ 10.4.0 and deploy it, using that project's own upgrade notes, then follow this guide. The two steps stay separate, so each one can be verified on its own.
 > - **On TickerQ 10.5.0 or later:** those releases are under a different license and are not covered. SharpTicker contains no code from them, and moving back to 1.0.0 is not verified.
-> - Use **1.0.0 for every SharpTicker package**. Later SharpTicker versions are upgraded from 1.0.0 like any other release.
+> - **The current release is `1.0.0-rc.1`**, a prerelease of 1.0.0. Use it for every SharpTicker package until 1.0.0 is released.
+> - Later SharpTicker versions are upgraded from 1.0.0 like any other release.
 
 This guide moves an application from TickerQ to SharpTicker. It was verified against a real application on TickerQ 10.4.0 and against EF Core migrations generated with the old package.
 
@@ -60,9 +61,9 @@ Replace each package with its counterpart and use the same version for all of th
 | `TickerQ.Instrumentation.OpenTelemetry` | `SharpTicker.Instrumentation.OpenTelemetry` |
 
 ```xml
-<PackageReference Include="SharpTicker" Version="1.0.0" />
-<PackageReference Include="SharpTicker.EntityFrameworkCore" Version="1.0.0" />
-<PackageReference Include="SharpTicker.Dashboard" Version="1.0.0" />
+<PackageReference Include="SharpTicker" Version="1.0.0-rc.1" />
+<PackageReference Include="SharpTicker.EntityFrameworkCore" Version="1.0.0-rc.1" />
+<PackageReference Include="SharpTicker.Dashboard" Version="1.0.0-rc.1" />
 ```
 
 There is one package version for .NET 8, 9 and 10; there are no separate version lines per .NET release.
@@ -184,11 +185,11 @@ Never rename the database itself as part of this migration.
 Copy this prompt into your AI coding assistant, from the root of your repository:
 
 ````text
-Migrate this repository from TickerQ to SharpTicker 1.0.0. Work on a new branch and do not commit.
+Migrate this repository from TickerQ to SharpTicker 1.0.0-rc.1. Work on a new branch and do not commit.
 
 Rules:
 1. Packages: replace every TickerQ* PackageReference with its SharpTicker* counterpart
-   (TickerQ -> SharpTicker, TickerQ.X -> SharpTicker.X), all on version 1.0.0.
+   (TickerQ -> SharpTicker, TickerQ.X -> SharpTicker.X), all on version 1.0.0-rc.1.
    Include Directory.Packages.props if the repository uses central package management.
 2. Code (*.cs, *.csproj, *.props, *.razor, *.cshtml only): replace "TickerQ" with "SharpTicker" ONLY where
    it is not followed by a lowercase letter (regex: TickerQ(?![a-z])). Never change ITickerQueryable,
