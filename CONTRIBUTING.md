@@ -99,7 +99,6 @@ Use [GitHub Issues](https://github.com/msx752/SharpTicker/issues) for bugs and f
 For maintainers. `main` is protected: changes land through pull requests once CI passes.
 
 1. Open a pull request from `develop` to `main` and merge it with a **merge commit**. Do not squash or rebase it: that rewrites the commits, and `develop` would then show the same changes as new on the next pull request.
-
 2. Create a GitHub release with a new tag `v<version>` on a commit of `main`, for example `v1.2.0` or `v1.2.0-rc.1`. The version follows [Semantic Versioning](https://semver.org) and is used for every package.
 3. Tick **Set as a pre-release** exactly when the version has a `-` suffix. NuGet treats those versions as prereleases.
 4. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then it builds, tests on every target and packs all packages.

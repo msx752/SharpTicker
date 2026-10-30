@@ -7,6 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSharpTicker(options =>
 {
+    options.WithJsonContext(SampleJsonContext.Default);
     options.AddDashboard();
 });
 

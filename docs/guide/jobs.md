@@ -107,6 +107,8 @@ await tickers.AddAsync(new TimeTickerEntity
 
 Requests are stored as JSON. For trimmed or AOT applications, pass a source-generated `JsonTypeInfo<T>` to `CreateTickerRequest`, or register a context with `WithJsonContext(...)` on the options builder. `UseGZipCompression()` compresses stored requests; it is off by default.
 
+The dashboard offers an example request for every job that takes one. It builds the example from the same serializer options, so in a trimmed or AOT application only request types that are listed in the registered context get an example; for the others the request field stays editable and you enter the JSON by hand.
+
 ## Code-first registration
 
 `MapTicker` registers jobs without the attribute. It is useful for classes you do not own, generic setups and small inline handlers.

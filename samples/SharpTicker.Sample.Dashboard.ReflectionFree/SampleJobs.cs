@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using SharpTicker.Utilities.Base;
 using SharpTicker.Utilities.Interfaces;
 
@@ -32,6 +33,12 @@ public class CleanupJob : ITickerFunction
 }
 
 public record OrderRequest(string OrderId, decimal Amount);
+
+// Reflection-free serialization: every request type must be listed in a source-generated context,
+// and the context is passed to SharpTicker with WithJsonContext (see Program.cs). Without it,
+// requests cannot be serialized and the dashboard has no example JSON to offer.
+[JsonSerializable(typeof(OrderRequest))]
+internal partial class SampleJsonContext : JsonSerializerContext;
 
 public class ProcessOrderJob : ITickerFunction<OrderRequest>
 {
