@@ -159,6 +159,37 @@ namespace TestApp
     }
 
     [Fact]
+    public void ACronWithADayName_Compiles_BecauseTheSchedulerAcceptsIt()
+    {
+        var result = GeneratorHarness.Run(Jobs(@"
+        [TickerFunction(""Mondays"", ""0 0 9 * * MON-FRI"")]
+        public Task Mondays() => Task.CompletedTask;"));
+
+        Assert.Empty(result.Ids);
+        Assert.Contains(@"""0 0 9 * * MON-FRI""", result.Factory);
+    }
+
+    [Fact]
+    public void ACronWithAFieldAfterTheSixth_IsAnError_BecauseTheSchedulerRejectsIt()
+    {
+        var result = GeneratorHarness.Run(Jobs(@"
+        [TickerFunction(""Extra"", ""0 0 0 * * * 2030"")]
+        public Task Extra() => Task.CompletedTask;"));
+
+        Assert.Equal(new[] { "ST003" }, result.Ids);
+    }
+
+    [Fact]
+    public void ABackwardsRange_IsAnError()
+    {
+        var result = GeneratorHarness.Run(Jobs(@"
+        [TickerFunction(""Night"", ""0 0 22-2 * * *"")]
+        public Task Night() => Task.CompletedTask;"));
+
+        Assert.Equal(new[] { "ST003" }, result.Ids);
+    }
+
+    [Fact]
     public void AnEmptyFunctionName_IsAnError()
     {
         var result = GeneratorHarness.Run(Jobs(@"
