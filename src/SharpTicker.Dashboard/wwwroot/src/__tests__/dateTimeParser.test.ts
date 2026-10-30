@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getDateFormatRegion, buildDatePart, formatDate, formatTime } from '../utilities/dateTimeParser';
+import { getDateFormatRegion, buildDatePart, formatDate, formatTime, formatExecutedAt } from '../utilities/dateTimeParser';
 
 describe('getDateFormatRegion', () => {
     it('returns "us" for America/ prefixed IANA timezone', () => {
@@ -151,5 +151,20 @@ describe('formatTime', () => {
 
     it('formats exact days without hours', () => {
         expect(formatTime(86400)).toBe('1d');
+    });
+});
+
+describe('formatExecutedAt', () => {
+    it.each(['0001-01-01T00:00:00', '0001-01-01T00:00:00Z'])('reads as blank for the empty date %s', (value) => {
+        expect(formatExecutedAt(value, 0)).toBe('');
+    });
+
+    it('reads as blank for an empty Date', () => {
+        expect(formatExecutedAt(new Date('0001-01-01T00:00:00Z'), 0)).toBe('');
+    });
+
+    it('shows how long ago and how long it took for a real date', () => {
+        const recent = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        expect(formatExecutedAt(recent, 1500)).toMatch(/ago \(took .+\)$/);
     });
 });

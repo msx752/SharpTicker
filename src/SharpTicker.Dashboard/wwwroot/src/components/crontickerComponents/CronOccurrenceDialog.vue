@@ -10,7 +10,7 @@ import { methodName, type TickerNotificationHubType } from '@/hub/tickerNotifica
 import type { GetCronTickerOccurrenceResponse } from '@/http/services/types/cronTickerOccurrenceService.types'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
-import { formatTime, formatTimeAgo } from '@/utilities/dateTimeParser'
+import { formatExecutedAt } from '@/utilities/dateTimeParser'
 
 const confirmDialog = useDialog<{ data: string }>().withComponent(
   () => import('@/components/common/ConfirmDialog.vue'),
@@ -110,7 +110,7 @@ const addHubListeners = async () => {
           ...currentItem,
           ...val,
           status: Status[val.status as any],
-          executedAt: `${formatTimeAgo(val.executedAt)} (took ${formatTime(val.elapsedTime as number, true)})`,
+          executedAt: formatExecutedAt(val.executedAt, val.elapsedTime as number),
           retryIntervals: currentItem.retryIntervals,
           lockedAt: currentItem.lockedAt, // Preserve existing lockedAt
           lockHolder: currentItem.lockHolder,

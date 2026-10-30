@@ -160,3 +160,11 @@ export function formatTimeAgo(date: string | Date): string {
     }
     return timeago(date)
 }
+
+// A job that has not finished has no execution time yet and the server sends the empty date
+// (0001-01-01) for it. Showing "25 years ago" for that is wrong, so it reads as blank.
+export function formatExecutedAt(executedAt: string | Date, elapsedTime: number): string {
+    const isUnset = typeof executedAt === 'string' ? executedAt.startsWith('0001-') : executedAt.getUTCFullYear() <= 1
+    if (isUnset) return ''
+    return `${formatTimeAgo(executedAt)} (took ${formatTime(elapsedTime, true)})`
+}

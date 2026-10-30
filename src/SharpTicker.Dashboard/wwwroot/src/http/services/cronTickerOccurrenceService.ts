@@ -1,5 +1,5 @@
 
-import { formatDate, formatTime, formatTimeAgo } from '@/utilities/dateTimeParser';
+import { formatDate, formatExecutedAt } from '@/utilities/dateTimeParser';
 import { useBaseHttpService } from '../base/baseHttpService';
 import { Status } from './types/base/baseHttpResponse.types';
 import { GetCronTickerOccurrenceGraphDataRequest, GetCronTickerOccurrenceGraphDataResponse, GetCronTickerOccurrenceRequest, GetCronTickerOccurrenceResponse } from './types/cronTickerOccurrenceService.types';
@@ -27,7 +27,7 @@ const getByCronTickerId = () => {
             }
 
             if (response.executedAt != null) {
-                response.executedAt = `${formatTimeAgo(response.executedAt)} (took ${formatTime(response.elapsedTime as number, true)})`;
+                response.executedAt = formatExecutedAt(response.executedAt, response.elapsedTime as number);
             }
 
             const utcExecutionTime = response.executionTime.endsWith('Z') ? response.executionTime : response.executionTime + 'Z';
@@ -80,7 +80,7 @@ const getByCronTickerIdPaginated = () => {
                     }
                     
                     if (item.executedAt != null) {
-                        item.executedAt = `${formatTimeAgo(item.executedAt)} (took ${formatTime(item.elapsedTime as number, true)})`;
+                        item.executedAt = formatExecutedAt(item.executedAt, item.elapsedTime as number);
                     }
                     
                     const utcExecutionTime = item.executionTime.endsWith('Z') ? item.executionTime : item.executionTime + 'Z';
