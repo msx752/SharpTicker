@@ -75,6 +75,8 @@ Expressions are parsed by [NCrontab](https://github.com/atifaziz/NCrontab) with 
 0 30 9 * * 1-5   → 09:30:00 on weekdays
 ```
 
+Each field takes `*`, a value, a list (`1,15`), a range (`9-17`), and a step (`*/15`, `0-30/5`). Month and day of week also accept names in any case, for example `MON-FRI`, `Jan,Jul` or `Sunday`; a name can be shortened to its first letters (`MON`, `Sept`). The source generator checks the same rules at build time, so a cron it rejects is reported as a compile error instead of failing at startup.
+
 A five-field expression without seconds is accepted on `[TickerFunction]` and by `CronExpression.Parse`, which add `0` seconds in front. Expressions given directly to `CronTickerEntity.Expression` through the cron manager are not expanded, so use six fields there.
 
 ### Time zone
