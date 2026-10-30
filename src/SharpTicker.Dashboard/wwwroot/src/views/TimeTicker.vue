@@ -15,7 +15,7 @@ import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { BarChart, LineChart, PieChart } from 'echarts/charts'
+import { LineChart, PieChart } from 'echarts/charts'
 import {
   TitleComponent,
   TooltipComponent,
@@ -30,7 +30,6 @@ import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/
 
 use([
   CanvasRenderer,
-  BarChart,
   LineChart,
   PieChart,
   TitleComponent,

@@ -21,19 +21,22 @@ export interface DayResults {
   results?: StatusCount[] | null
 }
 
-export interface StatusBarSeries {
+export interface StatusLineSeries {
   name: string
-  type: 'bar'
-  stack: 'total'
-  barMaxWidth: number
+  type: 'line'
+  smooth: boolean
+  symbol: 'circle'
+  symbolSize: number
   itemStyle: { color: string }
+  lineStyle: { width: number; color: string }
+  areaStyle: { color: { type: 'linear'; x: number; y: number; x2: number; y2: number; colorStops: { offset: number; color: string }[] } }
   emphasis: { focus: 'series' }
   data: number[]
 }
 
 export interface StatusTimeSeries {
   xAxisData: string[]
-  series: StatusBarSeries[]
+  series: StatusLineSeries[]
   legendData: string[]
   hasData: boolean
 }
@@ -42,7 +45,7 @@ export interface StatusTimeSeries {
 export const ZOOM_SLIDER_MIN_DAYS = 14
 
 /**
- * ECharts option for the stacked status bars. Shared by the Time and Cron ticker pages so both
+ * ECharts option for the status lines. Shared by the Time and Cron ticker pages so both
  * charts look and behave the same, including the "nothing happened" state.
  */
 export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string) {
@@ -61,7 +64,7 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
     },
     tooltip: {
       trigger: 'axis',
-      axisPointer: { type: 'shadow' },
+      axisPointer: { type: 'cross' },
       backgroundColor: 'rgba(42, 42, 42, 0.95)',
       borderColor: '#666',
       borderWidth: 1,
@@ -86,11 +89,13 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
     xAxis: {
       type: 'category',
       data: chart.xAxisData,
+      boundaryGap: false,
       axisLabel: { color: '#bdbdbd', fontSize: 10, rotate: days > 8 ? 45 : 0 },
       axisLine: { lineStyle: { color: '#424242' } },
     },
     yAxis: {
       type: 'value',
+      min: 0,
       minInterval: 1,
       axisLabel: { color: '#bdbdbd', fontSize: 10 },
       axisLine: { lineStyle: { color: '#424242' } },
@@ -130,7 +135,7 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
 }
 
 /**
- * Turns the per-day status counts returned by the API into stacked bar series.
+ * Turns the per-day status counts returned by the API into line series.
  *
  * Days keep the order the server sent them in (the date strings are locale formatted, so sorting
  * them as text would put 01/11 before 27/10). Statuses that never occur in the range are left out,
@@ -170,15 +175,33 @@ export function buildStatusTimeSeries(
 
   const series = [...countsByStatus.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([status, data]): StatusBarSeries => ({
-      name: statusName(status),
-      type: 'bar',
-      stack: 'total',
-      barMaxWidth: 40,
-      itemStyle: { color: STATUS_COLORS[status] ?? FALLBACK_COLOR },
-      emphasis: { focus: 'series' },
-      data,
-    }))
+    .map(([status, data]): StatusLineSeries => {
+      const color = STATUS_COLORS[status] ?? FALLBACK_COLOR
+      return {
+        name: statusName(status),
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 6,
+        itemStyle: { color },
+        lineStyle: { width: 2, color },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: color + '30' },
+              { offset: 1, color: color + '05' },
+            ],
+          },
+        },
+        emphasis: { focus: 'series' },
+        data,
+      }
+    })
 
   return {
     xAxisData,

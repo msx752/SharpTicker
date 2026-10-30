@@ -44,10 +44,14 @@ describe('buildStatusTimeSeries', () => {
     expect(result.series.map((s) => s.data)).toEqual([[4, 1], [2, 0]])
   })
 
-  it('stacks the series and colours them by status', () => {
+  it('draws a line per status in the status colour', () => {
     const result = buildStatusTimeSeries([{ date: 'd1', results: [{ item1: 5, item2: 1 }] }], name)
 
-    expect(result.series[0]).toMatchObject({ type: 'bar', stack: 'total', itemStyle: { color: STATUS_COLORS[5] } })
+    expect(result.series[0]).toMatchObject({
+      type: 'line',
+      itemStyle: { color: STATUS_COLORS[5] },
+      lineStyle: { color: STATUS_COLORS[5] },
+    })
   })
 
   it('uses a fallback colour and the supplied name for an unknown status', () => {
@@ -116,7 +120,10 @@ describe('buildStatusChartOption', () => {
     expect(buildStatusChartOption(buildStatusTimeSeries(days(ZOOM_SLIDER_MIN_DAYS + 1), name), 's').dataZoom).toHaveLength(2)
   })
 
-  it('shows whole numbers on the count axis', () => {
-    expect(buildStatusChartOption(buildStatusTimeSeries(days(2), name), 's').yAxis.minInterval).toBe(1)
+  it('shows whole numbers on the count axis and never goes below zero', () => {
+    const { yAxis } = buildStatusChartOption(buildStatusTimeSeries(days(2), name), 's')
+
+    expect(yAxis.minInterval).toBe(1)
+    expect(yAxis.min).toBe(0)
   })
 })
