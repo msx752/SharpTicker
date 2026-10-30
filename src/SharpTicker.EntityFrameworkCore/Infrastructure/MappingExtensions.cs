@@ -10,21 +10,25 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
     {
         internal static void UpdateCronTickerOccurrence<TCronTicker>(
             this UpdateSettersBuilder<CronTickerOccurrenceEntity<TCronTicker>> setters,
-            InternalFunctionContext functionContext)
+            InternalFunctionContext functionContext, DateTime updatedAt)
             where TCronTicker : CronTickerEntity, new()
         {
             var propsToUpdate = functionContext.GetPropsToUpdate();
 
-            if (propsToUpdate.Contains(nameof(InternalFunctionContext.Status)) &&
-                functionContext.Status != TickerStatus.Skipped)
+            // The status is written only when the context marks it. Without that check a result that updates something
+            // else, such as the execution time, would reset the status to the context's default.
+            if (propsToUpdate.Contains(nameof(InternalFunctionContext.Status)))
             {
-                setters.SetProperty(x => x.Status, functionContext.Status);
-            }
-            else
-            {
-                setters
-                    .SetProperty(x => x.Status, functionContext.Status)
-                    .SetProperty(x => x.SkippedReason, functionContext.ExceptionDetails);
+                if (functionContext.Status != TickerStatus.Skipped)
+                {
+                    setters.SetProperty(x => x.Status, functionContext.Status);
+                }
+                else
+                {
+                    setters
+                        .SetProperty(x => x.Status, functionContext.Status)
+                        .SetProperty(x => x.SkippedReason, functionContext.ExceptionDetails);
+                }
             }
 
             if (propsToUpdate.Contains(nameof(InternalFunctionContext.ExecutedAt)))
@@ -59,6 +63,8 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             {
                 setters.SetProperty(x => x.ExecutionTime, functionContext.ExecutionTime);
             }
+
+            setters.SetProperty(x => x.UpdatedAt, updatedAt);
         }
 
         internal static void UpdateTimeTicker<TTimeTicker>(this UpdateSettersBuilder<TTimeTicker> setters,
@@ -67,16 +73,20 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
         {
             var propsToUpdate = functionContext.GetPropsToUpdate();
 
-            if (propsToUpdate.Contains(nameof(InternalFunctionContext.Status)) &&
-                functionContext.Status != TickerStatus.Skipped)
+            // The status is written only when the context marks it. Without that check a result that updates something
+            // else, such as the execution time, would reset the status to the context's default.
+            if (propsToUpdate.Contains(nameof(InternalFunctionContext.Status)))
             {
-                setters.SetProperty(x => x.Status, functionContext.Status);
-            }
-            else
-            {
-                setters
-                    .SetProperty(x => x.Status, functionContext.Status)
-                    .SetProperty(x => x.SkippedReason, functionContext.ExceptionDetails);
+                if (functionContext.Status != TickerStatus.Skipped)
+                {
+                    setters.SetProperty(x => x.Status, functionContext.Status);
+                }
+                else
+                {
+                    setters
+                        .SetProperty(x => x.Status, functionContext.Status)
+                        .SetProperty(x => x.SkippedReason, functionContext.ExceptionDetails);
+                }
             }
 
             if (propsToUpdate.Contains(nameof(InternalFunctionContext.ExecutedAt)))
