@@ -93,8 +93,10 @@ For maintainers. `main` is protected: changes land through pull requests once CI
 
 1. Create a GitHub release with a new tag `v<version>` on a commit of `main`, for example `v1.2.0` or `v1.2.0-rc.1`. The version follows [Semantic Versioning](https://semver.org) and is used for every package.
 2. Tick **Set as a pre-release** exactly when the version has a `-` suffix. NuGet treats those versions as prereleases.
-3. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then the `nuget` environment waits for a reviewer to approve the publish.
-4. After approval it builds, tests on every target, packs and pushes all packages. NuGet versions cannot be deleted, only unlisted, so try a pipeline change with a pre-release first.
+3. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then it builds, tests on every target and packs all packages.
+4. The `nuget` environment then waits for a reviewer to approve the publish. After approval, the publish job pushes the packages that were built in step 3. NuGet versions cannot be deleted, only unlisted, so try a pipeline change with a pre-release first.
+
+Publishing uses [NuGet Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing): no API key is stored in the repository. The policy on nuget.org allows `msx752/SharpTicker`, workflow `release.yml` and environment `nuget` to push packages matching `SharpTicker*`. Renaming the workflow file or the environment breaks publishing until the policy is updated to match.
 
 If the push stops partway, re-run only the failed job; packages that were already pushed are skipped.
 
