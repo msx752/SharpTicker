@@ -466,7 +466,7 @@ const handleForceUIUpdate = () => {
               <template v-if="tickerHostStatus && isServicesReady">
                 <v-btn
                   color="warning"
-                  variant="elevated"
+                  variant="outlined"
                   size="small"
                   @click="handleRestart"
                   :loading="restartTicker?.loader?.value"
@@ -492,7 +492,7 @@ const handleForceUIUpdate = () => {
 
                 <v-btn
                   color="error"
-                  variant="elevated"
+                  variant="outlined"
                   size="small"
                   prepend-icon="mdi-stop-circle"
                   @click="confirmDialog?.open({...new ConfirmDialogProps(), confirmText: 'Stop' })"
@@ -686,7 +686,6 @@ const handleForceUIUpdate = () => {
 .nav-link:hover {
   color: #e0e0e0 !important;
   background: rgba(255, 255, 255, 0.1) !important;
-  transform: translateY(-1px) !important;
 }
 
 .nav-link.v-btn--active {
@@ -1079,6 +1078,8 @@ const handleForceUIUpdate = () => {
     justify-content: center;
     flex-direction: column;
     gap: 12px;
+    max-width: 100%;
+    flex-shrink: 1;
   }
 
   .navigation-links {

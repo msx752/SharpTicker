@@ -1815,6 +1815,8 @@ const canBeForceDeleted = ref<string[]>([])
   align-items: center;
   gap: 12px;
   flex: 1;
+  flex-wrap: wrap;
+  min-width: 0;
   justify-content: center;
 }
 

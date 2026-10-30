@@ -1315,7 +1315,7 @@ const getVisiblePageNumbers = () => {
   color: #bdbdbd !important;
   font-weight: 600 !important;
   font-size: 0.875rem !important;
-  text-transform: uppercase !important;
+  text-transform: none !important;
   letter-spacing: 0.5px !important;
   padding: 16px !important;
   border-bottom: none !important;
@@ -1330,7 +1330,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table__tr:hover {
   background: rgba(255, 255, 255, 0.05) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2) !important;
 }
 
@@ -1386,7 +1385,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table-footer .v-btn:hover {
   background: rgba(255, 255, 255, 0.1) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2) !important;
 }
 
@@ -1398,7 +1396,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table-footer .v-btn--variant-elevated:hover {
   background: var(--v-theme-primary) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(var(--v-theme-primary), 0.3) !important;
 }
 
@@ -1537,5 +1534,10 @@ const getVisiblePageNumbers = () => {
   .page-size-selector {
     justify-content: center;
   }
+}
+
+.content-grid > *,
+.bottom-grid > * {
+  min-width: 0;
 }
 </style>
