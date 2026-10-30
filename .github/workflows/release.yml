@@ -1,7 +1,9 @@
 name: Release
 
 # Publishes the packages to NuGet when a GitHub release is published.
-# The release tag is the package version, e.g. "v1.2.3" or "1.2.3".
+# The release tag is "v" plus the package version, e.g. "v1.2.3" or "v1.2.3-rc.1". The tag must be on main,
+# and the release is marked as a pre-release exactly when the version has a "-" suffix.
+# See "Releasing" in CONTRIBUTING.md.
 on:
   release:
     types: [published]
@@ -14,11 +16,67 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
 jobs:
+  # Runs without secrets or approval, so an invalid release never reaches the nuget environment.
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check tag, prerelease flag and branch
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          version="${TAG#v}"
+
+          # Semantic Versioning 2.0.0 without build metadata ("+..."), which NuGet does not keep
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          # The "v" prefix is required: the nuget environment only deploys from tags matching v*
+          if [[ "$TAG" != v* ]] || ! [[ "$version" =~ $semver ]]; then
+            echo "::error::Tag '$TAG' is not a version such as v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+          # A version with a "-" suffix is a prerelease on NuGet; the GitHub release must say the same
+          if [[ "$version" == *-* && "$PRERELEASE" != "true" ]]; then
+            echo "::error::$version is a prerelease version; mark the GitHub release as a pre-release."
+            exit 1
+          fi
+          if [[ "$version" != *-* && "$PRERELEASE" == "true" ]]; then
+            echo "::error::$version is a stable version; the GitHub release must not be marked as a pre-release."
+            exit 1
+          fi
+
+          # Only commits that are on main are released
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag '$TAG' points to a commit that is not on main."
+            exit 1
+          fi
+
+          # NuGet versions are permanent; fail instead of silently skipping an existing one
+          status=$(curl -s -o versions.json -w '%{http_code}' https://api.nuget.org/v3-flatcontainer/sharpticker/index.json)
+          if [[ "$status" == "200" ]] && jq -e --arg v "${version,,}" '.versions | index($v)' versions.json > /dev/null; then
+            echo "::error::SharpTicker $version is already on NuGet."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Build, test and publish
+    needs: validate
     runs-on: ubuntu-latest
-    # Holds the NUGET_API_KEY secret; add required reviewers to the environment to gate publishing
+    # Holds the NUGET_API_KEY secret; its required reviewer approves each publish
     environment: nuget
+    env:
+      PACKAGE_VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,9 +104,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Version from tag
-        run: echo "PACKAGE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-
       - name: Build
         run: dotnet build SharpTicker.slnx --configuration Release -p:Version="$PACKAGE_VERSION"
 
@@ -58,7 +113,9 @@ jobs:
       - name: Pack
         run: dotnet pack SharpTicker.slnx --configuration Release --no-build -p:Version="$PACKAGE_VERSION" --output nupkgs
 
-      # Pushing the .nupkg files also pushes the matching .snupkg symbol packages
+      # Pushing the .nupkg files also pushes the matching .snupkg symbol packages.
+      # --skip-duplicate only matters when re-running this job after a partial push; a new release
+      # of an existing version is already rejected by the validate job.
       - name: Publish to NuGet
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

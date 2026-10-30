@@ -87,6 +87,17 @@ bash .github/scripts/test.sh net8.0 -p:LatestPatchDependencies=true
 
 Use [GitHub Issues](https://github.com/msx752/SharpTicker/issues) for bugs and feature requests. Include steps to reproduce, the expected behavior and the actual behavior. Report security problems privately as described in [SECURITY.md](SECURITY.md).
 
+## Releasing
+
+For maintainers. `main` is protected: changes land through pull requests once CI passes.
+
+1. Create a GitHub release with a new tag `v<version>` on a commit of `main`, for example `v1.2.0` or `v1.2.0-rc.1`. The version follows [Semantic Versioning](https://semver.org) and is used for every package.
+2. Tick **Set as a pre-release** exactly when the version has a `-` suffix. NuGet treats those versions as prereleases.
+3. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then the `nuget` environment waits for a reviewer to approve the publish.
+4. After approval it builds, tests on every target, packs and pushes all packages. NuGet versions cannot be deleted, only unlisted, so try a pipeline change with a pre-release first.
+
+If the push stops partway, re-run only the failed job; packages that were already pushed are skipped.
+
 ## License
 
 By contributing, you agree that your contributions are licensed under the project's dual license, [MIT or Apache 2.0](LICENSE), at the user's option.
