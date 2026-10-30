@@ -1183,7 +1183,7 @@ const createChainJobs = async () => {
       executionTime: getExecutionTime(parentJob.value),
       retries: parentJob.value.retries,
       request: parentJob.value.requestData || null,
-      intervals: parentJob.value.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
+      retryIntervals: parentJob.value.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
       children: [] as any[]
     }
 
@@ -1196,7 +1196,7 @@ const createChainJobs = async () => {
           executionTime: getExecutionTime(child),
           retries: child.retries,
           request: child.requestData || null,
-          intervals: child.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
+          retryIntervals: child.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
           children: [] as any[]
         }
 
@@ -1209,7 +1209,7 @@ const createChainJobs = async () => {
               executionTime: getExecutionTime(grandChild),
               retries: grandChild.retries,
               request: grandChild.requestData || null,
-              intervals: grandChild.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
+              retryIntervals: grandChild.retryIntervals?.map(item => typeof item === 'object' ? item.value : item) || [],
               children: []
             })
           }

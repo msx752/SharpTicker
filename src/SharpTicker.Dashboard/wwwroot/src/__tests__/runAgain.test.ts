@@ -29,11 +29,11 @@ describe('buildRunAgainRequest', () => {
   })
 
   it('turns the retry intervals from the list text back into seconds', () => {
-    expect(buildRunAgainRequest(row({ retryIntervals: ['30s', '1m 30s', '2h'] }), '').intervals).toEqual([30, 90, 7200])
+    expect(buildRunAgainRequest(row({ retryIntervals: ['30s', '1m 30s', '2h'] }), '').retryIntervals).toEqual([30, 90, 7200])
   })
 
   it.each([null, '30s'])('sends no intervals when the row has none as a list (%j)', (retryIntervals) => {
-    expect(buildRunAgainRequest(row({ retryIntervals }), '').intervals).toBeUndefined()
+    expect(buildRunAgainRequest(row({ retryIntervals }), '').retryIntervals).toBeUndefined()
   })
 
   it.each([

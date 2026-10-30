@@ -77,16 +77,6 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.Equal(new[] { 30, 90 }, added.GetProperty("retryIntervals").EnumerateArray().Select(i => i.GetInt32()));
     }
 
-    /// <summary>The body the dashboard sends carries the intervals as "intervals", not "retryIntervals".</summary>
-    protected async Task AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync()
-    {
-        var id = await AddTimeTickerAsync(
-            $$"""{"function":"WriteJob","executionTime":"{{InTwoDays}}","retries":2,"intervals":[30,90]}""");
-
-        var added = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == id);
-        Assert.Equal(new[] { 30, 90 }, added.GetProperty("retryIntervals").EnumerateArray().Select(i => i.GetInt32()));
-    }
-
     [Fact]
     public async Task AddTimeTicker_IsRefused_ForAFunctionNobodyRegistered()
     {
@@ -274,6 +264,28 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     }
 
     [Fact]
+    public async Task AddCronTicker_StoresTheRetryIntervals()
+    {
+        var (_, body) = await _api.SendAsync(HttpMethod.Post, "/cron-ticker/add",
+            """{"function":"NewCron","expression":"0 0 * * * *","retries":2,"retryIntervals":[30,90]}""");
+
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var added = (await CronTickersAsync()).Single(c => c.GetProperty("id").GetGuid() == body.Value.GetProperty("tickerId").GetGuid());
+        Assert.Equal(new[] { 30, 90 }, added.GetProperty("retryIntervals").EnumerateArray().Select(i => i.GetInt32()));
+    }
+
+    [Fact]
+    public async Task UpdateCronTicker_ChangesTheRetryIntervals()
+    {
+        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={DashboardApiFixture.CronId}",
+            """{"function":"SeedCron","expression":"0 * * * * *","retries":3,"retryIntervals":[10,20,30]}""");
+
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var cron = (await CronTickersAsync()).Single(c => c.GetProperty("id").GetGuid() == DashboardApiFixture.CronId);
+        Assert.Equal(new[] { 10, 20, 30 }, cron.GetProperty("retryIntervals").EnumerateArray().Select(i => i.GetInt32()));
+    }
+
+    [Fact]
     public async Task UpdateCronTicker_ChangesTheExpressionAndDescription()
     {
         var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={DashboardApiFixture.CronId}",
@@ -422,9 +434,6 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
 [Collection(SharedStaticStateCollection.Name)]
 public class InMemoryDashboardApiWriteTests : DashboardApiWriteTests<InMemoryDashboardApiFixture>
 {
-    [Fact(Skip = "Known bug: the dashboard sends the retry intervals as \"intervals\", but the body is read straight into the ticker, whose property is \"retryIntervals\", so the intervals are dropped. Needs a decision: accept \"intervals\" on the server or send \"retryIntervals\" from the dashboard.")]
-    public Task AddTimeTicker_StoresTheRetryIntervalsTheDashboardSends() => AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync();
-
     [Fact(Skip = "Known inconsistency: with the in-memory store, updating a ticker that does not exist creates it (UpdateTickerWithChildren adds it when it is not found) and reports success, while the EF Core store fails the update. The expected behavior is a failure and no new ticker. Needs a decision, then unskip.")]
     public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
 }
@@ -432,9 +441,6 @@ public class InMemoryDashboardApiWriteTests : DashboardApiWriteTests<InMemoryDas
 [Collection(SharedStaticStateCollection.Name)]
 public class EfCoreDashboardApiWriteTests : DashboardApiWriteTests<EfCoreDashboardApiFixture>
 {
-    [Fact(Skip = "Known bug: the dashboard sends the retry intervals as \"intervals\", but the body is read straight into the ticker, whose property is \"retryIntervals\", so the intervals are dropped. Needs a decision: accept \"intervals\" on the server or send \"retryIntervals\" from the dashboard.")]
-    public Task AddTimeTicker_StoresTheRetryIntervalsTheDashboardSends() => AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync();
-
     [Fact]
     public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
 

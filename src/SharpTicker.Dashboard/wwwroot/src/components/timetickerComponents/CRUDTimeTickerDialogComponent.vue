@@ -273,7 +273,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             executionTime: executionDateTime,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           }, schedulingTimeZone)
           .then(() => {
             emit('confirm')
@@ -286,7 +286,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             executionTime: executionDateTime,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           }, schedulingTimeZone)
           .then(() => {
             emit('confirm')

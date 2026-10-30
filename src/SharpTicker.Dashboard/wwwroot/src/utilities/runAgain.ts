@@ -22,6 +22,6 @@ export function buildRunAgainRequest(
     retries: Number.isNaN(retries) ? 0 : retries,
     description: item.description ?? '',
     // The list keeps the intervals as text such as "1m 30s"; the server wants seconds.
-    intervals: Array.isArray(item.retryIntervals) ? item.retryIntervals.map(parseDuration) : undefined,
+    retryIntervals: Array.isArray(item.retryIntervals) ? item.retryIntervals.map(parseDuration) : undefined,
   }
 }

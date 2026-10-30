@@ -174,7 +174,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             request: values.requestData,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           })
           .then(() => {
             emit('close')
@@ -188,7 +188,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             request: values.requestData,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           })
           .then(() => {
             emit('close')
