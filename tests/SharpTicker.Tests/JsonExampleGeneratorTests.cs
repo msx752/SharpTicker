@@ -402,6 +402,34 @@ public class JsonExampleGeneratorTests : IDisposable
         public int[]? Numbers { get; set; }
     }
 
+    [Fact]
+    public void TryGenerateExampleJson_WithUnconfiguredDefaultOptions_UsesReflection()
+    {
+        // What an app gets when it never calls WithJsonContext or configures the request serializer
+        TickerHelper.RequestJsonSerializerOptions = new JsonSerializerOptions();
+
+        var result = JsonExampleGenerator.TryGenerateExampleJson(typeof(PositionalRecord), out var json);
+
+        Assert.True(result);
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(JsonValueKind.String, doc.RootElement.GetProperty("OrderId").ValueKind);
+        Assert.Equal(JsonValueKind.Number, doc.RootElement.GetProperty("Amount").ValueKind);
+    }
+
+    [Fact]
+    public void TryGenerateExampleJson_WithPolicyButNoResolver_KeepsThePolicy()
+    {
+        TickerHelper.RequestJsonSerializerOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
+        var result = JsonExampleGenerator.TryGenerateExampleJson(typeof(PositionalRecord), out var json);
+
+        Assert.True(result);
+        using var doc = JsonDocument.Parse(json);
+        Assert.True(doc.RootElement.TryGetProperty("orderId", out _));
+    }
+
+    public record PositionalRecord(string OrderId, decimal Amount);
+
     public struct TestStruct
     {
         public int X { get; set; }
