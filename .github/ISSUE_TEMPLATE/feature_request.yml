@@ -30,7 +30,24 @@ body:
         - Extensibility (hooks for host code)
         - Testing support
         - Deployment and hosting
+        - Source generator (job registration)
         - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: |
+        Your best guess; maintainers confirm it during triage. See [Versioning](https://github.com/msx752/SharpTicker#versioning):
+        breaking changes to the public API, behavior or database schema only ship in a major version.
+      options:
+        - None (additive, no change for existing users)
+        - Behavior change for existing users
+        - Database schema change
+        - Breaking public API change
+        - Not sure
     validations:
       required: true
 

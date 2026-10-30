@@ -48,6 +48,8 @@ body:
     id: framework
     attributes:
       label: Target framework
+      description: Select every target you reproduced it on. Each target is a separate build.
+      multiple: true
       options:
         - net10.0
         - net9.0
@@ -63,6 +65,7 @@ body:
         - In-memory (default)
         - Entity Framework Core
         - MongoDB
+        - Redis
         - Not relevant
     validations:
       required: true
@@ -71,7 +74,7 @@ body:
     id: database
     attributes:
       label: Database and provider
-      description: Only if you use EF Core or MongoDB.
+      description: Only if you use EF Core, MongoDB or Redis.
       placeholder: "e.g. PostgreSQL 16 with Npgsql.EntityFrameworkCore.PostgreSQL 9.0.4"
 
   - type: dropdown

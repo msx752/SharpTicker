@@ -21,6 +21,7 @@ body:
         - Wrong or outdated information
         - Unclear explanation
         - Broken link or sample
+        - Missing sample
     validations:
       required: true
 
