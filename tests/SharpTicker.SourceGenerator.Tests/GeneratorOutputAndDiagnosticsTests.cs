@@ -143,7 +143,7 @@ namespace TestApp
         public Task Bad() => Task.CompletedTask;"));
 
         var diagnostic = Assert.Single(result.Diagnostics);
-        Assert.Equal("TQ003", diagnostic.Id);
+        Assert.Equal("ST003", diagnostic.Id);
         Assert.Equal(Microsoft.CodeAnalysis.DiagnosticSeverity.Error, diagnostic.Severity);
         Assert.Contains("not a cron", diagnostic.GetMessage());
     }
@@ -155,7 +155,7 @@ namespace TestApp
         [TickerFunction(""Bad"", ""0 0 24 * * *"")]
         public Task Bad() => Task.CompletedTask;"));
 
-        Assert.Equal(new[] { "TQ003" }, result.Ids);
+        Assert.Equal(new[] { "ST003" }, result.Ids);
     }
 
     [Fact]
@@ -165,7 +165,7 @@ namespace TestApp
         [TickerFunction("""")]
         public Task Nameless() => Task.CompletedTask;"));
 
-        Assert.Contains("TQ004", result.Ids);
+        Assert.Contains("ST004", result.Ids);
     }
 
     [Fact]
@@ -177,8 +177,8 @@ namespace TestApp
         [TickerFunction(""Same"")]
         public Task Two() => Task.CompletedTask;"));
 
-        Assert.Contains("TQ005", result.Ids);
-        Assert.Contains("Same", result.Diagnostics.First(d => d.Id == "TQ005").GetMessage());
+        Assert.Contains("ST005", result.Ids);
+        Assert.Contains("Same", result.Diagnostics.First(d => d.Id == "ST005").GetMessage());
     }
 
     [Fact]
@@ -188,7 +188,7 @@ namespace TestApp
         [TickerFunction(""Hidden"")]
         private Task Hidden() => Task.CompletedTask;"));
 
-        Assert.Contains("TQ002", result.Ids);
+        Assert.Contains("ST002", result.Ids);
     }
 
     [Fact]
@@ -198,7 +198,7 @@ namespace TestApp
         [TickerFunction(""Hidden"")]
         Task Hidden() => Task.CompletedTask;"));
 
-        Assert.Contains("TQ002", result.Ids);
+        Assert.Contains("ST002", result.Ids);
     }
 
     [Fact]
@@ -208,7 +208,7 @@ namespace TestApp
         [TickerFunction(""Abstract"")]
         public Task Abstract() => Task.CompletedTask;", classModifiers: "public abstract"));
 
-        Assert.Contains("TQ007", result.Ids);
+        Assert.Contains("ST007", result.Ids);
     }
 
     [Fact]
@@ -229,7 +229,7 @@ namespace TestApp
     }
 }");
 
-        Assert.Contains("TQ008", result.Ids);
+        Assert.Contains("ST008", result.Ids);
     }
 
     [Fact]
@@ -239,7 +239,7 @@ namespace TestApp
         [TickerFunction(""Param"")]
         public Task Param(string orderId) => Task.CompletedTask;"));
 
-        var diagnostic = Assert.Single(result.Diagnostics, d => d.Id == "TQ009");
+        var diagnostic = Assert.Single(result.Diagnostics, d => d.Id == "ST009");
         Assert.Contains("orderId", diagnostic.GetMessage());
     }
 
@@ -250,7 +250,7 @@ namespace TestApp
         [TickerFunction(""Limited"", null, 0, -1)]
         public Task Limited() => Task.CompletedTask;"));
 
-        Assert.Contains("TQ011", result.Ids);
+        Assert.Contains("ST011", result.Ids);
     }
 
     [Fact]

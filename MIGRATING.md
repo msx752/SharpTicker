@@ -144,6 +144,7 @@ If you create the schema with `EnsureCreated()` or `GenerateCreateScript()` inst
 | Redis coordination prefix (`InstanceName`) | `tickerq:` | `sharpticker:` | Only for rolling deployments; see [Rolling deployment](#rolling-deployment). Job data keys (`tq:*`) are unchanged. |
 | Tracing | ActivitySource `TickerQ`, tags `tickerq.*` | ActivitySource `SharpTicker`, tags `sharpticker.*` | Update OpenTelemetry source names, dashboards and alerts that filter on the old names. |
 | Generated code | `TickerQInstanceFactory` | `SharpTickerInstanceFactory` | Only if your code refers to the generated class by name. |
+| Source generator diagnostics | `TQ001` to `TQ011` | `ST001` to `ST011` | Update `NoWarn`, `.editorconfig` severities and `#pragma warning disable` lines that name the old IDs. The IDs keep their numbers. |
 
 ## 5. Removed APIs
 
@@ -178,6 +179,7 @@ Never rename the database itself as part of this migration.
 - [ ] EF Core: `dotnet ef migrations add VerifySharpTicker` is empty, or only adds `IsEnabled`/`IsSystemPaused`.
 - [ ] The dashboard opens at the expected URL.
 - [ ] Tracing dashboards and alerts use the `SharpTicker` source and `sharpticker.*` names.
+- [ ] `NoWarn`, `.editorconfig` and `#pragma` entries for source generator diagnostics use the `ST` IDs.
 - [ ] Existing cron jobs fire and their history shows in the dashboard.
 
 ## AI-assisted migration

@@ -74,7 +74,7 @@ public class CronValidatorTests
     public void ANumberTooLargeToRead_DoesNotThrow()
         => Assert.False(CronValidator.IsValidCronExpression("99999999999999999999 * * * * *"));
 
-    [Theory(Skip = "Known bug: the run time accepts month and day names (JAN, MON), but the build-time check rejects them, so [TickerFunction(\"Job\", \"0 0 9 * * MON\")] fails to compile with TQ003 although it would run.")]
+    [Theory(Skip = "Known bug: the run time accepts month and day names (JAN, MON), but the build-time check rejects them, so [TickerFunction(\"Job\", \"0 0 9 * * MON\")] fails to compile with ST003 although it would run.")]
     [InlineData("0 0 9 * * MON")]
     [InlineData("0 0 0 * JAN *")]
     [InlineData("0 0 9 * * MON-FRI")]

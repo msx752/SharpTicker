@@ -38,7 +38,7 @@ TickerFunctionAttribute(string functionName, TickerTaskPriority taskPriority, in
 
 ### Supported method shapes
 
-The source generator checks every job method and reports problems as compile errors (`TQ001` to `TQ011`):
+The source generator checks every job method and reports problems as compile errors (`ST001` to `ST011`):
 
 - The class and the method are `public` or `internal`. The class is not abstract and not nested.
 - The method is static or an instance method, synchronous or `async`.
@@ -57,7 +57,7 @@ public class InvoiceJobs(IInvoiceService invoices, ILogger<InvoiceJobs> logger)
 }
 ```
 
-If the class has several constructors, mark the one to use with `[SharpTickerConstructor]`. Otherwise the first one is used and the generator warns (`TQ006`).
+If the class has several constructors, mark the one to use with `[SharpTickerConstructor]`. Otherwise the first one is used and the generator warns (`ST006`).
 
 ## Job context
 
