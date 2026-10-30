@@ -34,7 +34,8 @@
         "exclude": [
           "_site/**",
           "obj/**",
-          "template/**"
+          "template/**",
+          "redirects/**"
         ]
       }
     ],
@@ -45,6 +46,13 @@
         ],
         "src": "../assets",
         "dest": "images"
+      },
+      {
+        "files": [
+          "*.html"
+        ],
+        "src": "redirects",
+        "dest": "."
       }
     ],
     "output": "_site",
