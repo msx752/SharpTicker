@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -87,11 +88,13 @@ public abstract class DashboardAuthTests<TFixture> : IClassFixture<TFixture> whe
     [Fact]
     public async Task AWriteWithoutCredentials_IsRefusedAndChangesNothing()
     {
-        var response = await SendAsync(HttpMethod.Delete, $"{Protected}/{DashboardApiFixture.DoneId}", null);
+        var response = await SendAsync(HttpMethod.Delete, $"{DashboardApiFixture.Api}/time-ticker/delete?id={DashboardApiFixture.DoneId}", null);
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
-        var still = await SendAsync(HttpMethod.Get, $"{Protected}/{DashboardApiFixture.DoneId}", ValidCredentials);
-        Assert.NotEqual(HttpStatusCode.NotFound, still.StatusCode);
+        var list = await SendAsync(HttpMethod.Get, Protected, ValidCredentials);
+        var ids = JsonDocument.Parse(await list.Content.ReadAsStringAsync()).RootElement.EnumerateArray()
+            .Select(ticker => ticker.GetProperty("id").GetGuid());
+        Assert.Contains(DashboardApiFixture.DoneId, ids);
     }
 
     [Fact]
