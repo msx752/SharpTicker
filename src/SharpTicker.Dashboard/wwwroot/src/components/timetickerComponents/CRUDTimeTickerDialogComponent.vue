@@ -7,6 +7,7 @@ import { tickerService } from '@/http/services/tickerService'
 import { timeTickerService } from '@/http/services/timeTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
 import { copyText } from '@/utilities/clipboard'
+import { checkJson } from '@/utilities/jsonText'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 
 const functionNamesStore = useFunctionNameStore()
@@ -130,6 +131,10 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
   },
   validationSchema: (validator) => ({
     functionName: validator.string().required('Function name is required'),
+    requestData: validator.string().defined().test('valid-json', 'Invalid JSON', (value, context) => {
+      const check = checkJson(value)
+      return check.valid || context.createError({ message: check.message })
+    }),
     executionDate: validator.date().when('ignoreDateTime', {
       is: true,
       then: (v) => v.notRequired(),
@@ -389,6 +394,21 @@ const requestHint = computed(() => {
   return ''
 })
 
+const requestCheck = computed(() => checkJson(getFieldValue('requestData')))
+const canFormat = computed(() => {
+  const check = requestCheck.value
+  return (
+    takesRequest.value &&
+    check.valid &&
+    check.formatted !== '' &&
+    check.formatted !== getFieldValue('requestData')
+  )
+})
+const formatRequest = () => {
+  const check = requestCheck.value
+  if (check.valid && check.formatted) setFieldValue('requestData', check.formatted)
+}
+
 const exampleCopied = ref(false)
 const copyExample = async () => {
   const text = formatJsonForDisplay(getFieldValue('exampleData'), false)
@@ -553,6 +573,17 @@ defineExpose({
                     </v-combobox>
                   </v-col>
                   <v-col cols="12">
+                    <div class="d-flex justify-end mb-1">
+                      <v-btn
+                        size="small"
+                        variant="text"
+                        prepend-icon="mdi-code-braces"
+                        :disabled="!canFormat"
+                        @click="formatRequest"
+                      >
+                        Format JSON
+                      </v-btn>
+                    </div>
                     <v-textarea
                       rows="10"
                       v-bind="bindField('requestData')"

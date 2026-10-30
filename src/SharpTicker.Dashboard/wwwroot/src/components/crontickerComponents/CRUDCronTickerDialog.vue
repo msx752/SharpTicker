@@ -7,6 +7,7 @@ import type { GetCronTickerResponse } from '@/http/services/types/cronTickerServ
 import { cronTickerService } from '@/http/services/cronTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
 import { copyText } from '@/utilities/clipboard'
+import { checkJson } from '@/utilities/jsonText'
 import cronstrue from 'cronstrue'
 const functionNamesStore = useFunctionNameStore()
 const getTickerRequestData = tickerService.getRequestData()
@@ -103,6 +104,10 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
   },
   validationSchema: (validator) => ({
     functionName: validator.string().required('Function name is required'),
+    requestData: validator.string().defined().test('valid-json', 'Invalid JSON', (value, context) => {
+      const check = checkJson(value)
+      return check.valid || context.createError({ message: check.message })
+    }),
     expression: validator
       .string()
       .required('Expression is required')
@@ -229,6 +234,21 @@ const requestHint = computed(() => {
   if (!hasExample.value) return 'No example is available for this request type. Enter the JSON by hand.'
   return ''
 })
+
+const requestCheck = computed(() => checkJson(getFieldValue('requestData')))
+const canFormat = computed(() => {
+  const check = requestCheck.value
+  return (
+    takesRequest.value &&
+    check.valid &&
+    check.formatted !== '' &&
+    check.formatted !== getFieldValue('requestData')
+  )
+})
+const formatRequest = () => {
+  const check = requestCheck.value
+  if (check.valid && check.formatted) setFieldValue('requestData', check.formatted)
+}
 
 const exampleCopied = ref(false)
 const copyExample = async () => {
@@ -472,6 +492,17 @@ defineExpose({
                     </v-combobox>
                   </v-col>
                   <v-col cols="12">
+                    <div class="d-flex justify-end mb-1">
+                      <v-btn
+                        size="small"
+                        variant="text"
+                        prepend-icon="mdi-code-braces"
+                        :disabled="!canFormat"
+                        @click="formatRequest"
+                      >
+                        Format JSON
+                      </v-btn>
+                    </div>
                     <v-textarea
                       rows="10"
                       v-bind="bindField('requestData')"
