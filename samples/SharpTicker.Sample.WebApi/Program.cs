@@ -62,4 +62,14 @@ public class SampleJobs
         Console.WriteLine($"[WebApi] Hello from SharpTicker! Id={context.Id}, ScheduledFor={context.ScheduledFor:O}");
         return Task.CompletedTask;
     }
+
+    // Takes a typed request, so the dashboard offers an example body for it
+    [TickerFunction("WebApiSample_ProcessOrder")]
+    public Task ProcessOrderAsync(TickerFunctionContext<OrderRequest> context, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"[WebApi] Processing order {context.Request?.OrderId} for ${context.Request?.Amount}");
+        return Task.CompletedTask;
+    }
 }
+
+public record OrderRequest(string OrderId, decimal Amount);

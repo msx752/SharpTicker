@@ -50,4 +50,14 @@ public class SampleJobs
         Console.WriteLine($"[Mongo] Hello from SharpTicker! Id={context.Id}, ScheduledFor={context.ScheduledFor:O}");
         return Task.CompletedTask;
     }
+
+    // Takes a typed request, so the dashboard offers an example body for it
+    [TickerFunction("MongoSample_ProcessOrder")]
+    public Task ProcessOrderAsync(TickerFunctionContext<OrderRequest> context, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"[Mongo] Processing order {context.Request?.OrderId} for ${context.Request?.Amount}");
+        return Task.CompletedTask;
+    }
 }
+
+public record OrderRequest(string OrderId, decimal Amount);
