@@ -145,6 +145,7 @@ If you create the schema with `EnsureCreated()` or `GenerateCreateScript()` inst
 | Tracing | ActivitySource `TickerQ`, tags `tickerq.*` | ActivitySource `SharpTicker`, tags `sharpticker.*` | Update OpenTelemetry source names, dashboards and alerts that filter on the old names. |
 | Generated code | `TickerQInstanceFactory` | `SharpTickerInstanceFactory` | Only if your code refers to the generated class by name. |
 | Source generator diagnostics | `TQ001` to `TQ011` | `ST001` to `ST011` | Update `NoWarn`, `.editorconfig` severities and `#pragma warning disable` lines that name the old IDs. The IDs keep their numbers. |
+| Cron with a backwards range | Accepted when added or updated, and run as the forward range (`22-2` ran at hours 2 to 22) | Refused when added or updated through the cron manager or the dashboard, and a compile error on an attribute | Only for crons you add or update. Crons already in your store keep running as before. Rewrite a refused one, for example `22-23,0-2`. |
 
 ## 5. Removed APIs
 
