@@ -11,15 +11,22 @@ namespace SharpTicker.Tests;
 /// <summary>
 /// The dashboard write API over HTTP. Each test gets its own application and data, because these change it.
 /// </summary>
-[Collection(SharedStaticStateCollection.Name)]
-public class DashboardApiWriteTests : IAsyncLifetime
+public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TFixture : DashboardApiFixture, new()
 {
-    private readonly DashboardApiFixture _api = new();
+    protected readonly TFixture _api = new();
 
     public Task InitializeAsync() => _api.InitializeAsync();
     public Task DisposeAsync() => _api.DisposeAsync();
 
     private static string InTwoDays => DateTime.UtcNow.AddDays(2).ToString("yyyy-MM-ddTHH:mm:ss'Z'");
+
+    /// <summary>
+    /// A time read back from a relational store has an unspecified kind and is written without a "Z", where the
+    /// in-memory store writes one. The dashboard treats both as UTC, so read both that way.
+    /// </summary>
+    private static DateTime AsUtc(JsonElement time)
+        => DateTime.Parse(time.GetString()!, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal);
 
     private async Task<JsonElement[]> TimeTickersAsync() => (await _api.GetAsync("/time-tickers")).EnumerateArray().ToArray();
     private async Task<JsonElement[]> CronTickersAsync() => (await _api.GetAsync("/cron-tickers")).EnumerateArray().ToArray();
@@ -56,7 +63,7 @@ public class DashboardApiWriteTests : IAsyncLifetime
             """{"function":"TzJob","executionTime":"2030-06-01T12:00:00"}""", "?timeZoneId=Europe/Istanbul");
 
         var added = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == id);
-        Assert.Equal(new DateTime(2030, 6, 1, 9, 0, 0, DateTimeKind.Utc), added.GetProperty("executionTime").GetDateTime().ToUniversalTime());
+        Assert.Equal(new DateTime(2030, 6, 1, 9, 0, 0, DateTimeKind.Utc), AsUtc(added.GetProperty("executionTime")));
     }
 
     [Fact]
@@ -69,10 +76,8 @@ public class DashboardApiWriteTests : IAsyncLifetime
         Assert.Equal(new[] { 30, 90 }, added.GetProperty("retryIntervals").EnumerateArray().Select(i => i.GetInt32()));
     }
 
-    [Fact(Skip = "Known bug: the dashboard sends the retry intervals as \"intervals\", but the body is read straight into " +
-                 "the ticker, whose property is \"retryIntervals\", so the intervals are dropped. Needs a decision: accept " +
-                 "\"intervals\" on the server or send \"retryIntervals\" from the dashboard.")]
-    public async Task AddTimeTicker_StoresTheRetryIntervalsTheDashboardSends()
+    /// <summary>The body the dashboard sends carries the intervals as "intervals", not "retryIntervals".</summary>
+    protected async Task AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync()
     {
         var id = await AddTimeTickerAsync(
             $$"""{"function":"WriteJob","executionTime":"{{InTwoDays}}","retries":2,"intervals":[30,90]}""");
@@ -109,10 +114,8 @@ public class DashboardApiWriteTests : IAsyncLifetime
         Assert.Equal(5, queued.GetProperty("retries").GetInt32());
     }
 
-    [Fact(Skip = "Known inconsistency: updating a ticker that does not exist creates it with the in-memory store " +
-                 "(UpdateTickerWithChildren adds it when it is not found) and reports success, while the EF Core store " +
-                 "fails the update. The expected behavior is a failure and no new ticker. Needs a decision, then unskip.")]
-    public async Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist()
+    /// <summary>Updating a ticker that does not exist is a failure and creates nothing.</summary>
+    protected async Task AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync()
     {
         var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={Guid.NewGuid()}",
             $$"""{"function":"OtherJob","executionTime":"{{InTwoDays}}"}""");
@@ -309,4 +312,24 @@ public class DashboardApiWriteTests : IAsyncLifetime
     }
 
     #endregion
+}
+
+[Collection(SharedStaticStateCollection.Name)]
+public class InMemoryDashboardApiWriteTests : DashboardApiWriteTests<InMemoryDashboardApiFixture>
+{
+    [Fact(Skip = "Known bug: the dashboard sends the retry intervals as \"intervals\", but the body is read straight into the ticker, whose property is \"retryIntervals\", so the intervals are dropped. Needs a decision: accept \"intervals\" on the server or send \"retryIntervals\" from the dashboard.")]
+    public Task AddTimeTicker_StoresTheRetryIntervalsTheDashboardSends() => AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync();
+
+    [Fact(Skip = "Known inconsistency: with the in-memory store, updating a ticker that does not exist creates it (UpdateTickerWithChildren adds it when it is not found) and reports success, while the EF Core store fails the update. The expected behavior is a failure and no new ticker. Needs a decision, then unskip.")]
+    public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
+}
+
+[Collection(SharedStaticStateCollection.Name)]
+public class EfCoreDashboardApiWriteTests : DashboardApiWriteTests<EfCoreDashboardApiFixture>
+{
+    [Fact(Skip = "Known bug: the dashboard sends the retry intervals as \"intervals\", but the body is read straight into the ticker, whose property is \"retryIntervals\", so the intervals are dropped. Needs a decision: accept \"intervals\" on the server or send \"retryIntervals\" from the dashboard.")]
+    public Task AddTimeTicker_StoresTheRetryIntervalsTheDashboardSends() => AssertTheRetryIntervalsTheDashboardSendsAreStoredAsync();
+
+    [Fact]
+    public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
 }

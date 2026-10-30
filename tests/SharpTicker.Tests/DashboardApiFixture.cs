@@ -8,10 +8,14 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using SharpTicker.Dashboard.DependencyInjection;
 using SharpTicker.DependencyInjection;
+using SharpTicker.EntityFrameworkCore.DbContextFactory;
+using SharpTicker.EntityFrameworkCore.DependencyInjection;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Base;
 using SharpTicker.Utilities.Entities;
@@ -21,14 +25,14 @@ using SharpTicker.Utilities.Interfaces;
 namespace SharpTicker.Tests;
 
 /// <summary>
-/// A real application with the in-memory store and the dashboard, served by a TestServer, so the tests call the
+/// A real application with a store and the dashboard, served by a TestServer, so the tests call the
 /// dashboard API over HTTP the way the browser does. The scheduler is switched off, so nothing runs and the data
 /// stays exactly as seeded.
 ///
 /// Seeded times are noon UTC on yesterday, today and tomorrow, not offsets from the current time, so a test that runs
 /// close to midnight still finds each ticker on the day the test expects.
 /// </summary>
-public sealed class DashboardApiFixture : IAsyncLifetime
+public abstract class DashboardApiFixture : IAsyncLifetime
 {
     public const string Api = "/ticker/dashboard/api";
 
@@ -82,6 +86,7 @@ public sealed class DashboardApiFixture : IAsyncLifetime
         builder.Services.AddSharpTicker(options =>
         {
             options.DisableBackgroundServices();
+            ConfigureStore(options);
             options.AddDashboard(dashboard => dashboard.WithNoAuth());
         });
 
@@ -110,6 +115,11 @@ public sealed class DashboardApiFixture : IAsyncLifetime
         await Store.RemoveTimeTickers(times.Select(t => t.Id).ToArray());
     }
 
+    /// <summary>Chooses the store the application runs on. The default is the in-memory store.</summary>
+    protected virtual void ConfigureStore(TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity> options) { }
+
+    protected virtual void DisposeStore() { }
+
     public async Task DisposeAsync()
     {
         Client?.Dispose();
@@ -118,6 +128,7 @@ public sealed class DashboardApiFixture : IAsyncLifetime
             await _app.StopAsync();
             await _app.DisposeAsync();
         }
+        DisposeStore();
     }
 
     private static DateTime NoonOf(DateTime day) => day.Date.AddHours(12);
@@ -199,4 +210,32 @@ public sealed class DashboardApiFixture : IAsyncLifetime
         var body = await response.Content.ReadAsStringAsync();
         return ((int)response.StatusCode, string.IsNullOrWhiteSpace(body) ? null : JsonDocument.Parse(body).RootElement.Clone());
     }
+}
+
+/// <summary>The default store: tickers live in memory, shared by the whole process.</summary>
+public sealed class InMemoryDashboardApiFixture : DashboardApiFixture
+{
+}
+
+/// <summary>EF Core on SQLite, so the same API tests run against a relational store and its queries.</summary>
+public sealed class EfCoreDashboardApiFixture : DashboardApiFixture
+{
+    private SqliteConnection? _connection;
+
+    protected override void ConfigureStore(TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity> options)
+    {
+        // An in-memory SQLite database lives as long as its connection stays open.
+        _connection = new SqliteConnection("Data Source=:memory:");
+        _connection.Open();
+
+        // The scheduler is off but the initializer still reads the store when the host starts, so the schema has
+        // to exist before the application starts.
+        var schema = new DbContextOptionsBuilder<SharpTickerDbContext>().UseSqlite(_connection).Options;
+        using (var context = new SharpTickerDbContext(schema))
+            context.Database.EnsureCreated();
+
+        options.AddOperationalStore(ef => ef.UseSharpTickerDbContext<SharpTickerDbContext>(db => db.UseSqlite(_connection)));
+    }
+
+    protected override void DisposeStore() => _connection?.Dispose();
 }

@@ -8,17 +8,17 @@ using Xunit;
 namespace SharpTicker.Tests;
 
 /// <summary>
-/// The dashboard read API over HTTP, against the seeded in-memory store (see <see cref="DashboardApiFixture"/>).
+/// The dashboard read API over HTTP, against the seeded store of the fixture it is run with, so the same tests run
+/// against every store (see <see cref="DashboardApiFixture"/>).
 /// Status numbers are TickerStatus: 0 Idle, 1 Queued, 2 InProgress, 3 Done, 4 DueDone, 5 Failed, 6 Cancelled, 7 Skipped.
 /// </summary>
-[Collection(SharedStaticStateCollection.Name)]
-public class DashboardApiReadTests : IClassFixture<DashboardApiFixture>
+public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> where TFixture : DashboardApiFixture
 {
     private const int Queued = 1, Done = 3, Failed = 5;
 
-    private readonly DashboardApiFixture _api;
+    private readonly TFixture _api;
 
-    public DashboardApiReadTests(DashboardApiFixture api) => _api = api;
+    protected DashboardApiReadTests(TFixture api) => _api = api;
 
     private static Guid[] Ids(JsonElement items) => items.EnumerateArray().Select(i => i.GetProperty("id").GetGuid()).ToArray();
 
@@ -412,4 +412,16 @@ public class DashboardApiReadTests : IClassFixture<DashboardApiFixture>
     }
 
     #endregion
+}
+
+[Collection(SharedStaticStateCollection.Name)]
+public class InMemoryDashboardApiReadTests : DashboardApiReadTests<InMemoryDashboardApiFixture>
+{
+    public InMemoryDashboardApiReadTests(InMemoryDashboardApiFixture api) : base(api) { }
+}
+
+[Collection(SharedStaticStateCollection.Name)]
+public class EfCoreDashboardApiReadTests : DashboardApiReadTests<EfCoreDashboardApiFixture>
+{
+    public EfCoreDashboardApiReadTests(EfCoreDashboardApiFixture api) : base(api) { }
 }
