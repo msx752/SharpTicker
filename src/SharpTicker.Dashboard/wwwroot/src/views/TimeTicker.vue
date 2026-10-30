@@ -3,6 +3,7 @@ import { onMounted, ref, provide, computed, onUnmounted, nextTick, watch } from 
 import { timeTickerService } from '@/http/services/timeTickerService'
 import type { GetTimeTickerResponse } from '@/http/services/types/timeTickerService.types'
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
+import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statusTimeSeries'
 import { tickerService } from '@/http/services/tickerService'
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
@@ -14,7 +15,7 @@ import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
+import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import {
   TitleComponent,
   TooltipComponent,
@@ -22,12 +23,14 @@ import {
   ToolboxComponent,
   GridComponent,
   DataZoomComponent,
+  GraphicComponent,
 } from 'echarts/components'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
 
 use([
   CanvasRenderer,
+  BarChart,
   LineChart,
   PieChart,
   TitleComponent,
@@ -35,7 +38,8 @@ use([
   LegendComponent,
   GridComponent,
   ToolboxComponent,
-  DataZoomComponent
+  DataZoomComponent,
+  GraphicComponent,
 ])
 
 // Use paginated service instead of regular one
@@ -92,7 +96,8 @@ const chartKey = ref(0)
 const chartData = ref({
   xAxisData: [] as string[],
   series: [] as any[],
-  legend: {} as any,
+  legendData: [] as string[],
+  hasData: true,
   title: 'Job statuses for all Time Tickers',
 })
 const pieChartData = ref<any[]>([])
@@ -252,79 +257,10 @@ const loadPieChartData = async () => {
 }
 
 const processTimeSeriesData = (data: GetTimeTickerGraphDataRangeResponse[]) => {
-  if (!data || !Array.isArray(data)) {
-    chartData.value.xAxisData = []
-    chartData.value.series = []
-    chartData.value.legend = { data: [] }
-    return
-  }
+  const built = buildStatusTimeSeries(data, (status) => Status[status] || `Status ${status}`)
 
-  const allStatuses = new Set<number>()
-  const dateMap = new Map<string, Map<number, number>>()
+  chartData.value = { ...built, title: chartData.value.title }
 
-  data.forEach((item) => {
-    if (!item.results) return
-    item.results.forEach((result: any) => {
-      allStatuses.add(result.item1)
-      if (!dateMap.has(item.date)) {
-        dateMap.set(item.date, new Map())
-      }
-      dateMap.get(item.date)!.set(result.item1, result.item2)
-    })
-  })
-
-  const uniqueDates = Array.from(dateMap.keys()).sort()
-  const statusArray = Array.from(allStatuses).sort((a, b) => a - b)
-
-  // Use the same statusColors mapping
-  const statusColors: { [key: number]: string } = {
-    0: '#A9A9A9', // Idle - Dark Gray
-    1: '#00CED1', // Queued - Dark Turquoise
-    2: '#6495ED', // InProgress - Royal Blue
-    3: '#32CD32', // Done - Lime Green
-    4: '#008000', // DueDone - Green
-    5: '#FF0000', // Failed - Red
-    6: '#FFD700', // Cancelled - Gold/Yellow
-    7: '#BA68C8', // Skipped - Medium Orchid (Purple)
-  }
-
-  const composedData = statusArray.map((status) => ({
-    name: Status[status] || `Status ${status}`,
-    type: 'line',
-    smooth: true,
-    symbol: 'circle',
-    symbolSize: 6,
-    itemStyle: { color: statusColors[status] || '#808080' },
-    lineStyle: { 
-      width: 2,
-      color: statusColors[status] || '#808080'
-    },
-    areaStyle: {
-      color: {
-        type: 'linear',
-        x: 0,
-        y: 0,
-        x2: 0,
-        y2: 1,
-        colorStops: [
-          { offset: 0, color: (statusColors[status] || '#808080') + '30' },
-          { offset: 1, color: (statusColors[status] || '#808080') + '05' }
-        ]
-      }
-    },
-    data: uniqueDates.map((date) => {
-      const statusMap = dateMap.get(date)
-      return statusMap ? (statusMap.get(status) || 0) : 0
-    }),
-  }))
-
-  chartData.value = {
-    xAxisData: uniqueDates,
-    series: composedData,
-    legend: { data: composedData.map(s => s.name) },
-    title: chartData.value.title
-  }
-  
   chartKey.value++
 }
 
@@ -412,99 +348,7 @@ const addHubListeners = async () => {
 }
 
 // Chart configurations
-const lineChartOption = computed(() => ({
-  backgroundColor: 'transparent',
-  title: {
-    text: 'Time Series Analysis',
-    subtext: chartData.value.title,
-    left: 'center',
-    top: '2%',
-    textStyle: {
-      color: '#e0e0e0',
-      fontSize: 14,
-      fontWeight: 600,
-    },
-    subtextStyle: {
-      color: '#9e9e9e',
-      fontSize: 11,
-    },
-  },
-  tooltip: {
-    trigger: 'axis',
-    backgroundColor: 'rgba(42, 42, 42, 0.95)',
-    borderColor: '#666',
-    borderWidth: 1,
-    axisPointer: {
-      type: 'cross',
-      label: {
-        backgroundColor: 'rgba(66, 66, 66, 0.9)',
-        color: '#fff',
-      },
-    },
-  },
-  legend: chartData.value.legend,
-  grid: {
-    left: '8%',
-    right: '8%',
-    bottom: '10%',
-    top: '18%',
-    containLabel: true,
-  },
-  xAxis: {
-    type: 'category',
-    boundaryGap: false,
-    data: chartData.value.xAxisData,
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-      rotate: 45,
-    },
-    axisLine: {
-      lineStyle: { color: '#424242' },
-    },
-  },
-  yAxis: {
-    type: 'value',
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-    },
-    axisLine: {
-      lineStyle: { color: '#424242' },
-    },
-    splitLine: {
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.05)',
-        type: 'dashed',
-      },
-    },
-  },
-  dataZoom: [
-    {
-      type: 'inside',
-      start: 0,
-      end: 100,
-    },
-    {
-      show: true,
-      type: 'slider',
-      bottom: '2%',
-      start: 0,
-      end: 100,
-      backgroundColor: 'rgba(47, 47, 47, 0.5)',
-      borderColor: '#666',
-      fillerColor: 'rgba(100, 181, 246, 0.2)',
-      handleStyle: {
-        color: '#64b5f6',
-        borderColor: '#64b5f6',
-      },
-    },
-  ],
-  series: chartData.value.series,
-  animation: true,
-  animationDuration: 1000,
-  animationEasing: 'cubicOut' as const,
-}))
+const lineChartOption = computed(() => buildStatusChartOption(chartData.value, chartData.value.title))
 
 const pieChartOption = computed(() => ({
   backgroundColor: 'transparent',
@@ -916,7 +760,7 @@ const canBeForceDeleted = ref<string[]>([])
               class="chart-btn-vertical"
               @click="activeChart = 'line'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-line</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-line</v-icon>
               <span class="btn-text">Time</span>
             </v-btn>
             <v-btn
@@ -926,7 +770,7 @@ const canBeForceDeleted = ref<string[]>([])
               class="chart-btn-vertical"
               @click="activeChart = 'pie'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-pie</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-pie</v-icon>
               <span class="btn-text">Status</span>
             </v-btn>
           </div>
@@ -2743,12 +2587,9 @@ const canBeForceDeleted = ref<string[]>([])
 /* Chart Styles */
 .chart-toggle-vertical {
   position: absolute;
-  top: 20px;
-  left: -70px;
+  top: 12px;
+  right: 16px;
   z-index: 10;
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 20px;
-  padding: 8px;
 }
 
 .chart-switch-vertical {
@@ -2758,9 +2599,10 @@ const canBeForceDeleted = ref<string[]>([])
   border: 1px solid rgba(100, 181, 246, 0.4);
   box-shadow: 0 8px 32px rgba(100, 181, 246, 0.2);
   overflow: hidden;
-  padding: 8px 4px;
+  padding: 4px;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 6px;
 }
 
@@ -2772,16 +2614,17 @@ const canBeForceDeleted = ref<string[]>([])
   letter-spacing: 1px;
   padding: 4px 0;
   text-align: center;
+  display: none;
 }
 
 .chart-btn-vertical {
-  min-width: 60px;
-  min-height: 70px;
+  min-width: 64px;
+  min-height: 36px;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
-  padding: 8px 4px;
+  padding: 6px 12px;
   font-size: 0.75rem;
   text-transform: none;
   background: rgba(255, 255, 255, 0.05);
@@ -2803,7 +2646,7 @@ const canBeForceDeleted = ref<string[]>([])
 
 .chart-btn-vertical .chart-icon {
   font-size: 20px;
-  margin-bottom: 4px;
+  margin-right: 4px;
 }
 
 .chart-btn-vertical .btn-text {
@@ -2853,13 +2696,13 @@ const canBeForceDeleted = ref<string[]>([])
 /* Responsive Chart Styles */
 @media (max-width: 1400px) {
   .chart-toggle-vertical {
-    top: 16px;
-    left: -52px;
+    top: 10px;
+    right: 12px;
   }
 
   .chart-btn-vertical {
-    min-width: 50px;
-    min-height: 60px;
+    min-width: 56px;
+    min-height: 32px;
     font-size: 0.7rem;
   }
 
@@ -2870,15 +2713,15 @@ const canBeForceDeleted = ref<string[]>([])
 
 @media (max-width: 768px) {
   .chart-toggle-vertical {
-    top: 12px;
-    left: -45px;
+    top: 8px;
+    right: 8px;
   }
 
   .chart-btn-vertical {
-    min-width: 40px;
-    min-height: 50px;
+    min-width: 44px;
+    min-height: 30px;
     font-size: 0.65rem;
-    padding: 6px 3px;
+    padding: 4px 8px;
   }
 
   .btn-text {

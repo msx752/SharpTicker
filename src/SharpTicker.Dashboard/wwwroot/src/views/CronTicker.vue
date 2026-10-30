@@ -2,12 +2,13 @@
 import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch, type Ref } from 'vue'
 import { cronTickerService } from '@/http/services/cronTickerService'
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
+import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statusTimeSeries'
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
+import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import { sleep } from '@/utilities/sleep'
 import {
   GetCronTickerGraphDataRangeResponse,
@@ -22,6 +23,8 @@ import {
   LegendComponent,
   ToolboxComponent,
   GridComponent,
+  DataZoomComponent,
+  GraphicComponent,
 } from 'echarts/components'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import cronstrue from 'cronstrue'
@@ -284,135 +287,16 @@ const updatePieChartForSelectedTicker = async (tickerId: string, min: number, ma
 }
 
 const GetCronTickerRangeGraphData = (res: GetCronTickerGraphDataRangeResponse[]) => {
-  try {
-    if (!res || !Array.isArray(res)) {
-      return
-    }
-    
-    // Extract unique Dates for xAxis
-    const uniqueDates = res.map((x) => x.date)
-
-    // Extract all unique item1 values (Status IDs)
-    const uniqueItem1Set = new Set<number>()
-
-    res.forEach(({ results }) => {
-      if (results && Array.isArray(results)) {
-        results.forEach(({ item1 }) => uniqueItem1Set.add(item1))
-      }
-    })
-    const uniqueItem1Array = Array.from(uniqueItem1Set) // Convert Set to Array
-
-    // Create a Map to store series data
-    const seriesMap = new Map<number, number[]>() // item1 -> data array
-
-    // Initialize seriesMap with empty arrays
-    uniqueItem1Array.forEach((item1) => {
-      seriesMap.set(item1, Array(uniqueDates.length).fill(0)) // Fill with 0s initially
-    })
-    
-    // Populate seriesMap with actual data
-    res.forEach(({ date, results }) => {
-      if (results && Array.isArray(results)) {
-        const dateIndex = uniqueDates.indexOf(date) // Find index in xAxis
-
-        results.forEach(({ item1, item2 }) => {
-          const dataArray = seriesMap.get(item1)
-          if (dataArray) {
-            dataArray[dateIndex] = item2 // Assign value at the correct index
-          }
-        })
-      }
-    })
-
-    // Generate series data
-    const composedData = Array.from(seriesMap.entries()).map(([item1, dataArray]) => ({
-      data: dataArray,
-      name: Status[item1] || `Unknown ${item1}`,
-      type: 'line',
-      smooth: true,
-      symbol: 'circle',
-      symbolSize: 6,
-      lineStyle: {
-        color: statusColors[item1] || '#999999',
-        width: 3,
-        shadowBlur: 10,
-        shadowColor: statusColors[item1] || '#999999',
-        shadowOffsetY: 2,
-      },
-      itemStyle: {
-        color: statusColors[item1] || '#999999',
-        borderColor: '#ffffff',
-        borderWidth: 2,
-        shadowBlur: 10,
-        shadowColor: 'rgba(0, 0, 0, 0.3)',
-        shadowOffsetY: 2,
-      },
-      areaStyle: {
-        color: {
-          type: 'linear',
-          x: 0,
-          y: 0,
-          x2: 0,
-          y2: 1,
-          colorStops: [
-            { offset: 0, color: (statusColors[item1] || '#999999') + '40' },
-            { offset: 1, color: (statusColors[item1] || '#999999') + '10' },
-          ],
-        },
-      },
-      emphasis: {
-        itemStyle: {
-          shadowBlur: 20,
-          shadowColor: statusColors[item1] || '#999999',
-          scale: true,
-          scaleSize: 2,
-        },
-        lineStyle: {
-          width: 4,
-        },
-      },
-    }))
-
-    const statuses = [
-      'Idle',
-      'Queued',
-      'InProgress',
-      'Done',
-      'DueDone',
-      'Failed',
-      'Cancelled',
-    ]
-
-    const seriesNames = composedData.filter((x) => x.data.some((y) => y > 0)).map((x) => x.name)
-
-    const legendData = {
-      show: true,
-      top: '15%',
-      textStyle: { color: '#fff', fontSize: 11 },
-      itemGap: 16,
-      itemWidth: 12,
-      itemHeight: 12,
-      selected: Object.fromEntries(
-        statuses.map((status) => [status, seriesNames.includes(status)]),
-      ),
-    }
-
-    // Update chartData to trigger reactivity
-    chartData.value = {
-      xAxisData: uniqueDates,
-      series: composedData,
-      legend: legendData,
-      title: chartData.value.title // Keep current title
-    }
-    
-    // Force chart re-render by updating the key
-    chartKey.value++
-    
-  } catch (error: any) {
-    if (error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED') {
-      return
-    }
+  if (!res || !Array.isArray(res)) {
+    return
   }
+
+  const built = buildStatusTimeSeries(res, (status) => Status[status] || `Unknown ${status}`)
+
+  chartData.value = { ...built, title: chartData.value.title }
+
+  // Force chart re-render by updating the key
+  chartKey.value++
 }
 
 const ShowCronTickerOccurrenceGraphData = async (functionName: string, id: string, min: number, max: number) => {
@@ -629,6 +513,7 @@ const addHubListeners = async () => {
 
 use([
   CanvasRenderer,
+  BarChart,
   LineChart,
   TitleComponent,
   TooltipComponent,
@@ -636,6 +521,8 @@ use([
   ToolboxComponent,
   GridComponent,
   PieChart,
+  DataZoomComponent,
+  GraphicComponent,
 ])
 
 provide(THEME_KEY, 'dark')
@@ -643,7 +530,8 @@ provide(THEME_KEY, 'dark')
 const chartData = ref({
   xAxisData: [] as string[],
   series: [] as any[],
-  legend: {} as any,
+  legendData: [] as string[],
+  hasData: true,
   title: 'Job statuses for all Cron Tickers'
 })
 
@@ -652,107 +540,7 @@ const pieChartData = ref([{ value: 1, name: 'Loading...', itemStyle: { color: '#
 const chartKey = ref(0)
 const pieChartKey = ref(0)
 
-const option = computed(() => ({
-  backgroundColor: 'transparent',
-  title: {
-    text: 'Time Series Analysis',
-    subtext: chartData.value.title,
-    left: 'center',
-    top: '2%',
-    textStyle: {
-      color: '#ffffff',
-      fontSize: 14,
-      fontWeight: 'bold',
-      textShadow: '0 2px 4px rgba(0,0,0,0.3)',
-    },
-    subtextStyle: {
-      color: '#bdbdbd',
-      fontSize: 12,
-    },
-  },
-  tooltip: {
-    trigger: 'axis',
-    backgroundColor: 'rgba(0, 0, 0, 0.95)',
-    borderColor: 'rgba(100, 181, 246, 0.5)',
-    borderWidth: 1,
-    textStyle: {
-      color: '#ffffff',
-    },
-    extraCssText: 'border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);',
-    axisPointer: {
-      type: 'cross',
-      label: {
-        backgroundColor: 'rgba(100, 181, 246, 0.8)',
-        color: '#ffffff',
-      },
-    },
-  },
-  legend: chartData.value.legend,
-  grid: {
-    left: '8%',
-    right: '8%',
-    bottom: '15%',
-    top: '25%',
-    containLabel: true,
-  },
-  xAxis: {
-    type: 'category',
-    boundaryGap: false,
-    data: chartData.value.xAxisData,
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-      rotate: 45,
-    },
-    axisLine: {
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.3)',
-        width: 1,
-      },
-    },
-    axisTick: {
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.3)',
-        width: 1,
-      },
-      length: 6,
-    },
-    splitLine: {
-      show: true,
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.05)',
-        width: 1,
-        type: 'dashed',
-      },
-    },
-  },
-  yAxis: {
-    type: 'value',
-    min: 0,
-    axisLine: {
-      show: false,
-    },
-    axisTick: {
-      show: false,
-    },
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-    },
-    splitLine: {
-      show: true,
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.08)',
-        width: 1,
-        type: 'dashed',
-      },
-    },
-  },
-  series: chartData.value.series,
-  animation: true,
-  animationDuration: 1000,
-  animationEasing: 'cubicOut' as const,
-}))
+const option = computed(() => buildStatusChartOption(chartData.value, chartData.value.title))
 
 const totalOption = computed(() => ({
   backgroundColor: 'transparent',
@@ -1051,7 +839,7 @@ const refreshData = async () => {
               class="chart-btn-vertical"
               @click="activeChart = 'line'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-line</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-line</v-icon>
               <span class="btn-text">Time</span>
             </v-btn>
             <v-btn
@@ -1061,7 +849,7 @@ const refreshData = async () => {
               class="chart-btn-vertical"
               @click="activeChart = 'pie'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-pie</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-pie</v-icon>
               <span class="btn-text">Status</span>
             </v-btn>
           </div>
@@ -1457,12 +1245,9 @@ const refreshData = async () => {
 
 .chart-toggle-vertical {
   position: absolute;
-  top: 20px;
-  left: -70px;
+  top: 12px;
+  right: 16px;
   z-index: 10;
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 20px;
-  padding: 8px;
 }
 
 .chart-switch-vertical {
@@ -1472,9 +1257,10 @@ const refreshData = async () => {
   border: 1px solid rgba(100, 181, 246, 0.4);
   box-shadow: 0 8px 32px rgba(100, 181, 246, 0.2);
   overflow: hidden;
-  padding: 8px 4px;
+  padding: 4px;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 6px;
 }
 
@@ -1487,20 +1273,21 @@ const refreshData = async () => {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   margin-bottom: 4px;
+  display: none;
 }
 
 .chart-btn-vertical {
-  min-width: 56px;
-  min-height: 64px;
+  min-width: 64px;
+  min-height: 36px;
   font-weight: 600;
   text-transform: none;
   letter-spacing: 0.5px;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   border-radius: 12px;
-  padding: 10px 6px;
+  padding: 6px 12px;
   font-size: 0.75rem;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -1510,7 +1297,7 @@ const refreshData = async () => {
 }
 
 .chart-btn-vertical:hover {
-  transform: translateX(-3px) scale(1.05);
+  transform: translateY(-1px);
   background: rgba(100, 181, 246, 0.2);
   border-color: rgba(100, 181, 246, 0.6);
   box-shadow: 0 8px 25px rgba(100, 181, 246, 0.3);
@@ -1521,7 +1308,7 @@ const refreshData = async () => {
   background: linear-gradient(135deg, rgba(100, 181, 246, 0.3) 0%, rgba(100, 181, 246, 0.15) 100%);
   border-color: rgba(100, 181, 246, 0.8);
   box-shadow: 0 4px 20px rgba(100, 181, 246, 0.4);
-  transform: translateX(-2px);
+  transform: translateY(-1px);
 }
 
 .btn-text {
@@ -2235,13 +2022,13 @@ const refreshData = async () => {
 
 @media (max-width: 1024px) {
   .chart-toggle-vertical {
-    top: 16px;
-    left: -52px;
+    top: 10px;
+    right: 12px;
   }
 
   .chart-btn-vertical {
-    min-width: 50px;
-    min-height: 60px;
+    min-width: 56px;
+    min-height: 32px;
     font-size: 0.7rem;
   }
 
@@ -2270,15 +2057,15 @@ const refreshData = async () => {
   }
 
   .chart-toggle-vertical {
-    top: 12px;
-    left: -45px;
+    top: 8px;
+    right: 8px;
   }
 
   .chart-btn-vertical {
-    min-width: 40px;
-    min-height: 50px;
+    min-width: 44px;
+    min-height: 30px;
     font-size: 0.65rem;
-    padding: 6px 3px;
+    padding: 4px 8px;
   }
 
   .btn-text {
