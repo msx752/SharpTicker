@@ -1,0 +1,16 @@
+- name: Getting started
+  href: getting-started.md
+- name: Jobs
+  href: jobs.md
+- name: Scheduling
+  href: scheduling.md
+- name: Storage
+  href: storage.md
+- name: Dashboard
+  href: dashboard.md
+- name: Production
+  href: operations.md
+- name: Migration
+  href: migrating.md
+- name: API
+  href: api/

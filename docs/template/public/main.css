@@ -1,0 +1,6 @@
+/* Keep the square logo at navbar height */
+#logo {
+  width: 32px;
+  height: 32px;
+  margin-right: 0.5rem;
+}

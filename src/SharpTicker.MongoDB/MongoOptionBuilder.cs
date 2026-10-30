@@ -12,7 +12,7 @@ namespace SharpTicker.MongoDB
         internal string CollectionPrefix { get; set; } = "ticker_";
 
         /// <summary>
-        /// Configure SharpTicker to own its own <see cref="MongoDB.Driver.IMongoClient"/> built from
+        /// Configure SharpTicker to own its own <see cref="global::MongoDB.Driver.IMongoClient"/> built from
         /// <paramref name="connectionString"/>. The client is registered as a singleton.
         /// </summary>
         public SharpTickerMongoOptionBuilder<TTimeTicker, TCronTicker> UseSharpTickerMongoClient(string connectionString, string databaseName)
@@ -25,7 +25,7 @@ namespace SharpTicker.MongoDB
         }
 
         /// <summary>
-        /// Reuse an <see cref="MongoDB.Driver.IMongoClient"/> already registered in DI.
+        /// Reuse an <see cref="global::MongoDB.Driver.IMongoClient"/> already registered in DI.
         /// </summary>
         public SharpTickerMongoOptionBuilder<TTimeTicker, TCronTicker> UseExistingMongoClient(string databaseName)
         {

@@ -119,7 +119,7 @@ dotnet test SharpTicker.slnx -c Release
 
 ## Documentation
 
-Documentation lives in the [project wiki](https://github.com/msx752/SharpTicker/wiki).
+Documentation: **[msx752.github.io/SharpTicker](https://msx752.github.io/SharpTicker/)**. Its source is in [`docs/`](docs).
 
 ## Contributing
 
