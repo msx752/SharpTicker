@@ -634,7 +634,7 @@ const getVisiblePageNumbers = () => {
 
 /* Dashboard Content */
 .dashboard-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   padding: 20px 24px 16px 24px;
 }

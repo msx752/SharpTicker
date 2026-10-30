@@ -572,7 +572,7 @@ const handleForceUIUpdate = () => {
 
 .header-container {
   width: 100%;
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   padding: 0 24px;
 }
@@ -734,7 +734,7 @@ const handleForceUIUpdate = () => {
 }
 
 .header-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   display: flex;
   align-items: center;
@@ -1121,7 +1121,7 @@ const handleForceUIUpdate = () => {
 }
 
 .footer-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;

@@ -1214,7 +1214,7 @@ const refreshData = async () => {
 
 /* Content Section */
 .dashboard-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   padding: 32px 24px 16px 24px;
 }

@@ -1,3 +1,8 @@
+:root {
+  /* Widest the page content and the header may grow. One value so the header lines up with the content. */
+  --dashboard-max-width: 2400px;
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
