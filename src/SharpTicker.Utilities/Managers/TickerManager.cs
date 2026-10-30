@@ -216,6 +216,10 @@ namespace SharpTicker.Utilities.Managers
             timeTicker.ExecutionTime = ConvertToUtcIfNeeded(timeTicker.ExecutionTime.Value);
             
             try {
+                if (await _persistenceProvider.GetTimeTickerById(timeTicker.Id, cancellationToken).ConfigureAwait(false) is null)
+                    return new TickerResult<TTimeTicker>(
+                        new TickerValidatorException($"Cannot find time ticker with id {timeTicker.Id}"));
+
                 var affectedRows = await _persistenceProvider.UpdateTimeTickers([timeTicker], cancellationToken: cancellationToken).ConfigureAwait(false);
                 
                 if (_executionContext.Functions.Any(x => x.TickerId == timeTicker.Id))
@@ -251,6 +255,10 @@ namespace SharpTicker.Utilities.Managers
             
             try
             {
+                if (await _persistenceProvider.GetCronTickerById(cronTicker.Id, cancellationToken).ConfigureAwait(false) is null)
+                    return new TickerResult<TCronTicker>(
+                        new TickerValidatorException($"Cannot find cron ticker with id {cronTicker.Id}"));
+
                 cronTicker.UpdatedAt = _clock.UtcNow;
 
                 var affectedRows = await _persistenceProvider.UpdateCronTickers([cronTicker], cancellationToken: cancellationToken);
@@ -528,6 +536,13 @@ namespace SharpTicker.Utilities.Managers
             
             try 
             {
+                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var existing = (await _persistenceProvider.GetTimeTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
+                    .Select(x => x.Id).ToHashSet();
+                if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
+                    return new TickerResult<List<TTimeTicker>>(
+                        new TickerValidatorException($"Cannot find time ticker with id {missing}"));
+
                 var affectedRows = await _persistenceProvider.UpdateTimeTickers(validTickers.ToArray(), cancellationToken: cancellationToken).ConfigureAwait(false);
                 
                 if (needsRestart)
@@ -602,6 +617,13 @@ namespace SharpTicker.Utilities.Managers
             
             try
             {
+                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var existing = (await _persistenceProvider.GetCronTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
+                    .Select(x => x.Id).ToHashSet();
+                if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
+                    return new TickerResult<List<TCronTicker>>(
+                        new TickerValidatorException($"Cannot find cron ticker with id {missing}"));
+
                 var affectedRows = await _persistenceProvider.UpdateCronTickers(validTickers.ToArray(), cancellationToken: cancellationToken);
 
                 // Update internal functions for those that need it

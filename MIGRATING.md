@@ -146,6 +146,7 @@ If you create the schema with `EnsureCreated()` or `GenerateCreateScript()` inst
 | Generated code | `TickerQInstanceFactory` | `SharpTickerInstanceFactory` | Only if your code refers to the generated class by name. |
 | Source generator diagnostics | `TQ001` to `TQ011` | `ST001` to `ST011` | Update `NoWarn`, `.editorconfig` severities and `#pragma warning disable` lines that name the old IDs. The IDs keep their numbers. |
 | Cron with a backwards range | Accepted when added or updated, and run as the forward range (`22-2` ran at hours 2 to 22) | Refused when added or updated through the cron manager or the dashboard, and a compile error on an attribute | Only for crons you add or update. Crons already in your store keep running as before. Rewrite a refused one, for example `22-23,0-2`. |
+| Updating a ticker that does not exist | The in-memory, MongoDB and Redis stores created it, or reported success without changing anything; EF Core failed | Fails on every store, with a `TickerValidatorException`, and creates nothing | Only if you relied on an update creating a ticker. Add it with `AddAsync` instead. |
 
 ## 5. Removed APIs
 

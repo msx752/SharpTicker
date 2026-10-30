@@ -336,6 +336,85 @@ public class TickerManagerBatchTests : IAsyncLifetime
 
     #endregion
 
+    #region Updating what does not exist
+
+    [Fact]
+    public async Task UpdatingATimeTickerThatDoesNotExist_Fails_AndCreatesNothing()
+    {
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = Guid.NewGuid(), Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddHours(1) });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Empty(await Store.GetTimeTickers(null, default));
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerThatDoesNotExist_Fails_AndCreatesNothing()
+    {
+        var result = await Crons.UpdateAsync(new CronTickerEntity { Id = Guid.NewGuid(), Function = CronFunction, Expression = "0 0 * * * *" });
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.Empty(await Store.GetCronTickers(null, default));
+    }
+
+    [Fact]
+    public async Task UpdatingATimeTickerBatchThatHasOneMissing_Fails_AndChangesNothing()
+    {
+        var added = (await Times.AddBatchAsync(new List<TimeTickerEntity> { Time(), Time() })).Result;
+        var update = new List<TimeTickerEntity>
+        {
+            new() { Id = added[0].Id, Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddDays(3), Description = "changed" },
+            new() { Id = Guid.NewGuid(), Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddDays(3) },
+        };
+
+        var result = await Times.UpdateBatchAsync(update);
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        var stored = await Store.GetTimeTickers(null, default);
+        Assert.Equal(2, stored.Length);
+        Assert.All(stored, t => Assert.NotEqual("changed", t.Description));
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerBatchThatHasOneMissing_Fails_AndChangesNothing()
+    {
+        var added = (await Crons.AddBatchAsync(new List<CronTickerEntity> { Cron(), Cron() })).Result;
+        var update = new List<CronTickerEntity>
+        {
+            new() { Id = added[0].Id, Function = CronFunction, Expression = "0 5 * * * *" },
+            new() { Id = Guid.NewGuid(), Function = CronFunction, Expression = "0 5 * * * *" },
+        };
+
+        var result = await Crons.UpdateBatchAsync(update);
+
+        Assert.False(result.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(result.Exception);
+        Assert.All(await Store.GetCronTickers(null, default), c => Assert.Equal("0 0 * * * *", c.Expression));
+    }
+
+    [Fact]
+    public async Task UpdatingATicker_WithAnEmptyId_Fails()
+    {
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = Guid.Empty, Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddHours(1) });
+
+        Assert.False(result.IsSucceeded);
+    }
+
+    [Fact]
+    public async Task UpdatingATickerThatExists_StillWorks()
+    {
+        var added = (await Times.AddAsync(new TimeTickerEntity { Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddHours(1) })).Result;
+
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = added.Id, Function = TimeFunction, ExecutionTime = DateTime.UtcNow.AddHours(2), Description = "later" });
+
+        Assert.True(result.IsSucceeded);
+        Assert.Equal("later", Assert.Single(await Store.GetTimeTickers(null, default)).Description);
+    }
+
+    #endregion
+
     #region Backwards cron ranges
 
     [Fact]

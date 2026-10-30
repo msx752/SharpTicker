@@ -105,14 +105,31 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.Equal(5, queued.GetProperty("retries").GetInt32());
     }
 
-    /// <summary>Updating a ticker that does not exist is a failure and creates nothing.</summary>
-    protected async Task AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync()
+    /// <summary>Updating a ticker that does not exist is a failure and creates nothing, whichever store is used.</summary>
+    [Fact]
+    public async Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist()
     {
-        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={Guid.NewGuid()}",
-            $$"""{"function":"OtherJob","executionTime":"{{InTwoDays}}"}""");
+        var id = Guid.NewGuid();
+
+        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={id}",
+            $$"""{"id":"{{id}}","function":"OtherJob","executionTime":"{{InTwoDays}}"}""");
 
         Assert.False(body!.Value.GetProperty("success").GetBoolean());
+        Assert.Contains("Cannot find time ticker", body.Value.GetProperty("message").GetString());
         Assert.Equal(3, (await TimeTickersAsync()).Length);
+    }
+
+    [Fact]
+    public async Task UpdateCronTicker_ReportsFailureAndCreatesNothing_ForACronTickerThatDoesNotExist()
+    {
+        var id = Guid.NewGuid();
+
+        var (_, body) = await _api.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={id}",
+            $$"""{"id":"{{id}}","function":"SeedCron","expression":"0 * * * * *"}""");
+
+        Assert.False(body!.Value.GetProperty("success").GetBoolean());
+        Assert.Contains("Cannot find cron ticker", body.Value.GetProperty("message").GetString());
+        Assert.Equal(2, (await CronTickersAsync()).Length);
     }
 
     [Fact]
@@ -434,16 +451,11 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
 [Collection(SharedStaticStateCollection.Name)]
 public class InMemoryDashboardApiWriteTests : DashboardApiWriteTests<InMemoryDashboardApiFixture>
 {
-    [Fact(Skip = "Known inconsistency: with the in-memory store, updating a ticker that does not exist creates it (UpdateTickerWithChildren adds it when it is not found) and reports success, while the EF Core store fails the update. The expected behavior is a failure and no new ticker. Needs a decision, then unskip.")]
-    public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
 }
 
 [Collection(SharedStaticStateCollection.Name)]
 public class EfCoreDashboardApiWriteTests : DashboardApiWriteTests<EfCoreDashboardApiFixture>
 {
-    [Fact]
-    public Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist() => AssertUpdatingAMissingTickerFailsAndCreatesNothingAsync();
-
     [Fact]
     public Task AFailureOfTheStore_IsLoggedOnTheServer_ButNotReturnedToTheBrowser() => AssertAFailureOfTheStoreIsLoggedButNotReturnedAsync();
 }
