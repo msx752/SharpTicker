@@ -16,8 +16,12 @@ namespace SharpTicker.MongoDB.Tests;
 /// </summary>
 public class MongoTestFixture : IAsyncLifetime
 {
-    public MongoDbContainer Container { get; } = new MongoDbBuilder()
-        .WithImage("mongo:7")
+    // No credentials: with a root user the image first runs a temporary mongod for initialisation and
+    // then restarts it on the same port, which occasionally fails with "Address already in use" (exit 48).
+    // The host port is already random (Testcontainers maps 27017 to a free port).
+    public MongoDbContainer Container { get; } = new MongoDbBuilder("mongo:7")
+        .WithUsername(string.Empty)
+        .WithPassword(string.Empty)
         .Build();
 
     public IMongoClient Client { get; private set; } = null!;
