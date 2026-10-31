@@ -81,6 +81,8 @@ A run is cancelled by `RequestCancellation()`, by the cancel button in the dashb
 
 A job that runs at once, because it was added for now, is not tied to the request that added it: it keeps running after that request has ended and is cancelled only by the cases above.
 
+When the application stops, the scheduler waits up to 20 seconds for the jobs that are running, so a job that honors its token can record that it was cancelled before the host disposes its services. A job that is still running when the wait ends is recorded as `Cancelled` and its lock is released; it is not retried. A job that ignores its token keeps running until the process ends, and it delays the stop by the whole wait, so pass the token on to what the job awaits.
+
 ## Payloads
 
 A job can take a typed request. Use `TickerFunctionContext<TRequest>` and read the `Request` field:

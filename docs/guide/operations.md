@@ -79,6 +79,7 @@ A job reports its own failure through the exception handler above. These entries
 | `SharpTicker.TaskScheduler` | Error | A job threw an exception that nothing handled, or the scheduler could not start a worker thread. The scheduler keeps running. |
 | `SharpTicker.TaskScheduler` | Warning | The scheduler was disposed with queued jobs that had not started. The number is in the entry. |
 | `SharpTicker.Dispatcher.SharpTickerDispatcher` | Warning | Jobs were dispatched while the application was stopping, so they will not start. The entry names each function and ticker id. Their tickers stay `InProgress`. |
+| `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Warning | The application is stopping with jobs running. The first entry says that the scheduler waits for them and names them (the first ten); the second says that some were still running when the wait ended (20 seconds, or the host's shutdown timeout if that comes first) and were recorded as `Cancelled`. |
 | `SharpTicker.EntityFrameworkCore.StartupRelease` | Error | Releasing the jobs that a dead node or an earlier run of this node left locked failed when the application started. |
 
 ## Tracing
