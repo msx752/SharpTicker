@@ -17,11 +17,6 @@
        <ProjectReference Include="../SharpTicker.Utilities/SharpTicker.Utilities.csproj" />
    </ItemGroup>
 
-    <ItemGroup>
-        <!-- Only for HostOptions.ShutdownTimeout: how long the scheduler may wait for running jobs when the application stops. -->
-        <PackageReference Include="Microsoft.Extensions.Hosting" Version="$(DotNetAbstractionsVersion)" />
-    </ItemGroup>
-
     <Target Name="CopyAnalyzer" AfterTargets="Build">
         <MakeDir Directories="$(OutputPath)analyzers/dotnet/cs" />
     </Target>
