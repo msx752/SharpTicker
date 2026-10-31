@@ -41,7 +41,8 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
                                 .Include(x => x.Children),
                             TickerRelation.ChildrenDeep => query
                                 .Include(x => x.Children)
-                                .ThenInclude(x => x.Children),
+                                .ThenInclude(x => x.Children)
+                                .AsSingleQuery(),
                             _ => query
                         };
                     }
@@ -92,6 +93,7 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             var baseQuery = dbContext.Set<TTimeTicker>()
                 .Include(x => x.Children)
                 .ThenInclude(x => x.Children)
+                .AsSingleQuery()
                 .AsNoTracking();
             
             if (predicate != null)
@@ -116,6 +118,7 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             var baseQuery = dbContext.Set<TTimeTicker>()
                 .Include(x => x.Children)
                 .ThenInclude(x => x.Children)
+                .AsSingleQuery()
                 .AsNoTracking();
             
             if (predicate != null)
@@ -159,6 +162,7 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             var tickersToDelete = await dbContext.Set<TTimeTicker>()
                 .Include(x => x.Children)
                 .ThenInclude(x => x.Children) // Include grandchildren if needed
+                .AsSingleQuery()
                 .Where(x => idList.Contains(x.Id))
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
