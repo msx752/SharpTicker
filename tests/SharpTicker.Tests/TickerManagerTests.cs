@@ -762,6 +762,32 @@ public class TickerManagerTests : IDisposable
         _hostScheduler.Received(1).Restart();
     }
 
+    [Fact]
+    public async Task DeleteTimeTickerAsync_RowRemoved_NotifiesTheDashboard()
+    {
+        var tickerId = Guid.NewGuid();
+
+        _persistenceProvider
+            .RemoveTimeTickers(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns(1);
+
+        await _timeTickerManager.DeleteAsync(tickerId, CancellationToken.None);
+
+        await _notificationHubSender.Received(1).RemoveTimeTickerNotifyAsync(tickerId);
+    }
+
+    [Fact]
+    public async Task DeleteTimeTickerAsync_NoRowsAffected_DoesNotNotifyTheDashboard()
+    {
+        _persistenceProvider
+            .RemoveTimeTickers(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns(0);
+
+        await _timeTickerManager.DeleteAsync(Guid.NewGuid(), CancellationToken.None);
+
+        await _notificationHubSender.DidNotReceive().RemoveTimeTickerNotifyAsync(Arg.Any<Guid>());
+    }
+
     // ---------------------------------------------------------------
     // DeleteCronTickerAsync
     // ---------------------------------------------------------------

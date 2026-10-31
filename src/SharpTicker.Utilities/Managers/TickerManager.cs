@@ -297,9 +297,13 @@ namespace SharpTicker.Utilities.Managers
         private async Task<TickerResult<TTimeTicker>> DeleteTimeTickerAsync(Guid id, CancellationToken cancellationToken = default)
         {
             var affectedRows = await _persistenceProvider.RemoveTimeTickers([id], cancellationToken: cancellationToken);
-            
+
             if(affectedRows > 0 && _executionContext.Functions.Any(x => x.TickerId == id))
                 _sharpTickerHostScheduler.Restart();
+
+            // The dashboard list refreshes on this notification; without it a deleted row stays on screen until a reload
+            if (affectedRows > 0)
+                await _notificationHubSender.RemoveTimeTickerNotifyAsync(id).ConfigureAwait(false);
 
             return new TickerResult<TTimeTicker>(affectedRows);
         }
