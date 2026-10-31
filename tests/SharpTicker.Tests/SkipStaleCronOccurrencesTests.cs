@@ -15,6 +15,7 @@ using Xunit;
 
 namespace SharpTicker.Tests;
 
+[Collection(SharedStaticStateCollection.Name)]
 public class SkipStaleCronOccurrencesTests : IAsyncLifetime
 {
     private sealed class FakeTimeTicker : TimeTickerEntity<FakeTimeTicker> { }

@@ -38,9 +38,12 @@ namespace SharpTicker.Sample.WebApi.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<bool>("IsEnabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsSystemPaused")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER")
-                        .HasDefaultValueSql("1");
+                        .HasDefaultValue(false);
 
                     b.Property<byte[]>("Request")
                         .HasColumnType("BLOB");

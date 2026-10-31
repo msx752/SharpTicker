@@ -6,6 +6,7 @@ import http from "./axiosConfig";
 import type { Path, PathValue } from "@/utilities/pathTypes";
 import { useAlert } from "@/composables/useAlert";
 import { getStatusValueSafe } from "../services/types/base/baseHttpResponse.types";
+import { ActionFailedError, getActionFailure } from "./actionResponse";
 
 /* ------------------------------------------------------------------
    1) Define TableHeader Interface and Helper Function
@@ -164,7 +165,7 @@ export function useBaseHttpService(
 
   const cancelRequest: Ref<Function | undefined> = ref(undefined);
   const loader = ref(false);
-  const { showHttpError } = useAlert();
+  const { showHttpError, showError } = useAlert();
 
   // Will be set if you call FixToResponseModel
   const responseModelKeys: Ref<string[] | undefined> = ref([]);
@@ -242,6 +243,9 @@ export function useBaseHttpService(
           }),
         });
 
+        const refusal = getActionFailure(res.data);
+        if (refusal !== undefined) throw new ActionFailedError(refusal);
+
         if (res.data.status != undefined) {
           res.data.status = getStatusValueSafe(res.data.status);
         }
@@ -257,9 +261,12 @@ export function useBaseHttpService(
 
         return response.value;
       } catch (error) {
-        // Don't show error alert here since axios interceptor handles it
-        // Only show if explicitly requested and not suppressed
-        if (options?.suppressAlert === false) {
+        if (error instanceof ActionFailedError) {
+          // The request itself worked, so the axios interceptor never saw an error. Tell the user why it was refused.
+          if (options?.suppressAlert !== true) showError(error.message);
+        } else if (options?.suppressAlert === false) {
+          // Don't show error alert here since axios interceptor handles it
+          // Only show if explicitly requested and not suppressed
           showHttpError(error);
         }
         throw error;

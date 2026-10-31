@@ -3,46 +3,28 @@ import { onMounted, ref, provide, computed, onUnmounted, nextTick, watch } from 
 import { timeTickerService } from '@/http/services/timeTickerService'
 import type { GetTimeTickerResponse } from '@/http/services/types/timeTickerService.types'
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
+import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statusTimeSeries'
 import { tickerService } from '@/http/services/tickerService'
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import ChainJobsModal from '@/components/ChainJobsModal.vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { formatDate } from '@/utilities/dateTimeParser'
+import { buildRunAgainRequest } from '@/utilities/runAgain'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
-import { use } from 'echarts/core'
-import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
-import {
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  ToolboxComponent,
-  GridComponent,
-  DataZoomComponent,
-} from 'echarts/components'
 import VChart, { THEME_KEY } from 'vue-echarts'
+import '@/utilities/echartsSetup'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
-
-use([
-  CanvasRenderer,
-  LineChart,
-  PieChart,
-  TitleComponent,
-  TooltipComponent,
-  LegendComponent,
-  GridComponent,
-  ToolboxComponent,
-  DataZoomComponent
-])
 
 // Use paginated service instead of regular one
 const getTimeTickersPaginated = timeTickerService.getTimeTickersPaginated()
 const deleteTimeTicker = timeTickerService.deleteTimeTicker()
 const deleteTimeTickersBatch = timeTickerService.deleteTimeTickersBatch()
 const requestCancelTicker = tickerService.requestCancel()
+const addTimeTicker = timeTickerService.addTimeTicker()
+const getTickerRequest = tickerService.getRequestData()
 const getTimeTickersGraphDataRange = timeTickerService.getTimeTickersGraphDataRange()
 const getTimeTickersGraphData = timeTickerService.getTimeTickersGraphData()
 
@@ -92,7 +74,8 @@ const chartKey = ref(0)
 const chartData = ref({
   xAxisData: [] as string[],
   series: [] as any[],
-  legend: {} as any,
+  legendData: [] as string[],
+  hasData: true,
   title: 'Job statuses for all Time Tickers',
 })
 const pieChartData = ref<any[]>([])
@@ -102,6 +85,25 @@ const pieChartKey = ref(0)
 provide(THEME_KEY, 'dark')
 
 const timeZoneStore = useTimeZoneStore()
+
+// Adds a new ticker with the same function, request, retries and description, to run right away.
+// A time ticker runs once, so running it again is a new row.
+const runningAgain = ref(new Set<string>())
+
+const runAgain = async (item: GetTimeTickerResponse) => {
+  if (runningAgain.value.has(item.id)) return
+  runningAgain.value.add(item.id)
+  try {
+    const stored = await getTickerRequest.requestAsync(item.id, 1)
+    await addTimeTicker.requestAsync(
+      buildRunAgainRequest(item, stored?.result),
+      timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone,
+    )
+    await loadPageData()
+  } finally {
+    runningAgain.value.delete(item.id)
+  }
+}
 
 onMounted(async () => {
   // Initialize WebSocket connection
@@ -252,79 +254,10 @@ const loadPieChartData = async () => {
 }
 
 const processTimeSeriesData = (data: GetTimeTickerGraphDataRangeResponse[]) => {
-  if (!data || !Array.isArray(data)) {
-    chartData.value.xAxisData = []
-    chartData.value.series = []
-    chartData.value.legend = { data: [] }
-    return
-  }
+  const built = buildStatusTimeSeries(data, (status) => Status[status] || `Status ${status}`)
 
-  const allStatuses = new Set<number>()
-  const dateMap = new Map<string, Map<number, number>>()
+  chartData.value = { ...built, title: chartData.value.title }
 
-  data.forEach((item) => {
-    if (!item.results) return
-    item.results.forEach((result: any) => {
-      allStatuses.add(result.item1)
-      if (!dateMap.has(item.date)) {
-        dateMap.set(item.date, new Map())
-      }
-      dateMap.get(item.date)!.set(result.item1, result.item2)
-    })
-  })
-
-  const uniqueDates = Array.from(dateMap.keys()).sort()
-  const statusArray = Array.from(allStatuses).sort((a, b) => a - b)
-
-  // Use the same statusColors mapping
-  const statusColors: { [key: number]: string } = {
-    0: '#A9A9A9', // Idle - Dark Gray
-    1: '#00CED1', // Queued - Dark Turquoise
-    2: '#6495ED', // InProgress - Royal Blue
-    3: '#32CD32', // Done - Lime Green
-    4: '#008000', // DueDone - Green
-    5: '#FF0000', // Failed - Red
-    6: '#FFD700', // Cancelled - Gold/Yellow
-    7: '#BA68C8', // Skipped - Medium Orchid (Purple)
-  }
-
-  const composedData = statusArray.map((status) => ({
-    name: Status[status] || `Status ${status}`,
-    type: 'line',
-    smooth: true,
-    symbol: 'circle',
-    symbolSize: 6,
-    itemStyle: { color: statusColors[status] || '#808080' },
-    lineStyle: { 
-      width: 2,
-      color: statusColors[status] || '#808080'
-    },
-    areaStyle: {
-      color: {
-        type: 'linear',
-        x: 0,
-        y: 0,
-        x2: 0,
-        y2: 1,
-        colorStops: [
-          { offset: 0, color: (statusColors[status] || '#808080') + '30' },
-          { offset: 1, color: (statusColors[status] || '#808080') + '05' }
-        ]
-      }
-    },
-    data: uniqueDates.map((date) => {
-      const statusMap = dateMap.get(date)
-      return statusMap ? (statusMap.get(status) || 0) : 0
-    }),
-  }))
-
-  chartData.value = {
-    xAxisData: uniqueDates,
-    series: composedData,
-    legend: { data: composedData.map(s => s.name) },
-    title: chartData.value.title
-  }
-  
   chartKey.value++
 }
 
@@ -412,99 +345,7 @@ const addHubListeners = async () => {
 }
 
 // Chart configurations
-const lineChartOption = computed(() => ({
-  backgroundColor: 'transparent',
-  title: {
-    text: 'Time Series Analysis',
-    subtext: chartData.value.title,
-    left: 'center',
-    top: '2%',
-    textStyle: {
-      color: '#e0e0e0',
-      fontSize: 14,
-      fontWeight: 600,
-    },
-    subtextStyle: {
-      color: '#9e9e9e',
-      fontSize: 11,
-    },
-  },
-  tooltip: {
-    trigger: 'axis',
-    backgroundColor: 'rgba(42, 42, 42, 0.95)',
-    borderColor: '#666',
-    borderWidth: 1,
-    axisPointer: {
-      type: 'cross',
-      label: {
-        backgroundColor: 'rgba(66, 66, 66, 0.9)',
-        color: '#fff',
-      },
-    },
-  },
-  legend: chartData.value.legend,
-  grid: {
-    left: '8%',
-    right: '8%',
-    bottom: '10%',
-    top: '18%',
-    containLabel: true,
-  },
-  xAxis: {
-    type: 'category',
-    boundaryGap: false,
-    data: chartData.value.xAxisData,
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-      rotate: 45,
-    },
-    axisLine: {
-      lineStyle: { color: '#424242' },
-    },
-  },
-  yAxis: {
-    type: 'value',
-    axisLabel: {
-      color: '#bdbdbd',
-      fontSize: 10,
-    },
-    axisLine: {
-      lineStyle: { color: '#424242' },
-    },
-    splitLine: {
-      lineStyle: {
-        color: 'rgba(255, 255, 255, 0.05)',
-        type: 'dashed',
-      },
-    },
-  },
-  dataZoom: [
-    {
-      type: 'inside',
-      start: 0,
-      end: 100,
-    },
-    {
-      show: true,
-      type: 'slider',
-      bottom: '2%',
-      start: 0,
-      end: 100,
-      backgroundColor: 'rgba(47, 47, 47, 0.5)',
-      borderColor: '#666',
-      fillerColor: 'rgba(100, 181, 246, 0.2)',
-      handleStyle: {
-        color: '#64b5f6',
-        borderColor: '#64b5f6',
-      },
-    },
-  ],
-  series: chartData.value.series,
-  animation: true,
-  animationDuration: 1000,
-  animationEasing: 'cubicOut' as const,
-}))
+const lineChartOption = computed(() => buildStatusChartOption(chartData.value, chartData.value.title))
 
 const pieChartOption = computed(() => ({
   backgroundColor: 'transparent',
@@ -627,7 +468,7 @@ const processedTableData = computed(() => {
 const headersWithSelection = computed(() => {
   // For now, define headers manually since paginated response might not have headers
   const headers = [
-    { title: 'Function', key: 'function', sortable: true, visibility: true },
+    { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
     { title: 'Status', key: 'status', sortable: true, visibility: true },
     { title: 'Request Type', key: 'RequestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
@@ -916,7 +757,7 @@ const canBeForceDeleted = ref<string[]>([])
               class="chart-btn-vertical"
               @click="activeChart = 'line'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-line</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-line</v-icon>
               <span class="btn-text">Time</span>
             </v-btn>
             <v-btn
@@ -926,7 +767,7 @@ const canBeForceDeleted = ref<string[]>([])
               class="chart-btn-vertical"
               @click="activeChart = 'pie'"
             >
-              <v-icon class="mb-1 chart-icon">mdi-chart-pie</v-icon>
+              <v-icon class="mr-1 chart-icon">mdi-chart-pie</v-icon>
               <span class="btn-text">Status</span>
             </v-btn>
           </div>
@@ -983,7 +824,6 @@ const canBeForceDeleted = ref<string[]>([])
                     <v-icon size="18">mdi-plus</v-icon>
                   </div>
                   <span class="btn-text">Add Ticker</span>
-                  <div class="btn-shine"></div>
                 </button>
 
                 <button class="premium-action-btn tertiary-action" @click="openChainJobsModal()">
@@ -991,7 +831,6 @@ const canBeForceDeleted = ref<string[]>([])
                     <v-icon size="18">mdi-family-tree</v-icon>
                   </div>
                   <span class="btn-text">Chain Jobs</span>
-                  <div class="btn-shine"></div>
                 </button>
               </div>
             </div>
@@ -1434,6 +1273,23 @@ const canBeForceDeleted = ref<string[]>([])
                   </v-tooltip>
                 </div>
 
+                <!-- Run Again Button -->
+                <div class="action-btn-wrapper">
+                  <v-tooltip location="top">
+                    <template v-slot:activator="{ props }">
+                      <button
+                        v-bind="props"
+                        @click="runAgain(item)"
+                        class="modern-action-btn run-btn"
+                        :disabled="runningAgain.has(item.id)"
+                      >
+                        <v-icon size="16">mdi-play-outline</v-icon>
+                      </button>
+                    </template>
+                    <span>Run again</span>
+                  </v-tooltip>
+                </div>
+
                 <!-- Delete Button -->
                 <div
                   class="action-btn-wrapper"
@@ -1663,7 +1519,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .tree-expand-btn:hover {
   background-color: rgba(100, 181, 246, 0.1) !important;
-  transform: scale(1.1);
 }
 
 .tree-expand-placeholder {
@@ -1686,7 +1541,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .tree-icon-wrapper:hover {
   background: rgba(255, 255, 255, 0.1);
-  transform: translateY(-1px);
 }
 
 .tree-icon {
@@ -1725,7 +1579,6 @@ const canBeForceDeleted = ref<string[]>([])
 @keyframes treeExpand {
   from {
     opacity: 0;
-    transform: translateY(-4px);
   }
   to {
     opacity: 1;
@@ -1828,32 +1681,27 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Dashboard Layout */
 .time-ticker-dashboard {
-  background: linear-gradient(135deg, #212121 0%, #2d2d2d 100%);
+  background: #212121;
   min-height: 100vh;
-  font-family:
-    'Inter',
-    -apple-system,
-    BlinkMacSystemFont,
-    sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   position: relative;
   color: #e0e0e0;
 }
 
 /* Content Section */
 .dashboard-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   padding: 32px 24px 16px 24px;
 }
 
 /* Table Section */
 .table-section {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
+  box-shadow: none;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
-  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .section-header {
@@ -1900,11 +1748,6 @@ const canBeForceDeleted = ref<string[]>([])
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: 16px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(20px);
 }
 
 .premium-action-btn {
@@ -1940,35 +1783,17 @@ const canBeForceDeleted = ref<string[]>([])
   white-space: nowrap;
 }
 
-.premium-action-btn .btn-shine {
-  position: absolute;
-  top: 0;
-  left: -100%;
-  width: 100%;
-  height: 100%;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-  transition: left 0.5s ease;
-}
 
-.premium-action-btn:hover .btn-shine {
-  left: 100%;
-}
 
 .primary-action {
-  background: linear-gradient(135deg, #64b5f6 0%, #1976d2 100%);
+  background: #1976d2;
   color: #ffffff;
-  box-shadow: 0 4px 20px rgba(100, 181, 246, 0.4);
 }
 
 .primary-action:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 30px rgba(100, 181, 246, 0.6);
-  background: linear-gradient(135deg, #90caf9 0%, #1565c0 100%);
+  background: #1565c0;
 }
 
-.primary-action .btn-icon {
-  background: rgba(255, 255, 255, 0.2);
-}
 
 .secondary-action {
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
@@ -1977,7 +1802,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .secondary-action:hover {
-  transform: translateY(-2px);
   background: linear-gradient(135deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.08) 100%);
   border-color: rgba(255, 255, 255, 0.25);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
@@ -1989,34 +1813,27 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .tertiary-action {
-  background: linear-gradient(135deg, rgba(156, 39, 176, 0.1) 0%, rgba(156, 39, 176, 0.05) 100%);
+  background: transparent;
   color: #e0e0e0;
-  border: 1px solid rgba(156, 39, 176, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.16);
 }
 
 .tertiary-action:hover {
-  transform: translateY(-2px);
-  background: linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.08) 100%);
-  border-color: rgba(156, 39, 176, 0.25);
-  box-shadow: 0 8px 25px rgba(156, 39, 176, 0.2);
+  background: rgba(255, 255, 255, 0.06);
 }
 
-.tertiary-action .btn-icon {
-  background: rgba(156, 39, 176, 0.2);
-  color: #ab47bc;
-}
 
 /* Search and Info Group */
 .search-info-group {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1;
+  flex: 1 1 520px;
+  flex-wrap: wrap;
   justify-content: center;
 }
 
 .status-chip {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
@@ -2028,7 +1845,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .utility-btn {
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.05);
   transition: all 0.2s ease;
 }
@@ -2050,6 +1866,8 @@ const canBeForceDeleted = ref<string[]>([])
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 76px; /* two buttons per row at the narrowest */
   align-items: center;
   gap: 6px;
   padding: 2px;
@@ -2074,7 +1892,6 @@ const canBeForceDeleted = ref<string[]>([])
   border: none;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.1);
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -2099,7 +1916,6 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .modern-action-btn:hover {
-  transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
   border-color: rgba(255, 255, 255, 0.2);
 }
@@ -2163,8 +1979,18 @@ const canBeForceDeleted = ref<string[]>([])
 
 .edit-btn:hover {
   border-color: rgba(100, 181, 246, 0.5);
-  box-shadow: 0 8px 25px rgba(100, 181, 246, 0.4);
+  box-shadow: none;
   background: rgba(100, 181, 246, 0.15);
+}
+
+.run-btn {
+  color: #4caf50;
+  border-color: rgba(76, 175, 80, 0.2);
+}
+
+.run-btn:hover {
+  border-color: rgba(76, 175, 80, 0.5);
+  background: rgba(76, 175, 80, 0.15);
 }
 
 .duplicate-btn {
@@ -2246,7 +2072,7 @@ const canBeForceDeleted = ref<string[]>([])
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.15) !important;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 
 /* Enhanced table styles */
@@ -2269,6 +2095,12 @@ const canBeForceDeleted = ref<string[]>([])
   height: 64px;
 }
 
+/* Let cell contents wrap, so the table fits its container instead of scrolling sideways.
+   Header cells share the same class and keep whole words, so only the table body may break inside a word. */
+:deep(.enhanced-table tbody .v-data-table__td) {
+  overflow-wrap: anywhere;
+}
+
 :deep(.enhanced-table .v-data-table__wrapper) {
   border-radius: 12px;
   background: transparent;
@@ -2285,9 +2117,9 @@ const canBeForceDeleted = ref<string[]>([])
   font-weight: 600;
   font-size: 0.75rem;
   color: #ffffff;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.8px;
-  box-shadow: 0 2px 8px rgba(100, 181, 246, 0.1);
+  box-shadow: none;
 }
 
 :deep(.enhanced-table .v-data-table__tr) {
@@ -2414,7 +2246,6 @@ const canBeForceDeleted = ref<string[]>([])
 
 .child-jobs-dropdown {
   background: rgba(42, 42, 42, 0.98);
-  backdrop-filter: blur(20px);
   border-radius: 8px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -2614,7 +2445,6 @@ const canBeForceDeleted = ref<string[]>([])
   }
   50% {
     opacity: 0.8;
-    transform: scale(1.05);
     box-shadow: 0 0 0 4px rgba(255, 152, 0, 0.1);
   }
 }
@@ -2716,64 +2546,52 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Analytics Overview Card */
 .analytics-overview {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
-  overflow: visible;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: none;
+  padding: 20px;
+  margin: 0 0 24px;
   position: relative;
-  margin-top: 24px;
 }
 
-.analytics-overview:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.6);
-}
 
 /* Chart Styles */
 .chart-toggle-vertical {
-  position: absolute;
-  top: 20px;
-  left: -70px;
-  z-index: 10;
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 20px;
-  padding: 8px;
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 12px;
 }
 
 .chart-switch-vertical {
-  background: rgba(66, 66, 66, 0.95);
-  backdrop-filter: blur(20px);
-  border-radius: 16px;
-  border: 1px solid rgba(100, 181, 246, 0.4);
-  box-shadow: 0 8px 32px rgba(100, 181, 246, 0.2);
-  overflow: hidden;
-  padding: 8px 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
 }
 
 .chart-switch-vertical .toggle-label {
   font-size: 0.7rem;
   font-weight: 600;
   color: #bdbdbd;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 1px;
   padding: 4px 0;
   text-align: center;
+  display: none;
 }
 
 .chart-btn-vertical {
-  min-width: 60px;
-  min-height: 70px;
+  min-width: 64px;
+  min-height: 36px;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
   justify-content: center;
-  padding: 8px 4px;
+  padding: 6px 12px;
   font-size: 0.75rem;
   text-transform: none;
   background: rgba(255, 255, 255, 0.05);
@@ -2783,19 +2601,17 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 .chart-btn-vertical.v-btn--active {
-  background: linear-gradient(135deg, #64b5f6, #42a5f5);
-  box-shadow: 0 4px 12px rgba(100, 181, 246, 0.3);
-  border: 1px solid rgba(100, 181, 246, 0.6);
+  background: #1976d2;
+  color: #ffffff;
 }
 
 .chart-btn-vertical:not(.v-btn--active):hover {
-  background: rgba(100, 181, 246, 0.1);
-  border: 1px solid rgba(100, 181, 246, 0.3);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .chart-btn-vertical .chart-icon {
   font-size: 20px;
-  margin-bottom: 4px;
+  margin-right: 4px;
 }
 
 .chart-btn-vertical .btn-text {
@@ -2821,9 +2637,6 @@ const canBeForceDeleted = ref<string[]>([])
   margin: 0;
   position: relative;
   overflow: hidden;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .chart-compact {
@@ -2844,14 +2657,10 @@ const canBeForceDeleted = ref<string[]>([])
 
 /* Responsive Chart Styles */
 @media (max-width: 1400px) {
-  .chart-toggle-vertical {
-    top: 16px;
-    left: -52px;
-  }
 
   .chart-btn-vertical {
-    min-width: 50px;
-    min-height: 60px;
+    min-width: 56px;
+    min-height: 32px;
     font-size: 0.7rem;
   }
 
@@ -2861,16 +2670,12 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 @media (max-width: 768px) {
-  .chart-toggle-vertical {
-    top: 12px;
-    left: -45px;
-  }
 
   .chart-btn-vertical {
-    min-width: 40px;
-    min-height: 50px;
+    min-width: 44px;
+    min-height: 30px;
     font-size: 0.65rem;
-    padding: 6px 3px;
+    padding: 4px 8px;
   }
 
   .btn-text {

@@ -178,6 +178,10 @@ namespace SharpTicker.Utilities.Managers
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
 
+            if (CronRangeCheck.HasBackwardsRange(entity.Expression))
+                return new TickerResult<TCronTicker>(
+                    new TickerValidatorException($"The cron expression {entity.Expression} has a range that runs backwards, which is not supported"));
+
             
             entity.CreatedAt = _clock.UtcNow;
             entity.UpdatedAt = _clock.UtcNow;
@@ -212,6 +216,10 @@ namespace SharpTicker.Utilities.Managers
             timeTicker.ExecutionTime = ConvertToUtcIfNeeded(timeTicker.ExecutionTime.Value);
             
             try {
+                if (await _persistenceProvider.GetTimeTickerById(timeTicker.Id, cancellationToken).ConfigureAwait(false) is null)
+                    return new TickerResult<TTimeTicker>(
+                        new TickerValidatorException($"Cannot find time ticker with id {timeTicker.Id}"));
+
                 var affectedRows = await _persistenceProvider.UpdateTimeTickers([timeTicker], cancellationToken: cancellationToken).ConfigureAwait(false);
                 
                 if (_executionContext.Functions.Any(x => x.TickerId == timeTicker.Id))
@@ -240,9 +248,17 @@ namespace SharpTicker.Utilities.Managers
             if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+
+            if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
+                return new TickerResult<TCronTicker>(
+                    new TickerValidatorException($"The cron expression {cronTicker.Expression} has a range that runs backwards, which is not supported"));
             
             try
             {
+                if (await _persistenceProvider.GetCronTickerById(cronTicker.Id, cancellationToken).ConfigureAwait(false) is null)
+                    return new TickerResult<TCronTicker>(
+                        new TickerValidatorException($"Cannot find cron ticker with id {cronTicker.Id}"));
+
                 cronTicker.UpdatedAt = _clock.UtcNow;
 
                 var affectedRows = await _persistenceProvider.UpdateCronTickers([cronTicker], cancellationToken: cancellationToken);
@@ -353,6 +369,9 @@ namespace SharpTicker.Utilities.Managers
             DateTime earliestForNonImmediate = default;
             foreach (var entity in entities)
             {
+                if (entity is null)
+                    return new TickerResult<List<TTimeTicker>>(new TickerValidatorException("Ticker must not be null!"));
+
                 if (entity.Id == Guid.Empty)
                     entity.Id = Guid.NewGuid();
 
@@ -409,12 +428,21 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TCronTicker>>> AddCronTickersBatchAsync(List<TCronTicker> entities, CancellationToken cancellationToken = default)
         {
+            if (entities == null || entities.Count == 0)
+                return new TickerResult<List<TCronTicker>>(entities ?? new List<TCronTicker>());
+
             var validEntities = new List<TCronTicker>();
             var errors = new List<Exception>();
             var nextOccurrences = new List<DateTime>();
             
             foreach (var entity in entities)
             {
+                if (entity is null)
+                {
+                    errors.Add(new TickerValidatorException("Ticker must not be null!"));
+                    continue;
+                }
+
                 if (entity.Id == Guid.Empty)
                     entity.Id = Guid.NewGuid();
 
@@ -427,6 +455,12 @@ namespace SharpTicker.Utilities.Managers
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(entity.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
                     errors.Add(new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
+                    continue;
+                }
+
+                if (CronRangeCheck.HasBackwardsRange(entity.Expression))
+                {
+                    errors.Add(new TickerValidatorException($"The cron expression {entity.Expression} has a range that runs backwards, which is not supported"));
                     continue;
                 }
 
@@ -467,6 +501,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TTimeTicker>>> UpdateTimeTickersBatchAsync(List<TTimeTicker> timeTickers, CancellationToken cancellationToken = default)
         {
+            if (timeTickers == null || timeTickers.Count == 0)
+                return new TickerResult<List<TTimeTicker>>(timeTickers ?? new List<TTimeTicker>());
+
             var validTickers = new List<TTimeTicker>();
             var errors = new List<Exception>();
             var needsRestart = false;
@@ -499,6 +536,13 @@ namespace SharpTicker.Utilities.Managers
             
             try 
             {
+                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var existing = (await _persistenceProvider.GetTimeTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
+                    .Select(x => x.Id).ToHashSet();
+                if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
+                    return new TickerResult<List<TTimeTicker>>(
+                        new TickerValidatorException($"Cannot find time ticker with id {missing}"));
+
                 var affectedRows = await _persistenceProvider.UpdateTimeTickers(validTickers.ToArray(), cancellationToken: cancellationToken).ConfigureAwait(false);
                 
                 if (needsRestart)
@@ -519,6 +563,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<List<TCronTicker>>> UpdateCronTickersBatchAsync(List<TCronTicker> cronTickers, CancellationToken cancellationToken = default)
         {
+            if (cronTickers == null || cronTickers.Count == 0)
+                return new TickerResult<List<TCronTicker>>(cronTickers ?? new List<TCronTicker>());
+
             var validTickers = new List<TCronTicker>();
             var errors = new List<Exception>();
             var nextOccurrences = new List<DateTime>();
@@ -529,7 +576,7 @@ namespace SharpTicker.Utilities.Managers
             {
                 if (cronTicker is null)
                 {
-                    errors.Add(new Exception("Cron ticker must not be null!"));
+                    errors.Add(new TickerValidatorException("Cron ticker must not be null!"));
                     continue;
                 }
 
@@ -542,6 +589,12 @@ namespace SharpTicker.Utilities.Managers
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
                     errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    continue;
+                }
+
+                if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
+                {
+                    errors.Add(new TickerValidatorException($"The cron expression {cronTicker.Expression} has a range that runs backwards, which is not supported"));
                     continue;
                 }
                 
@@ -564,6 +617,13 @@ namespace SharpTicker.Utilities.Managers
             
             try
             {
+                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var existing = (await _persistenceProvider.GetCronTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
+                    .Select(x => x.Id).ToHashSet();
+                if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
+                    return new TickerResult<List<TCronTicker>>(
+                        new TickerValidatorException($"Cannot find cron ticker with id {missing}"));
+
                 var affectedRows = await _persistenceProvider.UpdateCronTickers(validTickers.ToArray(), cancellationToken: cancellationToken);
 
                 // Update internal functions for those that need it
@@ -591,6 +651,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<TTimeTicker>> DeleteTimeTickersBatchAsync(List<Guid> ids, CancellationToken cancellationToken = default)
         {
+            if (ids == null || ids.Count == 0)
+                return new TickerResult<TTimeTicker>(0);
+
             var affectedRows = await _persistenceProvider.RemoveTimeTickers(ids.ToArray(), cancellationToken: cancellationToken);
             
             if (affectedRows > 0 && _executionContext.Functions.Any(x => ids.Contains(x.TickerId)))
@@ -601,6 +664,9 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task<TickerResult<TCronTicker>> DeleteCronTickersBatchAsync(List<Guid> ids, CancellationToken cancellationToken = default)
         {
+            if (ids == null || ids.Count == 0)
+                return new TickerResult<TCronTicker>(0);
+
             var affectedRows = await _persistenceProvider.RemoveCronTickers(ids.ToArray(), cancellationToken: cancellationToken);
             
             if (affectedRows > 0 && _executionContext.Functions.Any(x => ids.Contains(x.ParentId ?? Guid.Empty)))

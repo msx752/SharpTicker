@@ -201,6 +201,158 @@ public class TickerExecutionTaskHandlerTests : IDisposable
         Assert.Equal(TickerStatus.Cancelled, context.Status);
     }
 
+    /// <summary>The token each UpdateTickerAsync call was given, in order.</summary>
+    private List<CancellationToken> RecordUpdateTokens()
+    {
+        var tokens = new List<CancellationToken>();
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
+            .Returns(call => { tokens.Add(call.ArgAt<CancellationToken>(1)); return Task.CompletedTask; });
+        return tokens;
+    }
+
+    [Fact]
+    public async Task ACancelledJob_IsRecordedAsCancelled_WithAWriteThatTheCancellationCannotStop()
+    {
+        // The write is what keeps a cancelled job from staying InProgress: with the cancelled token it fails on EF Core.
+        var tokens = RecordUpdateTokens();
+        using var cancelled = new CancellationTokenSource();
+        var context = CreateContext(ct: async (token, _, _) =>
+        {
+            cancelled.Cancel();
+            await Task.Delay(TimeSpan.FromSeconds(5), token);
+        });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false, cancelled.Token);
+
+        Assert.Equal(TickerStatus.Cancelled, context.Status);
+        var written = Assert.Single(tokens);
+        Assert.False(written.IsCancellationRequested);
+        Assert.False(written.CanBeCanceled);
+    }
+
+    [Fact]
+    public async Task APlainOperationCanceledException_IsCancelled_WhenTheJobsOwnTokenWasCancelled()
+    {
+        var tokens = RecordUpdateTokens();
+        using var cancelled = new CancellationTokenSource();
+        var context = CreateContext(ct: (token, _, _) =>
+        {
+            cancelled.Cancel();
+            token.ThrowIfCancellationRequested();     // throws OperationCanceledException, not TaskCanceledException
+            return Task.CompletedTask;
+        });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false, cancelled.Token);
+
+        Assert.Equal(TickerStatus.Cancelled, context.Status);
+        Assert.False(Assert.Single(tokens).IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task APlainOperationCanceledException_IsAFailure_WhenNobodyCancelledTheJob()
+    {
+        var context = CreateContext(ct: (_, _, _) => throw new OperationCanceledException("a timeout inside the job"));
+
+        await _handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.Equal(TickerStatus.Failed, context.Status);
+    }
+
+    /// <summary>
+    /// HttpClient reports its own timeout as a TaskCanceledException that carries a TimeoutException, although nobody cancelled
+    /// the job. That is a failure like any other, so it is retried and recorded as Failed, and the exception handler hears about
+    /// it as one. A real HttpClient and a server that never answers make sure the test follows what HttpClient does.
+    /// </summary>
+    [Fact]
+    public async Task AnHttpClientTimeoutInsideTheJob_IsAFailureThatIsRetried()
+    {
+        var exceptionHandler = Substitute.For<ITickerExceptionHandler>();
+        var services = new ServiceCollection();
+        services.AddSingleton(_internalManager);
+        services.AddSingleton(_instrumentation);
+        services.AddSingleton(exceptionHandler);
+        var handler = new TickerExecutionTaskHandler(services.BuildServiceProvider(), _clock, _instrumentation, _internalManager);
+
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;   // accepts connections and never answers
+            var attempts = 0;
+            var context = CreateContext(ct: async (token, _, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromMilliseconds(150) };
+                await http.GetAsync($"http://127.0.0.1:{port}/", token);
+            });
+            context.Retries = 1;
+            context.RetryIntervals = [0];
+
+            await handler.ExecuteTaskAsync(context, isDue: false);
+
+            Assert.Equal(TickerStatus.Failed, context.Status);
+            Assert.Equal(2, attempts);
+            await exceptionHandler.Received().HandleExceptionAsync(Arg.Any<Exception>(), context.TickerId, context.Type);
+            await exceptionHandler.DidNotReceive().HandleCanceledExceptionAsync(Arg.Any<Exception>(), Arg.Any<Guid>(), Arg.Any<TickerType>());
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task ATaskCanceledExceptionWithATimeoutInside_IsStillCancelled_WhenTheJobsOwnTokenWasCancelled()
+    {
+        using var cancelled = new CancellationTokenSource();
+        var context = CreateContext(ct: (_, _, _) =>
+        {
+            cancelled.Cancel();
+            throw new TaskCanceledException("cancelled", new TimeoutException());
+        });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false, cancelled.Token);
+
+        Assert.Equal(TickerStatus.Cancelled, context.Status);
+    }
+
+    [Fact]
+    public async Task ATaskCanceledExceptionWithoutATimeoutInside_IsStillCancelled()
+    {
+        // What Task.Delay(delay, token) throws when the token is cancelled: a cancelled task counts as a cancellation.
+        var context = CreateContext(ct: (_, _, _) => throw new TaskCanceledException("cancelled", new InvalidOperationException()));
+
+        await _handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.Equal(TickerStatus.Cancelled, context.Status);
+    }
+
+    [Fact]
+    public async Task ASucceededJob_IsRecordedAsDone_EvenWhenTheTokenWasCancelledMeanwhile()
+    {
+        var tokens = RecordUpdateTokens();
+        using var cancelled = new CancellationTokenSource();
+        var context = CreateContext(ct: (_, _, _) => { cancelled.Cancel(); return Task.CompletedTask; });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false, cancelled.Token);
+
+        Assert.Equal(TickerStatus.Done, context.Status);
+        Assert.False(Assert.Single(tokens).IsCancellationRequested);
+    }
+
+    [Fact]
+    public async Task AFailedJob_IsRecordedAsFailed_EvenWhenTheTokenWasCancelledMeanwhile()
+    {
+        var tokens = RecordUpdateTokens();
+        using var cancelled = new CancellationTokenSource();
+        var context = CreateContext(ct: (_, _, _) => { cancelled.Cancel(); throw new InvalidOperationException("boom"); });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false, cancelled.Token);
+
+        Assert.Equal(TickerStatus.Failed, context.Status);
+        Assert.All(tokens.TakeLast(1), t => Assert.False(t.IsCancellationRequested));
+    }
+
     [Fact]
     public async Task ExecuteTaskAsync_CallsCancelledExceptionHandler_WhenRegistered()
     {

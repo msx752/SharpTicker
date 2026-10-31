@@ -37,6 +37,9 @@ const vuetify = createVuetify({
     VPullToRefresh
   },
   directives,
+  defaults: {
+    VBtn: { class: 'text-none', style: 'letter-spacing: normal' },
+  },
   date: {
     formats: {
       keyboardDate: (date: Date) => {

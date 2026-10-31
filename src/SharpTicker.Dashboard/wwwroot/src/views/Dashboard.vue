@@ -207,7 +207,7 @@ const availablePageSizes = [5, 10, 20, 50]
 
 // Table headers for Vuetify data table
 const functionHeaders = [
-  { title: 'Function Name', key: 'function', sortable: true },
+  { title: 'Function Name', key: 'function', sortable: true, minWidth: '200px' },
   { title: 'Request Namespace', key: 'request', sortable: true },
   { title: 'Priority', key: 'priority', sortable: true },
 ]
@@ -634,7 +634,7 @@ const getVisiblePageNumbers = () => {
 
 /* Dashboard Content */
 .dashboard-content {
-  max-width: 1400px;
+  max-width: var(--dashboard-max-width);
   margin: 0 auto;
   padding: 20px 24px 16px 24px;
 }
@@ -648,8 +648,7 @@ const getVisiblePageNumbers = () => {
 }
 
 .metric-card {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
   border-radius: 12px;
   padding: 16px;
   display: flex;
@@ -673,7 +672,6 @@ const getVisiblePageNumbers = () => {
 }
 
 .metric-card:hover {
-  transform: translateY(-2px);
   box-shadow: 0 8px 25px rgba(0, 0, 0, 0.6);
 }
 
@@ -704,7 +702,7 @@ const getVisiblePageNumbers = () => {
   font-weight: 600;
   color: #bdbdbd;
   margin: 0 0 4px 0;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.5px;
 }
 
@@ -757,8 +755,7 @@ const getVisiblePageNumbers = () => {
 }
 
 .stat-card {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
   border-radius: 12px;
   padding: 16px;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
@@ -767,7 +764,6 @@ const getVisiblePageNumbers = () => {
 }
 
 .stat-card:hover {
-  transform: translateY(-1px);
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.6);
 }
 
@@ -782,7 +778,7 @@ const getVisiblePageNumbers = () => {
   font-size: 0.875rem;
   font-weight: 600;
   color: #bdbdbd;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.5px;
 }
 
@@ -824,11 +820,10 @@ const getVisiblePageNumbers = () => {
 }
 
 .content-card {
-  background: rgba(66, 66, 66, 0.9);
-  backdrop-filter: blur(20px);
+  background: #2a2a2a;
   border-radius: 12px;
   padding: 20px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  box-shadow: none;
   border: 1px solid rgba(255, 255, 255, 0.1);
   transition: all 0.3s ease;
 }
@@ -953,7 +948,7 @@ const getVisiblePageNumbers = () => {
   font-weight: 700;
   font-size: 0.7rem;
   color: #bdbdbd;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.5px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
@@ -988,7 +983,7 @@ const getVisiblePageNumbers = () => {
   border-radius: 20px;
   font-size: 0.7rem;
   font-weight: 700;
-  text-transform: uppercase;
+  text-transform: none;
   letter-spacing: 0.5px;
 }
 
@@ -1311,8 +1306,7 @@ const getVisiblePageNumbers = () => {
 }
 
 .functions-table-vuetify .v-data-table-header {
-  background: rgba(66, 66, 66, 0.9) !important;
-  backdrop-filter: blur(20px) !important;
+  background: #2a2a2a !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
   padding: 0 !important;
 }
@@ -1321,7 +1315,7 @@ const getVisiblePageNumbers = () => {
   color: #bdbdbd !important;
   font-weight: 600 !important;
   font-size: 0.875rem !important;
-  text-transform: uppercase !important;
+  text-transform: none !important;
   letter-spacing: 0.5px !important;
   padding: 16px !important;
   border-bottom: none !important;
@@ -1336,7 +1330,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table__tr:hover {
   background: rgba(255, 255, 255, 0.05) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2) !important;
 }
 
@@ -1348,8 +1341,7 @@ const getVisiblePageNumbers = () => {
 }
 
 .functions-table-vuetify .v-data-table-footer {
-  background: rgba(66, 66, 66, 0.9) !important;
-  backdrop-filter: blur(20px) !important;
+  background: #2a2a2a !important;
   border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
   color: #bdbdbd !important;
   padding: 16px !important;
@@ -1393,7 +1385,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table-footer .v-btn:hover {
   background: rgba(255, 255, 255, 0.1) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2) !important;
 }
 
@@ -1405,7 +1396,6 @@ const getVisiblePageNumbers = () => {
 
 .functions-table-vuetify .v-data-table-footer .v-btn--variant-elevated:hover {
   background: var(--v-theme-primary) !important;
-  transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(var(--v-theme-primary), 0.3) !important;
 }
 
@@ -1490,7 +1480,6 @@ const getVisiblePageNumbers = () => {
 }
 
 .pagination-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
 }
 
@@ -1514,7 +1503,6 @@ const getVisiblePageNumbers = () => {
 }
 
 .page-number-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
 }
 
@@ -1546,5 +1534,15 @@ const getVisiblePageNumbers = () => {
   .page-size-selector {
     justify-content: center;
   }
+}
+
+.content-grid > *,
+.bottom-grid > * {
+  min-width: 0;
+}
+
+/* A long function name wraps inside its cell instead of pushing the other columns out of view. */
+.function-name {
+  overflow-wrap: anywhere;
 }
 </style>

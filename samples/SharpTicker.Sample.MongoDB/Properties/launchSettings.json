@@ -1,8 +1,9 @@
 {
   "profiles": {
-    "SharpTicker.Sample.MongoDB": {
+    "Development": {
       "commandName": "Project",
       "launchBrowser": true,
+      "launchUrl": "ticker/dashboard",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },

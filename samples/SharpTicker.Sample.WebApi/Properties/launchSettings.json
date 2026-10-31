@@ -1,8 +1,9 @@
 {
   "profiles": {
-    "SharpTicker.Sample.WebApi": {
+    "Development": {
       "commandName": "Project",
       "launchBrowser": true,
+      "launchUrl": "ticker/dashboard",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },

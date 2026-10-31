@@ -10,10 +10,12 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Dashboard.Authentication;
 using SharpTicker.Dashboard.Hubs;
 using SharpTicker.Dashboard.Infrastructure;
 using SharpTicker.Utilities;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
@@ -249,6 +251,28 @@ public static class DashboardEndpoints
         await WriteJson(context, response, dashboardOptions.DashboardJsonOptions);
     }
 
+    /// <summary>
+    /// The text a failed action reports, and the log entry that keeps the details on the server. A validation error,
+    /// such as an invalid cron expression, is logged as a warning and its message goes into the response, because it
+    /// is written for the person who made the request. The message of any other exception can hold internal details,
+    /// so it is only logged, as an error with the exception, and stays out of the response.
+    /// </summary>
+    private static string FailureMessage(HttpContext context, string message, Exception exception)
+    {
+        var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(DashboardEndpoints));
+
+        if (exception is TickerValidatorException)
+        {
+            logger.LogWarning("SharpTicker Dashboard request refused: {Action} - {Error}", message, exception.Message);
+            return $"{message}: {exception.Message}";
+        }
+
+        if (exception != null)
+            logger.LogError(exception, "SharpTicker Dashboard request failed: {Action} - {Error}", message, exception.Message);
+
+        return message;
+    }
+
     private static async Task ValidateAuth(HttpContext context)
     {
         var authService = context.RequestServices.GetRequiredService<IAuthService>();
@@ -387,7 +411,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Chain jobs created successfully" : "Failed to create chain jobs",
+            Message = result.IsSucceeded ? "Chain jobs created successfully" : FailureMessage(context, "Failed to create chain jobs", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -425,7 +449,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Time ticker updated successfully" : "Failed to update time ticker"
+            Message = result.IsSucceeded ? "Time ticker updated successfully" : FailureMessage(context, "Failed to update time ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -610,7 +634,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponseWithId
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker added successfully" : "Failed to add cron ticker",
+            Message = result.IsSucceeded ? "Cron ticker added successfully" : FailureMessage(context, "Failed to add cron ticker", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
     }
@@ -639,7 +663,7 @@ public static class DashboardEndpoints
         await WriteJson(context, new ActionResponse
         {
             Success = result.IsSucceeded,
-            Message = result.IsSucceeded ? "Cron ticker updated successfully" : "Failed to update cron ticker"
+            Message = result.IsSucceeded ? "Cron ticker updated successfully" : FailureMessage(context, "Failed to update cron ticker", result.Exception)
         }, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -667,8 +691,17 @@ public static class DashboardEndpoints
         where TCronTicker : CronTickerEntity, new()
     {
         var repository = context.RequestServices.GetRequiredService<ITickerDashboardRepository<TTimeTicker, TCronTicker>>();
+        var persistenceProvider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
+
+        // A cron ticker that is gone, for example deleted from another browser tab, has nothing to run. Without this
+        // check an occurrence pointing at nothing would be stored first.
+        if (await persistenceProvider.GetCronTickerById(id, cancellationToken) is null)
+        {
+            context.Response.StatusCode = 404;
+            return;
+        }
 
         await repository.AddOnDemandCronTickerOccurrenceAsync(id, cancellationToken);
         context.Response.StatusCode = 200;

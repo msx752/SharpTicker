@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
 
@@ -18,6 +20,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     
     // Worker queues for work stealing
     private readonly ConcurrentQueue<WorkItem>[] _workerQueues;
+    // 1 while a running worker holds the id (the index of its queue), 0 while the id is free
+    private readonly int[] _workerSlots;
     
     // Global state
     private volatile int _totalQueuedTasks;
@@ -27,26 +31,56 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private volatile int _nextQueueIndex;
     
     private readonly CancellationTokenSource _shutdownCts = new();
+    // Read this, not _shutdownCts.Token: the source is disposed at the end of DisposeAsync, and Token throws once it is
+    // disposed, while a copy of the token keeps answering. A worker still inside a job at that point looks at the token
+    // when the job ends, on a plain thread where an exception ends the process.
+    private readonly CancellationToken _shutdownToken;
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
-    
+    private readonly ILogger _logger;
+
+    /// <summary>
+    /// Called with the worker's id when it has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
+    /// worker at that point, so a job can be queued in the moment between the decision and the count.
+    /// </summary>
+    internal Action<int> OnWorkerLeaving;
+
+    /// <summary>
+    /// Called with the new worker's id right before its thread is started. Tests throw from it to see what happens when the operating
+    /// system refuses another thread.
+    /// </summary>
+    internal Action<int> OnWorkerThreadStarting;
+
     // Thread-local flag to detect if we're on a SharpTicker worker thread
     [ThreadStatic] public static bool IsSharpTickerWorkerThread;
     [ThreadStatic] private static int _threadWorkerIndex = -1;
     
     public SharpTickerTaskScheduler(
-        int maxConcurrency, 
+        int maxConcurrency,
         TimeSpan? idleWorkerTimeout = null,
         SoftSchedulerNotifyDebounce notifyDebounce = null)
+        : this(maxConcurrency, idleWorkerTimeout, notifyDebounce, null)
+    {
+    }
+
+    // The public constructor keeps its signature; the host passes its logger through this one.
+    internal SharpTickerTaskScheduler(
+        int maxConcurrency,
+        TimeSpan? idleWorkerTimeout,
+        SoftSchedulerNotifyDebounce notifyDebounce,
+        ILogger logger)
     {
         if (maxConcurrency <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), "Must be greater than zero");
-        
+
+        _logger = logger ?? NullLogger.Instance;
         _maxConcurrency = maxConcurrency;
         _idleWorkerTimeout = idleWorkerTimeout ?? TimeSpan.FromSeconds(60);
         _maxCapacityPerWorker = 1024; // Fixed optimal capacity
         _notifyDebounce = notifyDebounce ?? new SoftSchedulerNotifyDebounce(_ => { });
-        
+        _shutdownToken = _shutdownCts.Token;
+
         // Initialize all worker queues upfront for simplicity
+        _workerSlots = new int[maxConcurrency];
         _workerQueues = new ConcurrentQueue<WorkItem>[maxConcurrency];
         for (int i = 0; i < maxConcurrency; i++)
         {
@@ -86,9 +120,14 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     { 
                         await work(cancellationToken); 
                     } 
-                    catch 
-                    { 
-                        /* swallow */ 
+                    catch (OperationCanceledException)
+                    {
+                        // Expected - the job was cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        // Swallowed so the pool stays up, but not silently
+                        LogUnhandledJobFailure(ex);
                     }
                 },
                 CancellationToken.None,
@@ -173,18 +212,54 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         if (Interlocked.CompareExchange(ref _activeWorkers, currentWorkers + 1, currentWorkers) == currentWorkers)
         {
             // Successfully reserved a worker slot
-            var workerId = currentWorkers; // Use the slot we just reserved
-            var thread = new Thread(() => WorkerLoop(workerId))
+            var workerId = -1;
+            try
             {
-                IsBackground = true,
-                Name = $"SharpTicker.Worker-{workerId}"
-            };
-            thread.Start();
-            
+                workerId = ReserveWorkerId();
+                var thread = new Thread(() => WorkerLoop(workerId))
+                {
+                    IsBackground = true,
+                    Name = $"SharpTicker.Worker-{workerId}"
+                };
+                OnWorkerThreadStarting?.Invoke(workerId);
+                thread.Start();
+            }
+            catch (Exception ex)
+            {
+                // No thread was started, so nobody will count this slot out. Give it back, or the pool stays one worker
+                // short for good. The caller still sees the exception.
+                ReleaseWorkerId(workerId);
+                Interlocked.Decrement(ref _activeWorkers);
+                _logger.LogError(ex, "The task scheduler could not start a worker thread. {QueuedJobs} job(s) are queued, and the next job that is queued starts a worker again.", _totalQueuedTasks);
+                throw;
+            }
+
             _notifyDebounce.NotifySafely(_activeWorkers);
         }
     }
-    
+
+    // A worker's id is the index of the queue it owns, so two running workers must never share one. Workers can leave from
+    // anywhere in the range, which makes the number of running workers a wrong id for the next one: it can be the id of a
+    // worker that is still running, while the id that became free has no owner.
+    private int ReserveWorkerId()
+    {
+        // A free slot exists: the count was raised before this call and a worker gives its slot back before it lowers the
+        // count, so fewer than _maxConcurrency slots can be in use.
+        for (var i = 0; i < _workerSlots.Length; i++)
+        {
+            if (Interlocked.CompareExchange(ref _workerSlots[i], 1, 0) == 0)
+                return i;
+        }
+
+        throw new InvalidOperationException("No free worker id although fewer workers than the maximum are counted.");
+    }
+
+    private void ReleaseWorkerId(int workerId)
+    {
+        if (workerId >= 0)
+            Volatile.Write(ref _workerSlots[workerId], 0);
+    }
+
     private void WorkerLoop(int workerId)
     {
         // Set thread-local state
@@ -204,8 +279,29 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         finally
         {
             SynchronizationContext.SetSynchronizationContext(originalContext);
+            // The id goes back before the count goes down, so a worker that is started because the count is lower can
+            // always find a free id.
+            ReleaseWorkerId(workerId);
             Interlocked.Decrement(ref _activeWorkers);
             _notifyDebounce.NotifySafely(_activeWorkers);
+
+            // A job can be queued after this worker decided to leave and before it was counted out. The queueing side
+            // then still saw this worker and started none, so if the last workers leave together the job would wait
+            // with nobody to take it. Look again now that the count is down: either the queueing side sees the lower
+            // count, or this check sees its job.
+            if (_totalQueuedTasks > 0 && !_disposed && !_shutdownCts.IsCancellationRequested)
+            {
+                try
+                {
+                    EnsureWorkerAvailable();
+                }
+                catch
+                {
+                    // This runs on a plain thread, where an exception ends the process, and the one thing that can throw
+                    // here is the operating system refusing another thread. The job stays queued and the next job that is
+                    // queued starts a worker again, which is where this exception would have gone anyway.
+                }
+            }
         }
     }
     
@@ -215,7 +311,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         var localQueue = _workerQueues[workerId];
         var consecutiveStealFailures = 0;
         
-        while (!_shutdownCts.Token.IsCancellationRequested && !_disposed)
+        while (!_shutdownToken.IsCancellationRequested && !_disposed)
         {
             WorkItem workItem = default;
             bool foundWork = false;
@@ -261,6 +357,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     // Only exit if there's really no work and we have minimum workers
                     if (!anyWorkRemaining && _totalQueuedTasks == 0 && _activeWorkers > 1)
                     {
+                        OnWorkerLeaving?.Invoke(workerId);
                         break; // Exit this worker
                     }
                     
@@ -321,6 +418,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         return false;
     }
     
+    // A job reports its own failure through the ticker handler, so an exception that gets this far was handled by nothing.
+    private void LogUnhandledJobFailure(Exception exception)
+        => _logger.LogError(exception, "A job threw an exception that nothing handled. The scheduler keeps running.");
+
     private async Task ExecuteWorkAsync(WorkItem workItem)
     {
         // Decrement immediately after dequeue to keep counter in sync
@@ -329,7 +430,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         try
         {
             // Check cancellation before executing
-            if (!workItem.UserToken.IsCancellationRequested && !_shutdownCts.Token.IsCancellationRequested)
+            if (!workItem.UserToken.IsCancellationRequested && !_shutdownToken.IsCancellationRequested)
             {
                 // Start the work without awaiting it so this worker
                 // can continue processing other items while the task awaits.
@@ -347,7 +448,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                         {
                             if (t.IsFaulted)
                             {
-                                _ = t.Exception;
+                                LogUnhandledJobFailure(t.Exception.GetBaseException());
                             }
                         }
                         catch
@@ -363,9 +464,14 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     {
                         await task;
                     }
-                    catch
+                    catch (OperationCanceledException)
                     {
-                        // Swallow exceptions to keep worker alive
+                        // Expected - the job was cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        // Swallowed to keep the worker alive, but not silently
+                        LogUnhandledJobFailure(ex);
                     }
                 }
             }
@@ -374,10 +480,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         {
             // Expected - task was cancelled
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Log error if needed, but don't crash the worker
-            // Errors are swallowed to prevent worker thread crashes
+            // Swallowed so a failing job does not crash the worker thread, but not silently
+            LogUnhandledJobFailure(ex);
         }
     }
     
@@ -387,7 +493,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     /// </summary>
     internal void PostContinuation(SendOrPostCallback callback, object state)
     {
-        if (_disposed || _shutdownCts.Token.IsCancellationRequested)
+        if (_disposed || _shutdownToken.IsCancellationRequested)
             return;
         
         // Continuations get queued to the current worker's queue if possible
@@ -522,13 +628,18 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         }
 
         // Drain remaining queued items to keep the counter accurate
+        var dropped = 0;
         for (int i = 0; i < _maxConcurrency; i++)
         {
             while (_workerQueues[i].TryDequeue(out _))
             {
                 Interlocked.Decrement(ref _totalQueuedTasks);
+                dropped++;
             }
         }
+
+        if (dropped > 0)
+            _logger.LogWarning("The task scheduler was disposed with {DroppedJobs} queued job(s) that had not started. They were dropped.", dropped);
 
         _notifyDebounce?.Dispose();
         _shutdownCts?.Dispose();

@@ -270,6 +270,90 @@ public class InternalTickerManagerTests
     }
 
     [Fact]
+    public void EarliestCronTickerGroup_ACronWithDayNames_PicksTheNextWeekday()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            // _now is Sunday 2025-06-15, so the next weekday at 09:00 is Monday 2025-06-16.
+            var cron = MakeCron(Guid.NewGuid(), "Weekdays", "0 0 9 * * MON-FRI");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Equal(new DateTime(2025, 6, 16, 9, 0, 0, DateTimeKind.Utc), result!.Value.Next);
+            Assert.Equal("0 0 9 * * MON-FRI", Assert.Single(result.Value.Items).Expression);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
+    public void EarliestCronTickerGroup_ACronAlreadyStoredWithABackwardsRange_IsStillScheduled()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            // Refusing new crons with such a range must not stop the ones already in a store from running.
+            var cron = MakeCron(Guid.NewGuid(), "Stored", "0 0 22-2 * * *");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Single(result!.Value.Items);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
+    public void EarliestCronTickerGroup_ANamedCronAndItsNumericForm_FireTogether()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            var named = MakeCron(Guid.NewGuid(), "Named", "0 0 9 * * mon,wed,fri");
+            var numeric = MakeCron(Guid.NewGuid(), "Numeric", "0 0 9 * * 1,3,5");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { named, numeric }, _now, null);
+
+            Assert.NotNull(result);
+            Assert.Equal(2, result!.Value.Items.Length);
+            Assert.Equal(new DateTime(2025, 6, 16, 9, 0, 0, DateTimeKind.Utc), result.Value.Next);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
+    public void EarliestCronTickerGroup_ACronWithAMonthName_PicksThatMonth()
+    {
+        var origTz = CronScheduleCache.TimeZoneInfo;
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+        try
+        {
+            var cron = MakeCron(Guid.NewGuid(), "Quarterly", "0 0 0 1 Jul,Oct *");
+
+            var result = InvokeEarliestCronTickerGroup(new[] { cron }, _now, null);
+
+            Assert.Equal(new DateTime(2025, 7, 1, 0, 0, 0, DateTimeKind.Utc), result!.Value.Next);
+        }
+        finally
+        {
+            CronScheduleCache.TimeZoneInfo = origTz;
+        }
+    }
+
+    [Fact]
     public void EarliestCronTickerGroup_StoredOccurrenceSameTimeAsCalculated_MergesBoth()
     {
         var origTz = CronScheduleCache.TimeZoneInfo;
@@ -1032,5 +1116,49 @@ public class InternalTickerManagerTests
 
         await _notificationHub.Received(1)
             .UpdateCronOccurrenceFromInternalFunctionContext<FakeCronTicker>(Arg.Any<InternalFunctionContext>());
+    }
+
+    /// <summary>
+    /// A store behind a single connection, such as an in-memory SQLite database, cannot run two operations at once, so the
+    /// release of a node's time tickers and of its occurrences must not overlap.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseDeadNodeResources_RunsTheTwoReleasesOneAfterTheOther()
+    {
+        var running = 0;
+        var mostAtOnce = 0;
+        async Task Release()
+        {
+            var now = Interlocked.Increment(ref running);
+            int seen;
+            while (now > (seen = Volatile.Read(ref mostAtOnce)) && Interlocked.CompareExchange(ref mostAtOnce, now, seen) != seen) { }
+            await Task.Delay(50);
+            Interlocked.Decrement(ref running);
+        }
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>()).Returns(_ => Release());
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>()).Returns(_ => Release());
+
+        await _manager.ReleaseDeadNodeResources("node-a");
+
+        await _persistence.Received(1).ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>());
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
+        Assert.Equal(1, mostAtOnce);
+    }
+
+    /// <summary>
+    /// The two releases do not depend on each other, so a failure of the first must not leave the second undone. The
+    /// failure still reaches the caller.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseDeadNodeResources_StillReleasesTheTimeTickers_WhenReleasingTheOccurrencesFails()
+    {
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromException(new InvalidOperationException("the store refused")));
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.ReleaseDeadNodeResources("node-a"));
+
+        Assert.Equal("the store refused", failure.Message);
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
     }
 }

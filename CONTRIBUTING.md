@@ -5,10 +5,17 @@ Thanks for your interest in improving SharpTicker. This guide explains how to ge
 ## How to contribute
 
 1. Open an issue first for anything larger than a small fix, so the approach can be agreed on.
-2. Fork the repository and create a branch from `main`.
+2. Fork the repository and create a branch from `develop` (see [Branches](#branches)).
 3. Make your change, with tests.
 4. Make sure the build and all tests pass (see below).
-5. Open a pull request against `main` and describe what changed and why.
+5. Open a pull request against `develop` and describe what changed and why.
+
+## Branches
+
+- **`develop`** is where work happens. Pull requests from contributors target it, and maintainers may push to it directly. CI runs on every push and pull request.
+- **`main`** is the released state. It only receives changes through a pull request from `develop`, and every release is tagged on it.
+
+Do not delete `develop` after merging it into `main`, and do not turn on automatic deletion of merged branches for the repository.
 
 ## Development setup
 
@@ -91,10 +98,11 @@ Use [GitHub Issues](https://github.com/msx752/SharpTicker/issues) for bugs and f
 
 For maintainers. `main` is protected: changes land through pull requests once CI passes.
 
-1. Create a GitHub release with a new tag `v<version>` on a commit of `main`, for example `v1.2.0` or `v1.2.0-rc.1`. The version follows [Semantic Versioning](https://semver.org) and is used for every package.
-2. Tick **Set as a pre-release** exactly when the version has a `-` suffix. NuGet treats those versions as prereleases.
-3. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then it builds, tests on every target and packs all packages.
-4. The `nuget` environment then waits for a reviewer to approve the publish. After approval, the publish job pushes the packages that were built in step 3. NuGet versions cannot be deleted, only unlisted, so try a pipeline change with a pre-release first.
+1. Open a pull request from `develop` to `main` and merge it with a **merge commit**. Do not squash or rebase it: that rewrites the commits, and `develop` would then show the same changes as new on the next pull request.
+2. Create a GitHub release with a new tag `v<version>` on a commit of `main`, for example `v1.2.0` or `v1.2.0-rc.1`. The version follows [Semantic Versioning](https://semver.org) and is used for every package.
+3. Tick **Set as a pre-release** exactly when the version has a `-` suffix. NuGet treats those versions as prereleases.
+4. Publishing the release starts `release.yml`. It first checks the tag format, the pre-release flag, that the commit is on `main` and that the version is not on NuGet yet. Then it builds, tests on every target and packs all packages.
+5. The `nuget` environment then waits for a reviewer to approve the publish. After approval, the publish job pushes the packages that were built in step 3. NuGet versions cannot be deleted, only unlisted, so try a pipeline change with a pre-release first.
 
 Publishing uses [NuGet Trusted Publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing): no API key is stored in the repository. The policy on nuget.org allows `msx752/SharpTicker`, workflow `release.yml` and environment `nuget` to push packages matching `SharpTicker*`. Renaming the workflow file or the environment breaks publishing until the policy is updated to match.
 

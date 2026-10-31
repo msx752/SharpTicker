@@ -56,7 +56,7 @@ namespace SharpTicker.Dashboard.Hubs
         public override async Task OnDisconnectedAsync(Exception exception)
         {
             var connectionId = Context.ConnectionId;
-            var username = Context.Items["username"]?.ToString() ?? "unknown";
+            var username = Username ?? "unknown";
             
             _logger.LogInformation("SignalR connection disconnected: {ConnectionId} - User: {Username}", 
                 connectionId, username);
@@ -73,7 +73,7 @@ namespace SharpTicker.Dashboard.Hubs
             }
 
             await Groups.AddToGroupAsync(Context.ConnectionId, groupName);
-            var username = Context.Items["username"]?.ToString();
+            var username = Username;
             
             _logger.LogDebug("User {Username} joined group {GroupName}", username, groupName);
             await Clients.Caller.SendAsync("GroupJoined", groupName);
@@ -88,7 +88,7 @@ namespace SharpTicker.Dashboard.Hubs
             }
 
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, groupName);
-            var username = Context.Items["username"]?.ToString();
+            var username = Username;
             
             _logger.LogDebug("User {Username} left group {GroupName}", username, groupName);
             await Clients.Caller.SendAsync("GroupLeft", groupName);
@@ -100,12 +100,15 @@ namespace SharpTicker.Dashboard.Hubs
             {
                 connectionId = Context.ConnectionId,
                 authenticated = IsAuthenticated(),
-                username = Context.Items["username"]?.ToString() ?? "anonymous",
+                username = Username ?? "anonymous",
                 timestamp = DateTime.UtcNow
             };
 
             await Clients.Caller.SendAsync("Status", status);
         }
+
+        // A connection that never authenticated has no "username" item, and the Items indexer throws for a missing key.
+        private string? Username => Context.Items.TryGetValue("username", out var value) ? value?.ToString() : null;
 
         private bool IsAuthenticated()
         {

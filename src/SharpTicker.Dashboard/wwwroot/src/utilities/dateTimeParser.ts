@@ -160,3 +160,22 @@ export function formatTimeAgo(date: string | Date): string {
     }
     return timeago(date)
 }
+
+// A job that has not finished has no execution time yet and the server sends the empty date
+// (0001-01-01) for it. Showing "25 years ago" for that is wrong, so it reads as blank.
+export function formatExecutedAt(executedAt: string | Date, elapsedTime: number): string {
+    const isUnset = typeof executedAt === 'string' ? executedAt.startsWith('0001-') : executedAt.getUTCFullYear() <= 1
+    if (isUnset) return ''
+    return `${formatTimeAgo(executedAt)} (took ${formatTime(elapsedTime, true)})`
+}
+
+// The inverse of formatTime for whole seconds: "30s", "1m 30s", "2h", "1d 2h" become seconds.
+// formatTime drops the seconds once a duration reaches an hour, so those cannot be recovered.
+export function parseDuration(text: string): number {
+    const unitSeconds: Record<string, number> = { d: 86400, h: 3600, m: 60, s: 1 };
+    let total = 0;
+    for (const [, amount, unit] of text.matchAll(/(\d+)\s*([dhms])/g)) {
+        total += parseInt(amount) * unitSeconds[unit];
+    }
+    return total;
+}

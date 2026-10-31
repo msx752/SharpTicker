@@ -14,7 +14,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Tests;
 
-[Collection("TickerFunctionProviderState")]
+[Collection(SharedStaticStateCollection.Name)]
 public class TickerManagerTests : IDisposable
 {
     private const string ValidFunctionName = "TestFunction";

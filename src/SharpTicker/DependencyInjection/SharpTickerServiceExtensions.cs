@@ -2,6 +2,7 @@ using System;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using SharpTicker.BackgroundServices;
 using SharpTicker.Dispatcher;
 using SharpTicker.Provider;
@@ -20,6 +21,10 @@ namespace SharpTicker.DependencyInjection
 {
     public static class SharpTickerServiceExtensions
     {
+        // The logger the task scheduler writes to, or none when the host has no logging.
+        private static ILogger SchedulerLogger(IServiceProvider serviceProvider)
+            => serviceProvider.GetService<ILoggerFactory>()?.CreateLogger("SharpTicker.TaskScheduler");
+
         public static IServiceCollection AddSharpTicker(this IServiceCollection services, Action<TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity>> optionsBuilder = null)
             => AddSharpTicker<TimeTickerEntity, CronTickerEntity>(services, optionsBuilder);
 
@@ -69,12 +74,12 @@ namespace SharpTicker.DependencyInjection
                 {
                     var notification = sp.GetRequiredService<ISharpTickerNotificationHubSender>();
                     var notifyDebounce = new SoftSchedulerNotifyDebounce((value) => notification.UpdateActiveThreads(value));
-                    return new SharpTickerTaskScheduler(schedulerOptionsBuilder.MaxConcurrency, schedulerOptionsBuilder.IdleWorkerTimeOut, notifyDebounce);
+                    return new SharpTickerTaskScheduler(schedulerOptionsBuilder.MaxConcurrency, schedulerOptionsBuilder.IdleWorkerTimeOut, notifyDebounce, SchedulerLogger(sp));
                 });
             }
             else
             {
-                services.AddSingleton<ISharpTickerTaskScheduler>(_ => new SharpTickerTaskScheduler(schedulerOptionsBuilder.MaxConcurrency, schedulerOptionsBuilder.IdleWorkerTimeOut));
+                services.AddSingleton<ISharpTickerTaskScheduler>(sp => new SharpTickerTaskScheduler(schedulerOptionsBuilder.MaxConcurrency, schedulerOptionsBuilder.IdleWorkerTimeOut, null, SchedulerLogger(sp)));
                 // Register NoOp implementations when background services are disabled
                 services.AddSingleton<ISharpTickerHostScheduler, NoOpSharpTickerHostScheduler>();
                 services.AddSingleton<ISharpTickerDispatcher, NoOpSharpTickerDispatcher>();

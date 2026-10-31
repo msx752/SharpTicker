@@ -15,7 +15,7 @@ namespace SharpTicker.Tests;
 /// Tests for <see cref="TickerFunctionProvider"/>.
 /// Because the provider is fully static, each test must reset state via <see cref="ResetProvider"/>.
 /// </summary>
-[Collection("TickerFunctionProviderState")]
+[Collection(SharedStaticStateCollection.Name)]
 public class TickerFunctionProviderTests : IDisposable
 {
     public TickerFunctionProviderTests()

@@ -7,6 +7,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSharpTicker(options =>
 {
+    options.WithJsonContext(SampleJsonContext.Default);
     options.AddDashboard();
 });
 
@@ -39,5 +40,8 @@ builder.Services.MapTickerGroup("gr",gr =>
 var app = builder.Build();
 
 app.UseSharpTicker();
+
+// The browser opened by launchSettings.json lands on the site root; send it to the dashboard
+app.MapGet("/", () => Results.Redirect("/ticker/dashboard"));
 
 app.Run();

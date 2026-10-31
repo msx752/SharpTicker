@@ -8,6 +8,13 @@ namespace SharpTicker.SourceGenerator.Validation
         // Format with seconds (6 parts only): seconds, minutes, hours, day, month, day-of-week
         private static readonly int[] MinValues = { 0, 0, 0, 1, 1, 0 };
         private static readonly int[] MaxValues = { 59, 59, 23, 31, 12, 6 };
+
+        // Month (field 5) and day-of-week (field 6) accept names in any case. Like the scheduler, any start of the
+        // full name counts (MON, Mo, MONDAY, SEP, SEPT, SEPTEMBER).
+        private static readonly string[] MonthNames =
+            { "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER" };
+        private static readonly string[] DayNames =
+            { "SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY" };
         
         // Performance constants
         private const int RequiredPartsCount = 6;
@@ -19,14 +26,13 @@ namespace SharpTicker.SourceGenerator.Validation
         public static string NormalizeToSixPart(string expression)
         {
             if (string.IsNullOrEmpty(expression)) return expression;
-            var partCount = 0;
-            foreach (var c in expression.AsSpan())
-            {
-                if (c == ' ' && partCount < 6) partCount++;
-            }
-            // partCount = number of spaces = parts - 1
-            return partCount == 4 ? "0 " + expression.Trim() : expression.Trim();
+            var trimmed = expression.Trim();
+            // Count fields the way the scheduler does: runs of spaces separate fields, leading and trailing spaces do not.
+            return SplitFields(trimmed).Length == 5 ? "0 " + trimmed : trimmed;
         }
+
+        private static string[] SplitFields(string expression)
+            => expression.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
 
         public static bool IsValidCronExpression(string expression)
         {
@@ -35,100 +41,62 @@ namespace SharpTicker.SourceGenerator.Validation
             // Auto-normalize 5-part to 6-part
             var normalized = NormalizeToSixPart(expression);
 
-            // Use Span for efficient string splitting without allocations
-            var expressionSpan = normalized.AsSpan();
-            var parts = new string[RequiredPartsCount];
-            var partCount = SplitIntoSpan(expressionSpan, parts);
-
-            if (partCount != RequiredPartsCount)
+            // Anything but exactly six fields is invalid, including extra fields after the sixth.
+            var parts = SplitFields(normalized);
+            if (parts.Length != RequiredPartsCount)
                 return false;
 
             // Validate each part with corresponding min/max values
-            ReadOnlySpan<int> minSpan = MinValues;
-            ReadOnlySpan<int> maxSpan = MaxValues;
-            
             for (int i = 0; i < RequiredPartsCount; i++)
             {
-                if (!ValidatePart(parts[i], minSpan[i], maxSpan[i]))
+                if (!ValidatePart(parts[i], MinValues[i], MaxValues[i], NamesFor(i)))
                     return false;
             }
             
             return true;
         }
 
-        /// <summary>
-        /// Efficiently splits a ReadOnlySpan into parts without allocating intermediate arrays.
-        /// </summary>
-        private static int SplitIntoSpan(ReadOnlySpan<char> input, Span<string> output)
-        {
-            var partIndex = 0;
-            var start = 0;
-            
-            for (int i = 0; i < input.Length && partIndex < output.Length; i++)
-            {
-                if (input[i] == ' ')
-                {
-                    if (i > start) // Avoid empty parts
-                    {
-                        output[partIndex++] = input.Slice(start, i - start).ToString();
-                    }
-                    start = i + 1;
-                }
-            }
-            
-            // Add the last part if there's remaining content
-            if (start < input.Length && partIndex < output.Length)
-            {
-                output[partIndex++] = input.Slice(start).ToString();
-            }
-            
-            return partIndex;
-        }
+        private static string[] NamesFor(int fieldIndex)
+            => fieldIndex == 4 ? MonthNames : fieldIndex == 5 ? DayNames : null;
 
-        private static bool ValidatePart(string part, int min, int max)
+        private static bool ValidatePart(string part, int min, int max, string[] names)
         {
             // Fast path for wildcard
             if (part.Length == 1 && part[0] == '*') 
                 return true; // wildcard
 
             var span = part.AsSpan();
-            var values = new HashSet<int>();
             int i = 0;
 
-            while (i < span.Length)
+            // A list is one or more items separated by commas. An empty item, such as a trailing comma, is invalid.
+            while (true)
             {
                 int num1;
                 int num2 = -1;
                 int step = 1;
+                var wildcard = false;
 
-                // first number or '*'
-                if (span[i] == '*')
+                // first value or '*'
+                if (i < span.Length && span[i] == '*')
                 {
+                    wildcard = true;
                     num1 = min;
                     num2 = max;
                     i++;
                 }
-                else if (span[i] >= '0' && span[i] <= '9')
-                {
-                    num1 = ReadNumber(span, ref i);
-                    if (num1 == -1) return false; // Invalid number
-                }
                 else
                 {
-                    return false;
+                    num1 = ReadValue(span, ref i, names);
+                    if (num1 == -1) return false; // Neither a number nor a known name
                 }
 
-                // optional range "‑"
+                // optional range "-" (a wildcard cannot start a range)
                 if (i < span.Length && span[i] == '-')
                 {
+                    if (wildcard) return false;
                     i++;
-                    if (i < span.Length && span[i] >= '0' && span[i] <= '9')
-                    {
-                        num2 = ReadNumber(span, ref i);
-                        if (num2 == -1) return false; // Invalid number
-                    }
-                    else
-                        return false;
+                    num2 = ReadValue(span, ref i, names);
+                    if (num2 == -1) return false; // Neither a number nor a known name
                 }
 
                 // optional step "/"
@@ -147,20 +115,50 @@ namespace SharpTicker.SourceGenerator.Validation
                 if (num2 == -1) 
                     num2 = num1;
 
-                // validate bounds
-                if (num1 < min || num2 > max || num1 > num2 || step < 1 || step > max)
+                // validate bounds. A range has to run forward; a backwards range is not supported. A step larger
+                // than the field is accepted like the scheduler does; a step of zero is not.
+                if (num1 < min || num1 > max || num2 < min || num2 > max || num1 > num2 || step < 1)
                     return false;
 
-                // collect values
-                for (int v = num1; v <= num2; v += step)
-                    values.Add(v);
+                if (i >= span.Length)
+                    return true;
 
-                // skip comma
-                if (i < span.Length && span[i] == ',')
-                    i++;
+                if (span[i] != ',')
+                    return false;
+
+                i++; // the comma; another item has to follow
+            }
+        }
+
+        /// <summary>
+        /// Reads a number, or a name when the field has names. Returns -1 when there is neither.
+        /// </summary>
+        private static int ReadValue(ReadOnlySpan<char> span, ref int index, string[] names)
+        {
+            if (index >= span.Length)
+                return -1;
+
+            if (span[index] >= '0' && span[index] <= '9')
+                return ReadNumber(span, ref index);
+
+            if (names == null)
+                return -1;
+
+            var start = index;
+            while (index < span.Length && ((span[index] >= 'A' && span[index] <= 'Z') || (span[index] >= 'a' && span[index] <= 'z')))
+                index++;
+
+            var word = span.Slice(start, index - start).ToString();
+            if (word.Length == 0)
+                return -1;
+
+            for (int n = 0; n < names.Length; n++)
+            {
+                if (names[n].StartsWith(word, StringComparison.OrdinalIgnoreCase))
+                    return names == MonthNames ? n + 1 : n;
             }
 
-            return values.Count > 0;
+            return -1;
         }
 
         /// <summary>

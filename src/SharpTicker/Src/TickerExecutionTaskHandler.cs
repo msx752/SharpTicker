@@ -124,6 +124,20 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
     }
 
+    /// <summary>
+    /// Whether an OperationCanceledException that came out of a job means the job was cancelled, as opposed to failing.
+    /// </summary>
+    private static bool IsCancellation(OperationCanceledException exception, CancellationTokenSource jobToken)
+    {
+        // The job was asked to stop, by the cancel button, RequestCancellation or the application stopping.
+        if (jobToken.IsCancellationRequested)
+            return true;
+
+        // A cancelled task counts, except the one HttpClient throws when its own timeout runs out: the job was not cancelled,
+        // the request timed out, and a timeout is a failure that the retries are there for.
+        return exception is TaskCanceledException && exception.InnerException is not TimeoutException;
+    }
+
     private async Task RunContextFunctionAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken, bool isChild = false)
     {
         var typeName = TickerTypeNamesLower.GetValueOrDefault(context.Type, context.Type.ToString().ToLowerInvariant());
@@ -150,7 +164,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
 
         // IMPORTANT: Register the ticker FIRST, before creating the SkipIfAlreadyRunningAction callback
         // This ensures the current occurrence is properly tracked when the callback checks for siblings
-        TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue);
+        TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this);
 
         var tickerFunctionContext = new TickerFunctionContext
         {
@@ -215,7 +229,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 context.RetryCount = attempt;
                 break;
             }
-            catch (TaskCanceledException ex)
+            // A cancelled task counts, and so does any OperationCanceledException when this job's own token was cancelled,
+            // for example by the cancel button or by the application stopping. A plain OperationCanceledException that
+            // nobody asked for is an ordinary failure, and so is the TaskCanceledException that HttpClient throws when its own
+            // timeout runs out (see IsCancellation).
+            catch (OperationCanceledException ex) when (IsCancellation(ex, cancellationTokenSource))
             {
                 context.SetProperty(x => x.Status, TickerStatus.Cancelled)
                     .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
@@ -232,7 +250,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
                     await handler.HandleCanceledExceptionAsync(ex, context.TickerId, context.Type);
 
-                await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
+                // The outcome is written with no cancellation: the token that cancelled the job would cancel the write
+                // too, and the job would stay InProgress instead of ending as cancelled.
+                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
                 
                 // Clean up and exit early on cancellation
                 TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
@@ -261,7 +281,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 // Log job skipped
                 _sharpTickerInstrumentation.LogJobSkipped(context.TickerId, context.FunctionName, ex.Message);
 
-                await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
+                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
 
                 // Clean up and exit early on termination
                 TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
@@ -311,7 +331,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             // Log job completed successfully
             _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, true);
 
-            await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
+            await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
         }
         else if (lastException != null)
         {
@@ -327,7 +347,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             _sharpTickerInstrumentation.LogJobFailed(context.TickerId, context.FunctionName, lastException, context.RetryCount);
             _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, false);
 
-            await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
+            await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
         }
 
 

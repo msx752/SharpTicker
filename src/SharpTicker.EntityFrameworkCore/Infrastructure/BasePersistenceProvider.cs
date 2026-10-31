@@ -387,7 +387,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var dbContext = session.Context;
         await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
             .Where(x => x.Id == functionContext.TickerId)
-            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(functionContext), cancellationToken)
+            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(functionContext, _clock.UtcNow), cancellationToken)
             .ConfigureAwait(false);
     }
     
@@ -601,7 +601,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var dbContext = session.Context;
         await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
             .Where(x => idList.Contains(x.Id))
-            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(functionContext), cancellationToken)
+            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(functionContext, _clock.UtcNow), cancellationToken)
             .ConfigureAwait(false);
     }
     

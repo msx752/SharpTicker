@@ -3,6 +3,8 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Instrumentation;
@@ -47,21 +49,49 @@ public static class ServiceExtension
             var schedulerOptions = serviceProvider.GetService<SchedulerOptionsBuilder>();
             var hostScheduler = serviceProvider.GetService<ISharpTickerHostScheduler>();
 
+            var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger(StartupReleaseCategory) ?? NullLogger.Instance;
+            var executionContext = serviceProvider.GetService<TickerExecutionContext>();
+
             hostLifetime.ApplicationStarted.Register(() =>
             {
-                Task.Run(async () =>
-                {
-                    // Release resources held by dead nodes before the scheduler starts processing.
-                    await internalTickerManager.ReleaseDeadNodeResources(schedulerOptions.NodeIdentifier);
-                                        
-                    // After cleanup, restart the host scheduler so it immediately
-                    // picks up newly seeded cron tickers and jobs configured via the core pipeline.
-                    if (hostScheduler != null && hostScheduler.IsRunning)
-                    {
-                        hostScheduler.Restart();
-                    }
-                });
+                // The context keeps the task so that whoever needs to know the release is over, a test for one, can wait for it.
+                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, hostScheduler, logger));
+                if (executionContext != null)
+                    executionContext.ExternalProviderStartup = release;
             });
         });
+    }
+
+    private const string StartupReleaseCategory = "SharpTicker.EntityFrameworkCore.StartupRelease";
+
+    /// <summary>
+    /// Releases the jobs a dead node or an earlier run of this node left locked, then restarts the host scheduler so it picks
+    /// up what was seeded in the meantime.
+    /// </summary>
+    internal static async Task ReleaseDeadNodeResourcesOnStartAsync(
+        IInternalTickerManager internalTickerManager,
+        string nodeIdentifier,
+        ISharpTickerHostScheduler hostScheduler,
+        ILogger logger)
+    {
+        try
+        {
+            // Release resources held by dead nodes before the scheduler starts processing.
+            await internalTickerManager.ReleaseDeadNodeResources(nodeIdentifier);
+
+            // After cleanup, restart the host scheduler so it immediately
+            // picks up newly seeded cron tickers and jobs configured via the core pipeline.
+            if (hostScheduler != null && hostScheduler.IsRunning)
+            {
+                hostScheduler.Restart();
+            }
+        }
+        catch (Exception ex)
+        {
+            // Nobody awaits this task, so an exception would be lost. The host scheduler is not restarted after a failure,
+            // as before, but now the failure is on the server log.
+            logger.LogError(ex, "Releasing the jobs held by dead nodes and by an earlier run of node {NodeIdentifier} failed at startup. " +
+                                "Jobs that were left InProgress were not released by this step.", nodeIdentifier);
+        }
     }
 }

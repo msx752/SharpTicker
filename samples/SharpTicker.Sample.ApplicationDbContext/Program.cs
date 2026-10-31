@@ -36,6 +36,11 @@ using (var scope = app.Services.CreateScope())
 // Activate SharpTicker job processor (mirrors docs' minimal setup)
 app.UseSharpTicker();
 
+// Landing page so the browser opened by launchSettings.json shows something useful
+app.MapGet("/", () => Results.Text(
+    "SharpTicker + your own EF Core DbContext sample (no dashboard here).\n" +
+    "Schedule the sample job: POST /schedule-sample"));
+
 // Minimal endpoint to schedule the sample job
 app.MapPost("/schedule-sample", async (ITimeTickerManager<TimeTickerEntity> manager) =>
 {

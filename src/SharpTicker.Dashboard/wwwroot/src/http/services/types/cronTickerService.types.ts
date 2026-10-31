@@ -22,7 +22,7 @@ export class UpdateCronTickerRequest {
     request?:string;
     retries?: number;
     description?: string;
-    intervals?:number[];
+    retryIntervals?:number[];
     isEnabled?: boolean;
 }
 
@@ -42,5 +42,5 @@ export class AddCronTickerRequest {
     request?:string;
     retries?: number;
     description?: string;
-    intervals?:number[];
+    retryIntervals?:number[];
 }

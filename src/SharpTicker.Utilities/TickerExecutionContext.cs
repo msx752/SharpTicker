@@ -1,3 +1,4 @@
+using System.Threading.Tasks;
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -16,9 +17,12 @@ internal interface ITickerOptionsSeeding
 
 internal class TickerExecutionContext
 {
-   private long _nextOccurrenceTicks;
+   // -1 means nothing is planned. A zero here would read back as 0001-01-01 instead of "none".
+   private long _nextOccurrenceTicks = -1;
    internal Action<IServiceProvider> ExternalProviderApplicationAction { get; set; }
    internal Action<object> DashboardApplicationAction { get; set; }
+   /// <summary>The work an external provider starts when the application has started, so it can be waited for.</summary>
+   internal Task ExternalProviderStartup { get; set; }
    public Action<object, CoreNotifyActionType> NotifyCoreAction { get; set; }
    public string LastHostExceptionMessage { get; set; }
    internal ITickerOptionsSeeding OptionsSeeding { get; set; }

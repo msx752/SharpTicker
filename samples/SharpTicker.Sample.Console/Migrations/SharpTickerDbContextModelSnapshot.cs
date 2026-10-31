@@ -37,6 +37,14 @@ namespace SharpTicker.Sample.Console.Migrations
                     b.Property<string>("InitIdentifier")
                         .HasColumnType("TEXT");
 
+                    b.Property<bool>("IsEnabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("IsSystemPaused")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(false);
+
                     b.Property<byte[]>("Request")
                         .HasColumnType("BLOB");
 

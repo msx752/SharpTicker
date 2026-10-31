@@ -5,7 +5,7 @@ SharpTicker has two kinds of jobs:
 - **Time tickers** (`TimeTickerEntity`) run once, at a given time.
 - **Cron tickers** (`CronTickerEntity`) run repeatedly on a cron expression. Each run is stored as an occurrence.
 
-Both are managed through injectable managers: `ITimeTickerManager<TimeTickerEntity>` and `ICronTickerManager<CronTickerEntity>`. Their `AddAsync`, `UpdateAsync` and `DeleteAsync` methods, and the `*BatchAsync` variants, return a `TickerResult<T>`.
+Both are managed through injectable managers: `ITimeTickerManager<TimeTickerEntity>` and `ICronTickerManager<CronTickerEntity>`. Their `AddAsync`, `UpdateAsync` and `DeleteAsync` methods, and the `*BatchAsync` variants, return a `TickerResult<T>`. A failed result carries the reason in `Exception`. `UpdateAsync` of a ticker that does not exist fails with a `TickerValidatorException` and creates nothing, on every store; use `AddAsync` to create one. A `*BatchAsync` call with a null or empty list does nothing and succeeds, and a null ticker inside a list is a failed result.
 
 ## Time jobs
 
@@ -74,6 +74,8 @@ Expressions are parsed by [NCrontab](https://github.com/atifaziz/NCrontab) with 
 │ │ │ │ │ │
 0 30 9 * * 1-5   → 09:30:00 on weekdays
 ```
+
+Each field takes `*`, a value, a list (`1,15`), a range (`9-17`), and a step (`*/15`, `0-30/5`). Month and day of week also accept names in any case, for example `MON-FRI`, `Jan,Jul` or `Sunday`; a name can be shortened to its first letters (`MON`, `Sept`). The source generator checks the same rules at build time, so a cron it rejects is reported as a compile error instead of failing at startup. A range has to run forward: the source generator, the cron manager and the dashboard refuse a backwards one such as `22-2`. To cover hours that cross midnight, list two ranges, for example `22-23,0-2`.
 
 A five-field expression without seconds is accepted on `[TickerFunction]` and by `CronExpression.Parse`, which add `0` seconds in front. Expressions given directly to `CronTickerEntity.Expression` through the cron manager are not expanded, so use six fields there.
 

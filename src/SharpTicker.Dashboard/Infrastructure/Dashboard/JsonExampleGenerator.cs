@@ -29,8 +29,9 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
             try
             {
-                var typeInfo = options.GetTypeInfo(type);
-                json = BuildExampleJson(options, typeInfo, depth: 0);
+                var effectiveOptions = WithReflectionFallback(options);
+                var typeInfo = effectiveOptions.GetTypeInfo(type);
+                json = BuildExampleJson(effectiveOptions, typeInfo, depth: 0);
                 cache[type] = json;
                 return true;
             }
@@ -40,6 +41,20 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
                 cache[type] = json;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// A JsonSerializerOptions nobody configured has no type info resolver until its first
+        /// (de)serialization, so GetTypeInfo throws. Apps that never call WithJsonContext are in that
+        /// state; give a copy the default reflection resolver so they still get an example. Options that
+        /// already have a resolver (a JsonContext, or configured by the app) are used as they are.
+        /// </summary>
+        private static JsonSerializerOptions WithReflectionFallback(JsonSerializerOptions options)
+        {
+            if (options.TypeInfoResolver != null || !JsonSerializer.IsReflectionEnabledByDefault)
+                return options;
+
+            return new JsonSerializerOptions(options) { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
         }
 
         private static string BuildExampleJson(JsonSerializerOptions options, JsonTypeInfo typeInfo, int depth, HashSet<Type> visited = null)

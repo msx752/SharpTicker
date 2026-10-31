@@ -1,4 +1,4 @@
-## Release 2.5.2
+## Release 1.0.0
 
 ### New Rules
 
@@ -14,3 +14,4 @@ TQ007   | SharpTicker.SourceGenerator | Error | Abstract class contains [TickerF
 TQ008   | SharpTicker.SourceGenerator | Error | Nested class contains [TickerFunction] methods - only allowed in top-level classes
 TQ009   | SharpTicker.SourceGenerator | Error | Invalid TickerFunction parameter - only TickerFunctionContext, TickerFunctionContext<T>, CancellationToken, or no parameters allowed
 TQ010   | SharpTicker.SourceGenerator | Error | Multiple constructors with [SharpTickerConstructor] attribute - only one constructor can be marked
+TQ011   | SharpTicker.SourceGenerator | Error | Invalid maxConcurrency value - must be >= 0 (0 = unlimited)

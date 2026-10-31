@@ -1,11 +1,25 @@
 import * as signalR from "@microsoft/signalr";
 import { getBasePath, getBackendUrl } from '@/utilities/pathResolver';
+import { GroupMembership } from '@/hub/base/groupMembership';
 
 class BaseHub {
     public connection: signalR.HubConnection;
 
+    // The groups this page wants to be in, joined again after a reconnect (see GroupMembership).
+    private readonly groups = new GroupMembership({
+        isConnected: () => this.connection.state === signalR.HubConnectionState.Connected,
+        invoke: (method, ...args) => this.connection.invoke(method, ...args),
+    });
+
     constructor() {
         this.connection = this.createConnection();
+        this.rejoinGroupsOnReconnect();
+    }
+
+    private rejoinGroupsOnReconnect(): void {
+        this.connection.onreconnected(() => {
+            void this.groups.rejoinAll();
+        });
     }
 
     private createConnection(): signalR.HubConnection {
@@ -128,6 +142,7 @@ class BaseHub {
             this.connection.stop();
         }
         this.connection = this.createConnection();
+        this.rejoinGroupsOnReconnect();
     }
 
     // Send a message to the server
@@ -157,6 +172,7 @@ class BaseHub {
             console.log('🔗 SignalR: Starting connection...');
             await this.connection.start();
             console.log('✅ SignalR: Connection established successfully');
+            await this.groups.rejoinAll();
         } catch (err: any) {
             console.error('🚨 SignalR Connection Error:', err);
             
@@ -182,12 +198,12 @@ class BaseHub {
         }
     }
 
-    joinGroup(groupName: string): void {
-        this.connection.invoke("JoinGroup", groupName);
+    joinGroup(groupName: string): Promise<void> {
+        return this.groups.join(groupName);
     }
 
-    leaveGroup(groupName: string): void {
-        this.connection.invoke("LeaveGroup", groupName);
+    leaveGroup(groupName: string): Promise<void> {
+        return this.groups.leave(groupName);
     }
 
     // Subscribe to messages from the server

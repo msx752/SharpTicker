@@ -40,7 +40,7 @@ public class ServiceExtensionTests
             {
                 options.AddStackExchangeRedis(redis =>
                 {
-                    redis.Configuration = "localhost:6379,abortConnect=false";
+                    redis.Configuration = "localhost:16379,abortConnect=false";
                 });
             });
         });
@@ -90,7 +90,7 @@ public class ServiceExtensionTests
         {
             options.AddStackExchangeRedis(redis =>
             {
-                redis.Configuration = "localhost:6379,abortConnect=false";
+                redis.Configuration = "localhost:16379,abortConnect=false";
             });
         });
 

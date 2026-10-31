@@ -13,6 +13,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Tests;
 
+[Collection(SharedStaticStateCollection.Name)]
 public class SharpTickerSchedulerBackgroundServiceTests
 {
     [Fact]

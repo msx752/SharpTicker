@@ -40,7 +40,7 @@ export class AddTimeTickerRequest {
     retries!:number;
     description!:string;
     executionTime?:string;
-    intervals?:number[];
+    retryIntervals?:number[];
 }
 
 export class UpdateTimeTickerRequest {
@@ -49,7 +49,7 @@ export class UpdateTimeTickerRequest {
     retries!:number;
     description!:string;
     executionTime?:string;
-    intervals?:number[];
+    retryIntervals?:number[];
 }
 
 export class AddChainJobsRequest {
@@ -58,7 +58,7 @@ export class AddChainJobsRequest {
   executionTime?: string | null;
   retries!: number;
   request!: string | null; // string that gets converted to bytes by custom converter, or null if not set
-  intervals?: number[];
+  retryIntervals?:number[];
   runCondition?: number;
   children?: AddChainJobsRequest[];
 }

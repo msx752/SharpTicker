@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Models;
@@ -12,7 +13,7 @@ namespace SharpTicker.Utilities
         private static readonly ConcurrentDictionary<Guid, TickerCancellationTokenDetails>  TickerCancellationTokens = new();
         private static readonly ConcurrentDictionary<Guid, ConcurrentHashSet<Guid>> ParentIdIndex = new();
 
-        internal static void AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue)
+        internal static void AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue, object owner = null)
         {
             var details = new TickerCancellationTokenDetails
             {
@@ -20,7 +21,8 @@ namespace SharpTicker.Utilities
                 Type = context.Type,
                 CancellationSource = cancellationSource,
                 IsDue = isDue,
-                ParentId = context.ParentId ?? Guid.Empty
+                ParentId = context.ParentId ?? Guid.Empty,
+                Owner = owner
             };
             
             TickerCancellationTokens.TryAdd(context.TickerId, details);
@@ -34,6 +36,17 @@ namespace SharpTicker.Utilities
             }
         }
         
+        /// <summary>
+        /// The jobs of one owner that are running now. This registry is shared by the whole process, so a host asks for the jobs it
+        /// started and does not wait for those of another host that lives in the same process. A job is in the list from the moment
+        /// it starts until its result has been written, so an empty list means every job has recorded how it ended.
+        /// </summary>
+        internal static RunningJob[] GetRunningJobs(object owner)
+            => TickerCancellationTokens
+                .Where(x => ReferenceEquals(x.Value.Owner, owner))
+                .Select(x => new RunningJob(x.Key, x.Value.FunctionName, x.Value.Type, x.Value.ParentId))
+                .ToArray();
+
         internal static bool RemoveTickerCancellationToken(Guid tickerId)
         {
             var removed = TickerCancellationTokens.TryRemove(tickerId, out var details);
@@ -184,6 +197,8 @@ namespace SharpTicker.Utilities
         public bool IsDue { get; set; }
         public CancellationTokenSource CancellationSource { get; set; }
         public Guid ParentId { get; set; }
+        // Who started the job, a host; not part of the public surface.
+        internal object Owner { get; set; }
     }
     
     /// <summary>
@@ -247,5 +262,22 @@ namespace SharpTicker.Utilities
         {
             _lock?.Dispose();
         }
+    }
+
+    /// <summary>A job that is running, as <see cref="TickerCancellationTokenManager.GetRunningJobs"/> reports it.</summary>
+    internal readonly struct RunningJob
+    {
+        public RunningJob(Guid tickerId, string functionName, TickerType type, Guid parentId)
+        {
+            TickerId = tickerId;
+            FunctionName = functionName;
+            Type = type;
+            ParentId = parentId;
+        }
+
+        public Guid TickerId { get; }
+        public string FunctionName { get; }
+        public TickerType Type { get; }
+        public Guid ParentId { get; }
     }
 }

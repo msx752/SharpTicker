@@ -6,7 +6,11 @@ import { tickerService } from '@/http/services/tickerService'
 import type { GetCronTickerResponse } from '@/http/services/types/cronTickerService.types'
 import { cronTickerService } from '@/http/services/cronTickerService'
 import { formatTime } from '@/utilities/dateTimeParser'
+import { copyText } from '@/utilities/clipboard'
+import { checkJson } from '@/utilities/jsonText'
+import { requestDataRule } from '@/utilities/requestRule'
 import cronstrue from 'cronstrue'
+import { findCronProblem, isValidCronExpression } from '@/utilities/cronExpression'
 const functionNamesStore = useFunctionNameStore()
 const getTickerRequestData = tickerService.getRequestData()
 const updateCronTicker = cronTickerService.updateCronTicker()
@@ -56,38 +60,18 @@ const formatJsonForDisplay = (json: string, isHtml: boolean = false) => {
   }
 }
 
-// Validate cron expression using cronstrue
-// Cronstrue will throw an error if the expression is invalid
-// We require 6-segment format (with seconds)
-const validateCronExpression = (value: string): boolean => {
-  if (!value) return false
-  
-  // Check if it has 6 segments (seconds included)
-  const segments = value.trim().split(/\s+/)
-  if (segments.length !== 6) {
-    return false
-  }
-  
-  try {
-    // Try to parse the expression with cronstrue
-    // If it's invalid, it will throw an error
-    cronstrue.toString(value)
-    return true
-  } catch (error) {
-    return false
-  }
-}
-
 // Get readable expression for display
 const readableExpression = computed(() => {
   const expression = values.expression
-  if (!expression || !validateCronExpression(expression)) {
+  if (!expression || !isValidCronExpression(expression)) {
     return ''
   }
   try {
     return cronstrue.toString(expression)
   } catch (error) {
-    return ''
+    // The expression is valid but cronstrue cannot put it in words, for example with a full day name. Say it is valid
+    // instead of falling back to the hint for an empty field.
+    return 'Valid expression'
   }
 })
 
@@ -102,10 +86,18 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
   },
   validationSchema: (validator) => ({
     functionName: validator.string().required('Function name is required'),
+    requestData: requestDataRule(validator),
     expression: validator
       .string()
       .required('Expression is required')
-      .test('valid-cron', 'Invalid expression. Must be a valid 6-segment cron expression (seconds minutes hours day month day-of-week)', validateCronExpression),
+      .test({
+        name: 'valid-cron',
+        // cronstrue only describes a valid expression; whether it is valid is decided by the same rules as on the server
+        test: (value, context) => {
+          const problem = findCronProblem(value)
+          return problem ? context.createError({ message: problem }) : true
+        },
+      }),
   }),
   onFieldUpdate: {
     functionName: (value, update) => {
@@ -170,7 +162,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             request: values.requestData,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           })
           .then(() => {
             emit('close')
@@ -184,7 +176,7 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
             request: values.requestData,
             retries: parseInt(`${values.retries}`),
             description: values.description,
-            intervals: comboBoxModel.value.map((item) => item.value),
+            retryIntervals: comboBoxModel.value.map((item) => item.value),
           })
           .then(() => {
             emit('close')
@@ -210,6 +202,48 @@ const reqyestType = computed(() => {
 
   return requestType == '' ? 'No request data' : requestType
 })
+
+// The request field is locked only when the selected function takes no request. An example can be
+// missing for a function that does (its type could not be turned into JSON), and the field must
+// stay editable then, as well as for a stored request that is being edited.
+const takesRequest = computed(() => {
+  const requestType = functionNamesStore.data?.find(
+    (x) => x.functionName == getFieldValue('functionName'),
+  )?.functionRequestNamespace
+
+  return !!requestType || !!getFieldValue('requestData')
+})
+const hasExample = computed(() => formatJsonForDisplay(getFieldValue('exampleData'), false) !== undefined)
+const requestHint = computed(() => {
+  if (!getFieldValue('functionName')) return 'Select a function first.'
+  if (!takesRequest.value) return 'This function takes no request data.'
+  if (!hasExample.value) return 'No example is available for this request type. Enter the JSON by hand.'
+  return ''
+})
+
+const requestCheck = computed(() => checkJson(getFieldValue('requestData')))
+const canFormat = computed(() => {
+  const check = requestCheck.value
+  return (
+    takesRequest.value &&
+    check.valid &&
+    check.formatted !== '' &&
+    check.formatted !== getFieldValue('requestData')
+  )
+})
+const formatRequest = () => {
+  const check = requestCheck.value
+  if (check.valid && check.formatted) setFieldValue('requestData', check.formatted)
+}
+
+const exampleCopied = ref(false)
+const copyExample = async () => {
+  const text = formatJsonForDisplay(getFieldValue('exampleData'), false)
+  if (text === undefined || !(await copyText(text))) return
+
+  exampleCopied.value = true
+  setTimeout(() => (exampleCopied.value = false), 1500)
+}
 
 const comboBoxFilter = (_: any, queryText: any, item: any) => {
   const toLowerCaseString = (val: any) => String(val != null ? val : '').toLowerCase()
@@ -295,7 +329,17 @@ defineExpose({
                 <v-card-item>
                   <template v-slot:append>
                     <v-btn
+                      :icon="exampleCopied ? 'mdi-check' : 'mdi-content-copy'"
+                      :disabled="!hasExample"
+                      title="Copy the example"
+                      variant="text"
+                      @click="copyExample"
+                    ></v-btn>
+                    <v-btn
                       icon="mdi-share-outline"
+                      :disabled="!hasExample"
+                      title="Use the example as the request"
+                      variant="text"
                       @click="setFieldValue('requestData', getFieldValue('exampleData'))"
                     ></v-btn>
                   </template>
@@ -305,7 +349,8 @@ defineExpose({
                 </v-card-item>
 
                 <v-card-text>
-                  <div v-html="formatJsonForDisplay(getFieldValue('exampleData'), true)"></div>
+                  <pre v-if="hasExample" class="example-json">{{ formatJsonForDisplay(getFieldValue('exampleData'), false) }}</pre>
+                  <div v-else class="text-medium-emphasis">No example available.</div>
                 </v-card-text>
               </v-card>
             </v-container>
@@ -433,14 +478,25 @@ defineExpose({
                     </v-combobox>
                   </v-col>
                   <v-col cols="12">
+                    <div class="d-flex justify-end mb-1">
+                      <v-btn
+                        size="small"
+                        variant="text"
+                        prepend-icon="mdi-code-braces"
+                        :disabled="!canFormat"
+                        @click="formatRequest"
+                      >
+                        Format JSON
+                      </v-btn>
+                    </div>
                     <v-textarea
                       rows="10"
                       v-bind="bindField('requestData')"
                       label="Request Data"
                       variant="outlined"
-                      :disabled="
-                        formatJsonForDisplay(getFieldValue('exampleData'), false) == undefined
-                      "
+                      :disabled="!takesRequest"
+                      :hint="requestHint"
+                      persistent-hint
                     />
                   </v-col>
                 </v-row>
@@ -460,3 +516,16 @@ defineExpose({
     </v-dialog>
   </div>
 </template>
+
+<style scoped>
+.example-json {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+</style>

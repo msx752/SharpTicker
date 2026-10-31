@@ -38,7 +38,7 @@ TickerFunctionAttribute(string functionName, TickerTaskPriority taskPriority, in
 
 ### Supported method shapes
 
-The source generator checks every job method and reports problems as compile errors (`TQ001` to `TQ011`):
+The source generator checks every job method and reports problems as compile errors (`ST001` to `ST011`):
 
 - The class and the method are `public` or `internal`. The class is not abstract and not nested.
 - The method is static or an instance method, synchronous or `async`.
@@ -57,7 +57,7 @@ public class InvoiceJobs(IInvoiceService invoices, ILogger<InvoiceJobs> logger)
 }
 ```
 
-If the class has several constructors, mark the one to use with `[SharpTickerConstructor]`. Otherwise the first one is used and the generator warns (`TQ006`).
+If the class has several constructors, mark the one to use with `[SharpTickerConstructor]`. Otherwise the first one is used and the generator warns (`ST006`).
 
 ## Job context
 
@@ -74,6 +74,14 @@ If the class has several constructors, mark the one to use with `[SharpTickerCon
 | `RetryCount` | How many retries happened before this attempt. |
 | `RequestCancellation()` | Cancels this run. |
 | `CronOccurrenceOperations.SkipIfAlreadyRunning()` | For cron runs: skips this occurrence if the previous one is still running. |
+
+### Cancellation
+
+A run is cancelled by `RequestCancellation()`, by the cancel button in the dashboard, or by the application stopping. Pass the `CancellationToken` on to what the job awaits. When the job then throws `TaskCanceledException`, or `OperationCanceledException` (which is what `cancellationToken.ThrowIfCancellationRequested()` throws), the run is recorded as `Cancelled`, not `Failed`, and is not retried. An `OperationCanceledException` that nobody asked for, such as a timeout inside the job, is an ordinary failure and follows the retry rules. That includes the `TaskCanceledException` that `HttpClient` throws when its own timeout runs out: it carries a `TimeoutException` and the job's token was not cancelled, so the run is recorded as `Failed` and retried.
+
+A job that runs at once, because it was added for now, is not tied to the request that added it: it keeps running after that request has ended and is cancelled only by the cases above.
+
+When the application stops, the scheduler waits for the jobs that are running, for a little less than the host's shutdown timeout (`HostOptions.ShutdownTimeout`, 30 seconds by default), so a job that honors its token can record that it was cancelled before the host disposes its services. A job that is still running when the wait ends is recorded as `Cancelled` and its lock is released; it is not retried. A job that ignores its token keeps running until the process ends, and it delays the stop by the whole wait, so pass the token on to what the job awaits. If your jobs need longer to wind down, raise the shutdown timeout of the host, and on Kubernetes the termination grace period with it.
 
 ## Payloads
 
@@ -106,6 +114,8 @@ await tickers.AddAsync(new TimeTickerEntity
 ```
 
 Requests are stored as JSON. For trimmed or AOT applications, pass a source-generated `JsonTypeInfo<T>` to `CreateTickerRequest`, or register a context with `WithJsonContext(...)` on the options builder. `UseGZipCompression()` compresses stored requests; it is off by default.
+
+The dashboard offers an example request for every job that takes one. It builds the example from the same serializer options, so in a trimmed or AOT application only request types that are listed in the registered context get an example; for the others the request field stays editable and you enter the JSON by hand.
 
 ## Code-first registration
 
