@@ -230,12 +230,13 @@ public class SharpTickerTaskSchedulerResilienceTests
         using var holdLeaving = new ManualResetEventSlim(false);
         var started = new CountdownEvent(2);
         var leaving = 0;
-        scheduler.OnWorkerLeaving = () => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
+        scheduler.OnWorkerLeaving = _ => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
 
         // Two jobs that block, so both workers exist.
         for (var i = 0; i < 2; i++)
             await scheduler.QueueAsync(_ => { started.Signal(); holdJobs.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
-        Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the two workers did not start");
+        Assert.True(started.Wait(TimeSpan.FromSeconds(10)),
+            $"the two workers did not start: {2 - started.CurrentCount} jobs started, {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
 
         holdJobs.Set();
         Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2),
@@ -248,6 +249,44 @@ public class SharpTickerTaskSchedulerResilienceTests
         var finished = await Task.WhenAny(ran.Task, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.True(ReferenceEquals(finished, ran.Task),
             $"the job was left in the queue: {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
+    }
+
+    /// <summary>
+    /// A worker's id picks the queue it owns. When a worker from the middle leaves, the next worker has to take the id that
+    /// became free, not the id of a worker that is still running, or two workers share a queue and one queue has no owner.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerStartedAfterOneFromTheMiddleLeft_TakesTheFreeId()
+    {
+        await using var scheduler = new SharpTickerTaskScheduler(3, idleWorkerTimeout: TimeSpan.Zero);
+        using var holdJobs = new ManualResetEventSlim(false);
+        using var holdOthers = new ManualResetEventSlim(false);
+        using var holdNewJob = new ManualResetEventSlim(false);
+        var started = new CountdownEvent(3);
+        var startedIds = new ConcurrentQueue<int>();
+        // Only worker 1 is let through, so workers 0 and 2 keep running while it leaves.
+        scheduler.OnWorkerLeaving = id => { if (id != 1) holdOthers.Wait(); };
+        try
+        {
+            for (var i = 0; i < 3; i++)
+                await scheduler.QueueAsync(_ => { started.Signal(); holdJobs.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the three workers did not start");
+
+            scheduler.OnWorkerThreadStarting = startedIds.Enqueue;
+            holdJobs.Set();
+            Assert.True(await WaitUntilAsync(() => scheduler.ActiveWorkers == 2), $"worker 1 did not leave: {scheduler.ActiveWorkers} workers");
+
+            await scheduler.QueueAsync(_ => { holdNewJob.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+
+            Assert.True(await WaitUntilAsync(() => !startedIds.IsEmpty), "no worker was started for the queued job");
+            Assert.Equal(1, startedIds.First());
+        }
+        finally
+        {
+            holdJobs.Set();
+            holdOthers.Set();
+            holdNewJob.Set();
+        }
     }
 
     /// <summary>
@@ -269,18 +308,19 @@ public class SharpTickerTaskSchedulerResilienceTests
             using var holdLeaving = new ManualResetEventSlim(false);
             var started = new CountdownEvent(2);
             var leaving = 0;
-            scheduler.OnWorkerLeaving = () => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
+            scheduler.OnWorkerLeaving = _ => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
 
             for (var i = 0; i < 2; i++)
                 await scheduler.QueueAsync(_ => { started.Signal(); holdJobs.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
-            Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the two workers did not start");
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)),
+            $"the two workers did not start: {2 - started.CurrentCount} jobs started, {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
             holdJobs.Set();
             Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2),
                 $"the two workers did not decide to leave: {Volatile.Read(ref leaving)} did, {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
 
             var first = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             await scheduler.QueueAsync(_ => { first.TrySetResult(true); return Task.CompletedTask; }, TickerTaskPriority.Normal);
-            scheduler.OnWorkerThreadStarting = () => throw new InvalidOperationException(failure);
+            scheduler.OnWorkerThreadStarting = _ => throw new InvalidOperationException(failure);
             holdLeaving.Set();
 
             Assert.True(await WaitUntilAsync(() => scheduler.ActiveWorkers == 0),

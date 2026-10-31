@@ -18,6 +18,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     
     // Worker queues for work stealing
     private readonly ConcurrentQueue<WorkItem>[] _workerQueues;
+    // 1 while a running worker holds the id (the index of its queue), 0 while the id is free
+    private readonly int[] _workerSlots;
     
     // Global state
     private volatile int _totalQueuedTasks;
@@ -34,16 +36,16 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
     
     /// <summary>
-    /// Called when a worker has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
+    /// Called with the worker's id when it has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
     /// worker at that point, so a job can be queued in the moment between the decision and the count.
     /// </summary>
-    internal Action OnWorkerLeaving;
+    internal Action<int> OnWorkerLeaving;
 
     /// <summary>
-    /// Called right before a new worker thread is started. Tests throw from it to see what happens when the operating
+    /// Called with the new worker's id right before its thread is started. Tests throw from it to see what happens when the operating
     /// system refuses another thread.
     /// </summary>
-    internal Action OnWorkerThreadStarting;
+    internal Action<int> OnWorkerThreadStarting;
 
     // Thread-local flag to detect if we're on a SharpTicker worker thread
     [ThreadStatic] public static bool IsSharpTickerWorkerThread;
@@ -64,6 +66,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         _shutdownToken = _shutdownCts.Token;
 
         // Initialize all worker queues upfront for simplicity
+        _workerSlots = new int[maxConcurrency];
         _workerQueues = new ConcurrentQueue<WorkItem>[maxConcurrency];
         for (int i = 0; i < maxConcurrency; i++)
         {
@@ -190,21 +193,23 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         if (Interlocked.CompareExchange(ref _activeWorkers, currentWorkers + 1, currentWorkers) == currentWorkers)
         {
             // Successfully reserved a worker slot
-            var workerId = currentWorkers; // Use the slot we just reserved
+            var workerId = -1;
             try
             {
+                workerId = ReserveWorkerId();
                 var thread = new Thread(() => WorkerLoop(workerId))
                 {
                     IsBackground = true,
                     Name = $"SharpTicker.Worker-{workerId}"
                 };
-                OnWorkerThreadStarting?.Invoke();
+                OnWorkerThreadStarting?.Invoke(workerId);
                 thread.Start();
             }
             catch
             {
                 // No thread was started, so nobody will count this slot out. Give it back, or the pool stays one worker
                 // short for good. The caller still sees the exception.
+                ReleaseWorkerId(workerId);
                 Interlocked.Decrement(ref _activeWorkers);
                 throw;
             }
@@ -212,7 +217,29 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             _notifyDebounce.NotifySafely(_activeWorkers);
         }
     }
-    
+
+    // A worker's id is the index of the queue it owns, so two running workers must never share one. Workers can leave from
+    // anywhere in the range, which makes the number of running workers a wrong id for the next one: it can be the id of a
+    // worker that is still running, while the id that became free has no owner.
+    private int ReserveWorkerId()
+    {
+        // A free slot exists: the count was raised before this call and a worker gives its slot back before it lowers the
+        // count, so fewer than _maxConcurrency slots can be in use.
+        for (var i = 0; i < _workerSlots.Length; i++)
+        {
+            if (Interlocked.CompareExchange(ref _workerSlots[i], 1, 0) == 0)
+                return i;
+        }
+
+        throw new InvalidOperationException("No free worker id although fewer workers than the maximum are counted.");
+    }
+
+    private void ReleaseWorkerId(int workerId)
+    {
+        if (workerId >= 0)
+            Volatile.Write(ref _workerSlots[workerId], 0);
+    }
+
     private void WorkerLoop(int workerId)
     {
         // Set thread-local state
@@ -232,6 +259,9 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         finally
         {
             SynchronizationContext.SetSynchronizationContext(originalContext);
+            // The id goes back before the count goes down, so a worker that is started because the count is lower can
+            // always find a free id.
+            ReleaseWorkerId(workerId);
             Interlocked.Decrement(ref _activeWorkers);
             _notifyDebounce.NotifySafely(_activeWorkers);
 
@@ -307,7 +337,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     // Only exit if there's really no work and we have minimum workers
                     if (!anyWorkRemaining && _totalQueuedTasks == 0 && _activeWorkers > 1)
                     {
-                        OnWorkerLeaving?.Invoke();
+                        OnWorkerLeaving?.Invoke(workerId);
                         break; // Exit this worker
                     }
                     
