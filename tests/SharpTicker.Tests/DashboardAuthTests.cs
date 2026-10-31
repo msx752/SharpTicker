@@ -135,6 +135,7 @@ public abstract class DashboardAuthTests<TFixture> : IClassFixture<TFixture> whe
 }
 
 /// <summary>The dashboard authentication tests with Basic credentials.</summary>
+[Collection(SharedStaticStateCollection.Name)]
 public class BasicAuthDashboardTests : DashboardAuthTests<BasicAuthDashboardFixture>
 {
     public BasicAuthDashboardTests(BasicAuthDashboardFixture fixture) : base(fixture) { }
@@ -144,6 +145,7 @@ public class BasicAuthDashboardTests : DashboardAuthTests<BasicAuthDashboardFixt
 }
 
 /// <summary>The dashboard authentication tests with an API key.</summary>
+[Collection(SharedStaticStateCollection.Name)]
 public class ApiKeyDashboardTests : DashboardAuthTests<ApiKeyDashboardFixture>
 {
     public ApiKeyDashboardTests(ApiKeyDashboardFixture fixture) : base(fixture) { }
@@ -153,6 +155,7 @@ public class ApiKeyDashboardTests : DashboardAuthTests<ApiKeyDashboardFixture>
 }
 
 /// <summary>The dashboard authentication tests with a custom check.</summary>
+[Collection(SharedStaticStateCollection.Name)]
 public class CustomAuthDashboardTests : DashboardAuthTests<CustomAuthDashboardFixture>
 {
     public CustomAuthDashboardTests(CustomAuthDashboardFixture fixture) : base(fixture) { }
