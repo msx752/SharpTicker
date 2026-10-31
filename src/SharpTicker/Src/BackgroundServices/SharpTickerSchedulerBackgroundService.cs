@@ -1,13 +1,16 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using SharpTicker.SharpTickerThreadPool;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
+using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.BackgroundServices;
 
@@ -21,6 +24,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     private readonly ISharpTickerTaskScheduler  _taskScheduler;
     private readonly ITickerExecutionTaskHandler  _taskHandler;
     private readonly ITickerFunctionConcurrencyGate _concurrencyGate;
+    private readonly ILogger<SharpTickerSchedulerBackgroundService> _logger;
+    private readonly ITickerClock _clock;
     private int _started;
     public bool SkipFirstRun;
     public bool IsRunning => _started == 1;
@@ -32,8 +37,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ISharpTickerTaskScheduler taskScheduler,
         IInternalTickerManager  internalTickerManager,
         SchedulerOptionsBuilder schedulerOptions,
-        ITickerFunctionConcurrencyGate concurrencyGate)
+        ITickerFunctionConcurrencyGate concurrencyGate,
+        ILogger<SharpTickerSchedulerBackgroundService> logger = null,
+        ITickerClock clock = null)
     {
+        _logger = logger;
+        _clock = clock;
         _executionContext = executionContext;
         _taskHandler = taskHandler;
         _taskScheduler = taskScheduler;
@@ -217,6 +226,86 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _taskScheduler.Freeze();
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
+        await WaitForRunningJobsAsync(cancellationToken);
+    }
+
+    // The jobs run on the scheduler's workers, not inside this service, so stopping the service did not wait for them. The
+    // host then disposed its services under them: a job that honored the cancellation could not write that it was cancelled
+    // and stayed InProgress. The wait is bounded, because a job that ignores its token cannot be stopped and whatever ends the
+    // process, an orchestrator that runs out of patience for one, will not wait for it either. What is still running at the end
+    // is recorded as cancelled, with its lock released. The host waits for this method even after its own shutdown timeout has
+    // passed and cancelled the token, so recording the outcome then still happens before it disposes its services.
+    private const int MaxJobsInLog = 10;
+
+    /// <summary>
+    /// How long the stop waits for the running jobs. Shorter than the 30 seconds that the host and Kubernetes give by default,
+    /// so there is time left to record the jobs that did not finish. The wait also ends when the host cancels the token it
+    /// passes to <see cref="StopAsync"/>, which it does at its own shutdown timeout. Tests shorten it.
+    /// </summary>
+    internal TimeSpan ShutdownWaitLimit { get; set; } = TimeSpan.FromSeconds(20);
+
+    private async Task WaitForRunningJobsAsync(CancellationToken hostToken)
+    {
+        var running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
+        if (running.Length == 0)
+            return;
+
+        _logger?.LogWarning("The application is stopping and {JobCount} job(s) are running. Waiting for them to finish: {Jobs}.",
+            running.Length, DescribeJobs(running));
+
+        var limit = ShutdownWaitLimit;
+        var waited = Stopwatch.StartNew();
+        while (running.Length > 0 && waited.Elapsed < limit && !hostToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(25), hostToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
+        }
+
+        if (running.Length == 0)
+            return;
+
+        var now = _clock?.UtcNow ?? DateTime.UtcNow;
+        foreach (var job in running)
+        {
+            var context = new InternalFunctionContext
+            {
+                TickerId = job.TickerId,
+                FunctionName = job.FunctionName,
+                Type = job.Type,
+                ParentId = job.ParentId == Guid.Empty ? null : job.ParentId
+            };
+            context.SetProperty(x => x.Status, TickerStatus.Cancelled)
+                .SetProperty(x => x.ExecutedAt, now)
+                .SetProperty(x => x.ExceptionDetails, "The application stopped before the job finished.")
+                .SetProperty(x => x.ReleaseLock, true);
+
+            try
+            {
+                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Could not record job {FunctionName} ({TickerId}) as Cancelled when the application stopped.", job.FunctionName, job.TickerId);
+            }
+        }
+
+        _logger?.LogWarning("{JobCount} job(s) had not finished when the wait for them ended and are recorded as Cancelled: {Jobs}. " +
+                            "A job that ignores its cancellation token keeps running until the process ends.",
+            running.Length, DescribeJobs(running));
+    }
+
+    private static string DescribeJobs(RunningJob[] jobs)
+    {
+        var listed = string.Join(", ", jobs.Take(MaxJobsInLog).Select(j => $"{j.FunctionName} ({j.TickerId})"));
+        return jobs.Length > MaxJobsInLog ? $"{listed} and {jobs.Length - MaxJobsInLog} more" : listed;
     }
 
     public override void Dispose()

@@ -164,7 +164,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
 
         // IMPORTANT: Register the ticker FIRST, before creating the SkipIfAlreadyRunningAction callback
         // This ensures the current occurrence is properly tracked when the callback checks for siblings
-        TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue);
+        TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this);
 
         var tickerFunctionContext = new TickerFunctionContext
         {
