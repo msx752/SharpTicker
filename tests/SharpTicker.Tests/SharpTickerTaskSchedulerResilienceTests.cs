@@ -251,6 +251,57 @@ public class SharpTickerTaskSchedulerResilienceTests
     }
 
     /// <summary>
+    /// The last workers leave together and the one that looks at the queue again cannot start a replacement because the
+    /// operating system refuses another thread. That must not end the process, the reserved worker slot must be given
+    /// back, and the job must still run once a worker can be started.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerThatCannotBeStartedWhenTheLastWorkersLeave_DoesNotEndTheProcessOrShrinkThePool()
+    {
+        const string failure = "simulated thread start failure";
+        var unhandled = new ConcurrentQueue<Exception>();
+        UnhandledExceptionEventHandler record = (_, e) => { if (e.ExceptionObject is Exception x && x.Message == failure) unhandled.Enqueue(x); };
+        AppDomain.CurrentDomain.UnhandledException += record;
+        try
+        {
+            await using var scheduler = new SharpTickerTaskScheduler(2, idleWorkerTimeout: TimeSpan.Zero);
+            using var holdJobs = new ManualResetEventSlim(false);
+            using var holdLeaving = new ManualResetEventSlim(false);
+            var started = new CountdownEvent(2);
+            var leaving = 0;
+            scheduler.OnWorkerLeaving = () => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
+
+            for (var i = 0; i < 2; i++)
+                await scheduler.QueueAsync(_ => { started.Signal(); holdJobs.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+            Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the two workers did not start");
+            holdJobs.Set();
+            Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2),
+                $"the two workers did not decide to leave: {Volatile.Read(ref leaving)} did, {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
+
+            var first = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await scheduler.QueueAsync(_ => { first.TrySetResult(true); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+            scheduler.OnWorkerThreadStarting = () => throw new InvalidOperationException(failure);
+            holdLeaving.Set();
+
+            Assert.True(await WaitUntilAsync(() => scheduler.ActiveWorkers == 0),
+                $"the reserved worker slot was not given back: {scheduler.ActiveWorkers} workers counted");
+            await Task.Delay(200);
+            Assert.True(unhandled.IsEmpty, $"the leaving worker threw: {unhandled.FirstOrDefault()}");
+            Assert.Equal(1, scheduler.TotalQueuedTasks);
+
+            scheduler.OnWorkerThreadStarting = null;
+            var second = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await scheduler.QueueAsync(_ => { second.TrySetResult(true); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+
+            await Task.WhenAll(first.Task, second.Task).WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            AppDomain.CurrentDomain.UnhandledException -= record;
+        }
+    }
+
+    /// <summary>
     /// Disposing waits five seconds for the workers and then disposes the shutdown source. A job that blocks its worker
     /// thread is still running by then, and when it ends the worker looks at the shutdown token once more. That must not
     /// throw: the worker runs on a plain thread, so an exception there takes the whole process down.

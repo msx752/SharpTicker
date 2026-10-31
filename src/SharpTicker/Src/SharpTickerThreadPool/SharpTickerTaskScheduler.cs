@@ -33,13 +33,19 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private readonly CancellationToken _shutdownToken;
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
     
-    // Thread-local flag to detect if we're on a SharpTicker worker thread
     /// <summary>
     /// Called when a worker has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
     /// worker at that point, so a job can be queued in the moment between the decision and the count.
     /// </summary>
     internal Action OnWorkerLeaving;
 
+    /// <summary>
+    /// Called right before a new worker thread is started. Tests throw from it to see what happens when the operating
+    /// system refuses another thread.
+    /// </summary>
+    internal Action OnWorkerThreadStarting;
+
+    // Thread-local flag to detect if we're on a SharpTicker worker thread
     [ThreadStatic] public static bool IsSharpTickerWorkerThread;
     [ThreadStatic] private static int _threadWorkerIndex = -1;
     
@@ -185,13 +191,24 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         {
             // Successfully reserved a worker slot
             var workerId = currentWorkers; // Use the slot we just reserved
-            var thread = new Thread(() => WorkerLoop(workerId))
+            try
             {
-                IsBackground = true,
-                Name = $"SharpTicker.Worker-{workerId}"
-            };
-            thread.Start();
-            
+                var thread = new Thread(() => WorkerLoop(workerId))
+                {
+                    IsBackground = true,
+                    Name = $"SharpTicker.Worker-{workerId}"
+                };
+                OnWorkerThreadStarting?.Invoke();
+                thread.Start();
+            }
+            catch
+            {
+                // No thread was started, so nobody will count this slot out. Give it back, or the pool stays one worker
+                // short for good. The caller still sees the exception.
+                Interlocked.Decrement(ref _activeWorkers);
+                throw;
+            }
+
             _notifyDebounce.NotifySafely(_activeWorkers);
         }
     }
@@ -223,7 +240,18 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             // with nobody to take it. Look again now that the count is down: either the queueing side sees the lower
             // count, or this check sees its job.
             if (_totalQueuedTasks > 0 && !_disposed && !_shutdownCts.IsCancellationRequested)
-                EnsureWorkerAvailable();
+            {
+                try
+                {
+                    EnsureWorkerAvailable();
+                }
+                catch
+                {
+                    // This runs on a plain thread, where an exception ends the process, and the one thing that can throw
+                    // here is the operating system refusing another thread. The job stays queued and the next job that is
+                    // queued starts a worker again, which is where this exception would have gone anyway.
+                }
+            }
         }
     }
     
