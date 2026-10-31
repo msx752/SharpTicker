@@ -27,6 +27,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private volatile int _nextQueueIndex;
     
     private readonly CancellationTokenSource _shutdownCts = new();
+    // Read this, not _shutdownCts.Token: the source is disposed at the end of DisposeAsync, and Token throws once it is
+    // disposed, while a copy of the token keeps answering. A worker still inside a job at that point looks at the token
+    // when the job ends, on a plain thread where an exception ends the process.
+    private readonly CancellationToken _shutdownToken;
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
     
     // Thread-local flag to detect if we're on a SharpTicker worker thread
@@ -51,7 +55,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         _idleWorkerTimeout = idleWorkerTimeout ?? TimeSpan.FromSeconds(60);
         _maxCapacityPerWorker = 1024; // Fixed optimal capacity
         _notifyDebounce = notifyDebounce ?? new SoftSchedulerNotifyDebounce(_ => { });
-        
+        _shutdownToken = _shutdownCts.Token;
+
         // Initialize all worker queues upfront for simplicity
         _workerQueues = new ConcurrentQueue<WorkItem>[maxConcurrency];
         for (int i = 0; i < maxConcurrency; i++)
@@ -228,7 +233,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         var localQueue = _workerQueues[workerId];
         var consecutiveStealFailures = 0;
         
-        while (!_shutdownCts.Token.IsCancellationRequested && !_disposed)
+        while (!_shutdownToken.IsCancellationRequested && !_disposed)
         {
             WorkItem workItem = default;
             bool foundWork = false;
@@ -343,7 +348,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         try
         {
             // Check cancellation before executing
-            if (!workItem.UserToken.IsCancellationRequested && !_shutdownCts.Token.IsCancellationRequested)
+            if (!workItem.UserToken.IsCancellationRequested && !_shutdownToken.IsCancellationRequested)
             {
                 // Start the work without awaiting it so this worker
                 // can continue processing other items while the task awaits.
@@ -401,7 +406,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     /// </summary>
     internal void PostContinuation(SendOrPostCallback callback, object state)
     {
-        if (_disposed || _shutdownCts.Token.IsCancellationRequested)
+        if (_disposed || _shutdownToken.IsCancellationRequested)
             return;
         
         // Continuations get queued to the current worker's queue if possible

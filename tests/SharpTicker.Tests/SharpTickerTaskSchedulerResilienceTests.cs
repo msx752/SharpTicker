@@ -238,7 +238,8 @@ public class SharpTickerTaskSchedulerResilienceTests
         Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the two workers did not start");
 
         holdJobs.Set();
-        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2), "the two workers did not decide to leave");
+        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2),
+            $"the two workers did not decide to leave: {Volatile.Read(ref leaving)} did, {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
 
         var ran = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         await scheduler.QueueAsync(_ => { ran.TrySetResult(true); return Task.CompletedTask; }, TickerTaskPriority.Normal);
@@ -247,6 +248,39 @@ public class SharpTickerTaskSchedulerResilienceTests
         var finished = await Task.WhenAny(ran.Task, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.True(ReferenceEquals(finished, ran.Task),
             $"the job was left in the queue: {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
+    }
+
+    /// <summary>
+    /// Disposing waits five seconds for the workers and then disposes the shutdown source. A job that blocks its worker
+    /// thread is still running by then, and when it ends the worker looks at the shutdown token once more. That must not
+    /// throw: the worker runs on a plain thread, so an exception there takes the whole process down.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerStillInsideAJobWhenTheSchedulerIsDisposed_LeavesQuietlyWhenTheJobEnds()
+    {
+        var unhandled = new ConcurrentQueue<Exception>();
+        UnhandledExceptionEventHandler record = (_, e) => { if (e.ExceptionObject is ObjectDisposedException x) unhandled.Enqueue(x); };
+        AppDomain.CurrentDomain.UnhandledException += record;
+        try
+        {
+            var scheduler = new SharpTickerTaskScheduler(2);
+            using var holdJob = new ManualResetEventSlim(false);
+            var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await scheduler.QueueAsync(_ => { started.TrySetResult(true); holdJob.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            await scheduler.DisposeAsync();
+            Assert.Equal(1, scheduler.ActiveWorkers);
+
+            holdJob.Set();
+            Assert.True(await WaitUntilAsync(() => scheduler.ActiveWorkers == 0), "the worker did not leave after its job ended");
+            await Task.Delay(200);
+            Assert.True(unhandled.IsEmpty, $"the worker threw after the scheduler was disposed: {unhandled.FirstOrDefault()}");
+        }
+        finally
+        {
+            AppDomain.CurrentDomain.UnhandledException -= record;
+        }
     }
 
     [Fact]
