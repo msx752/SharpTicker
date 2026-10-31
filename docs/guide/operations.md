@@ -70,6 +70,17 @@ The handler is a singleton. Retries are configured per ticker; see [Scheduling](
 
 When the dashboard refuses an add or update, for example for an invalid cron expression, it logs a warning with the reason. A failure of the store is logged as an error with the exception. Both use the `SharpTicker.Dashboard.Endpoints.DashboardEndpoints` logger category. The browser gets the reason only for a refusal; for a failure of the store it gets a short message, so table and constraint names stay out of the page.
 
+### Scheduler log entries
+
+A job reports its own failure through the exception handler above. These entries are for what goes wrong around the jobs, and none of them is written when everything is fine:
+
+| Category | Level | What happened |
+|---|---|---|
+| `SharpTicker.TaskScheduler` | Error | A job threw an exception that nothing handled, or the scheduler could not start a worker thread. The scheduler keeps running. |
+| `SharpTicker.TaskScheduler` | Warning | The scheduler was disposed with queued jobs that had not started. The number is in the entry. |
+| `SharpTicker.Dispatcher.SharpTickerDispatcher` | Warning | Jobs were dispatched while the application was stopping, so they will not start. The entry names each function and ticker id. Their tickers stay `InProgress`. |
+| `SharpTicker.EntityFrameworkCore.StartupRelease` | Error | Releasing the jobs that a dead node or an earlier run of this node left locked failed when the application started. |
+
 ## Tracing
 
 SharpTicker reports job execution through `System.Diagnostics.ActivitySource` with the source name **`SharpTicker`**.
