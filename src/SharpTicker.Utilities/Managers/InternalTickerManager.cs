@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Text.Json.Serialization.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
@@ -484,11 +485,31 @@ namespace SharpTicker.Utilities.Managers
 
         public async Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
         {
-            var cronOccurrence = _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken);
-            
-            var timeTickers = _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken);
-            
-            await Task.WhenAll(cronOccurrence, timeTickers).ConfigureAwait(false);
+            // One after the other: a store behind a single connection, such as an in-memory SQLite database, cannot run two
+            // operations at once, and these are two short statements. They do not depend on each other, so the second runs
+            // even when the first fails, and the first failure is the one that reaches the caller.
+            Exception failure = null;
+
+            try
+            {
+                await _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+
+            try
+            {
+                await _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                failure ??= ex;
+            }
+
+            if (failure != null)
+                ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 }

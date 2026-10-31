@@ -1117,4 +1117,48 @@ public class InternalTickerManagerTests
         await _notificationHub.Received(1)
             .UpdateCronOccurrenceFromInternalFunctionContext<FakeCronTicker>(Arg.Any<InternalFunctionContext>());
     }
+
+    /// <summary>
+    /// A store behind a single connection, such as an in-memory SQLite database, cannot run two operations at once, so the
+    /// release of a node's time tickers and of its occurrences must not overlap.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseDeadNodeResources_RunsTheTwoReleasesOneAfterTheOther()
+    {
+        var running = 0;
+        var mostAtOnce = 0;
+        async Task Release()
+        {
+            var now = Interlocked.Increment(ref running);
+            int seen;
+            while (now > (seen = Volatile.Read(ref mostAtOnce)) && Interlocked.CompareExchange(ref mostAtOnce, now, seen) != seen) { }
+            await Task.Delay(50);
+            Interlocked.Decrement(ref running);
+        }
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>()).Returns(_ => Release());
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>()).Returns(_ => Release());
+
+        await _manager.ReleaseDeadNodeResources("node-a");
+
+        await _persistence.Received(1).ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>());
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
+        Assert.Equal(1, mostAtOnce);
+    }
+
+    /// <summary>
+    /// The two releases do not depend on each other, so a failure of the first must not leave the second undone. The
+    /// failure still reaches the caller.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseDeadNodeResources_StillReleasesTheTimeTickers_WhenReleasingTheOccurrencesFails()
+    {
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromException(new InvalidOperationException("the store refused")));
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.ReleaseDeadNodeResources("node-a"));
+
+        Assert.Equal("the store refused", failure.Message);
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
+    }
 }
