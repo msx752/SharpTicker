@@ -137,15 +137,16 @@ public class SchedulerShutdownTests
     }
 
     /// <summary>
-    /// The host cancels the token it passes to StopAsync at its own shutdown timeout. When that is shorter than the wait limit the
-    /// wait ends there, and the outcome is still recorded before the host goes on to dispose its services.
+    /// The wait follows the host's shutdown timeout, the setting an application already manages for how long a stop may take: it
+    /// ends a little before it, so there is time left to record the jobs that did not finish, and the host is not the one that
+    /// gives up first.
     /// </summary>
     [Fact]
-    public async Task WhenTheHostTimeoutIsShorterThanTheWaitLimit_TheWaitEndsAtTheHostTimeout_AndTheJobIsStillRecorded()
+    public async Task TheWaitFollowsTheHostShutdownTimeout_AndEndsBeforeIt()
     {
+        var hostTimeout = TimeSpan.FromSeconds(3);
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var app = await StartAsync(s => s.MapTicker("ShutdownHostTimeout", async (_, _) => { started.TrySetResult(); await Task.Delay(TimeSpan.FromSeconds(30)); }),
-            shutdownTimeout: TimeSpan.FromSeconds(1));
+        var app = await StartAsync(s => s.MapTicker("ShutdownHostTimeout", async (_, _) => { started.TrySetResult(); await Task.Delay(TimeSpan.FromSeconds(30)); }), hostTimeout);
         var store = StoreOf(app);
         var job = await AddJobAsync(app, "ShutdownHostTimeout");
         await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -157,10 +158,21 @@ public class SchedulerShutdownTests
         var stored = await store.GetTimeTickerById(job.Id, default);
         await store.RemoveTimeTickers(new[] { job.Id }, default);
         await app.DisposeAsync();
-        Assert.True(took < TimeSpan.FromSeconds(10), $"stopping took {took.TotalMilliseconds:F0} ms, the wait limit is 20 s");
+        Assert.InRange(took, TimeSpan.FromSeconds(1.5), hostTimeout);
         Assert.Equal(TickerStatus.Cancelled, stored.Status);
         Assert.Null(stored.LockHolder);
     }
+
+    [Theory]
+    [InlineData(30_000, 25_000)]    // the host default: a fifth, at most five seconds, is left over
+    [InlineData(60_000, 55_000)]
+    [InlineData(10_000, 8_000)]
+    [InlineData(1_000, 800)]
+    [InlineData(100, 0)]            // too short for any wait
+    [InlineData(0, 25_000)]         // no limit set on the host: its default is used
+    [InlineData(-1, 25_000)]        // Timeout.InfiniteTimeSpan
+    public void TheWaitLimit_IsALittleLessThanTheHostShutdownTimeout(int hostTimeoutMs, int expectedMs)
+        => Assert.Equal(TimeSpan.FromMilliseconds(expectedMs), SharpTickerSchedulerBackgroundService.WaitLimitFor(TimeSpan.FromMilliseconds(hostTimeoutMs)));
 
     /// <summary>The same wait and the same outcome for a cron occurrence as for a time ticker.</summary>
     [Fact]

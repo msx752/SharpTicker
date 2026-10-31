@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SharpTicker.SharpTickerThreadPool;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Enums;
@@ -25,6 +26,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     private readonly ITickerExecutionTaskHandler  _taskHandler;
     private readonly ITickerFunctionConcurrencyGate _concurrencyGate;
     private readonly ILogger<SharpTickerSchedulerBackgroundService> _logger;
+    private readonly IOptions<HostOptions> _hostOptions;
     private readonly ITickerClock _clock;
     private int _started;
     public bool SkipFirstRun;
@@ -39,10 +41,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         SchedulerOptionsBuilder schedulerOptions,
         ITickerFunctionConcurrencyGate concurrencyGate,
         ILogger<SharpTickerSchedulerBackgroundService> logger = null,
-        ITickerClock clock = null)
+        ITickerClock clock = null,
+        IOptions<HostOptions> hostOptions = null)
     {
         _logger = logger;
         _clock = clock;
+        _hostOptions = hostOptions;
         _executionContext = executionContext;
         _taskHandler = taskHandler;
         _taskScheduler = taskScheduler;
@@ -238,11 +242,27 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     private const int MaxJobsInLog = 10;
 
     /// <summary>
-    /// How long the stop waits for the running jobs. Shorter than the 30 seconds that the host and Kubernetes give by default,
-    /// so there is time left to record the jobs that did not finish. The wait also ends when the host cancels the token it
-    /// passes to <see cref="StopAsync"/>, which it does at its own shutdown timeout. Tests shorten it.
+    /// Replaces the wait limit that follows the host's shutdown timeout. Tests use it to keep a stop short.
     /// </summary>
-    internal TimeSpan ShutdownWaitLimit { get; set; } = TimeSpan.FromSeconds(20);
+    internal TimeSpan? ShutdownWaitLimit { get; set; }
+
+    // The host's shutdown timeout is the setting an application already manages for how long a stop may take, so the wait follows it:
+    // a little less, so there is time left to record the jobs that did not finish. A timeout that is zero or infinite means the host
+    // sets no limit, and the default of the host, 30 seconds, is used. The wait also ends when the host cancels the token it passes
+    // to StopAsync, which it does at that timeout.
+    internal static TimeSpan WaitLimitFor(TimeSpan hostShutdownTimeout)
+    {
+        var timeout = hostShutdownTimeout <= TimeSpan.Zero || hostShutdownTimeout == Timeout.InfiniteTimeSpan
+            ? TimeSpan.FromSeconds(30)
+            : hostShutdownTimeout;
+
+        var margin = TimeSpan.FromTicks(timeout.Ticks / 5);
+        if (margin < TimeSpan.FromMilliseconds(200)) margin = TimeSpan.FromMilliseconds(200);
+        if (margin > TimeSpan.FromSeconds(5)) margin = TimeSpan.FromSeconds(5);
+
+        var limit = timeout - margin;
+        return limit > TimeSpan.Zero ? limit : TimeSpan.Zero;
+    }
 
     private async Task WaitForRunningJobsAsync(CancellationToken hostToken)
     {
@@ -253,7 +273,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _logger?.LogWarning("The application is stopping and {JobCount} job(s) are running. Waiting for them to finish: {Jobs}.",
             running.Length, DescribeJobs(running));
 
-        var limit = ShutdownWaitLimit;
+        var limit = ShutdownWaitLimit ?? WaitLimitFor(_hostOptions?.Value.ShutdownTimeout ?? TimeSpan.FromSeconds(30));
         var waited = Stopwatch.StartNew();
         while (running.Length > 0 && waited.Elapsed < limit && !hostToken.IsCancellationRequested)
         {
