@@ -1,3 +1,7 @@
+/**
+ * The JSON text of a request body in the dashboard: checking it, locating an error by line and column, and formatting
+ * it without changing the data (numbers as typed, key order, string contents).
+ */
 import { describe, expect, it } from 'vitest'
 import { checkJson, describeJsonError, indentJson } from '@/utilities/jsonText'
 

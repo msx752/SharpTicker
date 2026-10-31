@@ -1,3 +1,7 @@
+/**
+ * The request the Run again button sends: a new time ticker with the same function, request data, retries, retry
+ * intervals and description as the row, and no execution time so the server runs it at once.
+ */
 import { describe, expect, it } from 'vitest'
 import { buildRunAgainRequest } from '@/utilities/runAgain'
 

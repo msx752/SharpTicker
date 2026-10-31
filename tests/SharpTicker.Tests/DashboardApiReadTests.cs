@@ -445,12 +445,14 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     #endregion
 }
 
+/// <summary>The dashboard API read tests on the in-memory store.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class InMemoryDashboardApiReadTests : DashboardApiReadTests<InMemoryDashboardApiFixture>
 {
     public InMemoryDashboardApiReadTests(InMemoryDashboardApiFixture api) : base(api) { }
 }
 
+/// <summary>The dashboard API read tests on EF Core with SQLite, so the same answers are checked on a relational store.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class EfCoreDashboardApiReadTests : DashboardApiReadTests<EfCoreDashboardApiFixture>
 {

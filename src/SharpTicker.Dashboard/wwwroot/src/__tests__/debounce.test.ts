@@ -1,3 +1,7 @@
+/**
+ * The debounce helper the dashboard uses so a burst of events, such as many live updates in a row, causes one reload:
+ * the call runs once after the burst and receives the latest arguments.
+ */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { debounce } from '@/utilities/debounce'
 

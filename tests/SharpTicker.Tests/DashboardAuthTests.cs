@@ -11,16 +11,19 @@ using Xunit;
 
 namespace SharpTicker.Tests;
 
+/// <summary>A dashboard that asks for Basic credentials (user admin).</summary>
 public sealed class BasicAuthDashboardFixture : DashboardApiFixture
 {
     protected override void ConfigureDashboard(DashboardOptionsBuilder dashboard) => dashboard.WithBasicAuth("admin", "s3cret");
 }
 
+/// <summary>A dashboard that asks for an API key sent as a Bearer token.</summary>
 public sealed class ApiKeyDashboardFixture : DashboardApiFixture
 {
     protected override void ConfigureDashboard(DashboardOptionsBuilder dashboard) => dashboard.WithApiKey("key-123");
 }
 
+/// <summary>A dashboard whose credentials are checked by a function the application supplies.</summary>
 public sealed class CustomAuthDashboardFixture : DashboardApiFixture
 {
     protected override void ConfigureDashboard(DashboardOptionsBuilder dashboard) => dashboard.WithCustomAuth(value => value == "let-me-in");
@@ -131,6 +134,7 @@ public abstract class DashboardAuthTests<TFixture> : IClassFixture<TFixture> whe
     }
 }
 
+/// <summary>The dashboard authentication tests with Basic credentials.</summary>
 public class BasicAuthDashboardTests : DashboardAuthTests<BasicAuthDashboardFixture>
 {
     public BasicAuthDashboardTests(BasicAuthDashboardFixture fixture) : base(fixture) { }
@@ -139,6 +143,7 @@ public class BasicAuthDashboardTests : DashboardAuthTests<BasicAuthDashboardFixt
     protected override string WrongCredentials => "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes("admin:wrong"));
 }
 
+/// <summary>The dashboard authentication tests with an API key.</summary>
 public class ApiKeyDashboardTests : DashboardAuthTests<ApiKeyDashboardFixture>
 {
     public ApiKeyDashboardTests(ApiKeyDashboardFixture fixture) : base(fixture) { }
@@ -147,6 +152,7 @@ public class ApiKeyDashboardTests : DashboardAuthTests<ApiKeyDashboardFixture>
     protected override string WrongCredentials => "Bearer key-124";
 }
 
+/// <summary>The dashboard authentication tests with a custom check.</summary>
 public class CustomAuthDashboardTests : DashboardAuthTests<CustomAuthDashboardFixture>
 {
     public CustomAuthDashboardTests(CustomAuthDashboardFixture fixture) : base(fixture) { }

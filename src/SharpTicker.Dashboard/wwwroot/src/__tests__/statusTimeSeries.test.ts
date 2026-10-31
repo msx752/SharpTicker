@@ -1,3 +1,7 @@
+/**
+ * The status chart of the dashboard: how the per-day counts the server sends become series, legend, colours, axis and
+ * the message shown when nothing happened.
+ */
 import { describe, expect, it } from 'vitest'
 import { buildStatusChartOption, buildStatusTimeSeries, STATUS_COLORS, ZOOM_SLIDER_MIN_DAYS } from '@/utilities/statusTimeSeries'
 

@@ -1,3 +1,8 @@
+/**
+ * Which SignalR groups a dashboard page is in. A group is joined on the server when the connection is up, remembered
+ * when it is down, joined again after a reconnect, forgotten when left, and kept for the next reconnect when the
+ * server call fails.
+ */
 import { describe, expect, it, vi } from 'vitest'
 import { GroupMembership, type GroupConnection } from '@/hub/base/groupMembership'
 

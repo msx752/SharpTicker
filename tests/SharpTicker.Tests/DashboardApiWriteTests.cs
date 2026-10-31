@@ -449,11 +449,13 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     #endregion
 }
 
+/// <summary>The dashboard API write tests on the in-memory store.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class InMemoryDashboardApiWriteTests : DashboardApiWriteTests<InMemoryDashboardApiFixture>
 {
 }
 
+/// <summary>The dashboard API write tests on EF Core with SQLite, plus the test that needs a store that can fail.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class EfCoreDashboardApiWriteTests : DashboardApiWriteTests<EfCoreDashboardApiFixture>
 {

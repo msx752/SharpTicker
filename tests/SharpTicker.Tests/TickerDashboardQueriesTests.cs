@@ -233,12 +233,14 @@ public abstract class TickerDashboardQueriesTests<TFixture> : IClassFixture<TFix
     }
 }
 
+/// <summary>The queryable dashboard queries on the in-memory store.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class InMemoryTickerDashboardQueriesTests : TickerDashboardQueriesTests<InMemoryDashboardApiFixture>
 {
     public InMemoryTickerDashboardQueriesTests(InMemoryDashboardApiFixture fixture) : base(fixture) { }
 }
 
+/// <summary>The queryable dashboard queries on EF Core with SQLite.</summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class EfCoreTickerDashboardQueriesTests : TickerDashboardQueriesTests<EfCoreDashboardApiFixture>
 {
