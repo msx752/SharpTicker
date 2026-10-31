@@ -77,7 +77,7 @@ If the class has several constructors, mark the one to use with `[SharpTickerCon
 
 ### Cancellation
 
-A run is cancelled by `RequestCancellation()`, by the cancel button in the dashboard, or by the application stopping. Pass the `CancellationToken` on to what the job awaits. When the job then throws `TaskCanceledException`, or `OperationCanceledException` (which is what `cancellationToken.ThrowIfCancellationRequested()` throws), the run is recorded as `Cancelled`, not `Failed`, and is not retried. An `OperationCanceledException` that nobody asked for, such as a timeout inside the job, is an ordinary failure and follows the retry rules.
+A run is cancelled by `RequestCancellation()`, by the cancel button in the dashboard, or by the application stopping. Pass the `CancellationToken` on to what the job awaits. When the job then throws `TaskCanceledException`, or `OperationCanceledException` (which is what `cancellationToken.ThrowIfCancellationRequested()` throws), the run is recorded as `Cancelled`, not `Failed`, and is not retried. An `OperationCanceledException` that nobody asked for, such as a timeout inside the job, is an ordinary failure and follows the retry rules. That includes the `TaskCanceledException` that `HttpClient` throws when its own timeout runs out: it carries a `TimeoutException` and the job's token was not cancelled, so the run is recorded as `Failed` and retried.
 
 A job that runs at once, because it was added for now, is not tied to the request that added it: it keeps running after that request has ended and is cancelled only by the cases above.
 

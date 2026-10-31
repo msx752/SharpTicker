@@ -124,6 +124,20 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
     }
 
+    /// <summary>
+    /// Whether an OperationCanceledException that came out of a job means the job was cancelled, as opposed to failing.
+    /// </summary>
+    private static bool IsCancellation(OperationCanceledException exception, CancellationTokenSource jobToken)
+    {
+        // The job was asked to stop, by the cancel button, RequestCancellation or the application stopping.
+        if (jobToken.IsCancellationRequested)
+            return true;
+
+        // A cancelled task counts, except the one HttpClient throws when its own timeout runs out: the job was not cancelled,
+        // the request timed out, and a timeout is a failure that the retries are there for.
+        return exception is TaskCanceledException && exception.InnerException is not TimeoutException;
+    }
+
     private async Task RunContextFunctionAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken, bool isChild = false)
     {
         var typeName = TickerTypeNamesLower.GetValueOrDefault(context.Type, context.Type.ToString().ToLowerInvariant());
@@ -215,10 +229,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 context.RetryCount = attempt;
                 break;
             }
-            // A cancelled task always counts. A plain OperationCanceledException, which is what
-            // cancellationToken.ThrowIfCancellationRequested() throws, counts when this job's own token was cancelled,
-            // for example by the cancel button or by the application stopping; otherwise it is an ordinary failure.
-            catch (OperationCanceledException ex) when (ex is TaskCanceledException || cancellationTokenSource.IsCancellationRequested)
+            // A cancelled task counts, and so does any OperationCanceledException when this job's own token was cancelled,
+            // for example by the cancel button or by the application stopping. A plain OperationCanceledException that
+            // nobody asked for is an ordinary failure, and so is the TaskCanceledException that HttpClient throws when its own
+            // timeout runs out (see IsCancellation).
+            catch (OperationCanceledException ex) when (IsCancellation(ex, cancellationTokenSource))
             {
                 context.SetProperty(x => x.Status, TickerStatus.Cancelled)
                     .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
