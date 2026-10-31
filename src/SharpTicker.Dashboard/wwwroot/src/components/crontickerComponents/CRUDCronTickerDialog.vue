@@ -10,6 +10,7 @@ import { copyText } from '@/utilities/clipboard'
 import { checkJson } from '@/utilities/jsonText'
 import { requestDataRule } from '@/utilities/requestRule'
 import cronstrue from 'cronstrue'
+import { findCronProblem, isValidCronExpression } from '@/utilities/cronExpression'
 const functionNamesStore = useFunctionNameStore()
 const getTickerRequestData = tickerService.getRequestData()
 const updateCronTicker = cronTickerService.updateCronTicker()
@@ -59,38 +60,18 @@ const formatJsonForDisplay = (json: string, isHtml: boolean = false) => {
   }
 }
 
-// Validate cron expression using cronstrue
-// Cronstrue will throw an error if the expression is invalid
-// We require 6-segment format (with seconds)
-const validateCronExpression = (value: string): boolean => {
-  if (!value) return false
-  
-  // Check if it has 6 segments (seconds included)
-  const segments = value.trim().split(/\s+/)
-  if (segments.length !== 6) {
-    return false
-  }
-  
-  try {
-    // Try to parse the expression with cronstrue
-    // If it's invalid, it will throw an error
-    cronstrue.toString(value)
-    return true
-  } catch (error) {
-    return false
-  }
-}
-
 // Get readable expression for display
 const readableExpression = computed(() => {
   const expression = values.expression
-  if (!expression || !validateCronExpression(expression)) {
+  if (!expression || !isValidCronExpression(expression)) {
     return ''
   }
   try {
     return cronstrue.toString(expression)
   } catch (error) {
-    return ''
+    // The expression is valid but cronstrue cannot put it in words, for example with a full day name. Say it is valid
+    // instead of falling back to the hint for an empty field.
+    return 'Valid expression'
   }
 })
 
@@ -109,7 +90,14 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
     expression: validator
       .string()
       .required('Expression is required')
-      .test('valid-cron', 'Invalid expression. Must be a valid 6-segment cron expression (seconds minutes hours day month day-of-week)', validateCronExpression),
+      .test({
+        name: 'valid-cron',
+        // cronstrue only describes a valid expression; whether it is valid is decided by the same rules as on the server
+        test: (value, context) => {
+          const problem = findCronProblem(value)
+          return problem ? context.createError({ message: problem }) : true
+        },
+      }),
   }),
   onFieldUpdate: {
     functionName: (value, update) => {
