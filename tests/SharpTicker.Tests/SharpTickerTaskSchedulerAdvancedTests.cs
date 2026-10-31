@@ -8,6 +8,7 @@ using Xunit;
 
 namespace SharpTicker.Tests;
 
+[Collection(SharedStaticStateCollection.Name)]
 public class SharpTickerTaskSchedulerAdvancedTests
 {
     [Fact]

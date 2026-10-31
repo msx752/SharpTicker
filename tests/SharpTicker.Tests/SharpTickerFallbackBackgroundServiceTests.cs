@@ -13,7 +13,7 @@ using Xunit;
 
 namespace SharpTicker.Tests;
 
-[Collection("TickerFunctionProviderState")]
+[Collection(SharedStaticStateCollection.Name)]
 public class SharpTickerFallbackBackgroundServiceTests
 {
     private readonly IInternalTickerManager _internalManager;

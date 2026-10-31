@@ -14,6 +14,7 @@ namespace SharpTicker.Tests;
 /// full queue makes the caller wait instead of growing without limit, idle workers leave but one stays, and the
 /// token a job was queued with is the token it receives.
 /// </summary>
+[Collection(SharedStaticStateCollection.Name)]
 public class SharpTickerTaskSchedulerResilienceTests
 {
     private static async Task<bool> WaitUntilAsync(Func<bool> condition, int seconds = 10)

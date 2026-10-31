@@ -20,6 +20,7 @@ namespace SharpTicker.Tests;
 /// count and the release of the lock. Only the properties the scheduler marked for update may change. The entity types
 /// are private to this class, so its store is separate from every other test's.
 /// </summary>
+[Collection(SharedStaticStateCollection.Name)]
 public class InMemoryProviderExecutionResultTests
 {
     private sealed class ResultTimeTicker : TimeTickerEntity<ResultTimeTicker> { }

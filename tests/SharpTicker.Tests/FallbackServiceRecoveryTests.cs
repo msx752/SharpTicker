@@ -20,7 +20,7 @@ namespace SharpTicker.Tests;
 /// and each of its children, gets its delegate, priority and concurrency limit, hands them to the scheduler as due jobs,
 /// and keeps going when the store fails or the scheduler is frozen or disposed.
 /// </summary>
-[Collection("TickerFunctionProviderState")]
+[Collection(SharedStaticStateCollection.Name)]
 public class FallbackServiceRecoveryTests : IAsyncLifetime
 {
     private readonly IInternalTickerManager _manager = Substitute.For<IInternalTickerManager>();

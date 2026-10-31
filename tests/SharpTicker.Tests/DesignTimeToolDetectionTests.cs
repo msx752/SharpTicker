@@ -14,6 +14,7 @@ using SharpTicker.Utilities.Interfaces.Managers;
 
 namespace SharpTicker.Tests;
 
+[Collection(SharedStaticStateCollection.Name)]
 public class DesignTimeToolDetectionTests
 {
     [Fact]
