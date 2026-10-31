@@ -100,6 +100,11 @@ public abstract class DashboardApiFixture : IAsyncLifetime
         _app.UseSharpTicker();
         await _app.StartAsync();
 
+        // The EF Core store releases the jobs an earlier run left locked on a background task right after the host has
+        // started. Wait for it, or it runs while this fixture sets up its data on the same connection.
+        var startup = _app.Services.GetRequiredService<TickerExecutionContext>().ExternalProviderStartup;
+        if (startup != null) await startup;
+
         Client = _app.GetTestClient();
         Store = _app.Services.GetRequiredService<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
 

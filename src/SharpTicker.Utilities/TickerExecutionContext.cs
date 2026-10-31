@@ -1,3 +1,4 @@
+using System.Threading.Tasks;
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -20,6 +21,8 @@ internal class TickerExecutionContext
    private long _nextOccurrenceTicks = -1;
    internal Action<IServiceProvider> ExternalProviderApplicationAction { get; set; }
    internal Action<object> DashboardApplicationAction { get; set; }
+   /// <summary>The work an external provider starts when the application has started, so it can be waited for.</summary>
+   internal Task ExternalProviderStartup { get; set; }
    public Action<object, CoreNotifyActionType> NotifyCoreAction { get; set; }
    public string LastHostExceptionMessage { get; set; }
    internal ITickerOptionsSeeding OptionsSeeding { get; set; }
