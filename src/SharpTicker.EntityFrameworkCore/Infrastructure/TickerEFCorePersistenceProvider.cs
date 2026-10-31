@@ -167,9 +167,23 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
             
-            // Remove using Entity Framework (respects cascade delete configuration)
-            dbContext.Set<TTimeTicker>().RemoveRange(tickersToDelete);
-            
+            // The model does not cascade a delete to the children (DeleteBehavior.NoAction), so the children and grandchildren
+            // are removed here with their parent. Left behind they would have no parent and no execution time, and would
+            // never run. A set by reference, because a ticker asked for can also be the child of another one asked for.
+            var withDescendants = new HashSet<TTimeTicker>(ReferenceEqualityComparer.Instance);
+            foreach (var ticker in tickersToDelete)
+            {
+                withDescendants.Add(ticker);
+                foreach (var child in ticker.Children ?? [])
+                {
+                    withDescendants.Add(child);
+                    foreach (var grandchild in child.Children ?? [])
+                        withDescendants.Add(grandchild);
+                }
+            }
+
+            dbContext.Set<TTimeTicker>().RemoveRange(withDescendants);
+
             return await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
         #endregion

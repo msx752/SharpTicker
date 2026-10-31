@@ -279,6 +279,115 @@ public class EfCorePersistenceProviderTests : IAsyncLifetime
         Assert.Equal(ticker2.Id, remaining[0].Id);
     }
 
+    // The model does not cascade a delete from a parent to its children (DeleteBehavior.NoAction), so the store has to remove
+    // the children and grandchildren itself. Before it did, they stayed behind with no parent and no execution time.
+    private TimeTickerEntity CreateChild(Guid parentId)
+    {
+        var child = CreateTimeTicker();
+        child.ParentId = parentId;
+        child.ExecutionTime = null;
+        return child;
+    }
+
+    private (TimeTickerEntity Parent, TimeTickerEntity[] Children, TimeTickerEntity[] Grandchildren) CreateTree()
+    {
+        var parent = CreateTimeTicker();
+        var children = new[] { CreateChild(parent.Id), CreateChild(parent.Id) };
+        var grandchildren = children.SelectMany(c => new[] { CreateChild(c.Id), CreateChild(c.Id) }).ToArray();
+        return (parent, children, grandchildren);
+    }
+
+    private static TimeTickerEntity[] AllRows((TimeTickerEntity Parent, TimeTickerEntity[] Children, TimeTickerEntity[] Grandchildren) tree)
+        => new[] { tree.Parent }.Concat(tree.Children).Concat(tree.Grandchildren).ToArray();
+
+    private async Task<int> CountRows(IEnumerable<Guid> ids)
+    {
+        var wanted = ids.ToList();   // a List, not an array: EF Core 8 and 9 cannot translate Contains on an array bound to ReadOnlySpan
+        using var ctx = CreateVerifyContext();
+        return await ctx.Set<TimeTickerEntity>().AsNoTracking().CountAsync(t => wanted.Contains(t.Id));
+    }
+
+    [Fact]
+    public async Task RemoveTimeTickers_AlsoRemovesTheChildrenAndGrandchildren()
+    {
+        var tree = CreateTree();
+        await SeedTimeTickers(AllRows(tree));
+
+        await _provider.RemoveTimeTickers(new[] { tree.Parent.Id }, CancellationToken.None);
+
+        Assert.Equal(0, await CountRows(AllRows(tree).Select(t => t.Id)));
+    }
+
+    [Fact]
+    public async Task RemoveTimeTickers_LeavesAnotherTreeAlone()
+    {
+        var removed = CreateTree();
+        var kept = CreateTree();
+        await SeedTimeTickers(AllRows(removed).Concat(AllRows(kept)).ToArray());
+
+        await _provider.RemoveTimeTickers(new[] { removed.Parent.Id }, CancellationToken.None);
+
+        var keptIds = AllRows(kept).Select(t => t.Id).ToArray();
+        Assert.Equal(keptIds.Length, await CountRows(keptIds));
+    }
+
+    [Fact]
+    public async Task RemoveTimeTickers_OfAChild_RemovesItsOwnChildrenAndKeepsTheParentAndTheSibling()
+    {
+        var tree = CreateTree();
+        await SeedTimeTickers(AllRows(tree));
+        var firstChild = tree.Children[0];
+        var itsChildren = tree.Grandchildren.Where(g => g.ParentId == firstChild.Id).Select(g => g.Id);
+
+        await _provider.RemoveTimeTickers(new[] { firstChild.Id }, CancellationToken.None);
+
+        Assert.Equal(0, await CountRows(itsChildren.Append(firstChild.Id)));
+        Assert.Equal(1, await CountRows(new[] { tree.Parent.Id }));
+        Assert.Equal(1, await CountRows(new[] { tree.Children[1].Id }));
+    }
+
+    [Fact]
+    public async Task RemoveTimeTickers_OfAParentAndOneOfItsChildrenTogether_RemovesTheWholeTree()
+    {
+        var tree = CreateTree();
+        await SeedTimeTickers(AllRows(tree));
+
+        await _provider.RemoveTimeTickers(new[] { tree.Parent.Id, tree.Children[0].Id }, CancellationToken.None);
+
+        Assert.Equal(0, await CountRows(AllRows(tree).Select(t => t.Id)));
+    }
+
+    // Nothing stops the removal of a ticker that is running, and that is not new. The job is not cancelled and runs to its end;
+    // the row is gone, so what it writes at the end reaches no row.
+    [Fact]
+    public async Task RemoveTimeTickers_OfAParentWithAChildThatIsRunning_RemovesTheWholeTreeWithoutFailing()
+    {
+        var tree = CreateTree();
+        tree.Children[0].Status = TickerStatus.InProgress;
+        tree.Children[0].LockHolder = NodeId;
+        tree.Children[0].LockedAt = _fixedNow;
+        await SeedTimeTickers(AllRows(tree));
+
+        var removed = await _provider.RemoveTimeTickers(new[] { tree.Parent.Id }, CancellationToken.None);
+
+        Assert.True(removed > 0);
+        Assert.Equal(0, await CountRows(AllRows(tree).Select(t => t.Id)));
+    }
+
+    [Fact]
+    public async Task TheResultOfAJobWhoseRowWasRemoved_ReachesNoRowAndDoesNotFail()
+    {
+        var ticker = CreateTimeTicker(status: TickerStatus.InProgress);
+        await SeedTimeTickers(ticker);
+        await _provider.RemoveTimeTickers(new[] { ticker.Id }, CancellationToken.None);
+        var result = new InternalFunctionContext { TickerId = ticker.Id }.SetProperty(x => x.Status, TickerStatus.Done);
+
+        var updated = await _provider.UpdateTimeTicker(result, CancellationToken.None);
+
+        Assert.Equal(0, updated);
+        Assert.Equal(0, await CountRows(new[] { ticker.Id }));
+    }
+
     // =========================================================================
     // 4. GetTimeTickerById
     // =========================================================================
