@@ -81,7 +81,7 @@ A run is cancelled by `RequestCancellation()`, by the cancel button in the dashb
 
 A job that runs at once, because it was added for now, is not tied to the request that added it: it keeps running after that request has ended and is cancelled only by the cases above.
 
-When the application stops, the scheduler waits up to 20 seconds for the jobs that are running, so a job that honors its token can record that it was cancelled before the host disposes its services. A job that is still running when the wait ends is recorded as `Cancelled` and its lock is released; it is not retried. A job that ignores its token keeps running until the process ends, and it delays the stop by the whole wait, so pass the token on to what the job awaits.
+When the application stops, the scheduler waits for the jobs that are running, for a little less than the host's shutdown timeout (`HostOptions.ShutdownTimeout`, 30 seconds by default), so a job that honors its token can record that it was cancelled before the host disposes its services. A job that is still running when the wait ends is recorded as `Cancelled` and its lock is released; it is not retried. A job that ignores its token keeps running until the process ends, and it delays the stop by the whole wait, so pass the token on to what the job awaits. If your jobs need longer to wind down, raise the shutdown timeout of the host, and on Kubernetes the termination grace period with it.
 
 ## Payloads
 
