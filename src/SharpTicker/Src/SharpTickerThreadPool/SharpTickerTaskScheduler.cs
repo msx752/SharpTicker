@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
 
@@ -34,7 +36,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     // when the job ends, on a plain thread where an exception ends the process.
     private readonly CancellationToken _shutdownToken;
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
-    
+    private readonly ILogger _logger;
+
     /// <summary>
     /// Called with the worker's id when it has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
     /// worker at that point, so a job can be queued in the moment between the decision and the count.
@@ -52,13 +55,24 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     [ThreadStatic] private static int _threadWorkerIndex = -1;
     
     public SharpTickerTaskScheduler(
-        int maxConcurrency, 
+        int maxConcurrency,
         TimeSpan? idleWorkerTimeout = null,
         SoftSchedulerNotifyDebounce notifyDebounce = null)
+        : this(maxConcurrency, idleWorkerTimeout, notifyDebounce, null)
+    {
+    }
+
+    // The public constructor keeps its signature; the host passes its logger through this one.
+    internal SharpTickerTaskScheduler(
+        int maxConcurrency,
+        TimeSpan? idleWorkerTimeout,
+        SoftSchedulerNotifyDebounce notifyDebounce,
+        ILogger logger)
     {
         if (maxConcurrency <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), "Must be greater than zero");
-        
+
+        _logger = logger ?? NullLogger.Instance;
         _maxConcurrency = maxConcurrency;
         _idleWorkerTimeout = idleWorkerTimeout ?? TimeSpan.FromSeconds(60);
         _maxCapacityPerWorker = 1024; // Fixed optimal capacity
@@ -106,9 +120,14 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     { 
                         await work(cancellationToken); 
                     } 
-                    catch 
-                    { 
-                        /* swallow */ 
+                    catch (OperationCanceledException)
+                    {
+                        // Expected - the job was cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        // Swallowed so the pool stays up, but not silently
+                        LogUnhandledJobFailure(ex);
                     }
                 },
                 CancellationToken.None,
@@ -205,12 +224,13 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                 OnWorkerThreadStarting?.Invoke(workerId);
                 thread.Start();
             }
-            catch
+            catch (Exception ex)
             {
                 // No thread was started, so nobody will count this slot out. Give it back, or the pool stays one worker
                 // short for good. The caller still sees the exception.
                 ReleaseWorkerId(workerId);
                 Interlocked.Decrement(ref _activeWorkers);
+                _logger.LogError(ex, "The task scheduler could not start a worker thread. {QueuedJobs} job(s) are queued, and the next job that is queued starts a worker again.", _totalQueuedTasks);
                 throw;
             }
 
@@ -398,6 +418,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         return false;
     }
     
+    // A job reports its own failure through the ticker handler, so an exception that gets this far was handled by nothing.
+    private void LogUnhandledJobFailure(Exception exception)
+        => _logger.LogError(exception, "A job threw an exception that nothing handled. The scheduler keeps running.");
+
     private async Task ExecuteWorkAsync(WorkItem workItem)
     {
         // Decrement immediately after dequeue to keep counter in sync
@@ -424,7 +448,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                         {
                             if (t.IsFaulted)
                             {
-                                _ = t.Exception;
+                                LogUnhandledJobFailure(t.Exception.GetBaseException());
                             }
                         }
                         catch
@@ -440,9 +464,14 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     {
                         await task;
                     }
-                    catch
+                    catch (OperationCanceledException)
                     {
-                        // Swallow exceptions to keep worker alive
+                        // Expected - the job was cancelled
+                    }
+                    catch (Exception ex)
+                    {
+                        // Swallowed to keep the worker alive, but not silently
+                        LogUnhandledJobFailure(ex);
                     }
                 }
             }
@@ -451,10 +480,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         {
             // Expected - task was cancelled
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Log error if needed, but don't crash the worker
-            // Errors are swallowed to prevent worker thread crashes
+            // Swallowed so a failing job does not crash the worker thread, but not silently
+            LogUnhandledJobFailure(ex);
         }
     }
     
@@ -599,13 +628,18 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         }
 
         // Drain remaining queued items to keep the counter accurate
+        var dropped = 0;
         for (int i = 0; i < _maxConcurrency; i++)
         {
             while (_workerQueues[i].TryDequeue(out _))
             {
                 Interlocked.Decrement(ref _totalQueuedTasks);
+                dropped++;
             }
         }
+
+        if (dropped > 0)
+            _logger.LogWarning("The task scheduler was disposed with {DroppedJobs} queued job(s) that had not started. They were dropped.", dropped);
 
         _notifyDebounce?.Dispose();
         _shutdownCts?.Dispose();

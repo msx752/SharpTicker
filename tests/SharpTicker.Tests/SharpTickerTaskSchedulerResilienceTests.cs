@@ -304,7 +304,8 @@ public class SharpTickerTaskSchedulerResilienceTests
         AppDomain.CurrentDomain.UnhandledException += record;
         try
         {
-            await using var scheduler = new SharpTickerTaskScheduler(2, idleWorkerTimeout: TimeSpan.Zero);
+            var logs = new CapturedLogs();
+            await using var scheduler = new SharpTickerTaskScheduler(2, TimeSpan.Zero, null, logs.CreateLogger("SharpTicker.TaskScheduler"));
             using var holdJobs = new ManualResetEventSlim(false);
             using var holdLeaving = new ManualResetEventSlim(false);
             var started = new CountdownEvent(2);
@@ -329,6 +330,7 @@ public class SharpTickerTaskSchedulerResilienceTests
             await Task.Delay(200);
             Assert.True(unhandled.IsEmpty, $"the leaving worker threw: {unhandled.FirstOrDefault()}");
             Assert.Equal(1, scheduler.TotalQueuedTasks);
+            Assert.Contains(logs.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error && e.Exception?.Message == failure);
 
             scheduler.OnWorkerThreadStarting = null;
             var second = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
