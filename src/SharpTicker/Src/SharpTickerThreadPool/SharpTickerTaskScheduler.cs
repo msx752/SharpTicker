@@ -30,6 +30,12 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private readonly SoftSchedulerNotifyDebounce _notifyDebounce;
     
     // Thread-local flag to detect if we're on a SharpTicker worker thread
+    /// <summary>
+    /// Called when a worker has decided to leave and is about to stop, before it is counted out. Tests use it to hold a
+    /// worker at that point, so a job can be queued in the moment between the decision and the count.
+    /// </summary>
+    internal Action OnWorkerLeaving;
+
     [ThreadStatic] public static bool IsSharpTickerWorkerThread;
     [ThreadStatic] private static int _threadWorkerIndex = -1;
     
@@ -206,6 +212,13 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             SynchronizationContext.SetSynchronizationContext(originalContext);
             Interlocked.Decrement(ref _activeWorkers);
             _notifyDebounce.NotifySafely(_activeWorkers);
+
+            // A job can be queued after this worker decided to leave and before it was counted out. The queueing side
+            // then still saw this worker and started none, so if the last workers leave together the job would wait
+            // with nobody to take it. Look again now that the count is down: either the queueing side sees the lower
+            // count, or this check sees its job.
+            if (_totalQueuedTasks > 0 && !_disposed && !_shutdownCts.IsCancellationRequested)
+                EnsureWorkerAvailable();
         }
     }
     
@@ -261,6 +274,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     // Only exit if there's really no work and we have minimum workers
                     if (!anyWorkRemaining && _totalQueuedTasks == 0 && _activeWorkers > 1)
                     {
+                        OnWorkerLeaving?.Invoke();
                         break; // Exit this worker
                     }
                     

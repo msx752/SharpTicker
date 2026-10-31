@@ -217,6 +217,38 @@ public class SharpTickerTaskSchedulerResilienceTests
         Assert.True(await again.Task.WaitAsync(TimeSpan.FromSeconds(10)), "no worker was started for the job queued after the workers left");
     }
 
+    /// <summary>
+    /// Two idle workers decide to leave. A job is queued in the moment after that decision and before they are counted
+    /// out, when the queueing side still sees two workers and starts none. Once both are gone nobody is left to take the
+    /// job unless the last worker to leave looks again.
+    /// </summary>
+    [Fact]
+    public async Task AJobQueuedWhileTheLastWorkersAreLeaving_IsNotLeftWaitingWithoutAWorker()
+    {
+        await using var scheduler = new SharpTickerTaskScheduler(2, idleWorkerTimeout: TimeSpan.Zero);
+        using var holdJobs = new ManualResetEventSlim(false);
+        using var holdLeaving = new ManualResetEventSlim(false);
+        var started = new CountdownEvent(2);
+        var leaving = 0;
+        scheduler.OnWorkerLeaving = () => { Interlocked.Increment(ref leaving); holdLeaving.Wait(); };
+
+        // Two jobs that block, so both workers exist.
+        for (var i = 0; i < 2; i++)
+            await scheduler.QueueAsync(_ => { started.Signal(); holdJobs.Wait(); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+        Assert.True(started.Wait(TimeSpan.FromSeconds(10)), "the two workers did not start");
+
+        holdJobs.Set();
+        Assert.True(await WaitUntilAsync(() => Volatile.Read(ref leaving) == 2), "the two workers did not decide to leave");
+
+        var ran = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await scheduler.QueueAsync(_ => { ran.TrySetResult(true); return Task.CompletedTask; }, TickerTaskPriority.Normal);
+        holdLeaving.Set();
+
+        var finished = await Task.WhenAny(ran.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.True(ReferenceEquals(finished, ran.Task),
+            $"the job was left in the queue: {scheduler.ActiveWorkers} workers, {scheduler.TotalQueuedTasks} queued");
+    }
+
     [Fact]
     public async Task EveryJobRunsExactlyOnce_WhenSeveralCallersQueueAtTheSameTime()
     {
