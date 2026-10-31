@@ -11,6 +11,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SharpTicker.BackgroundServices;
 using SharpTicker.DependencyInjection;
+using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
@@ -42,8 +43,22 @@ public class SchedulerShutdownTests
         builder.Services.AddSharpTicker();
         var app = builder.Build();
         app.UseSharpTicker();
+        // The in-memory store is shared by the whole process. What an earlier test left in it, a cron occurrence that is due for
+        // example, would be run by this host's scheduler and counted among its running jobs.
+        await ClearStoreAsync(app);
         await app.StartAsync();
         return app;
+    }
+
+    private static async Task ClearStoreAsync(WebApplication app)
+    {
+        var store = StoreOf(app);
+        var occurrences = await store.GetAllCronTickerOccurrences(null, default);
+        await store.RemoveCronTickerOccurrences(occurrences.Select(o => o.Id).ToArray(), default);
+        var crons = await store.GetCronTickers(null, default);
+        await store.RemoveCronTickers(crons.Select(c => c.Id).ToArray(), default);
+        var times = await store.GetTimeTickers(null, default);
+        await store.RemoveTimeTickers(times.Select(t => t.Id).ToArray(), default);
     }
 
     private static async Task<TimeTickerEntity> AddJobAsync(WebApplication app, string function)
@@ -87,23 +102,36 @@ public class SchedulerShutdownTests
         Assert.Empty(Warnings());
     }
 
+    // The job honors the cancellation but needs time to clean up, and the test holds it there until the warning has been written.
+    // A job that ends at once can be gone before the stop looks at the running jobs, and then there is nothing to warn about.
     [Fact]
     public async Task StoppingWithAJobRunning_LogsAWarningThatNamesTheJob()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var app = await StartAsync(s => s.MapTicker("ShutdownNamed", async (_, ct) => { started.TrySetResult(); await Task.Delay(TimeSpan.FromSeconds(30), ct); }));
+        var cleanedUp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var app = await StartAsync(s => s.MapTicker("ShutdownNamed", async (_, ct) =>
+        {
+            started.TrySetResult();
+            try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+            catch (OperationCanceledException) { await cleanedUp.Task; throw; }
+        }));
         var store = StoreOf(app);
         var job = await AddJobAsync(app, "ShutdownNamed");
         await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-        await app.StopAsync();
+        var stopping = app.StopAsync();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (Warnings().Length == 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
+        var logged = Warnings();
+        cleanedUp.TrySetResult();
+        await stopping;
 
         await store.RemoveTimeTickers(new[] { job.Id }, default);
         await app.DisposeAsync();
-        var warning = Assert.Single(Warnings());
+        var warning = Assert.Single(logged);
         Assert.Contains("ShutdownNamed", warning.Message);
         Assert.Contains(job.Id.ToString(), warning.Message);
-        Assert.Contains("1", warning.Message);
+        Assert.True(warning.Message.StartsWith("The application is stopping and 1 job(s)"), warning.Message);
     }
 
     /// <summary>
@@ -184,13 +212,18 @@ public class SchedulerShutdownTests
         var cron = (await app.Services.GetRequiredService<ICronTickerManager<CronTickerEntity>>()
             .AddAsync(new CronTickerEntity { Function = "ShutdownCron", Expression = "* * * * * *" })).Result;
         await started.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        // The occurrences whose jobs are running now. Others may be marked InProgress for the next second without having started,
+        // and a job that never starts is not something the stop waits for.
+        var handler = app.Services.GetRequiredService<ITickerExecutionTaskHandler>();
+        var running = TickerCancellationTokenManager.GetRunningJobs(handler).Select(j => j.TickerId).ToArray();
+        Assert.NotEmpty(running);
 
         await app.StopAsync();
 
         var occurrences = (await store.GetAllCronTickerOccurrences(x => x.CronTickerId == cron.Id, default)).ToList();
+        await store.RemoveCronTickerOccurrences(occurrences.Select(o => o.Id).ToArray(), default);
         await store.RemoveCronTickers(new[] { cron.Id }, default);
         await app.DisposeAsync();
-        Assert.DoesNotContain(occurrences, o => o.Status == TickerStatus.InProgress);
-        Assert.Contains(occurrences, o => o.Status == TickerStatus.Cancelled);
+        Assert.All(running, id => Assert.Equal(TickerStatus.Cancelled, occurrences.Single(o => o.Id == id).Status));
     }
 }
