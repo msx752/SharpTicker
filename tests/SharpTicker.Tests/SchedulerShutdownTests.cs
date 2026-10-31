@@ -161,4 +161,24 @@ public class SchedulerShutdownTests
         Assert.Equal(TickerStatus.Cancelled, stored.Status);
         Assert.Null(stored.LockHolder);
     }
+
+    /// <summary>The same wait and the same outcome for a cron occurrence as for a time ticker.</summary>
+    [Fact]
+    public async Task ACronOccurrenceThatHonorsCancellation_IsRecordedAsCancelled_BeforeStopReturns()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var app = await StartAsync(s => s.MapTicker("ShutdownCron", async (_, ct) => { started.TrySetResult(); await Task.Delay(TimeSpan.FromSeconds(30), ct); }));
+        var store = StoreOf(app);
+        var cron = (await app.Services.GetRequiredService<ICronTickerManager<CronTickerEntity>>()
+            .AddAsync(new CronTickerEntity { Function = "ShutdownCron", Expression = "* * * * * *" })).Result;
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(20));
+
+        await app.StopAsync();
+
+        var occurrences = (await store.GetAllCronTickerOccurrences(x => x.CronTickerId == cron.Id, default)).ToList();
+        await store.RemoveCronTickers(new[] { cron.Id }, default);
+        await app.DisposeAsync();
+        Assert.DoesNotContain(occurrences, o => o.Status == TickerStatus.InProgress);
+        Assert.Contains(occurrences, o => o.Status == TickerStatus.Cancelled);
+    }
 }
