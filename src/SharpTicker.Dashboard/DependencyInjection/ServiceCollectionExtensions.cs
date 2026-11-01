@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Encodings.Web;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -78,6 +80,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
             // Extract inline preload script from embedded index.html at startup.
             // Serving it as an external file allows CSP script-src 'self' without 'unsafe-inline'.
             string preloadScript = null;
+            string preloadVersion = null;
             string htmlTemplate = null;
             var indexFile = embeddedFileProvider.GetFileInfo("index.html");
             if (indexFile.Exists)
@@ -90,6 +93,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 if (scriptMatch.Success)
                 {
                     preloadScript = scriptMatch.Groups[1].Value;
+                    preloadVersion = VersionOf(preloadScript);
                     htmlTemplate = rawHtml.Remove(scriptMatch.Index, scriptMatch.Length);
                 }
                 else
@@ -189,7 +193,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
 
                     if (context.Response.StatusCode == 404 && htmlTemplate != null)
                     {
-                        var htmlContent = InjectExternalScripts(htmlTemplate, context, basePath);
+                        var htmlContent = InjectExternalScripts(htmlTemplate, context, basePath, preloadVersion);
 
                         context.Response.ContentType = "text/html";
                         context.Response.StatusCode = 200;
@@ -249,7 +253,16 @@ namespace SharpTicker.Dashboard.DependencyInjection
         /// Injects base tag and external script references into the HTML template.
         /// Config must load before preload since the preload script uses window.__dynamic_base__.
         /// </summary>
-        private static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath)
+        /// <summary>
+        /// A short, stable fingerprint of the preload script. The script holds the names of the hashed JS and CSS files of
+        /// this build, so its content changes with every dashboard build, while its file name does not. A proxy or a
+        /// browser that kept the old script after an upgrade would load the old dashboard. The page asks for the script
+        /// with this fingerprint in the query, which makes the address change with the content.
+        /// </summary>
+        internal static string VersionOf(string preloadScript)
+            => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(preloadScript))).Substring(0, 12).ToLowerInvariant();
+
+        private static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath, string preloadVersion)
         {
             if (string.IsNullOrEmpty(htmlTemplate))
                 return htmlTemplate ?? string.Empty;
@@ -262,7 +275,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
 
             var injection = $@"<base href=""{frontendBasePath}/"" />" +
                             @"<script src=""__sharpticker-config.js""></script>" +
-                            @"<script src=""__sharpticker-preload.js""></script>";
+                            $@"<script src=""__sharpticker-preload.js{(string.IsNullOrEmpty(preloadVersion) ? string.Empty : "?v=" + preloadVersion)}""></script>";
 
             var headOpen = Regex.Match(htmlTemplate, "(?is)<head\\b[^>]*>");
             if (headOpen.Success)
