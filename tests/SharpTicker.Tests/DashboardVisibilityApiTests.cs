@@ -91,6 +91,81 @@ public abstract class DashboardVisibilityApiTests<TFixture> : IClassFixture<TFix
         Assert.Equal(0, searched.GetProperty("totalCount").GetInt32());
     }
 
+    /// <summary>
+    /// A chain whose first ticker belongs to billing and whose child belongs to ops. The dashboard refuses to make such
+    /// a chain for a user, but host code (or an admin) can, so what a billing user gets of it is checked here. The chain
+    /// is removed again, so the other tests see the same data.
+    /// </summary>
+    private async Task<Guid> AddAMixedChainAsync()
+    {
+        var (_, added) = await _api.SendAsync(null, true, HttpMethod.Post, "/time-ticker/add",
+            $$"""{"function":"billing.Invoices","executionTime":"{{InTwoDays}}","children":[{"function":"ops.Cleanup","runCondition":0,"children":[{"function":"billing.Reminders","runCondition":0}]},{"function":"billing.Reminders","runCondition":0}]}""");
+        Assert.True(added!.Value.GetProperty("success").GetBoolean(), added.ToString());
+        return added.Value.GetProperty("tickerId").GetGuid();
+    }
+
+    /// <summary>The ids of the ops child and of the billing child, found in what the admin gets.</summary>
+    private async Task<(Guid HiddenChild, Guid VisibleChild)> TheTwoChildrenAsync(Guid root)
+    {
+        var asAdmin = (await _api.GetAsAsync(null, "/time-tickers", admin: true)).EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == root);
+        var children = asAdmin.GetProperty("children").EnumerateArray().ToArray();
+        Assert.True(children.Length == 2, asAdmin.GetRawText());
+        return (children.Single(c => c.GetProperty("function").GetString() == "ops.Cleanup").GetProperty("id").GetGuid(),
+            children.Single(c => c.GetProperty("function").GetString() == "billing.Reminders").GetProperty("id").GetGuid());
+    }
+
+    private static Guid[] ChildIdsAtAnyDepth(JsonElement ticker)
+        => ticker.GetProperty("children").EnumerateArray()
+            .SelectMany(c => new[] { c.GetProperty("id").GetGuid() }.Concat(ChildIdsAtAnyDepth(c))).ToArray();
+
+    [Fact]
+    public async Task TimeTickers_DoNotCarryTheChildrenOfAnotherTeam_OfAChainTheUserMaySee()
+    {
+        var root = await AddAMixedChainAsync();
+        try
+        {
+            var (hiddenChild, visibleChild) = await TheTwoChildrenAsync(root);
+            var asBilling = (await _api.GetAsAsync(Billing, "/time-tickers")).EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == root);
+            var below = ChildIdsAtAnyDepth(asBilling);
+
+            Assert.DoesNotContain(hiddenChild, below);
+            Assert.Contains(visibleChild, below);
+            // The ops child had a billing child of its own: it goes with the ops child
+            Assert.Equal(1, below.Length);
+            Assert.DoesNotContain("ops.Cleanup", asBilling.GetRawText());
+
+            // The admin still sees the whole chain
+            var asAdmin = (await _api.GetAsAsync(null, "/time-tickers", admin: true)).EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == root);
+            Assert.Contains(hiddenChild, ChildIdsAtAnyDepth(asAdmin));
+            Assert.Equal(3, ChildIdsAtAnyDepth(asAdmin).Length);
+        }
+        finally
+        {
+            await _api.SendAsync(null, true, HttpMethod.Delete, $"/time-ticker/delete?id={root}");
+        }
+    }
+
+    [Fact]
+    public async Task TimeTickersPaginated_DoNotCarryTheChildrenOfAnotherTeam_OfAChainTheUserMaySee()
+    {
+        var root = await AddAMixedChainAsync();
+        try
+        {
+            var (hiddenChild, visibleChild) = await TheTwoChildrenAsync(root);
+            var page = await _api.GetAsAsync(Billing, "/time-tickers/paginated?pageNumber=1&pageSize=50");
+            var asBilling = page.GetProperty("items").EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == root);
+            var below = ChildIdsAtAnyDepth(asBilling);
+
+            Assert.DoesNotContain(hiddenChild, below);
+            Assert.Contains(visibleChild, below);
+            Assert.DoesNotContain("ops.Cleanup", page.GetRawText());
+        }
+        finally
+        {
+            await _api.SendAsync(null, true, HttpMethod.Delete, $"/time-ticker/delete?id={root}");
+        }
+    }
+
     [Fact]
     public async Task CronTickers_ListsOnlyTheCronsOfTheUsersTeam()
     {

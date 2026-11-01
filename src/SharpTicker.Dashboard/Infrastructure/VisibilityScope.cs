@@ -53,6 +53,51 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
     public bool CanSeeFunction(string functionName) => _rule == null || _rule.CanSeeFunction(_user, functionName);
 
     /// <summary>
+    /// The ids of the tickers below the given ones, at any depth, that the user may not see. The rule is a predicate on the
+    /// first level of a query, so a chain comes back with all its children and a child can belong to another team than
+    /// its parent. A ticker that is hidden hides everything below it. The rule is evaluated on the ticker in memory, and a
+    /// predicate that cannot be evaluated for it (it throws) counts as not visible. Nothing is changed on the tickers:
+    /// they can be the instances a store keeps.
+    /// </summary>
+    public HashSet<Guid> HiddenChildIds(IEnumerable<TTimeTicker> tickers)
+    {
+        var hidden = new HashSet<Guid>();
+        if (TimeTickers == null)
+            return hidden;
+
+        var maySee = TimeTickers.Compile();
+        foreach (var ticker in tickers)
+            Collect(ticker, maySee, hidden, 0);
+        return hidden;
+    }
+
+    private static void Collect(TTimeTicker ticker, Func<TTimeTicker, bool> maySee, HashSet<Guid> hidden, int depth)
+    {
+        if (depth > 64)
+            return; // a chain this deep is not a real one
+
+        foreach (var child in ticker.Children ?? Array.Empty<TTimeTicker>())
+        {
+            if (!MaySee(maySee, child))
+                hidden.Add(child.Id);
+            else
+                Collect(child, maySee, hidden, depth + 1);
+        }
+    }
+
+    private static bool MaySee(Func<TTimeTicker, bool> maySee, TTimeTicker ticker)
+    {
+        try
+        {
+            return maySee(ticker);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// An id that no ticker has. A request about a ticker the user may not see runs with this id instead, so it gets
     /// exactly the answer for a ticker that does not exist.
     /// </summary>

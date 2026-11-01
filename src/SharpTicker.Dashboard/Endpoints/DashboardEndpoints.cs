@@ -238,6 +238,48 @@ public static class DashboardEndpoints
         return Results.Json(value, options.GetTypeInfo(typeof(T))).ExecuteAsync(context);
     }
 
+    /// <summary>
+    /// Writes tickers with the children left out that the user may not see (see <c>VisibilityScope.HiddenChildIds</c>).
+    /// The tickers are not changed: the answer is written from a copy, because a store can hand out the instances it keeps.
+    /// </summary>
+    private static Task WriteJsonWithoutHiddenChildren<T>(HttpContext context, T value, HashSet<Guid> hiddenChildIds, JsonSerializerOptions options)
+    {
+        if (hiddenChildIds.Count == 0)
+            return WriteJson(context, value, options);
+
+        var node = JsonSerializer.SerializeToNode(value, options.GetTypeInfo(typeof(T)));
+        DropHiddenChildren(node, hiddenChildIds);
+        return Results.Content(node?.ToJsonString() ?? "null", "application/json").ExecuteAsync(context);
+    }
+
+    private static void DropHiddenChildren(System.Text.Json.Nodes.JsonNode? node, HashSet<Guid> hiddenChildIds)
+    {
+        switch (node)
+        {
+            case System.Text.Json.Nodes.JsonArray array:
+                foreach (var item in array)
+                    DropHiddenChildren(item, hiddenChildIds);
+                break;
+            case System.Text.Json.Nodes.JsonObject obj:
+                if (obj["children"] is System.Text.Json.Nodes.JsonArray children)
+                {
+                    for (var i = children.Count - 1; i >= 0; i--)
+                    {
+                        if (children[i] is System.Text.Json.Nodes.JsonObject child
+                            && child["id"] is System.Text.Json.Nodes.JsonValue id
+                            && id.TryGetValue<string>(out var text)
+                            && Guid.TryParse(text, out var childId)
+                            && hiddenChildIds.Contains(childId))
+                            children.RemoveAt(i);
+                    }
+                }
+
+                foreach (var property in obj.ToList())
+                    DropHiddenChildren(property.Value, hiddenChildIds);
+                break;
+        }
+    }
+
     /// <summary>The cron id itself when the signed-in user may see that cron, otherwise an id that no cron has.</summary>
     private static Task<Guid> VisibleCron<TTimeTicker, TCronTicker>(HttpContext context, Guid id, System.Threading.CancellationToken cancellationToken)
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
@@ -258,14 +300,16 @@ public static class DashboardEndpoints
         return ticker.Children?.Select(child => FirstHiddenFunction(scope, child)).FirstOrDefault(found => found != null);
     }
 
-    private static void ClearIds<TTimeTicker>(TTimeTicker? ticker) where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+    // The ids come from the server and not from the body. Fresh ids, not empty ones: the manager only makes the id of the
+    // first ticker, and a store that keys its tickers by id (the in-memory one) would keep a single child of an empty id.
+    private static void GiveNewIds<TTimeTicker>(TTimeTicker? ticker) where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     {
         if (ticker == null)
             return;
 
-        ticker.Id = Guid.Empty;
+        ticker.Id = Guid.NewGuid();
         foreach (var child in ticker.Children ?? Array.Empty<TTimeTicker>())
-            ClearIds(child);
+            GiveNewIds(child);
     }
 
     private const string HiddenParentMessage = "You are not allowed to put a ticker under a ticker you cannot see";
@@ -365,8 +409,9 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var result = await repository.GetTimeTickersAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
-        await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        var result = await repository.GetTimeTickersAsync(cancellationToken, visibility: scope.Filter);
+        await WriteJsonWithoutHiddenChildren(context, result, scope.HiddenChildIds(result), dashboardOptions.DashboardJsonOptions);
     }
 
     private static async Task GetTimeTickersPaginated<TTimeTicker, TCronTicker>(HttpContext context)
@@ -387,8 +432,9 @@ public static class DashboardEndpoints
             : null;
         var search = context.Request.Query["search"].ToString();
 
-        var result = await repository.GetTimeTickersPaginatedAsync(pageNumber, pageSize, status, search, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
-        await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        var result = await repository.GetTimeTickersPaginatedAsync(pageNumber, pageSize, status, search, cancellationToken, visibility: scope.Filter);
+        await WriteJsonWithoutHiddenChildren(context, result, scope.HiddenChildIds(result.Items), dashboardOptions.DashboardJsonOptions);
     }
 
     private static async Task GetTimeTickersGraphDataRange<TTimeTicker, TCronTicker>(HttpContext context)
@@ -459,9 +505,9 @@ public static class DashboardEndpoints
         }
 
         // An id in the body would let an add replace a ticker that already has it (the Redis store overwrites), so
-        // with a rule the ids are made by the manager.
+        // with a rule the ids are made here.
         if (scope.HasRule)
-            ClearIds(chainRoot);
+            GiveNewIds(chainRoot);
 
         var result = await timeTickerManager.AddAsync(chainRoot, cancellationToken);
 
