@@ -19,7 +19,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private readonly int _maxCapacityPerWorker;
     
     // Worker queues for work stealing
-    private readonly ConcurrentQueue<WorkItem>[] _workerQueues;
+    private readonly WorkerQueue[] _workerQueues;
     // 1 while a running worker holds the id (the index of its queue), 0 while the id is free
     private readonly int[] _workerSlots;
     
@@ -29,6 +29,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private volatile bool _disposed;
     private volatile bool _isFrozen;
     private volatile int _nextQueueIndex;
+    // High and Normal jobs taken in a row while a Low job was waiting; see TryTakeNext
+    private int _higherTakenSinceLow;
     
     private readonly CancellationTokenSource _shutdownCts = new();
     // Read this, not _shutdownCts.Token: the source is disposed at the end of DisposeAsync, and Token throws once it is
@@ -81,10 +83,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
 
         // Initialize all worker queues upfront for simplicity
         _workerSlots = new int[maxConcurrency];
-        _workerQueues = new ConcurrentQueue<WorkItem>[maxConcurrency];
+        _workerQueues = new WorkerQueue[maxConcurrency];
         for (int i = 0; i < maxConcurrency; i++)
         {
-            _workerQueues[i] = new ConcurrentQueue<WorkItem>();
+            _workerQueues[i] = new WorkerQueue();
         }
         
         // Start at least one worker immediately to handle incoming tasks
@@ -93,11 +95,14 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     
     /// <summary>
     /// Queues work to be executed by the scheduler.
-    /// The priority parameter is ignored in this simplified version.
+    /// When more jobs are waiting than there are workers, High jobs start before Normal ones and Normal before Low ones;
+    /// within one priority the order is first in, first out. A Low job is not held back for ever: after
+    /// <see cref="LowPriorityAfterHigherJobs"/> higher priority jobs in a row while it waits, one Low job goes next.
+    /// LongRunning jobs do not use the pool and start at once.
     /// </summary>
     public async ValueTask QueueAsync(
         Func<CancellationToken, Task> work,
-        TickerTaskPriority priority, // Kept for backward compatibility but ignored
+        TickerTaskPriority priority,
         CancellationToken cancellationToken = default)
     {
         if (work == null)
@@ -145,7 +150,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         
         // Enqueue work
         var workItem = new WorkItem(work, cancellationToken);
-        targetQueue.Enqueue(workItem);
+        targetQueue.Enqueue(workItem, BucketOf(priority));
         var newTotal = Interlocked.Increment(ref _totalQueuedTasks);
         
         // Ensure we have workers to process the work
@@ -156,6 +161,80 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         }
     }
     
+    /// <summary>
+    /// How many High or Normal jobs may start in a row while a Low job waits, before the Low job goes next.
+    /// </summary>
+    internal const int LowPriorityAfterHigherJobs = 10;
+
+    private const int HighBucket = 0, NormalBucket = 1, LowBucket = 2, BucketCount = 3;
+
+    private static int BucketOf(TickerTaskPriority priority) => priority switch
+    {
+        TickerTaskPriority.High => HighBucket,
+        TickerTaskPriority.Low => LowBucket,
+        _ => NormalBucket,
+    };
+
+    /// <summary>
+    /// Takes the job that should start next: the highest priority one that is waiting in any queue, the worker's own
+    /// queue first. Every <see cref="LowPriorityAfterHigherJobs"/> higher priority jobs taken while a Low job waits, a
+    /// Low job is taken instead, so a steady stream of High jobs cannot hold it back for ever.
+    /// </summary>
+    private bool TryTakeNext(int workerId, out WorkItem workItem)
+    {
+        var lowWaiting = IsLowWaiting();
+
+        if (lowWaiting && Volatile.Read(ref _higherTakenSinceLow) >= LowPriorityAfterHigherJobs
+            && TryTakeFromBucket(workerId, LowBucket, out workItem))
+        {
+            Volatile.Write(ref _higherTakenSinceLow, 0);
+            return true;
+        }
+
+        for (var bucket = HighBucket; bucket < BucketCount; bucket++)
+        {
+            if (!TryTakeFromBucket(workerId, bucket, out workItem))
+                continue;
+
+            if (bucket == LowBucket || !lowWaiting)
+                Volatile.Write(ref _higherTakenSinceLow, 0);
+            else
+                Interlocked.Increment(ref _higherTakenSinceLow);
+            return true;
+        }
+
+        workItem = default;
+        return false;
+    }
+
+    private bool IsLowWaiting()
+    {
+        for (var i = 0; i < _workerQueues.Length; i++)
+        {
+            if (_workerQueues[i].CountOf(LowBucket) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    // The worker's own queue first, then the others, starting after this worker so that thieves do not all pick the same victim
+    private bool TryTakeFromBucket(int workerId, int bucket, out WorkItem workItem)
+    {
+        if (_workerQueues[workerId].TryDequeue(bucket, out workItem))
+            return true;
+
+        var startIndex = (workerId + 1) % _maxConcurrency;
+        for (var i = 0; i < _maxConcurrency - 1; i++)
+        {
+            var victim = (startIndex + i) % _maxConcurrency;
+            if (victim != workerId && _workerQueues[victim].TryDequeue(bucket, out workItem))
+                return true;
+        }
+
+        workItem = default;
+        return false;
+    }
+
     private int GetNextQueueIndex()
     {
         // Simple round-robin without complex CAS loop
@@ -164,7 +243,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     }
     
     private async ValueTask WaitForCapacityAsync(
-        ConcurrentQueue<WorkItem> queue,
+        WorkerQueue queue,
         CancellationToken cancellationToken)
     {
         var waitCount = 0;
@@ -308,7 +387,6 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     private async Task WorkerLoopCoreAsync(int workerId)
     {
         var lastWorkTime = DateTime.UtcNow;
-        var localQueue = _workerQueues[workerId];
         var consecutiveStealFailures = 0;
         
         while (!_shutdownToken.IsCancellationRequested && !_disposed)
@@ -316,14 +394,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             WorkItem workItem = default;
             bool foundWork = false;
             
-            // 1. Try local queue first (fastest path)
-            if (localQueue.TryDequeue(out workItem))
-            {
-                foundWork = true;
-                consecutiveStealFailures = 0;
-            }
-            // 2. Try work stealing if local queue is empty
-            else if (TryStealWork(workerId, out workItem))
+            // The highest priority job that is waiting, from this worker's queue first and then from the others
+            if (TryTakeNext(workerId, out workItem))
             {
                 foundWork = true;
                 consecutiveStealFailures = 0;
@@ -376,46 +448,6 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                 }
             }
         }
-    }
-    
-    private bool TryStealWork(int thiefWorkerId, out WorkItem workItem)
-    {
-        workItem = default;
-        
-        // Try to steal from other workers
-        // Start from a different position each time to avoid patterns
-        var startIndex = (thiefWorkerId + 1) % _maxConcurrency;
-        
-        // First pass: steal from queues with multiple items
-        for (int i = 0; i < _maxConcurrency - 1; i++)
-        {
-            var victimIndex = (startIndex + i) % _maxConcurrency;
-            if (victimIndex == thiefWorkerId)
-                continue; // Don't steal from ourselves
-            
-            var victimQueue = _workerQueues[victimIndex];
-            
-            // Only steal if victim has multiple items (leave at least one)
-            if (victimQueue.Count > 1 && victimQueue.TryDequeue(out workItem))
-            {
-                return true;
-            }
-        }
-        
-        // Second pass: steal even single items if we're desperate
-        for (int i = 0; i < _maxConcurrency - 1; i++)
-        {
-            var victimIndex = (startIndex + i) % _maxConcurrency;
-            if (victimIndex == thiefWorkerId)
-                continue;
-            
-            if (_workerQueues[victimIndex].TryDequeue(out workItem))
-            {
-                return true;
-            }
-        }
-        
-        return false;
     }
     
     // A job reports its own failure through the ticker handler, so an exception that gets this far was handled by nothing.
@@ -515,7 +547,8 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             },
             CancellationToken.None);
         
-        targetQueue.Enqueue(workItem);
+        // A continuation belongs to a job that is already running, so it goes before the jobs that have not started
+        targetQueue.Enqueue(workItem, HighBucket);
         // Count continuations to keep counter accurate
         Interlocked.Increment(ref _totalQueuedTasks);
         
@@ -631,7 +664,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         var dropped = 0;
         for (int i = 0; i < _maxConcurrency; i++)
         {
-            while (_workerQueues[i].TryDequeue(out _))
+            while (_workerQueues[i].TryDequeueAny(out _))
             {
                 Interlocked.Decrement(ref _totalQueuedTasks);
                 dropped++;
@@ -643,5 +676,36 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
 
         _notifyDebounce?.Dispose();
         _shutdownCts?.Dispose();
+    }
+}
+
+/// <summary>
+/// The jobs waiting for one worker, one first-in first-out queue per priority.
+/// </summary>
+internal sealed class WorkerQueue
+{
+    private readonly ConcurrentQueue<WorkItem>[] _buckets =
+    {
+        new ConcurrentQueue<WorkItem>(), new ConcurrentQueue<WorkItem>(), new ConcurrentQueue<WorkItem>(),
+    };
+
+    public int Count => _buckets[0].Count + _buckets[1].Count + _buckets[2].Count;
+
+    public int CountOf(int bucket) => _buckets[bucket].Count;
+
+    public void Enqueue(WorkItem item, int bucket) => _buckets[bucket].Enqueue(item);
+
+    public bool TryDequeue(int bucket, out WorkItem item) => _buckets[bucket].TryDequeue(out item);
+
+    public bool TryDequeueAny(out WorkItem item)
+    {
+        foreach (var bucket in _buckets)
+        {
+            if (bucket.TryDequeue(out item))
+                return true;
+        }
+
+        item = default;
+        return false;
     }
 }

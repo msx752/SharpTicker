@@ -8,17 +8,17 @@
         /// </summary>
         LongRunning,
         /// <summary>
-        /// High Priority Tasks are executed first.
+        /// When jobs are waiting for a free worker, High priority tasks start first.
         /// Using TickerTaskScheduler
         /// </summary>
         High,
         /// <summary>
-        /// Normal Priority Tasks are executed after high priority tasks.
+        /// When jobs are waiting for a free worker, Normal priority tasks start after High and before Low priority tasks.
         /// Using TickerTaskScheduler
         /// </summary>
         Normal,
         /// <summary>
-        /// Low Priority Tasks are executed last.
+        /// When jobs are waiting for a free worker, Low priority tasks start after High and Normal ones. A Low task is not held back for ever: after ten higher priority tasks have started in a row while it waits, it goes next.
         /// Using TickerTaskScheduler
         /// </summary>
         Low
