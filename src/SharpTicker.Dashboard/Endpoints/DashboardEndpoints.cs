@@ -602,7 +602,10 @@ public static class DashboardEndpoints
         int.TryParse(context.Request.Query["pageSize"].ToString(), out var pageSize);
         if (pageSize < 1) pageSize = 20;
 
-        var result = await repository.GetCronTickersPaginatedAsync(pageNumber, pageSize, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
+        // Only the crons that are enabled (true) or disabled (false); anything else lists all of them
+        bool? isEnabled = bool.TryParse(context.Request.Query["isEnabled"].ToString(), out var parsedEnabled) ? parsedEnabled : null;
+
+        var result = await repository.GetCronTickersPaginatedAsync(pageNumber, pageSize, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter, isEnabled: isEnabled);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 

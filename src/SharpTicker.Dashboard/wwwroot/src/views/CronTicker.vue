@@ -24,9 +24,11 @@ import { nextRunText, statusName } from '@/utilities/cronRunSummary'
 import { relativeTime } from '@/utilities/relativeTime'
 import { runInitialLoad } from '@/utilities/initialLoad'
 import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
+import { copyText } from '@/utilities/clipboard'
 
 const getCronTickerRangeGraphData = cronTickerService.getTimeTickersGraphDataRange()
 const getCronTickersPaginated = cronTickerService.getCronTickersPaginated()
+const getDisabledCount = cronTickerService.getDisabledCount()
 const getCronTickerRangeGraphDataById = cronTickerService.getTimeTickersGraphDataRangeById()
 const getCronTickersGraphDataAndParseToGraph = cronTickerService.getTimeTickersGraphData()
 const deleteCronTicker = cronTickerService.deleteCronTicker()
@@ -47,16 +49,50 @@ const currentPage = ref(1)
 const pageSize = ref(20)
 const totalCount = ref(0)
 
+// The list can be limited to the disabled crons, so a cron that was switched off by mistake is easy to find
+const showOnlyDisabled = ref(false)
+const disabledCount = ref(0)
+
+const loadDisabledCount = async () => {
+  try {
+    disabledCount.value = await getDisabledCount.requestAsync()
+  } catch {
+    // the chip keeps its last count
+  }
+}
+
 // Load page data with pagination
 const loadPageData = async () => {
   try {
-    const response = await getCronTickersPaginated.requestAsync(currentPage.value, pageSize.value)
+    void loadDisabledCount()
+    const response = await getCronTickersPaginated.requestAsync(
+      currentPage.value,
+      pageSize.value,
+      showOnlyDisabled.value ? false : undefined,
+    )
     if (response) {
       totalCount.value = response.totalCount || 0
     }
   } catch (error) {
     console.error('Failed to load paginated data:', error)
   }
+}
+
+const toggleDisabledFilter = async () => {
+  showOnlyDisabled.value = !showOnlyDisabled.value
+  currentPage.value = 1
+  await loadPageData()
+}
+
+// Copies the raw cron expression of a row
+const copiedExpression = ref('')
+const copyExpression = async (expression: string) => {
+  if (!(await copyText(expression))) return
+
+  copiedExpression.value = expression
+  setTimeout(() => {
+    if (copiedExpression.value === expression) copiedExpression.value = ''
+  }, 1500)
 }
 
 // Handle page change
@@ -986,6 +1022,19 @@ const refreshData = async () => {
                   getCronTickersPaginated.loader.value ? 'Loading...' : `${totalCount} total items`
                 }}
               </v-chip>
+              <v-chip
+                v-if="disabledCount > 0 || showOnlyDisabled"
+                :color="showOnlyDisabled ? 'warning' : undefined"
+                :variant="showOnlyDisabled ? 'flat' : 'tonal'"
+                size="small"
+                class="status-chip disabled-filter-chip"
+                :aria-pressed="showOnlyDisabled"
+                :title="showOnlyDisabled ? 'Show all crons' : 'Show only the disabled crons'"
+                @click="toggleDisabledFilter"
+              >
+                <v-icon size="small" class="mr-1">mdi-pause-circle-outline</v-icon>
+                Disabled {{ disabledCount }}
+              </v-chip>
             </div>
 
             <!-- Utility Actions Group -->
@@ -1034,7 +1083,14 @@ const refreshData = async () => {
                 <span v-if="scheduleText(item.expression)" class="schedule-text">
                   {{ scheduleText(item.expression) }}
                 </span>
-                <span class="schedule-expression">{{ item.expression }}</span>
+                <button
+                  type="button"
+                  class="schedule-expression"
+                  title="Copy the expression"
+                  @click="copyExpression(item.expression)"
+                >
+                  {{ copiedExpression === item.expression ? 'Copied' : item.expression }}
+                </button>
               </div>
             </template>
 
@@ -1896,6 +1952,20 @@ const refreshData = async () => {
   font-family: 'JetBrains Mono', 'Monaco', 'Consolas', monospace;
   font-size: 0.6875rem;
   color: #9e9e9e;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: copy;
+  text-align: left;
+}
+
+.schedule-expression:hover,
+.schedule-expression:focus-visible {
+  color: #e0e0e0;
+}
+
+.disabled-filter-chip {
+  cursor: pointer;
 }
 
 .enabled-chip {

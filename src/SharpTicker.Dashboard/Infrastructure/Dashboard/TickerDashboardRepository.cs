@@ -435,10 +435,13 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             return x => visibleIds.Contains(x.CronTickerId);
         }
         
-        public async Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
+        public async Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null, bool? isEnabled = null)
         {
+            // Only the crons with this enabled state, when the caller asks for one
+            Expression<Func<TCronTicker, bool>> enabledState = isEnabled == true ? x => x.IsEnabled : isEnabled == false ? x => !x.IsEnabled : null;
+
             // We need to cast TCronTicker[] to CronTickerEntity[] for the pagination result
-            var result = await _persistenceProvider.GetCronTickersPaginated(visibility?.CronTickers, pageNumber, pageSize, cancellationToken);
+            var result = await _persistenceProvider.GetCronTickersPaginated(enabledState.And(visibility?.CronTickers), pageNumber, pageSize, cancellationToken);
             return new PaginationResult<CronTickerEntity>(
                 result.Items.Cast<CronTickerEntity>(),
                 result.TotalCount,

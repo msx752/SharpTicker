@@ -21,7 +21,7 @@ namespace SharpTicker.Utilities.Interfaces
         Task<IList<TickerGraphData>> GetCronTickersGraphSpecificDataByIdAsync(Guid id, int pastDays, int futureDays,CancellationToken cancellationToken);
         Task<IList<Tuple<TickerStatus, int>>> GetCronTickerFullDataAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
         Task<CronTickerEntity[]> GetCronTickersAsync(CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
-        Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
+        Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null, bool? isEnabled = null);
         Task AddOnDemandCronTickerOccurrenceAsync(Guid id, CancellationToken cancellationToken = default);
         Task<CronTickerOccurrenceEntity<TCronTicker>[]> GetCronTickersOccurrencesAsync(Guid guid, CancellationToken cancellationToken = default);
         Task<PaginationResult<CronTickerOccurrenceEntity<TCronTicker>>> GetCronTickersOccurrencesPaginatedAsync(Guid guid, int pageNumber, int pageSize, CancellationToken cancellationToken = default);

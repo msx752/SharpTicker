@@ -339,6 +339,31 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
         Assert.NotEqual(Ids(first.GetProperty("items")), Ids(second.GetProperty("items")));
     }
 
+    [Theory]
+    [InlineData("false", false)]
+    [InlineData("true", true)]
+    public async Task CronTickersPaginated_CanListOnlyTheDisabledOrOnlyTheEnabledCrons(string isEnabled, bool expected)
+    {
+        var page = await _api.GetAsync($"/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled={isEnabled}");
+
+        var items = page.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal(items.Length, page.GetProperty("totalCount").GetInt32());
+        Assert.NotEmpty(items);
+        Assert.All(items, item => Assert.Equal(expected, item.GetProperty("isEnabled").GetBoolean()));
+    }
+
+    [Fact]
+    public async Task CronTickersPaginated_ListsEveryCron_WhenNoEnabledStateIsAsked()
+    {
+        var all = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20");
+        var disabled = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=false");
+        var enabled = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=true");
+        var nonsense = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=maybe");
+
+        Assert.Equal(all.GetProperty("totalCount").GetInt32(), disabled.GetProperty("totalCount").GetInt32() + enabled.GetProperty("totalCount").GetInt32());
+        Assert.Equal(all.GetProperty("totalCount").GetInt32(), nonsense.GetProperty("totalCount").GetInt32());
+    }
+
     [Fact]
     public async Task CronTickersGraphDataRange_CountsOccurrencesOnTheDayTheyAreScheduledFor()
     {

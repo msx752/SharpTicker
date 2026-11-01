@@ -103,9 +103,10 @@ const getCronTickersPaginated = () => {
         }
     };
 
-    const requestAsync = async (pageNumber: number = 1, pageSize: number = 20) => {
+    // isEnabled lists only the enabled (true) or only the disabled (false) crons; leave it out for all of them
+    const requestAsync = async (pageNumber: number = 1, pageSize: number = 20, isEnabled?: boolean) => {
         const response = await baseHttp.sendAsync("GET", "cron-tickers/paginated", { 
-            paramData: { pageNumber, pageSize } 
+            paramData: isEnabled === undefined ? { pageNumber, pageSize } : { pageNumber, pageSize, isEnabled }
         });
         const processed = processResponse(response);
         void loadRunSummary(processed);
@@ -116,6 +117,19 @@ const getCronTickersPaginated = () => {
         ...baseHttp,
         requestAsync
     };
+}
+
+// How many crons are disabled, for the filter chip above the table. One item per page is enough: only the total is read.
+const getDisabledCount = () => {
+    const baseHttp = useBaseHttpService<object, PaginatedCronTickerResponse>('single');
+    const requestAsync = async () => {
+        const response = await baseHttp.sendAsync("GET", "cron-tickers/paginated", {
+            paramData: { pageNumber: 1, pageSize: 1, isEnabled: false }
+        });
+        return response?.totalCount ?? 0;
+    };
+
+    return { requestAsync };
 }
 
 const updateCronTicker = () => {
@@ -218,6 +232,7 @@ const toggleCronTicker = () => {
 export const cronTickerService = {
     getCronTickers,
     getCronTickersPaginated,
+    getDisabledCount,
     updateCronTicker,
     addCronTicker,
     deleteCronTicker,
