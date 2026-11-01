@@ -1,5 +1,7 @@
 using System.Net;
+using System.Reflection;
 using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Http;
 using SharpTicker.Dashboard.DependencyInjection;
 using Xunit;
 
@@ -11,41 +13,30 @@ namespace SharpTicker.Tests;
 /// the old script after an upgrade loaded the old dashboard although the package was new. The page now asks for the
 /// script with a fingerprint of its content in the address, so a new build is a new address.
 /// </summary>
-[Collection(SharedStaticStateCollection.Name)]
-public class DashboardPreloadScriptTests : IClassFixture<InMemoryDashboardApiFixture>
+public class DashboardPreloadScriptTests
 {
-    private const string Base = "/ticker/dashboard";
+    private const string Page = "<html><head><title>x</title></head><body></body></html>";
 
-    private readonly InMemoryDashboardApiFixture _api;
+    private static string Inject(string? version, string basePath = "/ticker/dashboard")
+        => ServiceCollectionExtensions.InjectExternalScripts(Page, new DefaultHttpContext(), basePath, version!);
 
-    public DashboardPreloadScriptTests(InMemoryDashboardApiFixture api) => _api = api;
-
-    private async Task<string> GetAsync(string path)
+    [Fact]
+    public void ThePageAsksForThePreloadScriptWithTheFingerprintInTheAddress()
     {
-        var response = await _api.Client.GetAsync(path);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        return await response.Content.ReadAsStringAsync();
+        var page = Inject("0123456789ab");
+
+        Assert.Contains("<script src=\"__sharpticker-preload.js?v=0123456789ab\"></script>", page);
+        // The config script is not cached by the dashboard, so its address stays as it was
+        Assert.Contains("<script src=\"__sharpticker-config.js\"></script>", page);
     }
 
     [Fact]
-    public async Task ThePageAsksForThePreloadScriptWithTheFingerprintOfItsContent()
+    public void WithoutAFingerprint_ThePageAsksForThePlainAddress()
     {
-        var page = await GetAsync(Base + "/time-tickers");
-        var script = await GetAsync(Base + "/__sharpticker-preload.js");
+        var page = Inject(null);
 
-        var asked = Regex.Match(page, @"__sharpticker-preload\.js\?v=([0-9a-f]{12})""");
-        Assert.True(asked.Success, page);
-        Assert.Equal(ServiceCollectionExtensions.VersionOf(script), asked.Groups[1].Value);
-    }
-
-    [Fact]
-    public async Task TheScriptIsServedWhateverTheQuery()
-    {
-        var withQuery = await GetAsync(Base + "/__sharpticker-preload.js?v=anything");
-        var without = await GetAsync(Base + "/__sharpticker-preload.js");
-
-        Assert.Equal(without, withQuery);
-        Assert.Contains("index-", without); // the names of the hashed files of this build
+        Assert.Contains("<script src=\"__sharpticker-preload.js\"></script>", page);
+        Assert.DoesNotContain("?v=", page);
     }
 
     [Fact]
@@ -57,5 +48,58 @@ public class DashboardPreloadScriptTests : IClassFixture<InMemoryDashboardApiFix
         Assert.NotEqual(ServiceCollectionExtensions.VersionOf(old), ServiceCollectionExtensions.VersionOf(current));
         Assert.Equal(ServiceCollectionExtensions.VersionOf(current), ServiceCollectionExtensions.VersionOf(current));
         Assert.Matches("^[0-9a-f]{12}$", ServiceCollectionExtensions.VersionOf(current));
+    }
+
+    /// <summary>
+    /// A test that needs the dashboard UI inside the assembly, which is there only when the UI was built before the
+    /// .NET build (the test job of the CI does not build it). Without it the test is skipped, not passed.
+    /// </summary>
+    public sealed class FactWithTheDashboardBuildAttribute : FactAttribute
+    {
+        public FactWithTheDashboardBuildAttribute()
+        {
+            var built = typeof(ServiceCollectionExtensions).Assembly.GetManifestResourceNames()
+                .Any(name => name.EndsWith("wwwroot.dist.index.html", StringComparison.Ordinal));
+            if (!built)
+                Skip = "The dashboard UI is not built into SharpTicker.Dashboard in this run (npm run build comes first).";
+        }
+    }
+
+    [Collection(SharedStaticStateCollection.Name)]
+    public class WithTheBuiltDashboard : IClassFixture<InMemoryDashboardApiFixture>
+    {
+        private const string Base = "/ticker/dashboard";
+
+        private readonly InMemoryDashboardApiFixture _api;
+
+        public WithTheBuiltDashboard(InMemoryDashboardApiFixture api) => _api = api;
+
+        private async Task<string> GetAsync(string path)
+        {
+            var response = await _api.Client.GetAsync(path);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            return await response.Content.ReadAsStringAsync();
+        }
+
+        [FactWithTheDashboardBuild]
+        public async Task ThePageAsksForTheFingerprintOfTheScriptItServes()
+        {
+            var page = await GetAsync(Base + "/time-tickers");
+            var script = await GetAsync(Base + "/__sharpticker-preload.js");
+
+            var asked = Regex.Match(page, @"__sharpticker-preload\.js\?v=([0-9a-f]{12})""");
+            Assert.True(asked.Success, page);
+            Assert.Equal(ServiceCollectionExtensions.VersionOf(script), asked.Groups[1].Value);
+        }
+
+        [FactWithTheDashboardBuild]
+        public async Task TheScriptIsServedWhateverTheQuery()
+        {
+            var withQuery = await GetAsync(Base + "/__sharpticker-preload.js?v=anything");
+            var without = await GetAsync(Base + "/__sharpticker-preload.js");
+
+            Assert.Equal(without, withQuery);
+            Assert.Contains("index-", without); // the names of the hashed files of this build
+        }
     }
 }

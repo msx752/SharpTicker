@@ -262,7 +262,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
         internal static string VersionOf(string preloadScript)
             => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(preloadScript))).Substring(0, 12).ToLowerInvariant();
 
-        private static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath, string preloadVersion)
+        internal static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath, string preloadVersion)
         {
             if (string.IsNullOrEmpty(htmlTemplate))
                 return htmlTemplate ?? string.Empty;
