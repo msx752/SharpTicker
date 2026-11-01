@@ -104,7 +104,10 @@ const initializeServices = async () => {
 
 // Load initial data
 const loadInitialData = async () => {
-  if (!getOptions || !getTickerHostStatus) return
+  if (!getOptions || !getTickerHostStatus) {
+    timeZoneStore.markSchedulerTimeZoneSettled()
+    return
+  }
 
   try {
     // Wait for options to be loaded
@@ -125,6 +128,10 @@ const loadInitialData = async () => {
       lastHostExceptionMessage.value = ''
     }
 
+    // The pages wait for this before their first load (they format dates with the zone); a server that sent no zone,
+    // or no options at all, must not keep them waiting
+    timeZoneStore.markSchedulerTimeZoneSettled()
+
     // Wait for host status to be loaded
     await getTickerHostStatus.requestAsync()
 
@@ -136,6 +143,7 @@ const loadInitialData = async () => {
     // Failed to load initial data
     currentMachine.value = 'Error'
     tickerHostStatus.value = false
+    timeZoneStore.markSchedulerTimeZoneSettled()
   }
 }
 
@@ -757,6 +765,7 @@ const handleForceUIUpdate = () => {
 }
 
 .status-pulse {
+  position: relative;
   width: 12px;
   height: 12px;
   border-radius: 50%;
@@ -765,26 +774,61 @@ const handleForceUIUpdate = () => {
 
 .pulse-active {
   background: #4caf50;
-  animation: pulse-success 2s infinite;
-  box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 2.67;
 }
+
 
 .pulse-inactive {
   background: #f44336;
-  animation: pulse-error 2s infinite;
-  box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 2.67;
 }
 
-@keyframes pulse-success {
-  0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
-  70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+
+/*
+ * The status dots pulse with a ring that grows and fades. It is drawn with transform and opacity, which the browser
+ * runs on the compositor; animating box-shadow made it repaint the header on every frame, on every page, for as long
+ * as the page was open.
+ */
+.pulse-active::after,
+.pulse-inactive::after,
+.websocket-connected::after,
+.websocket-connecting::after,
+.websocket-disconnected::after,
+.websocket-warning::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: inherit;
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: pulse-ring var(--pulse-duration, 2s) infinite;
 }
 
-@keyframes pulse-error {
-  0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7); }
-  70% { box-shadow: 0 0 0 10px rgba(244, 67, 54, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }
+@keyframes pulse-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  70%,
+  100% {
+    transform: scale(var(--pulse-scale, 2.5));
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-active::after,
+  .pulse-inactive::after,
+  .websocket-connected::after,
+  .websocket-connecting::after,
+  .websocket-disconnected::after,
+  .websocket-warning::after {
+    animation: none;
+  }
 }
 
 .system-details {
@@ -825,6 +869,7 @@ const handleForceUIUpdate = () => {
 }
 
 .websocket-indicator {
+  position: relative;
   width: 8px;
   height: 8px;
   border-radius: 50%;
@@ -833,33 +878,31 @@ const handleForceUIUpdate = () => {
 
 .websocket-connected {
   background: #4caf50;
-  animation: pulse-success 2s infinite;
-  box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 3.5;
 }
+
 
 .websocket-connecting {
   background: #ff9800;
-  animation: pulse-warning 1.5s infinite;
-  box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7);
+  --pulse-duration: 1.5s;
+  --pulse-scale: 2.5;
 }
+
 
 .websocket-disconnected {
   background: #f44336;
-  animation: pulse-error 2s infinite;
-  box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 3.5;
 }
+
 
 .websocket-warning {
   background: #ff9800;
-  animation: pulse-warning 1.5s infinite;
-  box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7);
+  --pulse-duration: 1.5s;
+  --pulse-scale: 2.5;
 }
 
-@keyframes pulse-warning {
-  0% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7); }
-  70% { box-shadow: 0 0 0 6px rgba(255, 152, 0, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0); }
-}
 
 .websocket-text {
   font-size: 0.75rem;

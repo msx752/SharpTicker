@@ -15,6 +15,8 @@ import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
 import VChart, { THEME_KEY } from 'vue-echarts'
+import { runInitialLoad } from '@/utilities/initialLoad'
+import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 import '@/utilities/echartsSetup'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
 
@@ -105,42 +107,44 @@ const runAgain = async (item: GetTimeTickerResponse) => {
   }
 }
 
-onMounted(async () => {
-  // Initialize WebSocket connection
-  try {
-    const connectionStore = useConnectionStore()
-    if (!connectionStore.isInitialized) {
-      await connectionStore.initializeConnectionWithRetry()
-    }
-  } catch (error: any) {}
+// The charts are built after the table has painted, so the table is what appears first
+const chartsReady = ref(false)
 
-  // Load initial data with pagination
-  try {
-    await loadPageData()
-  } catch (error) {
-    // Failed to load time tickers
-  }
-  
-  // Load chart data
-  try {
-    await loadTimeSeriesChartData(-3, 3)
-    await loadPieChartData()
-  } catch (error) {
-    console.error('Failed to load chart data:', error)
-  }
-  
-  // Add hub listeners
-  try {
-    await addHubListeners()
-  } catch (error) {
-    // Failed to add hub listeners
-  }
+const zoneGate = createZoneReloadGate(
+  () => timeZoneStore.whenSchedulerTimeZoneKnown(),
+  () => timeZoneStore.effectiveTimeZone,
+)
+let pageActive = true
+
+onMounted(() => {
+  const connectionStore = useConnectionStore()
+
+  // The dates are formatted with the time zone in use when they arrive, so the first load waits until that zone is
+  // final; the watcher below then ignores the change that made it final. See utilities/zoneReloadGate.ts.
+  const withZone = zoneGate.firstLoad
+
+  // The table, the chart data and the connection start together; see utilities/initialLoad.ts
+  runInitialLoad({
+    connect: async () => {
+      if (!connectionStore.isInitialized) {
+        await connectionStore.initializeConnectionWithRetry()
+      }
+    },
+    loadTable: withZone(loadPageData),
+    loadCharts: [withZone(() => loadTimeSeriesChartData(-3, 3)), withZone(loadPieChartData)],
+    showCharts: () => {
+      chartsReady.value = true
+    },
+    attachListeners: addHubListeners,
+    isActive: () => pageActive,
+  })
 })
 
 // Reload data when display timezone changes
 watch(
   () => timeZoneStore.effectiveTimeZone,
-  async () => {
+  async (zone) => {
+    if (!zoneGate.shouldReload(zone)) return
     try {
       await loadPageData()
       await loadTimeSeriesChartData(-3, 3)
@@ -152,6 +156,7 @@ watch(
 )
 
 onUnmounted(() => {
+  pageActive = false
   TickerNotificationHub.stopReceiver(methodName.onReceiveAddTimeTicker)
   TickerNotificationHub.stopReceiver(methodName.onReceiveUpdateTimeTicker)
   TickerNotificationHub.stopReceiver(methodName.onReceiveDeleteTimeTicker)
@@ -777,12 +782,14 @@ const canBeForceDeleted = ref<string[]>([])
         <div v-if="activeChart === 'line'" class="chart-section">
           <div class="chart-wrapper">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="lineChartOption"
               :key="`chart-${chartKey}`"
               :loading="chartLoading"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
 
@@ -790,12 +797,14 @@ const canBeForceDeleted = ref<string[]>([])
         <div v-if="activeChart === 'pie'" class="chart-section">
           <div class="chart-wrapper">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="pieChartOption"
               :key="`pie-${pieChartKey}`"
               :loading="chartLoading"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
       </div>

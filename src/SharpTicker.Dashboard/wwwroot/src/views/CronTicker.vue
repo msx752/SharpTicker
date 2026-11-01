@@ -17,6 +17,8 @@ import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
 import { describeSchedule } from '@/utilities/cronSchedule'
+import { runInitialLoad } from '@/utilities/initialLoad'
+import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 
 const getCronTickerRangeGraphData = cronTickerService.getTimeTickersGraphDataRange()
 const getCronTickersPaginated = cronTickerService.getCronTickersPaginated()
@@ -374,66 +376,50 @@ const onSubmitToggleConfirmDialog = async () => {
   }
 }
 
-onMounted(async () => {
-  try {
-    isMounted.value = true
-    // Ensure WebSocket connection is established (only if not already initialized)
-    try {
-      const connectionStore = useConnectionStore()
+// The charts are built after the table has painted, so the table is what appears first
+const chartsReady = ref(false)
+
+const zoneGate = createZoneReloadGate(
+  () => timeZoneStore.whenSchedulerTimeZoneKnown(),
+  () => timeZoneStore.effectiveTimeZone,
+)
+
+onMounted(() => {
+  isMounted.value = true
+  const connectionStore = useConnectionStore()
+
+  // The dates are formatted with the time zone in use when they arrive, so the first load waits until that zone is
+  // final; the watcher below then ignores the change that made it final. See utilities/zoneReloadGate.ts.
+  const withZone = zoneGate.firstLoad
+
+  // The table, the chart data and the connection start together; see utilities/initialLoad.ts
+  runInitialLoad({
+    connect: async () => {
       if (!connectionStore.isInitialized) {
         await connectionStore.initializeConnectionWithRetry()
       }
-    } 
-    catch (error: any) {}
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load cron tickers data
-    try {
-      await loadPageData()
-    } catch (error: any) {
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load graph data range
-    try {
-      const res = await getCronTickerRangeGraphData.requestAsync(-3, 3)
-      GetCronTickerRangeGraphData(res)
-    } catch (error: any) {
-      if (error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED') {
-        return
-      }
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load status distribution data
-    try {
-      await getTimeTickersGraphDataAndParseToGraph()
-    } catch (error: any) {
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Add hub listeners
-    try {
-      await addHubListeners()
-    } catch (error: any) {
-    }
-    
-  } catch (error: any) {
-  }
+    },
+    loadTable: withZone(loadPageData),
+    loadCharts: [
+      withZone(async () => {
+        const res = await getCronTickerRangeGraphData.requestAsync(-3, 3)
+        if (isMounted.value) GetCronTickerRangeGraphData(res)
+      }),
+      withZone(getTimeTickersGraphDataAndParseToGraph),
+    ],
+    showCharts: () => {
+      chartsReady.value = true
+    },
+    attachListeners: addHubListeners,
+    isActive: () => isMounted.value,
+  })
 })
 
 // Reload data when display timezone changes
 watch(
   () => timeZoneStore.effectiveTimeZone,
-  async () => {
+  async (zone) => {
+    if (!zoneGate.shouldReload(zone)) return
     try {
       if (!isMounted.value) return
 
@@ -874,11 +860,13 @@ const refreshData = async () => {
 
           <div class="chart-container">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="option"
               :key="`chart-${chartKey}`"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
 
@@ -908,11 +896,13 @@ const refreshData = async () => {
 
           <div class="chart-container">
             <v-chart
+              v-if="chartsReady"
               class="status-chart"
               :option="totalOption"
               :key="`pie-chart-${pieChartKey}`"
               autoresize
             />
+            <div v-else class="status-chart"></div>
           </div>
         </div>
       </div>
