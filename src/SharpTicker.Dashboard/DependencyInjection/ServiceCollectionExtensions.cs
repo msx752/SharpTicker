@@ -1,8 +1,6 @@
 using System;
 using System.IO;
 using System.Reflection;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Encodings.Web;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -80,7 +78,6 @@ namespace SharpTicker.Dashboard.DependencyInjection
             // Extract inline preload script from embedded index.html at startup.
             // Serving it as an external file allows CSP script-src 'self' without 'unsafe-inline'.
             string preloadScript = null;
-            string preloadVersion = null;
             string htmlTemplate = null;
             var indexFile = embeddedFileProvider.GetFileInfo("index.html");
             if (indexFile.Exists)
@@ -93,7 +90,6 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 if (scriptMatch.Success)
                 {
                     preloadScript = scriptMatch.Groups[1].Value;
-                    preloadVersion = VersionOf(preloadScript);
                     htmlTemplate = rawHtml.Remove(scriptMatch.Index, scriptMatch.Length);
                 }
                 else
@@ -136,18 +132,23 @@ namespace SharpTicker.Dashboard.DependencyInjection
 
                     if (string.Equals(path, "/__sharpticker-config.js", StringComparison.OrdinalIgnoreCase))
                     {
-                        var configJs = GenerateConfigJs(context, basePath, config);
+                        // The preload script goes with the configuration: it names the hashed files of this build, so it
+                        // has to come from the same answer, which is made for each request and never stored.
+                        var configJs = WithPreload(GenerateConfigJs(context, basePath, config), preloadScript);
                         context.Response.ContentType = "application/javascript; charset=utf-8";
                         context.Response.Headers.CacheControl = "no-cache";
                         await context.Response.WriteAsync(configJs);
                         return;
                     }
 
+                    // Before this address was folded into the configuration script, pages asked for it. A page that a cache
+                    // still holds does, so it keeps answering, with nothing to do (the configuration script already does
+                    // it, and doing it twice would add every tag twice) and never stored.
                     if (string.Equals(path, "/__sharpticker-preload.js", StringComparison.OrdinalIgnoreCase) && preloadScript != null)
                     {
                         context.Response.ContentType = "application/javascript; charset=utf-8";
-                        context.Response.Headers.CacheControl = "public,max-age=3600";
-                        await context.Response.WriteAsync(preloadScript);
+                        context.Response.Headers.CacheControl = "no-cache";
+                        await context.Response.WriteAsync(LegacyPreloadNote);
                         return;
                     }
 
@@ -193,9 +194,12 @@ namespace SharpTicker.Dashboard.DependencyInjection
 
                     if (context.Response.StatusCode == 404 && htmlTemplate != null)
                     {
-                        var htmlContent = InjectExternalScripts(htmlTemplate, context, basePath, preloadVersion);
+                        var htmlContent = InjectExternalScripts(htmlTemplate, context, basePath);
 
+                        // Also the answer for an address of a file that does not exist (an old hashed file that an old page
+                        // asks for), so it must never be stored under that address.
                         context.Response.ContentType = "text/html";
+                        context.Response.Headers.CacheControl = "no-cache";
                         context.Response.StatusCode = 200;
                         await context.Response.WriteAsync(htmlContent);
                     }
@@ -250,19 +254,24 @@ namespace SharpTicker.Dashboard.DependencyInjection
         }
 
         /// <summary>
-        /// Injects base tag and external script references into the HTML template.
-        /// Config must load before preload since the preload script uses window.__dynamic_base__.
+        /// What the old address of the preload script answers now. The configuration script carries the preload script.
         /// </summary>
-        /// <summary>
-        /// A short, stable fingerprint of the preload script. The script holds the names of the hashed JS and CSS files of
-        /// this build, so its content changes with every dashboard build, while its file name does not. A proxy or a
-        /// browser that kept the old script after an upgrade would load the old dashboard. The page asks for the script
-        /// with this fingerprint in the query, which makes the address change with the content.
-        /// </summary>
-        internal static string VersionOf(string preloadScript)
-            => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(preloadScript))).Substring(0, 12).ToLowerInvariant();
+        internal const string LegacyPreloadNote = "/* The preload script is part of __sharpticker-config.js. */";
 
-        internal static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath, string preloadVersion)
+        /// <summary>
+        /// The configuration script followed by the preload script. The preload script reads
+        /// <c>window.__dynamic_base__</c>, which the configuration sets, so it has to come second. It holds the names of
+        /// the hashed JS and CSS files of this build: its content changes with every dashboard build while its address
+        /// does not, so it must not be a file that a proxy or a browser can keep. The configuration script is made for
+        /// each request and is sent with <c>Cache-Control: no-cache</c>.
+        /// </summary>
+        internal static string WithPreload(string configJs, string preloadScript)
+            => string.IsNullOrEmpty(preloadScript) ? configJs : configJs + "\n" + preloadScript;
+
+        /// <summary>
+        /// Injects the base tag and the configuration script (which carries the preload script) into the HTML template.
+        /// </summary>
+        internal static string InjectExternalScripts(string htmlTemplate, HttpContext httpContext, string basePath)
         {
             if (string.IsNullOrEmpty(htmlTemplate))
                 return htmlTemplate ?? string.Empty;
@@ -274,8 +283,7 @@ namespace SharpTicker.Dashboard.DependencyInjection
             var frontendBasePath = CombinePathBase(pathBase, basePath);
 
             var injection = $@"<base href=""{frontendBasePath}/"" />" +
-                            @"<script src=""__sharpticker-config.js""></script>" +
-                            $@"<script src=""__sharpticker-preload.js{(string.IsNullOrEmpty(preloadVersion) ? string.Empty : "?v=" + preloadVersion)}""></script>";
+                            @"<script src=""__sharpticker-config.js""></script>";
 
             var headOpen = Regex.Match(htmlTemplate, "(?is)<head\\b[^>]*>");
             if (headOpen.Success)

@@ -1,6 +1,4 @@
 using System.Net;
-using System.Reflection;
-using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http;
 using SharpTicker.Dashboard.DependencyInjection;
 using Xunit;
@@ -8,46 +6,54 @@ using Xunit;
 namespace SharpTicker.Tests;
 
 /// <summary>
-/// The page of the dashboard asks for a small script that holds the names of the hashed JS and CSS files of the build.
-/// Its file name stays the same while its content changes with every dashboard build, so a proxy or a browser that kept
-/// the old script after an upgrade loaded the old dashboard although the package was new. The page now asks for the
-/// script with a fingerprint of its content in the address, so a new build is a new address.
+/// The page of the dashboard needs a small script that holds the names of the hashed JS and CSS files of the build. Its
+/// content changes with every dashboard build, so it must not be something a proxy or a browser can keep: after an
+/// upgrade the page would load the old dashboard. It is part of the configuration script, which is made for each request
+/// and is never stored, and what the dashboard answers in place of a file that does not exist is never stored either.
 /// </summary>
 public class DashboardPreloadScriptTests
 {
     private const string Page = "<html><head><title>x</title></head><body></body></html>";
-
-    private static string Inject(string? version, string basePath = "/ticker/dashboard")
-        => ServiceCollectionExtensions.InjectExternalScripts(Page, new DefaultHttpContext(), basePath, version!);
+    private const string Config = "(function(){window.__dynamic_base__='/ticker/dashboard';})();";
+    private const string Preload = "(function(){var preloads=[{src:'/assets/index-HAuLUDoJ.js'}];})();";
 
     [Fact]
-    public void ThePageAsksForThePreloadScriptWithTheFingerprintInTheAddress()
+    public void ThePreloadScript_FollowsTheConfiguration_ThatItNeeds()
     {
-        var page = Inject("0123456789ab");
+        var script = ServiceCollectionExtensions.WithPreload(Config, Preload);
 
-        Assert.Contains("<script src=\"__sharpticker-preload.js?v=0123456789ab\"></script>", page);
-        // The config script is not cached by the dashboard, so its address stays as it was
+        Assert.StartsWith(Config, script);
+        Assert.EndsWith(Preload, script);
+        Assert.True(script.IndexOf("__dynamic_base__", StringComparison.Ordinal) < script.IndexOf("preloads", StringComparison.Ordinal));
+        // On a line of its own, so a comment at the end of one script cannot swallow the other
+        Assert.Contains(Config + "\n" + Preload, script);
+    }
+
+    [Fact]
+    public void WithoutAPreloadScript_TheConfigurationIsLeftAsItIs()
+    {
+        Assert.Equal(Config, ServiceCollectionExtensions.WithPreload(Config, null!));
+        Assert.Equal(Config, ServiceCollectionExtensions.WithPreload(Config, ""));
+    }
+
+    [Fact]
+    public void ThePageAsksForOneScript_NotForTheOldPreloadAddress()
+    {
+        var page = ServiceCollectionExtensions.InjectExternalScripts(Page, new DefaultHttpContext(), "/ticker/dashboard");
+
         Assert.Contains("<script src=\"__sharpticker-config.js\"></script>", page);
+        Assert.DoesNotContain("__sharpticker-preload", page);
+        Assert.Contains("<base href=\"/ticker/dashboard/\" />", page);
+        // In the head, before anything else, as before
+        Assert.True(page.IndexOf("<base", StringComparison.Ordinal) < page.IndexOf("<title>", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void WithoutAFingerprint_ThePageAsksForThePlainAddress()
+    public void TheOldPreloadAddress_AnswersNothingToDo()
     {
-        var page = Inject(null);
-
-        Assert.Contains("<script src=\"__sharpticker-preload.js\"></script>", page);
-        Assert.DoesNotContain("?v=", page);
-    }
-
-    [Fact]
-    public void TheFingerprintChangesWithTheContentAndOnlyWithIt()
-    {
-        var old = "src=\"/assets/index-DVF8oRIG.js\" href=\"/assets/index-0zCv2v9a.css\"";
-        var current = "src=\"/assets/index-HAuLUDoJ.js\" href=\"/assets/index-BeFe0rmL.css\"";
-
-        Assert.NotEqual(ServiceCollectionExtensions.VersionOf(old), ServiceCollectionExtensions.VersionOf(current));
-        Assert.Equal(ServiceCollectionExtensions.VersionOf(current), ServiceCollectionExtensions.VersionOf(current));
-        Assert.Matches("^[0-9a-f]{12}$", ServiceCollectionExtensions.VersionOf(current));
+        // Doing it twice would add every tag twice
+        Assert.DoesNotContain("preloads", ServiceCollectionExtensions.LegacyPreloadNote);
+        Assert.StartsWith("/*", ServiceCollectionExtensions.LegacyPreloadNote);
     }
 
     /// <summary>
@@ -74,32 +80,46 @@ public class DashboardPreloadScriptTests
 
         public WithTheBuiltDashboard(InMemoryDashboardApiFixture api) => _api = api;
 
-        private async Task<string> GetAsync(string path)
+        private async Task<HttpResponseMessage> GetAsync(string path)
         {
             var response = await _api.Client.GetAsync(path);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            return await response.Content.ReadAsStringAsync();
+            return response;
+        }
+
+        private static string[] CacheControl(HttpResponseMessage response)
+            => response.Headers.CacheControl?.ToString().Split(", ") ?? Array.Empty<string>();
+
+        [FactWithTheDashboardBuild]
+        public async Task TheConfigurationScript_CarriesThePreloadScript_AndIsNeverStored()
+        {
+            var response = await GetAsync(Base + "/__sharpticker-config.js");
+            var script = await response.Content.ReadAsStringAsync();
+
+            Assert.Contains("window.__dynamic_base__", script);
+            Assert.Contains("assets/index-", script); // the hashed files of this build
+            Assert.True(script.IndexOf("window.__dynamic_base__", StringComparison.Ordinal) < script.IndexOf("assets/index-", StringComparison.Ordinal));
+            Assert.Contains("no-cache", CacheControl(response));
         }
 
         [FactWithTheDashboardBuild]
-        public async Task ThePageAsksForTheFingerprintOfTheScriptItServes()
+        public async Task TheOldPreloadAddress_StillAnswers_WithNothingToDo_AndIsNeverStored()
+        {
+            var response = await GetAsync(Base + "/__sharpticker-preload.js");
+
+            Assert.Equal(ServiceCollectionExtensions.LegacyPreloadNote, await response.Content.ReadAsStringAsync());
+            Assert.Contains("no-cache", CacheControl(response));
+        }
+
+        [FactWithTheDashboardBuild]
+        public async Task ThePage_AndTheAnswerForAFileThatDoesNotExist_AreNeverStored()
         {
             var page = await GetAsync(Base + "/time-tickers");
-            var script = await GetAsync(Base + "/__sharpticker-preload.js");
+            var missing = await GetAsync(Base + "/assets/index-doesNotExist.js");
 
-            var asked = Regex.Match(page, @"__sharpticker-preload\.js\?v=([0-9a-f]{12})""");
-            Assert.True(asked.Success, page);
-            Assert.Equal(ServiceCollectionExtensions.VersionOf(script), asked.Groups[1].Value);
-        }
-
-        [FactWithTheDashboardBuild]
-        public async Task TheScriptIsServedWhateverTheQuery()
-        {
-            var withQuery = await GetAsync(Base + "/__sharpticker-preload.js?v=anything");
-            var without = await GetAsync(Base + "/__sharpticker-preload.js");
-
-            Assert.Equal(without, withQuery);
-            Assert.Contains("index-", without); // the names of the hashed files of this build
+            Assert.Contains("no-cache", CacheControl(page));
+            Assert.Contains("no-cache", CacheControl(missing));
+            Assert.DoesNotContain("__sharpticker-preload", await page.Content.ReadAsStringAsync());
         }
     }
 }
