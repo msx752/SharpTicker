@@ -48,3 +48,18 @@ function formatSuccessRate(successful: number, finalJobs: number): string | null
   const oneDecimal = (Math.floor((successful * 1000) / finalJobs) / 10).toFixed(1)
   return oneDecimal.endsWith('.0') ? oneDecimal.slice(0, -2) : oneDecimal
 }
+
+/**
+ * The share of one status among all jobs, for the Status Distribution panel: one decimal, no trailing ".0".
+ * A status that has jobs but a share below the rounding step reads "<0.1", not "0": one failed job among 2001 must not
+ * disappear from the panel.
+ */
+export function formatShare(count: number, total: number): string {
+  if (count <= 0 || total <= 0) return '0'
+
+  const share = (count / total) * 100
+  if (share < 0.05) return '<0.1'
+
+  const oneDecimal = share.toFixed(1)
+  return oneDecimal.endsWith('.0') ? oneDecimal.slice(0, -2) : oneDecimal
+}

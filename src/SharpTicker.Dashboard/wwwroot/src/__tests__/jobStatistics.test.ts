@@ -4,7 +4,7 @@
  * below 100% is never shown as 100%.
  */
 import { describe, expect, it } from 'vitest'
-import { summarizeJobStatuses, type JobStatisticsEntry } from '@/utilities/jobStatistics'
+import { summarizeJobStatuses, formatShare, type JobStatisticsEntry } from '@/utilities/jobStatistics'
 
 const week = (done: number, failed: number, total: number, cancelled: number) => [
   { item1: 0, item2: done },
@@ -85,5 +85,26 @@ describe('summarizeJobStatuses', () => {
 
   it('has no numbers before the answer arrived', () => {
     expect(summarizeJobStatuses(undefined)).toBeNull()
+  })
+})
+
+describe('formatShare', () => {
+  it('rounds to one decimal and drops a trailing .0', () => {
+    expect(formatShare(1, 3)).toBe('33.3')
+    expect(formatShare(50, 100)).toBe('50')
+  })
+
+  it('does not let a single failed job among 2001 read as 0', () => {
+    expect(formatShare(1, 2001)).toBe('<0.1')
+  })
+
+  it('shows 0 only when there are no jobs of that status or no jobs at all', () => {
+    expect(formatShare(0, 2001)).toBe('0')
+    expect(formatShare(0, 0)).toBe('0')
+    expect(formatShare(5, 0)).toBe('0')
+  })
+
+  it('keeps a share that rounds to a whole 0.1', () => {
+    expect(formatShare(1, 1000)).toBe('0.1')
   })
 })

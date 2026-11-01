@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { tickerService } from '@/http/services/tickerService'
 import { formatDate } from '@/utilities/dateTimeParser'
-import { summarizeJobStatuses } from '@/utilities/jobStatistics'
+import { summarizeJobStatuses, formatShare } from '@/utilities/jobStatistics'
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { useFunctionNameStore } from '@/stores/functionNames'
@@ -40,8 +40,7 @@ onMounted(async () => {
       if (status) {
         status.count = item.item2
         // Calculate percentage of total
-        const raw = ((item.item2 / total) * 100).toFixed(1)
-        status.percentage = raw.endsWith('.0') ? raw.slice(0, -2) : raw
+        status.percentage = formatShare(item.item2, total)
       }
     })
   })
@@ -61,7 +60,7 @@ onMounted(async () => {
   await functionNamesStore.loadData().then((res) => {
     functionItems.value = [] // Clear existing items
     res.value?.forEach((item) => {
-      const request = item.functionRequestNamespace == '' ? 'N/A' : item.functionRequestNamespace
+      const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
       functionItems.value.push({
         function: item.functionName,
         request: request,
@@ -367,7 +366,7 @@ const getVisiblePageNumbers = () => {
               <v-icon class="title-icon" color="primary">mdi-chart-donut-variant</v-icon>
               Status Distribution
             </h2>
-            <p class="card-subtitle">Current job status breakdown</p>
+            <p class="card-subtitle">All-time job status breakdown</p>
           </div>
 
           <div class="status-compact-list">

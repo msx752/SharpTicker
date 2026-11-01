@@ -375,7 +375,7 @@ const setRowProp = (propContext: any) => {
                   <span class="executing-text">Executing...</span>
                 </div>
                 <div v-else-if="hasStatus(item.status, Status.Cancelled) || hasStatus(item.status, Status.Queued)" class="na-text">
-                  N/A
+                  —
                 </div>
                 <div v-else class="execution-time">
                   {{ item.executedAt }}
@@ -387,7 +387,7 @@ const setRowProp = (propContext: any) => {
             <template v-slot:item.retryIntervals="{ item }">
               <div class="retry-intervals-cell">
                 <div v-if="!item.retryIntervals || item.retryIntervals.length === 0" class="no-retries">
-                  <span class="na-text">N/A</span>
+                  <span class="na-text">—</span>
                 </div>
                 <div v-else class="retry-timeline-compact">
                   <div 
