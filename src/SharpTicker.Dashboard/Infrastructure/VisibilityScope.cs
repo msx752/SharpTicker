@@ -1,9 +1,14 @@
 using System;
+using System.Collections.Generic;
 using System.Linq.Expressions;
+using System.Linq;
 using System.Security.Claims;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Dashboard.Infrastructure;
@@ -46,6 +51,55 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
     public bool HasRule => _rule != null;
 
     public bool CanSeeFunction(string functionName) => _rule == null || _rule.CanSeeFunction(_user, functionName);
+
+    /// <summary>
+    /// An id that no ticker has. A request about a ticker the user may not see runs with this id instead, so it gets
+    /// exactly the answer for a ticker that does not exist.
+    /// </summary>
+    public static readonly Guid NoTicker = Guid.Empty;
+
+    /// <summary>The id itself when the user may see that time ticker, otherwise <see cref="NoTicker"/>.</summary>
+    public async Task<Guid> VisibleTimeTickerIdAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, Guid id, CancellationToken cancellationToken)
+    {
+        if (TimeTickers == null)
+            return id;
+
+        var found = await provider.GetTimeTickers(TimeTickers.And(t => t.Id == id), cancellationToken);
+        return found.Length > 0 ? id : NoTicker;
+    }
+
+    /// <summary>The id itself when the user may see that cron ticker, otherwise <see cref="NoTicker"/>.</summary>
+    public async Task<Guid> VisibleCronTickerIdAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, Guid id, CancellationToken cancellationToken)
+    {
+        if (CronTickers == null)
+            return id;
+
+        var found = await provider.GetCronTickers(CronTickers.And(c => c.Id == id), cancellationToken);
+        return found.Length > 0 ? id : NoTicker;
+    }
+
+    /// <summary>The occurrence id itself when the user may see the cron it belongs to, otherwise <see cref="NoTicker"/>.</summary>
+    public async Task<Guid> VisibleOccurrenceIdAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, Guid id, CancellationToken cancellationToken)
+    {
+        if (CronTickers == null)
+            return id;
+
+        var occurrence = (await provider.GetAllCronTickerOccurrences(o => o.Id == id, cancellationToken)).FirstOrDefault();
+        if (occurrence == null)
+            return id;
+
+        return await VisibleCronTickerIdAsync(provider, occurrence.CronTickerId, cancellationToken) == NoTicker ? NoTicker : id;
+    }
+
+    /// <summary>Only the ids of the time tickers the user may see.</summary>
+    public async Task<List<Guid>> VisibleTimeTickerIdsAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, List<Guid> ids, CancellationToken cancellationToken)
+    {
+        if (TimeTickers == null || ids.Count == 0)
+            return ids;
+
+        var found = await provider.GetTimeTickers(TimeTickers.And(t => ids.Contains(t.Id)), cancellationToken);
+        return found.Select(t => t.Id).ToList();
+    }
 
     /// <summary>Reads the rule registered for the dashboard and applies it to the user of this request.</summary>
     public static VisibilityScope<TTimeTicker, TCronTicker> For(HttpContext context)

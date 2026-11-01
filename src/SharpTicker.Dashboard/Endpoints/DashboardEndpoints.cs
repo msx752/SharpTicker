@@ -238,6 +238,28 @@ public static class DashboardEndpoints
         return Results.Json(value, options.GetTypeInfo(typeof(T))).ExecuteAsync(context);
     }
 
+    /// <summary>The cron id itself when the signed-in user may see that cron, otherwise an id that no cron has.</summary>
+    private static Task<Guid> VisibleCron<TTimeTicker, TCronTicker>(HttpContext context, Guid id, System.Threading.CancellationToken cancellationToken)
+        where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        where TCronTicker : CronTickerEntity, new()
+        => VisibilityScope<TTimeTicker, TCronTicker>.For(context).VisibleCronTickerIdAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), id, cancellationToken);
+
+    /// <summary>The first function of the ticker or of any child, at any depth, that the user may not use.</summary>
+    private static string? FirstHiddenFunction<TTimeTicker, TCronTicker>(VisibilityScope<TTimeTicker, TCronTicker> scope, TTimeTicker? ticker)
+        where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        where TCronTicker : CronTickerEntity, new()
+    {
+        if (ticker == null)
+            return null;
+
+        if (ticker.Function is { } function && !scope.CanSeeFunction(function))
+            return function;
+
+        return ticker.Children?.Select(child => FirstHiddenFunction(scope, child)).FirstOrDefault(found => found != null);
+    }
+
+    private static string HiddenFunctionMessage(string function) => $"You are not allowed to use the function '{function}'";
+
     private static async Task GetAuthInfo(HttpContext context)
     {
         var authService = context.RequestServices.GetRequiredService<IAuthService>();
@@ -410,6 +432,12 @@ public static class DashboardEndpoints
             chainRoot.ExecutionTime = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
         }
 
+        if (FirstHiddenFunction(VisibilityScope<TTimeTicker, TCronTicker>.For(context), chainRoot) is { } hidden)
+        {
+            await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenFunctionMessage(hidden) }, dashboardOptions.DashboardJsonOptions);
+            return;
+        }
+
         var result = await timeTickerManager.AddAsync(chainRoot, cancellationToken);
 
         await WriteJson(context, new ActionResponseWithId
@@ -437,8 +465,15 @@ public static class DashboardEndpoints
         // Use Dashboard-specific JSON options
         var timeTicker = (TTimeTicker)JsonSerializer.Deserialize(jsonString, dashboardOptions.DashboardJsonOptions.GetTypeInfo(typeof(TTimeTicker)));
 
-        // Ensure the ID matches
-        timeTicker.Id = id;
+        // Ensure the ID matches. A ticker the user may not see is updated as one that does not exist.
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        timeTicker.Id = await scope.VisibleTimeTickerIdAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), id, cancellationToken);
+
+        if (FirstHiddenFunction(scope, timeTicker) is { } hidden)
+        {
+            await WriteJson(context, new ActionResponse { Success = false, Message = HiddenFunctionMessage(hidden) }, dashboardOptions.DashboardJsonOptions);
+            return;
+        }
 
         if (timeTicker.ExecutionTime is DateTime executionTime && !string.IsNullOrEmpty(timeZoneId))
         {
@@ -466,6 +501,8 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
 
+        id = await VisibilityScope<TTimeTicker, TCronTicker>.For(context).VisibleTimeTickerIdAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), id, cancellationToken);
+
         var result = await timeTickerManager.DeleteAsync(id, cancellationToken);
 
         await WriteJson(context, new ActionResponse
@@ -489,6 +526,7 @@ public static class DashboardEndpoints
         var ids = (Guid[])JsonSerializer.Deserialize(jsonString, dashboardOptions.DashboardJsonOptions.GetTypeInfo(typeof(Guid[])));
 
         var idList = ids is { Length: > 0 } ? new List<Guid>(ids) : new List<Guid>();
+        idList = await VisibilityScope<TTimeTicker, TCronTicker>.For(context).VisibleTimeTickerIdsAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), idList, cancellationToken);
         var result = await timeTickerManager.DeleteBatchAsync(idList, cancellationToken);
 
         await WriteJson(context, new ActionResponse
@@ -546,9 +584,13 @@ public static class DashboardEndpoints
             .Take(MaxRunSummaryIds)
             .ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF cannot translate on net8
 
+        var query = provider.CronTickersQuery().AsNoTracking().Where(x => ids.Contains(x.Id));
+        if (VisibilityScope<TTimeTicker, TCronTicker>.For(context).CronTickers is { } visibleCrons)
+            query = query.Where(visibleCrons);
+
         var crons = ids.Count == 0
             ? Array.Empty<TCronTicker>()
-            : await provider.CronTickersQuery().AsNoTracking().Where(x => ids.Contains(x.Id)).ToArrayAsync(cancellationToken);
+            : await query.ToArrayAsync(cancellationToken);
 
         var now = DateTime.UtcNow;
         var summaries = new List<CronRunSummary>(crons.Length);
@@ -607,6 +649,7 @@ public static class DashboardEndpoints
         if (!int.TryParse(context.Request.Query["futureDays"].ToString(), out var futureDays))
             futureDays = 3;
 
+        id = await VisibleCron<TTimeTicker, TCronTicker>(context, id, cancellationToken);
         var result = await repository.GetCronTickersGraphSpecificDataByIdAsync(id, pastDays, futureDays, cancellationToken);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
@@ -632,6 +675,7 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
         var cronTickerId = Guid.Parse(context.Request.RouteValues["cronTickerId"]?.ToString()!);
 
+        cronTickerId = await VisibleCron<TTimeTicker, TCronTicker>(context, cronTickerId, cancellationToken);
         var result = await repository.GetCronTickersOccurrencesAsync(cronTickerId, cancellationToken);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
@@ -650,6 +694,7 @@ public static class DashboardEndpoints
         int.TryParse(context.Request.Query["pageSize"].ToString(), out var pageSize);
         if (pageSize < 1) pageSize = 20;
 
+        cronTickerId = await VisibleCron<TTimeTicker, TCronTicker>(context, cronTickerId, cancellationToken);
         var result = await repository.GetCronTickersOccurrencesPaginatedAsync(cronTickerId, pageNumber, pageSize, cancellationToken);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
@@ -663,6 +708,7 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
         var cronTickerId = Guid.Parse(context.Request.RouteValues["cronTickerId"]?.ToString()!);
 
+        cronTickerId = await VisibleCron<TTimeTicker, TCronTicker>(context, cronTickerId, cancellationToken);
         var result = await repository.GetCronTickersOccurrencesGraphDataAsync(cronTickerId, cancellationToken);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
@@ -681,6 +727,12 @@ public static class DashboardEndpoints
 
         // Use Dashboard-specific JSON options
         var cronTicker = (TCronTicker)JsonSerializer.Deserialize(jsonString, dashboardOptions.DashboardJsonOptions.GetTypeInfo(typeof(TCronTicker)));
+
+        if (cronTicker?.Function is { } addedFunction && !VisibilityScope<TTimeTicker, TCronTicker>.For(context).CanSeeFunction(addedFunction))
+        {
+            await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenFunctionMessage(addedFunction) }, dashboardOptions.DashboardJsonOptions);
+            return;
+        }
 
         var result = await cronTickerManager.AddAsync(cronTicker, cancellationToken);
 
@@ -708,8 +760,15 @@ public static class DashboardEndpoints
         // Use Dashboard-specific JSON options
         var cronTicker = (TCronTicker)JsonSerializer.Deserialize(jsonString, dashboardOptions.DashboardJsonOptions.GetTypeInfo(typeof(TCronTicker)));
 
-        // Ensure the ID matches
-        cronTicker.Id = id;
+        // Ensure the ID matches. A cron the user may not see is updated as one that does not exist.
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        cronTicker.Id = await scope.VisibleCronTickerIdAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), id, cancellationToken);
+
+        if (cronTicker.Function is { } updatedFunction && !scope.CanSeeFunction(updatedFunction))
+        {
+            await WriteJson(context, new ActionResponse { Success = false, Message = HiddenFunctionMessage(updatedFunction) }, dashboardOptions.DashboardJsonOptions);
+            return;
+        }
 
         var result = await cronTickerManager.UpdateAsync(cronTicker, cancellationToken);
 
@@ -730,6 +789,7 @@ public static class DashboardEndpoints
         var id = Guid.Parse(context.Request.Query["id"].ToString());
         bool.TryParse(context.Request.Query["isEnabled"].ToString(), out var isEnabled);
 
+        id = await VisibleCron<TTimeTicker, TCronTicker>(context, id, cancellationToken);
         var success = await repository.ToggleCronTickerAsync(id, isEnabled, cancellationToken);
 
         await WriteJson(context, new ActionResponse
@@ -747,6 +807,8 @@ public static class DashboardEndpoints
         var persistenceProvider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
+
+        id = await VisibleCron<TTimeTicker, TCronTicker>(context, id, cancellationToken);
 
         // A cron ticker that is gone, for example deleted from another browser tab, has nothing to run. Without this
         // check an occurrence pointing at nothing would be stored first.
@@ -769,6 +831,7 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
 
+        id = await VisibleCron<TTimeTicker, TCronTicker>(context, id, cancellationToken);
         var result = await cronTickerManager.DeleteAsync(id, cancellationToken);
 
         await WriteJson(context, new ActionResponse
@@ -786,6 +849,7 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
         var id = Guid.Parse(context.Request.Query["id"].ToString());
 
+        id = await VisibilityScope<TTimeTicker, TCronTicker>.For(context).VisibleOccurrenceIdAsync(context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), id, cancellationToken);
         await repository.DeleteCronTickerOccurrenceByIdAsync(id, cancellationToken);
         context.Response.StatusCode = 200;
     }
@@ -798,7 +862,14 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var id = Guid.Parse(context.Request.Query["id"].ToString());
 
-        if (repository.CancelTickerById(id))
+        // A ticker the user may not see is not running, as far as this user can tell.
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+        var visible = scope.Filter == null
+            || await scope.VisibleTimeTickerIdAsync(provider, id, context.RequestAborted) != VisibilityScope<TTimeTicker, TCronTicker>.NoTicker
+            || await scope.VisibleOccurrenceIdAsync(provider, id, context.RequestAborted) != VisibilityScope<TTimeTicker, TCronTicker>.NoTicker;
+
+        if (visible && repository.CancelTickerById(id))
         {
             context.Response.StatusCode = 200;
             return;
@@ -824,6 +895,12 @@ public static class DashboardEndpoints
         var tickerId = Guid.Parse(context.Request.RouteValues["id"]?.ToString()!);
         Enum.TryParse<TickerType>(context.Request.Query["tickerType"].ToString(), out var tickerType);
 
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+        tickerId = tickerType == TickerType.TimeTicker
+            ? await scope.VisibleTimeTickerIdAsync(provider, tickerId, cancellationToken)
+            : await scope.VisibleCronTickerIdAsync(provider, tickerId, cancellationToken);
+
         var resultData = await repository.GetTickerRequestByIdAsync(tickerId, tickerType, cancellationToken);
 
         var response = new TickerRequestResponse
@@ -841,7 +918,8 @@ public static class DashboardEndpoints
         var repository = context.RequestServices.GetRequiredService<ITickerDashboardRepository<TTimeTicker, TCronTicker>>();
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
 
-        var result = repository.GetTickerFunctions().Select(x => new TickerFunctionResponse
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        var result = repository.GetTickerFunctions().Where(x => scope.CanSeeFunction(x.Item1)).Select(x => new TickerFunctionResponse
         {
             FunctionName = x.Item1,
             FunctionRequestNamespace = x.Item2.Item1,
