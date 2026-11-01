@@ -376,15 +376,6 @@ const setRowProp = (propContext: any) => {
 
             <!-- The exact time first, how long ago it was in the tooltip; the duration has its own column -->
             <template v-slot:item.executedAt="{ item }">
-              <span class="execution-time" :title="item.executedAgo || undefined">{{ item.executedAt || '—' }}</span>
-            </template>
-
-            <template v-slot:item.durationText="{ item }">
-              <span class="execution-time">{{ item.durationText || '—' }}</span>
-            </template>
-
-            <!-- Executed At Column (the cell below is not used: its name does not match the column key) -->
-            <template v-slot:item.ExecutedAt="{ item }">
               <div class="executed-at-cell">
                 <div v-if="hasStatus(item.status, Status.InProgress)" class="executing-indicator">
                   <v-icon size="16" class="spinning">mdi-loading</v-icon>
@@ -393,10 +384,14 @@ const setRowProp = (propContext: any) => {
                 <div v-else-if="hasStatus(item.status, Status.Cancelled) || hasStatus(item.status, Status.Queued)" class="na-text">
                   —
                 </div>
-                <div v-else class="execution-time">
-                  {{ item.executedAt }}
+                <div v-else class="execution-time" :title="item.executedAgo || undefined">
+                  {{ item.executedAt || '—' }}
                 </div>
               </div>
+            </template>
+
+            <template v-slot:item.durationText="{ item }">
+              <span class="execution-time">{{ hasStatus(item.status, Status.InProgress) ? '—' : item.durationText || '—' }}</span>
             </template>
 
             <!-- Retry Intervals Column -->

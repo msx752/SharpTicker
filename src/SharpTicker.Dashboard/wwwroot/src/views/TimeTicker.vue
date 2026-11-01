@@ -1180,7 +1180,8 @@ const canBeForceDeleted = ref<string[]>([])
               </v-badge>
             </template>
 
-            <template v-slot:item.ExecutedAt="{ item }">
+            <!-- A running job has no time yet, so it shows the moving dots; a job that never ran shows a dash -->
+            <template v-slot:item.executedAt="{ item }">
               <div
                 v-if="hasStatus(item.status, Status.InProgress)"
                 class="snippet"
@@ -1190,21 +1191,11 @@ const canBeForceDeleted = ref<string[]>([])
                   <div class="dot-carousel"></div>
                 </div>
               </div>
-              <div v-else class="text-caption">
-                {{
-                  hasStatus(item.status, Status.Cancelled) || hasStatus(item.status, Status.Queued)
-                    ? ''
-                    : item.executedAt
-                }}
-              </div>
-            </template>
-
-            <template v-slot:item.executedAt="{ item }">
-              <span class="text-caption" :title="item.executedAgo || undefined">{{ item.executedAt || '—' }}</span>
+              <span v-else class="text-caption" :title="item.executedAgo || undefined">{{ item.executedAt || '—' }}</span>
             </template>
 
             <template v-slot:item.durationText="{ item }">
-              <span class="text-caption">{{ item.durationText || '—' }}</span>
+              <span class="text-caption">{{ hasStatus(item.status, Status.InProgress) ? '—' : item.durationText || '—' }}</span>
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">
