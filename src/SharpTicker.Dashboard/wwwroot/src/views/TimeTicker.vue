@@ -1220,78 +1220,62 @@ const canBeForceDeleted = ref<string[]>([])
             </template>
 
             <template v-slot:item.lockHolder="{ item }">
-              <span class="text-caption">{{ item.lockHolder }}</span>
-              <v-tooltip v-if="item.lockHolder != ''" activator="parent" location="left">
-                <span>Locked At: {{ formatDate(item.lockedAt, true, timeZoneStore.effectiveTimeZone) }}</span>
-              </v-tooltip>
+              <span
+                class="text-caption"
+                :title="item.lockHolder ? `Locked At: ${formatDate(item.lockedAt, true, timeZoneStore.effectiveTimeZone)}` : undefined"
+                >{{ item.lockHolder }}</span
+              >
             </template>
 
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
                 <!-- Edit (not started yet) or Duplicate -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        v-if="
-                          hasStatus(item.status, Status.Queued) ||
-                          hasStatus(item.status, Status.Idle)
-                        "
-                        @click="
-                          crudTimeTickerDialog.open({
-                            ...item,
-                            executionTime: item.executionTime,
-                            isFromDuplicate: false,
-                          })
-                        "
-                        class="modern-action-btn edit-btn"
-                        aria-label="Edit"
-                      >
-                        <v-icon size="16">mdi-pencil</v-icon>
-                      </button>
-                      <button
-                        v-else
-                        v-bind="props"
-                        @click="
-                          crudTimeTickerDialog.open({
-                            ...item,
-                            executionTime: item.executionTime,
-                            isFromDuplicate: true,
-                          })
-                        "
-                        class="modern-action-btn duplicate-btn"
-                        aria-label="Duplicate"
-                      >
-                        <v-icon size="16">mdi-content-copy</v-icon>
-                      </button>
-                    </template>
-                    <span>{{
-                      hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle)
-                        ? 'Edit'
-                        : 'Duplicate'
-                    }}</span>
-                  </v-tooltip>
+                <div
+                  class="action-btn-wrapper"
+                  :title="hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle) ? 'Edit' : 'Duplicate'"
+                >
+                  <button
+                    v-if="hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle)"
+                    @click="
+                      crudTimeTickerDialog.open({
+                        ...item,
+                        executionTime: item.executionTime,
+                        isFromDuplicate: false,
+                      })
+                    "
+                    class="modern-action-btn edit-btn"
+                    aria-label="Edit"
+                  >
+                    <v-icon size="16">mdi-pencil</v-icon>
+                  </button>
+                  <button
+                    v-else
+                    @click="
+                      crudTimeTickerDialog.open({
+                        ...item,
+                        executionTime: item.executionTime,
+                        isFromDuplicate: true,
+                      })
+                    "
+                    class="modern-action-btn duplicate-btn"
+                    aria-label="Duplicate"
+                  >
+                    <v-icon size="16">mdi-content-copy</v-icon>
+                  </button>
                 </div>
 
                 <!-- Run Again -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="runAgain(item)"
-                        class="modern-action-btn run-btn"
-                        :class="{ busy: runningAgain.has(item.id) }"
-                        :disabled="runningAgain.has(item.id)"
-                        aria-label="Run again"
-                      >
-                        <v-icon v-if="runningAgain.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
-                        <v-icon v-else size="16">mdi-play-outline</v-icon>
-                      </button>
-                    </template>
-                    <span>Run again</span>
-                  </v-tooltip>
+                <div class="action-btn-wrapper" title="Run again">
+                  <button
+                    @click="runAgain(item)"
+                    class="modern-action-btn run-btn"
+                    :class="{ busy: runningAgain.has(item.id) }"
+                    :disabled="runningAgain.has(item.id)"
+                    aria-label="Run again"
+                  >
+                    <v-icon v-if="runningAgain.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                    <v-icon v-else size="16">mdi-play-outline</v-icon>
+                  </button>
                 </div>
 
                 <!-- Cancel and delete live in the menu -->

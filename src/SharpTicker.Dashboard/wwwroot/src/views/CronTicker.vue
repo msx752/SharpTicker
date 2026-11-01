@@ -1137,40 +1137,28 @@ const refreshData = async () => {
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
                 <!-- Edit -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="crudCronTickerDialog.open({ ...item, isFromDuplicate: false })"
-                        class="modern-action-btn edit-btn"
-                        aria-label="Edit ticker"
-                      >
-                        <v-icon size="16">mdi-pencil</v-icon>
-                      </button>
-                    </template>
-                    <span>Edit Ticker</span>
-                  </v-tooltip>
+                <div class="action-btn-wrapper" title="Edit Ticker">
+                  <button
+                    @click="crudCronTickerDialog.open({ ...item, isFromDuplicate: false })"
+                    class="modern-action-btn edit-btn"
+                    aria-label="Edit ticker"
+                  >
+                    <v-icon size="16">mdi-pencil</v-icon>
+                  </button>
                 </div>
 
                 <!-- Run now -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="RunCronTickerOnDemand(item.id)"
-                        class="modern-action-btn run-btn"
-                        :class="{ 'btn-disabled': !item.isEnabled }"
-                        :disabled="!item.isEnabled || runningNow.has(item.id)"
-                        aria-label="Run now"
-                      >
-                        <v-icon v-if="runningNow.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
-                        <v-icon v-else size="16">mdi-play-outline</v-icon>
-                      </button>
-                    </template>
-                    <span>{{ cronRunNowReason(item.isEnabled) ?? 'Run Now' }}</span>
-                  </v-tooltip>
+                <div class="action-btn-wrapper" :title="cronRunNowReason(item.isEnabled) ?? 'Run Now'">
+                  <button
+                    @click="RunCronTickerOnDemand(item.id)"
+                    class="modern-action-btn run-btn"
+                    :class="{ 'btn-disabled': !item.isEnabled }"
+                    :disabled="!item.isEnabled || runningNow.has(item.id)"
+                    aria-label="Run now"
+                  >
+                    <v-icon v-if="runningNow.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                    <v-icon v-else size="16">mdi-play-outline</v-icon>
+                  </button>
                 </div>
 
                 <!-- The rest, with delete last -->
