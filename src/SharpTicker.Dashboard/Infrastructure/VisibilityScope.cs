@@ -4,6 +4,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Dashboard.Infrastructure;
 
@@ -35,6 +36,11 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
 
     /// <summary>The cron tickers the user may see, or null for all of them.</summary>
     public Expression<Func<TCronTicker, bool>>? CronTickers { get; }
+
+    /// <summary>The predicates in the form the repository takes, or null when nothing is restricted.</summary>
+    public TickerVisibility<TTimeTicker, TCronTicker>? Filter => TimeTickers == null && CronTickers == null
+        ? null
+        : new TickerVisibility<TTimeTicker, TCronTicker>(TimeTickers, CronTickers);
 
     /// <summary>True when a rule is registered, even if it allows this user everything.</summary>
     public bool HasRule => _rule != null;

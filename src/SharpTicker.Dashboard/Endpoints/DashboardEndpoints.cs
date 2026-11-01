@@ -331,7 +331,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var result = await repository.GetTimeTickersAsync(cancellationToken);
+        var result = await repository.GetTimeTickersAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -353,7 +353,7 @@ public static class DashboardEndpoints
             : null;
         var search = context.Request.Query["search"].ToString();
 
-        var result = await repository.GetTimeTickersPaginatedAsync(pageNumber, pageSize, status, search, cancellationToken);
+        var result = await repository.GetTimeTickersPaginatedAsync(pageNumber, pageSize, status, search, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -370,7 +370,7 @@ public static class DashboardEndpoints
         if (!int.TryParse(context.Request.Query["futureDays"].ToString(), out var futureDays))
             futureDays = 3;
 
-        var result = await repository.GetTimeTickersGraphSpecificDataAsync(pastDays, futureDays, cancellationToken);
+        var result = await repository.GetTimeTickersGraphSpecificDataAsync(pastDays, futureDays, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -382,7 +382,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var result = await repository.GetTimeTickerFullDataAsync(cancellationToken);
+        var result = await repository.GetTimeTickerFullDataAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -506,7 +506,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var result = await repository.GetCronTickersAsync(cancellationToken);
+        var result = await repository.GetCronTickersAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -523,7 +523,7 @@ public static class DashboardEndpoints
         int.TryParse(context.Request.Query["pageSize"].ToString(), out var pageSize);
         if (pageSize < 1) pageSize = 20;
 
-        var result = await repository.GetCronTickersPaginatedAsync(pageNumber, pageSize, cancellationToken);
+        var result = await repository.GetCronTickersPaginatedAsync(pageNumber, pageSize, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -589,7 +589,7 @@ public static class DashboardEndpoints
         if (!int.TryParse(context.Request.Query["futureDays"].ToString(), out var futureDays))
             futureDays = 3;
 
-        var result = await repository.GetCronTickersGraphSpecificDataAsync(pastDays, futureDays, cancellationToken);
+        var result = await repository.GetCronTickersGraphSpecificDataAsync(pastDays, futureDays, cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -619,7 +619,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var result = await repository.GetCronTickerFullDataAsync(cancellationToken);
+        var result = await repository.GetCronTickerFullDataAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
     }
 
@@ -915,7 +915,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var jobStatuses = await repository.GetLastWeekJobStatusesAsync(cancellationToken);
+        var jobStatuses = await repository.GetLastWeekJobStatusesAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, jobStatuses.Select(x => new TupleResponse<int, int> { Item1 = x.Item1, Item2 = x.Item2 }).ToArray(), dashboardOptions.DashboardJsonOptions);
     }
 
@@ -927,7 +927,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var jobStatuses = await repository.GetOverallJobStatusesAsync(cancellationToken);
+        var jobStatuses = await repository.GetOverallJobStatusesAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, jobStatuses.Select(x => new TupleResponse<TickerStatus, int> { Item1 = x.Item1, Item2 = x.Item2 }).ToArray(), dashboardOptions.DashboardJsonOptions);
     }
 
@@ -939,7 +939,7 @@ public static class DashboardEndpoints
         var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var cancellationToken = context.RequestAborted;
 
-        var machineJobs = await repository.GetMachineJobsAsync(cancellationToken);
+        var machineJobs = await repository.GetMachineJobsAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
         await WriteJson(context, machineJobs.Select(x => new TupleResponse<string, int> { Item1 = x.Item1, Item2 = x.Item2 }).ToArray(), dashboardOptions.DashboardJsonOptions);
     }
 
