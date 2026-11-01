@@ -91,6 +91,40 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
         return await VisibleCronTickerIdAsync(provider, occurrence.CronTickerId, cancellationToken) == NoTicker ? NoTicker : id;
     }
 
+    /// <summary>True only when a time ticker with this id exists and the user may see it.</summary>
+    public async Task<bool> CanSeeTimeTickerAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, Guid id, CancellationToken cancellationToken)
+        => (await provider.GetTimeTickers(TimeTickers.And(t => t.Id == id), cancellationToken)).Length > 0;
+
+    /// <summary>
+    /// True when the ticker, or a ticker below it, names a parent that the user cannot see and that the ticker does not
+    /// already have. <paramref name="storedParentId"/> is the parent the root has in the store, which stays allowed.
+    /// </summary>
+    public async Task<bool> NamesAHiddenParentAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, TTimeTicker ticker, Guid? storedParentId, CancellationToken cancellationToken)
+    {
+        if (TimeTickers == null)
+            return false;
+
+        return await NamesAHiddenParentAsync(provider, ticker, storedParentId, cancellationToken, 0);
+    }
+
+    private async Task<bool> NamesAHiddenParentAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, TTimeTicker ticker, Guid? allowedParentId, CancellationToken cancellationToken, int depth)
+    {
+        if (depth > 64)
+            return true; // a chain this deep is not a real one
+
+        if (ticker.ParentId is { } parentId && parentId != allowedParentId
+            && await VisibleTimeTickerIdAsync(provider, parentId, cancellationToken) == NoTicker)
+            return true;
+
+        foreach (var child in ticker.Children ?? Array.Empty<TTimeTicker>())
+        {
+            if (await NamesAHiddenParentAsync(provider, child, ticker.Id, cancellationToken, depth + 1))
+                return true;
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// True only when an occurrence with this id exists and the user may see the cron it belongs to. Unlike
     /// <see cref="VisibleOccurrenceIdAsync"/> an id that is not an occurrence is not visible, so it can be used to

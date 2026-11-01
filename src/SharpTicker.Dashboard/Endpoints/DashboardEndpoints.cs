@@ -258,6 +258,8 @@ public static class DashboardEndpoints
         return ticker.Children?.Select(child => FirstHiddenFunction(scope, child)).FirstOrDefault(found => found != null);
     }
 
+    private const string HiddenParentMessage = "You are not allowed to put a ticker under a ticker you cannot see";
+
     private static string HiddenFunctionMessage(string function) => $"You are not allowed to use the function '{function}'";
 
     private static async Task GetAuthInfo(HttpContext context)
@@ -439,6 +441,13 @@ public static class DashboardEndpoints
             return;
         }
 
+        if (chainRoot != null && await scope.NamesAHiddenParentAsync(
+                context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>(), chainRoot, null, cancellationToken))
+        {
+            await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenParentMessage }, dashboardOptions.DashboardJsonOptions);
+            return;
+        }
+
         var result = await timeTickerManager.AddAsync(chainRoot, cancellationToken);
 
         await WriteJson(context, new ActionResponseWithId
@@ -487,7 +496,18 @@ public static class DashboardEndpoints
         // The body must not reach other tickers: with a rule the children in it are dropped, because editing one ticker
         // never changes its children and a child with the id of a ticker the user cannot see would be written too.
         if (scope.TimeTickers != null)
+        {
             timeTicker.Children = new List<TTimeTicker>();
+
+            // ParentId can be set from the body, so it may not move the ticker under one the user cannot see
+            var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+            var stored = await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
+            if (await scope.NamesAHiddenParentAsync(provider, timeTicker, stored?.ParentId, cancellationToken))
+            {
+                await WriteJson(context, new ActionResponse { Success = false, Message = HiddenParentMessage }, dashboardOptions.DashboardJsonOptions);
+                return;
+            }
+        }
 
         var result = await timeTickerManager.UpdateAsync(timeTicker, cancellationToken);
 
@@ -872,7 +892,7 @@ public static class DashboardEndpoints
         var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
         var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
         var visible = scope.Filter == null
-            || await scope.VisibleTimeTickerIdAsync(provider, id, context.RequestAborted) != VisibilityScope<TTimeTicker, TCronTicker>.NoTicker
+            || await scope.CanSeeTimeTickerAsync(provider, id, context.RequestAborted)
             || await scope.CanSeeOccurrenceAsync(provider, id, context.RequestAborted);
 
         if (visible && repository.CancelTickerById(id))

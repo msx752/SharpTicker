@@ -66,6 +66,14 @@ public class DashboardVisibilityHubTests
             Sender = new SharpTickerNotificationHubSender(context, services.BuildServiceProvider());
         }
 
+        public static object?[] ArgumentsOf(IClientProxy proxy, string method)
+        {
+            var call = Assert.Single(
+                proxy.ReceivedCalls().Where(c => c.GetMethodInfo().Name == nameof(IClientProxy.SendCoreAsync)),
+                c => (string)c.GetArguments()[0]! == method);
+            return (object?[])call.GetArguments()[1]!;
+        }
+
         public static bool Sent(IClientProxy proxy, string method)
             => proxy.ReceivedCalls().Any(c => c.GetMethodInfo().Name == nameof(IClientProxy.SendCoreAsync) && (string)c.GetArguments()[0]! == method);
     }
@@ -140,6 +148,41 @@ public class DashboardVisibilityHubTests
         public HashSet<Guid> Allowed { get; } = new();
 
         public Task<bool> CanFollowCronAsync(ClaimsPrincipal user, Guid cronTickerId) => Task.FromResult(Allowed.Contains(cronTickerId));
+    }
+
+    [Fact]
+    public async Task ATimeTickerNotification_DoesNotCarryTheChildren()
+    {
+        var h = new SenderHarness();
+        h.Connections.Add("billing", Team("billing"));
+        var parent = new TimeTickerEntity { Id = Guid.NewGuid(), Function = "billing.Invoices" };
+        parent.Children = new List<TimeTickerEntity> { new() { Id = Guid.NewGuid(), Function = "ops.Cleanup" } };
+
+        await h.Sender.UpdateTimeTickerNotifyAsync(parent);
+
+        var payload = JsonSerializer.SerializeToElement(Assert.Single(SenderHarness.ArgumentsOf(h.Selected, "UpdateTimeTickerNotification")));
+        Assert.DoesNotContain("ops.Cleanup", payload.GetRawText());
+        Assert.Equal("billing.Invoices", payload.GetProperty("function").GetString());
+    }
+
+    /// <summary>Allows every time ticker and only the crons of the user's team.</summary>
+    private sealed class OnlyCronsAreLimited : ITickerVisibilityRule
+    {
+        public System.Linq.Expressions.Expression<Func<TimeTickerEntity, bool>>? TimeTickers(ClaimsPrincipal user) => null;
+        public System.Linq.Expressions.Expression<Func<CronTickerEntity, bool>>? CronTickers(ClaimsPrincipal user) => c => c.Function.StartsWith("billing.");
+        public bool CanSeeFunction(ClaimsPrincipal user, string functionName) => true;
+    }
+
+    [Fact]
+    public async Task AnIdThatIsNoTimeTicker_IsNotAVisibleTimeTicker_EvenWhenTheRuleAllowsEveryTimeTicker()
+    {
+        var provider = Substitute.For<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        provider.GetTimeTickers(default!, default).ReturnsForAnyArgs(Task.FromResult(Array.Empty<TimeTickerEntity>()));
+        var services = new ServiceCollection().AddScoped<ITickerVisibilityRule, OnlyCronsAreLimited>().BuildServiceProvider();
+        var scope = VisibilityScope<TimeTickerEntity, CronTickerEntity>.For(services, Team("billing"));
+
+        Assert.Null(scope.TimeTickers);
+        Assert.False(await scope.CanSeeTimeTickerAsync(provider, Guid.NewGuid(), default));
     }
 
     private sealed class HubHarness

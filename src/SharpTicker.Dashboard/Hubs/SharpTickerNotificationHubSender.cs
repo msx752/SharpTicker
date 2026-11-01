@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Linq.Expressions;
 using System.Security.Claims;
 using System.Text.Json;
@@ -65,6 +66,8 @@ namespace SharpTicker.Dashboard.Hubs
         {
             var entity = (TimeTickerEntity)timeTicker;
             var json = JsonSerializer.SerializeToElement(entity, DashboardJsonSerializerContext.Default.TimeTickerEntity);
+            if (_services?.GetService<HubConnections>() != null)
+                json = WithoutChildren(json); // the children can be tickers the receiver may not see
             await SendToThoseWhoMaySeeAsync("UpdateTimeTickerNotification", json, (rule, user) => rule.TimeTickers(user), entity);
         }
 
@@ -99,6 +102,18 @@ namespace SharpTicker.Dashboard.Hubs
 
             if (receivers.Count > 0)
                 await _hubContext.Clients.Clients(receivers).SendAsync(method, payload);
+        }
+
+        private static JsonElement WithoutChildren(JsonElement ticker)
+        {
+            if (ticker.ValueKind != JsonValueKind.Object)
+                return ticker;
+
+            var node = System.Text.Json.Nodes.JsonNode.Parse(ticker.GetRawText())!.AsObject();
+            foreach (var key in node.Select(p => p.Key).Where(k => string.Equals(k, "children", StringComparison.OrdinalIgnoreCase)).ToList())
+                node.Remove(key);
+
+            return JsonSerializer.SerializeToElement(node);
         }
 
         private bool MaySee<TEntity>(ITickerVisibilityRule rule, ClaimsPrincipal user,

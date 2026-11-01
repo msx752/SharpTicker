@@ -390,6 +390,23 @@ public abstract class DashboardVisibilityApiTests<TFixture> : IClassFixture<TFix
         await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/time-ticker/delete?id={own}");
     }
 
+    [Fact]
+    public async Task ATicker_CannotBePutUnderATickerOfAnotherTeam_WhenAddedOrUpdated()
+    {
+        var before = (await AllTimeTickerIdsAsync()).Length;
+        var (_, added) = await _api.SendAsync(Billing, false, HttpMethod.Post, "/time-ticker/add",
+            $$"""{"function":"billing.Invoices","executionTime":"{{InTwoDays}}","parentId":"{{OpsCleanupId}}"}""");
+        Assert.False(added!.Value.GetProperty("success").GetBoolean(), added.ToString());
+        Assert.Equal(before, (await AllTimeTickerIdsAsync()).Length);
+
+        var (_, own) = await _api.SendAsync(Billing, false, HttpMethod.Post, "/time-ticker/add", $$"""{"function":"billing.Reminders","executionTime":"{{InTwoDays}}"}""");
+        var id = own!.Value.GetProperty("tickerId").GetGuid();
+        var (_, moved) = await _api.SendAsync(Billing, false, HttpMethod.Put, $"/time-ticker/update?id={id}",
+            $$"""{"function":"billing.Reminders","executionTime":"{{InTwoDays}}","parentId":"{{OpsCleanupId}}"}""");
+        Assert.False(moved!.Value.GetProperty("success").GetBoolean(), moved.ToString());
+        await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/time-ticker/delete?id={id}");
+    }
+
     #endregion
 }
 
