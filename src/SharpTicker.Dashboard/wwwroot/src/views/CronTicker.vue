@@ -20,6 +20,7 @@ import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
 import { describeSchedule } from '@/utilities/cronSchedule'
+import { nextRunText, statusName } from '@/utilities/cronRunSummary'
 import { runInitialLoad } from '@/utilities/initialLoad'
 import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 
@@ -775,6 +776,8 @@ const headersWithoutReadable = computed(() => {
     { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
     { title: 'Enabled', key: 'isEnabled', sortable: false, visibility: true },
     { title: 'Schedule', key: 'expression', sortable: true, visibility: true },
+    { title: 'Last Run', key: 'lastRun', sortable: false, visibility: true },
+    { title: 'Next Run', key: 'nextRun', sortable: false, visibility: true },
     { title: 'Request Type', key: 'requestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
     { title: 'Retry Configuration', key: 'retryIntervals', sortable: false, visibility: true },
@@ -1029,6 +1032,27 @@ const refreshData = async () => {
               </div>
             </template>
 
+            <template v-slot:item.lastRun="{ item }">
+              <button
+                v-if="item.lastRun"
+                type="button"
+                class="last-run-cell"
+                :title="'Open the occurrences of ' + item.function"
+                @click="onRowAction('occurrences', item)"
+              >
+                <span class="last-run-status" :style="{ color: statusColors[item.lastStatus ?? -1] }">
+                  <v-icon size="10">mdi-circle</v-icon>
+                  {{ statusName(item.lastStatus) }}
+                </span>
+                <span class="last-run-time">{{ item.lastRun }}</span>
+              </button>
+              <span v-else class="no-intervals">—</span>
+            </template>
+
+            <template v-slot:item.nextRun="{ item }">
+              <span :class="{ 'no-intervals': !item.isEnabled || !item.nextRun }">{{ nextRunText(item) }}</span>
+            </template>
+
             <template v-slot:item.retryIntervals="{ item }">
               <div class="retry-display" v-if="item.retryIntervals?.length || (item.retries && item.retries > 0)">
                 <div class="retry-header" v-if="item.retries > 0">
@@ -1134,6 +1158,30 @@ const refreshData = async () => {
 </template> 
 
 <style scoped>
+.last-run-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 2px 0;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.last-run-cell:hover .last-run-time {
+  text-decoration: underline;
+}
+.last-run-status {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.last-run-time {
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
 /* Dashboard Layout */
 .cron-ticker-dashboard {
   background: #212121;

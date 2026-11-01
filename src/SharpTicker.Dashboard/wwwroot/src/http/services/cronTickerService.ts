@@ -5,6 +5,7 @@ import { AddCronTickerRequest, GetCronTickerGraphDataRangeResponse, GetCronTicke
 import { nameof } from '@/utilities/nameof';
 import { useFunctionNameStore } from '@/stores/functionNames';
 import { useTimeZoneStore } from '@/stores/timeZoneStore';
+import { toRunFields, type CronRunSummaryResponse } from '@/utilities/cronRunSummary';
 
 interface PaginatedCronTickerResponse {
     items: GetCronTickerResponse[]
@@ -78,11 +79,37 @@ const getCronTickersPaginated = () => {
             return response;
     };
     
+    // The last run and the next run come from a second request for the crons on the page, so the table does not wait
+    // for them. A failure leaves those cells empty; the table itself is already shown.
+    const summaryHttp = useBaseHttpService<object, CronRunSummaryResponse>('array');
+
+    const loadRunSummary = async (response: PaginatedCronTickerResponse) => {
+        const items = response?.items;
+        if (!Array.isArray(items) || items.length === 0) return;
+        const zone = timeZoneStore.effectiveTimeZone;
+        try {
+            const summaries = await summaryHttp.sendAsync("GET", "cron-tickers/run-summary", {
+                paramData: { ids: items.map((x: GetCronTickerResponse) => x.id).join(',') },
+                suppressAlert: true,
+            }) as CronRunSummaryResponse[];
+            // The page may have changed while the request ran; fill in only the rows that are still there
+            const byId = new Map(summaries.map(x => [x.id, x]));
+            for (const item of items as GetCronTickerResponse[]) {
+                const summary = byId.get(item.id);
+                if (summary) Object.assign(item, toRunFields(summary, zone));
+            }
+        } catch {
+            // the cells stay empty
+        }
+    };
+
     const requestAsync = async (pageNumber: number = 1, pageSize: number = 20) => {
         const response = await baseHttp.sendAsync("GET", "cron-tickers/paginated", { 
             paramData: { pageNumber, pageSize } 
         });
-        return processResponse(response);
+        const processed = processResponse(response);
+        void loadRunSummary(processed);
+        return processed;
     };
     
     return {
