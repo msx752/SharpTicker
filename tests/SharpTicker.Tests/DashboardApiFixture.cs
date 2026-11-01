@@ -55,6 +55,9 @@ public abstract class DashboardApiFixture : IAsyncLifetime
     public CapturedLogs Logs { get; } = new();
 
     public HttpClient Client { get; private set; } = null!;
+
+    /// <summary>The services of the running host, for tests that use the public managers instead of the HTTP API.</summary>
+    public IServiceProvider Services => _app!.Services;
     public ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store { get; private set; } = null!;
 
     public DateTime Today { get; } = DateTime.UtcNow.Date;

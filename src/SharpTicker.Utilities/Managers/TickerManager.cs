@@ -540,7 +540,7 @@ namespace SharpTicker.Utilities.Managers
             
             try 
             {
-                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var ids = validTickers.Select(x => x.Id).Distinct().ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF Core on net8 cannot translate
                 var existing = (await _persistenceProvider.GetTimeTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
                     .Select(x => x.Id).ToHashSet();
                 if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
@@ -621,7 +621,7 @@ namespace SharpTicker.Utilities.Managers
             
             try
             {
-                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var ids = validTickers.Select(x => x.Id).Distinct().ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF Core on net8 cannot translate
                 var existing = (await _persistenceProvider.GetCronTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
                     .Select(x => x.Id).ToHashSet();
                 if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
