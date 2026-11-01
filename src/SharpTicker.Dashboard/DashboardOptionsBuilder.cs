@@ -87,9 +87,7 @@ public class DashboardOptionsBuilder
     /// Limit what each signed-in user sees and can act on, see <see cref="ITickerVisibilityRule"/>. It needs
     /// <see cref="WithHostAuthentication"/>; the application fails to start when it is combined with another mode.
     /// </summary>
-    // Internal until every endpoint and the live notifications apply the rule: a rule that is registered but only
-    // applied to some of them would give a false sense of protection. It becomes public with the change that finishes that.
-    internal DashboardOptionsBuilder WithVisibilityRule<TRule>() where TRule : class, ITickerVisibilityRule
+    public DashboardOptionsBuilder WithVisibilityRule<TRule>() where TRule : class, ITickerVisibilityRule
     {
         VisibilityRuleType = typeof(TRule);
         return this;
