@@ -13,6 +13,10 @@ export class GetCronTickerOccurrenceResponse {
     executionTime!:string;
     executionTimeFormatted!:string;
     executedAt!:string;
+    /** Set by the service: how long ago it ran, for the tooltip of the exact time. */
+    executedAgo?:string;
+    /** Set by the service: how long it took. */
+    durationText?:string;
     elapsedTime!:string|number;
     retryCount!:number;
     actions:string|undefined = undefined;

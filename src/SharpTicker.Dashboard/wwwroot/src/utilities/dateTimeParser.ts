@@ -161,12 +161,38 @@ export function formatTimeAgo(date: string | Date): string {
     return timeago(date)
 }
 
+export interface ExecutionTexts {
+    /** The exact time the job ran, in the time zone of the dashboard. */
+    executedAt: string
+    /** How long ago it ran, for the tooltip of the exact time. */
+    executedAgo: string
+    /** How long it took. */
+    duration: string
+}
+
 // A job that has not finished has no execution time yet and the server sends the empty date
-// (0001-01-01) for it. Showing "25 years ago" for that is wrong, so it reads as blank.
-export function formatExecutedAt(executedAt: string | Date, elapsedTime: number): string {
+// (0001-01-01) for it. Showing "25 years ago" for that is wrong, so all three texts read as blank.
+export function describeExecution(executedAt: string | Date, elapsedTime: number, timeZone?: string): ExecutionTexts {
     const isUnset = typeof executedAt === 'string' ? executedAt.startsWith('0001-') : executedAt.getUTCFullYear() <= 1
-    if (isUnset) return ''
-    return `${formatTimeAgo(executedAt)} (took ${formatTime(elapsedTime, true)})`
+    if (isUnset) return { executedAt: '', executedAgo: '', duration: '' }
+
+    const iso = typeof executedAt === 'string' ? executedAt : executedAt.toISOString()
+    return {
+        executedAt: formatDate(iso, true, timeZone),
+        executedAgo: formatTimeAgo(executedAt),
+        duration: formatTime(elapsedTime, true),
+    }
+}
+
+/** What a row needs to show when and how long it ran: the exact time first, the rest as separate fields. */
+export function applyExecution(
+    item: { executedAt: string; elapsedTime: string | number; executedAgo?: string; durationText?: string },
+    timeZone?: string,
+): void {
+    const texts = describeExecution(item.executedAt, item.elapsedTime as number, timeZone)
+    item.executedAt = texts.executedAt
+    item.executedAgo = texts.executedAgo
+    item.durationText = texts.duration
 }
 
 // The inverse of formatTime for whole seconds: "30s", "1m 30s", "2h", "1d 2h" become seconds.

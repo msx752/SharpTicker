@@ -483,7 +483,8 @@ const headersWithSelection = computed(() => {
     { title: 'Request Type', key: 'RequestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
     { title: 'Execution Time', key: 'executionTimeFormatted', sortable: true, visibility: true },
-    { title: 'Executed At (Elapsed Time)', key: 'executedAt', sortable: false, visibility: true },
+    { title: 'Executed At', key: 'executedAt', sortable: false, visibility: true },
+    { title: 'Duration', key: 'durationText', sortable: false, visibility: true, align: 'end' as const },
     { title: 'Lock Holder', key: 'lockHolder', sortable: false, visibility: true },
     { title: 'Retry Status', key: 'retryIntervals', sortable: false, visibility: true },
     { title: 'Actions', key: 'actions', sortable: false, visibility: true },
@@ -1196,6 +1197,14 @@ const canBeForceDeleted = ref<string[]>([])
                     : item.executedAt
                 }}
               </div>
+            </template>
+
+            <template v-slot:item.executedAt="{ item }">
+              <span class="text-caption" :title="item.executedAgo || undefined">{{ item.executedAt || '—' }}</span>
+            </template>
+
+            <template v-slot:item.durationText="{ item }">
+              <span class="text-caption">{{ item.durationText || '—' }}</span>
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">

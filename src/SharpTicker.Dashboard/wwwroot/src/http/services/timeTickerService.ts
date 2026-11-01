@@ -1,5 +1,5 @@
 
-import { formatDate, formatTime, formatExecutedAt } from '@/utilities/dateTimeParser';
+import { formatDate, formatTime, applyExecution } from '@/utilities/dateTimeParser';
 import { useBaseHttpService } from '../base/baseHttpService';
 import { Status } from './types/base/baseHttpResponse.types';
 import {
@@ -40,7 +40,7 @@ const getTimeTickers = () => {
                 }
 
                 if (item.executedAt != null)
-                    item.executedAt = formatExecutedAt(item.executedAt, item.elapsedTime as number);
+                    applyExecution(item, timeZoneStore.effectiveTimeZone);
 
                 item.executionTimeFormatted = formatDate(item.executionTime, true, timeZoneStore.effectiveTimeZone);
                 item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? '';
@@ -112,7 +112,7 @@ const getTimeTickersPaginated = () => {
                         }
                         
                         if (item.executedAt != null)
-                            item.executedAt = formatExecutedAt(item.executedAt, item.elapsedTime as number);
+                            applyExecution(item, timeZoneStore.effectiveTimeZone);
                         
                         item.executionTimeFormatted = formatDate(item.executionTime, true, timeZoneStore.effectiveTimeZone);
                         item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? '';
