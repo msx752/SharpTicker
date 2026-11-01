@@ -470,7 +470,7 @@ const getVisiblePageNumbers = () => {
               <v-icon class="title-icon" color="primary">mdi-server-network</v-icon>
               Machines
             </h2>
-            <p class="card-subtitle">{{ machineItems.length }} machine instances</p>
+            <p class="card-subtitle">{{ machineItems.length }} lock holders, jobs counted all time</p>
           </div>
 
           <div class="machines-list">
