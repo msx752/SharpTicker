@@ -13,6 +13,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.SignalR;
 using SharpTicker.Utilities.Entities;
 
 namespace SharpTicker.Dashboard.DependencyInjection
@@ -35,7 +36,8 @@ namespace SharpTicker.Dashboard.DependencyInjection
             services.AddSingleton(config);
 
             services.AddRouting();
-            services.AddSignalR();
+            services.AddSignalR()
+                .AddJsonProtocol(options => AddHubJsonContextWhenReflectionIsOff(options, JsonSerializer.IsReflectionEnabledByDefault));
 
             // The new authentication system is registered in ServiceExtensions.cs
             // This method is kept for backward compatibility with existing middleware pipeline
@@ -45,6 +47,21 @@ namespace SharpTicker.Dashboard.DependencyInjection
             {
                 options.AddPolicy("SharpTicker_Dashboard_CORS", config.CorsPolicyBuilder);
             });
+        }
+
+        /// <summary>
+        /// The hub sends ids, text, JSON elements and the connection status. SignalR's JSON protocol serializes them
+        /// with the application-wide options, and in an application that has reflection-based serialization turned
+        /// off nothing can be sent without a resolver: the write fails and the connection is dropped, so the dashboard
+        /// would never get a live update. Only in that case the dashboard's source-generated context is added, after
+        /// any resolver the application registered itself. An application that has reflection on is left alone.
+        /// </summary>
+        internal static void AddHubJsonContextWhenReflectionIsOff(JsonHubProtocolOptions options, bool reflectionIsEnabled)
+        {
+            if (reflectionIsEnabled)
+                return;
+
+            options.PayloadSerializerOptions.TypeInfoResolverChain.Add(DashboardJsonSerializerContext.Default);
         }
 
         internal static void UseDashboardWithEndpoints<TTimeTicker, TCronTicker>(this IApplicationBuilder app, DashboardOptionsBuilder config)

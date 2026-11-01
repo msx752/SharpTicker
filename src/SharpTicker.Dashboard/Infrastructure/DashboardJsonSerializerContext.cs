@@ -78,6 +78,7 @@ namespace SharpTicker.Dashboard.Infrastructure;
 [JsonSerializable(typeof(int[]))]
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(System.Text.Json.JsonElement))]
+[JsonSerializable(typeof(HubConnectionStatus))]
 internal partial class DashboardJsonSerializerContext : JsonSerializerContext
 {
 }

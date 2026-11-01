@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Configuration;
@@ -12,6 +13,16 @@ using SharpTicker.Dashboard.Infrastructure;
 
 namespace SharpTicker.Dashboard.Hubs
 {
+    /// <summary>
+    /// What <c>GetStatus</c> sends back to the caller. A named type, not an anonymous one, so the source-generated
+    /// serializer context can describe it for applications that run without reflection-based serialization.
+    /// </summary>
+    internal sealed record HubConnectionStatus(
+        [property: JsonPropertyName("connectionId")] string ConnectionId,
+        [property: JsonPropertyName("authenticated")] bool Authenticated,
+        [property: JsonPropertyName("username")] string Username,
+        [property: JsonPropertyName("timestamp")] DateTime Timestamp);
+
     public class SharpTickerNotificationHub : Hub
     {
         private readonly IConfiguration _config;
@@ -114,13 +125,11 @@ namespace SharpTicker.Dashboard.Hubs
         
         public async Task GetStatus()
         {
-            var status = new
-            {
-                connectionId = Context.ConnectionId,
-                authenticated = IsAuthenticated(),
-                username = Username ?? "anonymous",
-                timestamp = DateTime.UtcNow
-            };
+            var status = new HubConnectionStatus(
+                Context.ConnectionId,
+                IsAuthenticated(),
+                Username ?? "anonymous",
+                DateTime.UtcNow);
 
             await Clients.Caller.SendAsync("Status", status);
         }
