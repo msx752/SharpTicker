@@ -2348,7 +2348,7 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 :deep(.red-badge .v-badge__badge) {
-  color: red !important;
+  color: #E57373 !important;
 }
 
 :deep(.grey-badge .v-badge__badge) {
