@@ -16,17 +16,7 @@ import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
-import cronstrue from 'cronstrue'
-
-// Helper function to get readable cron expression
-const getReadableCronExpression = (expression: string): string => {
-  try {
-    // cronstrue expects 6-part format with seconds
-    return cronstrue.toString(expression)
-  } catch (error) {
-    return 'Invalid cron expression'
-  }
-}
+import { describeSchedule } from '@/utilities/cronSchedule'
 
 const getCronTickerRangeGraphData = cronTickerService.getTimeTickersGraphDataRange()
 const getCronTickersPaginated = cronTickerService.getCronTickersPaginated()
@@ -35,6 +25,15 @@ const getCronTickersGraphDataAndParseToGraph = cronTickerService.getTimeTickersG
 const deleteCronTicker = cronTickerService.deleteCronTicker()
 const runCronTickerOnDemand = cronTickerService.runCronTickerOnDemand()
 const toggleCronTicker = cronTickerService.toggleCronTicker()
+
+// The scheduler evaluates an expression in its own time zone, so the sentence names that zone
+const scheduleText = (expression: string) =>
+  describeSchedule(expression, timeZoneStore.schedulerTimeZone)
+
+// A disabled cron is muted, so it stands out in the list without hiding that it exists
+const cronRowProps = ({ item }: { item: { isEnabled?: boolean } }) => ({
+  class: item.isEnabled === false ? 'cron-row-disabled' : '',
+})
 
 // Pagination state
 const currentPage = ref(1)
@@ -761,7 +760,8 @@ const headersWithoutReadable = computed(() => {
   // Define headers manually for paginated response
   return [
     { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
-    { title: 'Expression', key: 'expression', sortable: true, visibility: true },
+    { title: 'Enabled', key: 'isEnabled', sortable: false, visibility: true },
+    { title: 'Schedule', key: 'expression', sortable: true, visibility: true },
     { title: 'Request Type', key: 'requestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
     { title: 'Retry Configuration', key: 'retryIntervals', sortable: false, visibility: true },
@@ -988,16 +988,28 @@ const refreshData = async () => {
             :items-per-page="-1"
             hide-default-footer
             class="enhanced-table"
+            :row-props="cronRowProps"
           >
+            <template v-slot:item.isEnabled="{ item }">
+              <!-- Icon and text, so the state is not told by colour alone -->
+              <v-chip
+                size="small"
+                variant="tonal"
+                :color="item.isEnabled ? 'success' : 'warning'"
+                :prepend-icon="item.isEnabled ? 'mdi-check-circle-outline' : 'mdi-pause-circle-outline'"
+                class="enabled-chip"
+              >
+                {{ item.isEnabled ? 'Enabled' : 'Disabled' }}
+              </v-chip>
+            </template>
+
             <template v-slot:item.expression="{ item }">
-              <v-tooltip location="top">
-                <template #activator="{ props }">
-                  <span v-bind="props" class="expression-tooltip">
-                    {{ item.expression }}
-                  </span>
-                </template>
-                <span>{{ getReadableCronExpression(item.expression) }}</span>
-              </v-tooltip>
+              <div class="schedule-cell">
+                <span v-if="scheduleText(item.expression)" class="schedule-text">
+                  {{ scheduleText(item.expression) }}
+                </span>
+                <span class="schedule-expression">{{ item.expression }}</span>
+              </div>
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">
@@ -1866,18 +1878,34 @@ const refreshData = async () => {
   pointer-events: none;
 }
 
-.expression-tooltip {
-  cursor: help;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  color: #64b5f6;
-  transition: all 0.2s ease;
+.schedule-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
 }
 
-.expression-tooltip:hover {
-  color: #90caf9;
-  text-shadow: 0 0 8px rgba(100, 181, 246, 0.3);
+.schedule-text {
+  font-size: 0.8125rem;
+  color: #e0e0e0;
 }
+
+/* The raw expression stays visible and exact, but second to the sentence */
+.schedule-expression {
+  font-family: 'JetBrains Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 0.6875rem;
+  color: #9e9e9e;
+}
+
+.enabled-chip {
+  font-weight: 500;
+}
+
+/* Muted, but the state (second cell) and the actions (last cell, with the enable button) keep full strength */
+:deep(.cron-row-disabled td:not(:nth-child(2)):not(:last-child)) {
+  opacity: 0.55;
+}
+
 
 /* Clean Retry Intervals Display */
 .retry-display {

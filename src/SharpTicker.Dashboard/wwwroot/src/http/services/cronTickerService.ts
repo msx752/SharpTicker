@@ -19,7 +19,7 @@ const getCronTickers = () => {
 
     const baseHttp = useBaseHttpService<GetCronTickerRequest, GetCronTickerResponse>('array')
         .FixToResponseModel(GetCronTickerResponse, response => {
-            response.requestType = functionNamesStore.getNamespaceOrNull(response.function) ?? 'N/A';
+            response.requestType = functionNamesStore.getNamespaceOrNull(response.function) ?? '—';
             response.createdAt = formatDate(response.createdAt, true, timeZoneStore.effectiveTimeZone);
             response.updatedAt = formatDate(response.updatedAt, true, timeZoneStore.effectiveTimeZone);
             response.initIdentifier = response.initIdentifier?.split("_").slice(0, 2).join("_");
@@ -60,7 +60,7 @@ const getCronTickersPaginated = () => {
             // Process items in the paginated response
             if (response && response.items && Array.isArray(response.items)) {
                 response.items = response.items.map((item: GetCronTickerResponse) => {
-                    item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? 'N/A';
+                    item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? '—';
                     item.createdAt = formatDate(item.createdAt, true, timeZoneStore.effectiveTimeZone);
                     item.updatedAt = formatDate(item.updatedAt, true, timeZoneStore.effectiveTimeZone);
                     item.initIdentifier = item.initIdentifier?.split("_").slice(0, 2).join("_");
