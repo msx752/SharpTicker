@@ -21,6 +21,7 @@ import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
 import { describeSchedule } from '@/utilities/cronSchedule'
 import { nextRunText, statusName } from '@/utilities/cronRunSummary'
+import { relativeTime } from '@/utilities/relativeTime'
 import { runInitialLoad } from '@/utilities/initialLoad'
 import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 
@@ -343,6 +344,11 @@ const ShowCronTickerOccurrenceGraphData = async (functionName: string, id: strin
     chartLoading.value = false
   }
 }
+
+// The words in the Last Run and Next Run cells are relative to now, so they are recomputed as time passes
+const clock = ref(Date.now())
+const clockTimer = setInterval(() => (clock.value = Date.now()), 15_000)
+onUnmounted(() => clearInterval(clockTimer))
 
 const { showSuccess } = useAlert()
 const runningNow = ref(new Set<string>())
@@ -1037,20 +1043,24 @@ const refreshData = async () => {
                 v-if="item.lastRun"
                 type="button"
                 class="last-run-cell"
-                :title="'Open the occurrences of ' + item.function"
+                :title="item.lastRun + ' (click to open the occurrences)'"
                 @click="onRowAction('occurrences', item)"
               >
                 <span class="last-run-status" :style="{ color: statusColors[item.lastStatus ?? -1] }">
                   <v-icon size="10">mdi-circle</v-icon>
                   {{ statusName(item.lastStatus) }}
                 </span>
-                <span class="last-run-time">{{ item.lastRun }}</span>
+                <span class="last-run-time">{{ relativeTime(item.lastRunAt, clock) }}</span>
               </button>
               <span v-else class="no-intervals">—</span>
             </template>
 
             <template v-slot:item.nextRun="{ item }">
-              <span :class="{ 'no-intervals': !item.isEnabled || !item.nextRun }">{{ nextRunText(item) }}</span>
+              <span
+                :class="{ 'no-intervals': !item.isEnabled || !item.nextRun }"
+                :title="item.isEnabled ? item.nextRun : undefined"
+                >{{ nextRunText(item, clock) }}</span
+              >
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">

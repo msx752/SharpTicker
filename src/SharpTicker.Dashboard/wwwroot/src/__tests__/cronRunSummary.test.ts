@@ -7,6 +7,8 @@ describe('toRunFields', () => {
       { id: 'a', nextRun: '2026-11-01T10:00:00Z', lastRun: '2026-11-01T09:00:00Z', lastStatus: 3, lastOccurrenceId: 'o' },
       'Asia/Tokyo',
     )
+    expect(fields.nextRunAt).toBe('2026-11-01T10:00:00Z')
+    expect(fields.lastRunAt).toBe('2026-11-01T09:00:00Z')
     expect(fields.nextRun).toBe('2026-11-01 19:00:00')
     expect(fields.lastRun).toBe('2026-11-01 18:00:00')
     expect(fields.lastStatus).toBe(3)
@@ -20,17 +22,27 @@ describe('toRunFields', () => {
 
   it('leaves out what the server did not give', () => {
     const fields = toRunFields({ id: 'a', nextRun: null, lastRun: null, lastStatus: null, lastOccurrenceId: null }, 'UTC')
-    expect(fields).toEqual({ lastRun: undefined, lastStatus: undefined, lastOccurrenceId: undefined, nextRun: undefined })
+    expect(fields).toEqual({
+      lastRunAt: undefined,
+      nextRunAt: undefined,
+      lastRun: undefined,
+      lastStatus: undefined,
+      lastOccurrenceId: undefined,
+      nextRun: undefined,
+    })
   })
 })
 
 describe('nextRunText', () => {
+  const now = Date.parse('2026-11-01T12:00:00Z')
+
   it('says Disabled for a disabled cron, whatever the server sent', () => {
-    expect(nextRunText({ isEnabled: false, nextRun: '2026-11-01 10:00:00' })).toBe('Disabled')
+    expect(nextRunText({ isEnabled: false, nextRunAt: '2026-11-01T12:10:00Z' }, now)).toBe('Disabled')
   })
-  it('shows the time, or a dash while it is not known', () => {
-    expect(nextRunText({ isEnabled: true, nextRun: '2026-11-01 10:00:00' })).toBe('2026-11-01 10:00:00')
-    expect(nextRunText({ isEnabled: true })).toBe('—')
+
+  it('says in words how far ahead the next run is, or a dash while it is not known', () => {
+    expect(nextRunText({ isEnabled: true, nextRunAt: '2026-11-01T12:10:00Z' }, now)).toBe('in 10m')
+    expect(nextRunText({ isEnabled: true }, now)).toBe('—')
   })
 })
 

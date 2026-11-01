@@ -1,4 +1,5 @@
 import { formatDate } from '@/utilities/dateTimeParser'
+import { relativeTime } from '@/utilities/relativeTime'
 
 /** What the server answers for one cron: see `CronRunSummary` in the dashboard endpoints. */
 export interface CronRunSummaryResponse {
@@ -11,6 +12,10 @@ export interface CronRunSummaryResponse {
 
 /** The fields the Cron Tickers table adds to a row once the summary has arrived. */
 export interface CronRunFields {
+  /** The moments as the server sent them (UTC), for the words relative to now. */
+  lastRunAt?: string
+  nextRunAt?: string
+  /** The same moments formatted in the zone the dashboard shows, for the tooltip. */
   lastRun?: string
   lastStatus?: number
   lastOccurrenceId?: string
@@ -35,6 +40,8 @@ export const statusName = (status: number | null | undefined): string =>
 /** The times are formatted in the zone the dashboard shows, so a change of that zone needs a new call. */
 export function toRunFields(summary: CronRunSummaryResponse, timeZone: string): CronRunFields {
   return {
+    lastRunAt: summary.lastRun ?? undefined,
+    nextRunAt: summary.nextRun ?? undefined,
     lastRun: summary.lastRun ? formatDate(summary.lastRun, true, timeZone) : undefined,
     lastStatus: summary.lastStatus ?? undefined,
     lastOccurrenceId: summary.lastOccurrenceId ?? undefined,
@@ -42,8 +49,8 @@ export function toRunFields(summary: CronRunSummaryResponse, timeZone: string): 
   }
 }
 
-/** The text of the Next Run cell: the time, or why there is none. */
-export function nextRunText(row: { isEnabled: boolean; nextRun?: string }): string {
+/** The text of the Next Run cell: how far ahead it is in words, or why there is none. */
+export function nextRunText(row: { isEnabled: boolean; nextRunAt?: string }, now: number = Date.now()): string {
   if (!row.isEnabled) return 'Disabled'
-  return row.nextRun ?? '—'
+  return relativeTime(row.nextRunAt, now) || '—'
 }
