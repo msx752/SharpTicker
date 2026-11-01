@@ -6,6 +6,9 @@ import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statu
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
+import RowActionsMenu from '@/components/common/RowActionsMenu.vue'
+import { cronTickerMenuActions, cronRunNowReason } from '@/utilities/rowActions'
+import { useAlert } from '@/composables/useAlert'
 import { sleep } from '@/utilities/sleep'
 import {
   GetCronTickerGraphDataRangeResponse,
@@ -340,10 +343,34 @@ const ShowCronTickerOccurrenceGraphData = async (functionName: string, id: strin
   }
 }
 
+const { showSuccess } = useAlert()
+const runningNow = ref(new Set<string>())
+
 const RunCronTickerOnDemand = async (id: string) => {
-  await runCronTickerOnDemand.requestAsync(id)
-  await sleep(1000)
-  await loadPageData()
+  if (runningNow.value.has(id)) return
+  runningNow.value.add(id)
+  try {
+    await runCronTickerOnDemand.requestAsync(id)
+    showSuccess('The cron ticker was queued to run now.')
+    await sleep(1000)
+    await loadPageData()
+  } finally {
+    runningNow.value.delete(id)
+  }
+}
+
+const onRowAction = (key: string, item: GetCronTickerResponse) => {
+  if (key === 'toggle') ToggleCronTickerEnabled(item.id, item.isEnabled)
+  else if (key === 'chart') void ShowCronTickerOccurrenceGraphData(item.function, item.id, -3, 3)
+  else if (key === 'occurrences')
+    cronOccurrenceDialog.open({ id: item.id, retries: item.retries, retryIntervals: item.retryIntervals })
+  else if (key === 'delete')
+    confirmDialog.open({
+      ...new ConfirmDialogProps(),
+      id: item.id,
+      showWarningAlert: item.initIdentifier != undefined,
+      warningAlertMessage: 'System-seeded ticker. To remove permanently, delete its cron expression from code.',
+    })
 }
 
 const ToggleCronTickerEnabled = (id: string, isEnabled: boolean) => {
@@ -1019,67 +1046,7 @@ const refreshData = async () => {
 
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
-                <!-- Enable/Disable Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="ToggleCronTickerEnabled(item.id, item.isEnabled)"
-                        class="modern-action-btn"
-                        :class="item.isEnabled ? 'disable-btn' : 'enable-btn'"
-                      >
-                        <v-icon size="16">mdi-power</v-icon>
-                      </button>
-                    </template>
-                    <span>{{ item.isEnabled ? 'Disable' : 'Enable' }}</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Chart Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="ShowCronTickerOccurrenceGraphData(item.function, item.id, -3, 3)"
-                        class="modern-action-btn chart-btn"
-                        :class="{ active: selectedCronTickerGraphData === item.id }"
-                        :disabled="chartLoading"
-                      >
-                        <v-icon v-if="chartLoading" size="16" class="loading-spin">mdi-loading</v-icon>
-                        <v-icon v-else size="16">mdi-chart-areaspline</v-icon>
-                      </button>
-                    </template>
-                    <span>View Occurrences</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Occurrences Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          (event) => {
-                            cronOccurrenceDialog.open({
-                              id: item.id,
-                              retries: item.retries,
-                              retryIntervals: item.retryIntervals,
-                            });
-                          }
-                        "
-                        class="modern-action-btn occurrences-btn"
-                      >
-                        <v-icon size="16">mdi-folder-open</v-icon>
-                      </button>
-                    </template>
-                    <span>View Occurrences</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Edit Button -->
+                <!-- Edit -->
                 <div class="action-btn-wrapper">
                   <v-tooltip location="top">
                     <template v-slot:activator="{ props }">
@@ -1087,6 +1054,7 @@ const refreshData = async () => {
                         v-bind="props"
                         @click="crudCronTickerDialog.open({ ...item, isFromDuplicate: false })"
                         class="modern-action-btn edit-btn"
+                        aria-label="Edit ticker"
                       >
                         <v-icon size="16">mdi-pencil</v-icon>
                       </button>
@@ -1095,7 +1063,7 @@ const refreshData = async () => {
                   </v-tooltip>
                 </div>
 
-                <!-- Run Button -->
+                <!-- Run now -->
                 <div class="action-btn-wrapper">
                   <v-tooltip location="top">
                     <template v-slot:activator="{ props }">
@@ -1104,38 +1072,23 @@ const refreshData = async () => {
                         @click="RunCronTickerOnDemand(item.id)"
                         class="modern-action-btn run-btn"
                         :class="{ 'btn-disabled': !item.isEnabled }"
-                        :disabled="!item.isEnabled"
+                        :disabled="!item.isEnabled || runningNow.has(item.id)"
+                        aria-label="Run now"
                       >
-                        <v-icon size="16">mdi-play-outline</v-icon>
+                        <v-icon v-if="runningNow.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                        <v-icon v-else size="16">mdi-play-outline</v-icon>
                       </button>
                     </template>
-                    <span>Run Now</span>
+                    <span>{{ cronRunNowReason(item.isEnabled) ?? 'Run Now' }}</span>
                   </v-tooltip>
                 </div>
 
-                <!-- Delete Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          confirmDialog.open({
-                            ...new ConfirmDialogProps(),
-                            id: item.id,
-                            showWarningAlert: item.initIdentifier != undefined ? true : false,
-                            warningAlertMessage:
-                              'System-seeded ticker. To remove permanently, delete its cron expression from code.',
-                          })
-                        "
-                        class="modern-action-btn delete-btn"
-                      >
-                        <v-icon size="16">mdi-trash-can</v-icon>
-                      </button>
-                    </template>
-                    <span>Delete Ticker</span>
-                  </v-tooltip>
-                </div>
+                <!-- The rest, with delete last -->
+                <RowActionsMenu
+                  :actions="cronTickerMenuActions({ isEnabled: item.isEnabled, chartLoading })"
+                  :label="`More actions for ${item.function}`"
+                  @select="(key) => onRowAction(key, item)"
+                />
               </div>
             </template>
           </v-data-table>
@@ -1731,8 +1684,8 @@ const refreshData = async () => {
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
-  flex-wrap: wrap;
-  min-width: 76px; /* two buttons per row at the narrowest */
+  flex-wrap: nowrap;
+  min-width: 112px; /* two inline actions and the menu, in one row */
   align-items: center;
   gap: 6px;
   padding: 2px;

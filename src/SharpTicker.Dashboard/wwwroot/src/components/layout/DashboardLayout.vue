@@ -55,6 +55,9 @@ let stopTicker: any = null
   const confirmDialog = useDialog<ConfirmDialogProps>().withComponent(
     () => import('../common/ConfirmDialog.vue'),
   )
+  const restartConfirmDialog = useDialog<ConfirmDialogProps>().withComponent(
+    () => import('../common/ConfirmDialog.vue'),
+  )
 
 
 // Initialize stores and services lazily
@@ -176,7 +179,20 @@ onMounted(async () => {
   }
 })
 
-// Restart handler ensures at least 1s animation and until request completes
+// Restart asks first, as Stop System does. The animation lasts at least 1s and until the request completes.
+function askRestart() {
+  if (restartIsAnimating.value) return
+  restartConfirmDialog?.open({
+    ...new ConfirmDialogProps(),
+    icon: 'mdi-restart',
+    iconColor: '#FF9800',
+    title: 'Restart the scheduler',
+    text: 'The scheduler wakes up and plans its next jobs again from the stored schedule.',
+    confirmText: 'Restart',
+    confirmColor: '#FF9800',
+  })
+}
+
 async function handleRestart() {
   if (!restartTicker) return
   restartIsAnimating.value = true
@@ -476,7 +492,7 @@ const handleForceUIUpdate = () => {
                   color="warning"
                   variant="outlined"
                   size="small"
-                  @click="handleRestart"
+                  @click="askRestart"
                   :loading="restartTicker?.loader?.value"
                   class="action-btn restart-btn"
                   :disabled="restartIsAnimating"
@@ -558,6 +574,17 @@ const handleForceUIUpdate = () => {
             stopTicker.loader.value = false;
           })
         })
+      "
+    />
+    <component
+      v-if="restartConfirmDialog && restartConfirmDialog.isOpen"
+      :is="restartConfirmDialog.Component"
+      :is-open="restartConfirmDialog.isOpen"
+      @close="restartConfirmDialog.close()"
+      :dialog-props="restartConfirmDialog.propData"
+      @confirm="
+        restartConfirmDialog.close();
+        handleRestart();
       "
     />
   </Teleport>

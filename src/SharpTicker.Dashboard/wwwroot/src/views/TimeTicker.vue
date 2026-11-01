@@ -14,6 +14,9 @@ import { buildRunAgainRequest } from '@/utilities/runAgain'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
+import RowActionsMenu from '@/components/common/RowActionsMenu.vue'
+import { timeTickerMenuActions } from '@/utilities/rowActions'
+import { useAlert } from '@/composables/useAlert'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import { runInitialLoad } from '@/utilities/initialLoad'
 import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
@@ -90,6 +93,7 @@ const timeZoneStore = useTimeZoneStore()
 
 // Adds a new ticker with the same function, request, retries and description, to run right away.
 // A time ticker runs once, so running it again is a new row.
+const { showSuccess } = useAlert()
 const runningAgain = ref(new Set<string>())
 
 const runAgain = async (item: GetTimeTickerResponse) => {
@@ -101,6 +105,7 @@ const runAgain = async (item: GetTimeTickerResponse) => {
       buildRunAgainRequest(item, stored?.result),
       timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone,
     )
+    showSuccess('A new time ticker was added with the same function and request.')
     await loadPageData()
   } finally {
     runningAgain.value.delete(item.id)
@@ -733,8 +738,20 @@ const getRetryStatus = (index: number, item: any) => {
   }
 }
 
+// A refused cancel is explained by the alert the HTTP layer shows (the server says why); here the row only gets
+// the Force delete entry, so an operator can remove a row that no node runs.
 const requestCancel = async (id: string) => {
-  await requestCancelTicker.requestAsync(id)
+  try {
+    await requestCancelTicker.requestAsync(id)
+    showSuccess('Cancel requested. The job stops when it next checks for cancellation.')
+  } catch {
+    canBeForceDeleted.value.push(id)
+  }
+}
+
+const onRowAction = (key: string, item: GetTimeTickerResponse) => {
+  if (key === 'cancel') void requestCancel(item.id)
+  else if (key === 'delete') confirmDialog.open({ id: item.id })
 }
 
 const onSubmitConfirmDialog = async () => {
@@ -1210,35 +1227,7 @@ const canBeForceDeleted = ref<string[]>([])
 
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
-                <!-- Cancel Button -->
-                <div
-                  class="action-btn-wrapper"
-                  :class="{ 'action-btn-disabled': !hasStatus(item.status, Status.InProgress) }"
-                >
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          requestCancel(item.id).catch(() => {
-                            canBeForceDeleted.push(item.id)
-                          })
-                        "
-                        :disabled="
-                          !hasStatus(item.status, Status.InProgress) ||
-                          canBeForceDeleted.includes(item.id)
-                        "
-                        class="modern-action-btn cancel-btn"
-                        :class="{ active: hasStatus(item.status, Status.InProgress) }"
-                      >
-                        <v-icon size="16">mdi-cancel</v-icon>
-                      </button>
-                    </template>
-                    <span>Cancel Operation</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Edit/Duplicate Button -->
+                <!-- Edit (not started yet) or Duplicate -->
                 <div class="action-btn-wrapper">
                   <v-tooltip location="top">
                     <template v-slot:activator="{ props }">
@@ -1256,6 +1245,7 @@ const canBeForceDeleted = ref<string[]>([])
                           })
                         "
                         class="modern-action-btn edit-btn"
+                        aria-label="Edit"
                       >
                         <v-icon size="16">mdi-pencil</v-icon>
                       </button>
@@ -1270,6 +1260,7 @@ const canBeForceDeleted = ref<string[]>([])
                           })
                         "
                         class="modern-action-btn duplicate-btn"
+                        aria-label="Duplicate"
                       >
                         <v-icon size="16">mdi-content-copy</v-icon>
                       </button>
@@ -1282,7 +1273,7 @@ const canBeForceDeleted = ref<string[]>([])
                   </v-tooltip>
                 </div>
 
-                <!-- Run Again Button -->
+                <!-- Run Again -->
                 <div class="action-btn-wrapper">
                   <v-tooltip location="top">
                     <template v-slot:activator="{ props }">
@@ -1290,48 +1281,29 @@ const canBeForceDeleted = ref<string[]>([])
                         v-bind="props"
                         @click="runAgain(item)"
                         class="modern-action-btn run-btn"
+                        :class="{ busy: runningAgain.has(item.id) }"
                         :disabled="runningAgain.has(item.id)"
+                        aria-label="Run again"
                       >
-                        <v-icon size="16">mdi-play-outline</v-icon>
+                        <v-icon v-if="runningAgain.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                        <v-icon v-else size="16">mdi-play-outline</v-icon>
                       </button>
                     </template>
                     <span>Run again</span>
                   </v-tooltip>
                 </div>
 
-                <!-- Delete Button -->
-                <div
-                  class="action-btn-wrapper"
-                  :class="{
-                    'action-btn-disabled':
-                      hasStatus(item.status, Status.InProgress) &&
-                      !canBeForceDeleted.includes(item.id),
-                  }"
-                >
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="confirmDialog.open({ id: item.id })"
-                        :disabled="
-                          hasStatus(item.status, Status.InProgress) &&
-                          !canBeForceDeleted.includes(item.id)
-                        "
-                        class="modern-action-btn delete-btn"
-                        :class="{
-                          active:
-                            !hasStatus(item.status, Status.InProgress) ||
-                            canBeForceDeleted.includes(item.id),
-                        }"
-                      >
-                        <v-icon size="16">mdi-trash-can</v-icon>
-                      </button>
-                    </template>
-                    <span>{{
-                      canBeForceDeleted.includes(item.id) ? 'Force Delete Ticker' : 'Delete Ticker'
-                    }}</span>
-                  </v-tooltip>
-                </div>
+                <!-- Cancel and delete live in the menu -->
+                <RowActionsMenu
+                  :actions="
+                    timeTickerMenuActions({
+                      isInProgress: hasStatus(item.status, Status.InProgress),
+                      canBeForceDeleted: canBeForceDeleted.includes(item.id),
+                    })
+                  "
+                  :label="`More actions for ${item.function}`"
+                  @select="(key) => onRowAction(key, item)"
+                />
               </div>
             </template>
 
@@ -1490,6 +1462,19 @@ const canBeForceDeleted = ref<string[]>([])
 </template>
 
 <style scoped>
+.loading-spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Enhanced Tree Table Styles */
 .tree-cell {
   position: relative;
@@ -1875,8 +1860,8 @@ const canBeForceDeleted = ref<string[]>([])
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
-  flex-wrap: wrap;
-  min-width: 76px; /* two buttons per row at the narrowest */
+  flex-wrap: nowrap;
+  min-width: 112px; /* two inline actions and the menu, in one row */
   align-items: center;
   gap: 6px;
   padding: 2px;
