@@ -345,6 +345,51 @@ public abstract class DashboardVisibilityApiTests<TFixture> : IClassFixture<TFix
         Assert.Equal(1, occurrences.GetArrayLength());
     }
 
+    [Fact]
+    public async Task ATickerOfAnotherTeam_CannotBeCancelled_ButTheUsersOwnCan()
+    {
+        using var others = new System.Threading.CancellationTokenSource();
+        using var own = new System.Threading.CancellationTokenSource();
+        Register(OpsCleanupId, others);
+        Register(BillingInvoicesId, own);
+        try
+        {
+            var (hidden, body) = await _api.SendAsync(Billing, false, HttpMethod.Post, $"/ticker/cancel?id={OpsCleanupId}");
+            var (allowed, _) = await _api.SendAsync(Billing, false, HttpMethod.Post, $"/ticker/cancel?id={BillingInvoicesId}");
+
+            Assert.Equal(400, hidden);
+            Assert.Equal("not-running-on-this-node", body!.Value.GetProperty("reason").GetString());
+            Assert.False(others.IsCancellationRequested, "the job of another team was cancelled");
+            Assert.Equal(200, allowed);
+            Assert.True(own.IsCancellationRequested);
+        }
+        finally
+        {
+            SharpTicker.Utilities.TickerCancellationTokenManager.RemoveTickerCancellationToken(OpsCleanupId);
+            SharpTicker.Utilities.TickerCancellationTokenManager.RemoveTickerCancellationToken(BillingInvoicesId);
+        }
+
+        static void Register(Guid id, System.Threading.CancellationTokenSource source)
+            => SharpTicker.Utilities.TickerCancellationTokenManager.AddTickerCancellationToken(source,
+                new SharpTicker.Utilities.Models.InternalFunctionContext { TickerId = id, FunctionName = "Test", Type = SharpTicker.Utilities.Enums.TickerType.TimeTicker }, isDue: false);
+    }
+
+    [Fact]
+    public async Task UpdatingATicker_CannotWriteToATickerOfAnotherTeamThroughItsChildren()
+    {
+        var (_, added) = await _api.SendAsync(Billing, false, HttpMethod.Post, "/time-ticker/add", $$"""{"function":"billing.Reminders","executionTime":"{{InTwoDays}}"}""");
+        var own = added!.Value.GetProperty("tickerId").GetGuid();
+
+        var (_, body) = await _api.SendAsync(Billing, false, HttpMethod.Put, $"/time-ticker/update?id={own}",
+            $$"""{"function":"billing.Reminders","executionTime":"{{InTwoDays}}","children":[{"id":"{{OpsCleanupId}}","function":"billing.Invoices","executionTime":"{{InTwoDays}}","description":"taken"}]}""");
+
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var ops = (await _api.GetAsAsync(Ops, "/time-tickers")).EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == OpsCleanupId);
+        Assert.Equal("ops.Cleanup", ops.GetProperty("function").GetString());
+        Assert.NotEqual("taken", ops.GetProperty("description").GetString());
+        await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/time-ticker/delete?id={own}");
+    }
+
     #endregion
 }
 

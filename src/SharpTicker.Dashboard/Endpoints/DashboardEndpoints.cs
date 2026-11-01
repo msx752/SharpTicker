@@ -432,7 +432,8 @@ public static class DashboardEndpoints
             chainRoot.ExecutionTime = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
         }
 
-        if (FirstHiddenFunction(VisibilityScope<TTimeTicker, TCronTicker>.For(context), chainRoot) is { } hidden)
+        var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
+        if (FirstHiddenFunction(scope, chainRoot) is { } hidden)
         {
             await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenFunctionMessage(hidden) }, dashboardOptions.DashboardJsonOptions);
             return;
@@ -482,6 +483,11 @@ public static class DashboardEndpoints
             var utc = TimeZoneInfo.ConvertTimeToUtc(unspecified, tz);
             timeTicker.ExecutionTime = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
         }
+
+        // The body must not reach other tickers: with a rule the children in it are dropped, because editing one ticker
+        // never changes its children and a child with the id of a ticker the user cannot see would be written too.
+        if (scope.TimeTickers != null)
+            timeTicker.Children = new List<TTimeTicker>();
 
         var result = await timeTickerManager.UpdateAsync(timeTicker, cancellationToken);
 
@@ -867,7 +873,7 @@ public static class DashboardEndpoints
         var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
         var visible = scope.Filter == null
             || await scope.VisibleTimeTickerIdAsync(provider, id, context.RequestAborted) != VisibilityScope<TTimeTicker, TCronTicker>.NoTicker
-            || await scope.VisibleOccurrenceIdAsync(provider, id, context.RequestAborted) != VisibilityScope<TTimeTicker, TCronTicker>.NoTicker;
+            || await scope.CanSeeOccurrenceAsync(provider, id, context.RequestAborted);
 
         if (visible && repository.CancelTickerById(id))
         {

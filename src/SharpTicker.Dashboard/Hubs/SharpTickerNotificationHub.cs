@@ -8,6 +8,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using SharpTicker.Dashboard.Authentication;
+using SharpTicker.Dashboard.Infrastructure;
 
 namespace SharpTicker.Dashboard.Hubs
 {
@@ -50,6 +51,9 @@ namespace SharpTicker.Dashboard.Hubs
             Context.Items["username"] = authResult.Username;
             Context.Items["authenticated"] = true;
 
+            // Only kept when a visibility rule is registered: the notifications are then sent per connection
+            Services?.GetService<HubConnections>()?.Add(connectionId, Context.User ?? new ClaimsPrincipal());
+
             await base.OnConnectedAsync();
         }
 
@@ -61,6 +65,8 @@ namespace SharpTicker.Dashboard.Hubs
             _logger.LogInformation("SignalR connection disconnected: {ConnectionId} - User: {Username}", 
                 connectionId, username);
 
+            Services?.GetService<HubConnections>()?.Remove(connectionId);
+
             await base.OnDisconnectedAsync(exception);
         }
 
@@ -69,6 +75,18 @@ namespace SharpTicker.Dashboard.Hubs
             if (!IsAuthenticated())
             {
                 await Clients.Caller.SendAsync("Error", "Authentication required");
+                return;
+            }
+
+            // The groups are named after a cron ticker and carry its occurrence updates, so with a visibility rule a
+            // user only joins the group of a cron they may see. The answer is the same as for a cron that does not
+            // exist, which has a group that nothing is ever sent to.
+            var gate = Services?.GetService<IVisibilityGate>();
+            if (gate != null && Guid.TryParse(groupName, out var cronTickerId)
+                && !await gate.CanFollowCronAsync(Context.User ?? new ClaimsPrincipal(), cronTickerId))
+            {
+                _logger.LogDebug("User {Username} was not added to group {GroupName}: the cron ticker is not visible to them", Username, groupName);
+                await Clients.Caller.SendAsync("GroupJoined", groupName);
                 return;
             }
 
@@ -106,6 +124,8 @@ namespace SharpTicker.Dashboard.Hubs
 
             await Clients.Caller.SendAsync("Status", status);
         }
+
+        private IServiceProvider? Services => Context.GetHttpContext()?.RequestServices;
 
         // A connection that never authenticated has no "username" item, and the Items indexer throws for a missing key.
         private string? Username => Context.Items.TryGetValue("username", out var value) ? value?.ToString() : null;

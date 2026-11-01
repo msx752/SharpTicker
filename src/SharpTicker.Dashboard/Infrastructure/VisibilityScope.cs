@@ -91,6 +91,21 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
         return await VisibleCronTickerIdAsync(provider, occurrence.CronTickerId, cancellationToken) == NoTicker ? NoTicker : id;
     }
 
+    /// <summary>
+    /// True only when an occurrence with this id exists and the user may see the cron it belongs to. Unlike
+    /// <see cref="VisibleOccurrenceIdAsync"/> an id that is not an occurrence is not visible, so it can be used to
+    /// decide whether an action may go ahead.
+    /// </summary>
+    public async Task<bool> CanSeeOccurrenceAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, Guid id, CancellationToken cancellationToken)
+    {
+        var occurrence = (await provider.GetAllCronTickerOccurrences(o => o.Id == id, cancellationToken)).FirstOrDefault();
+        if (occurrence == null)
+            return false;
+
+        return CronTickers == null
+            || await VisibleCronTickerIdAsync(provider, occurrence.CronTickerId, cancellationToken) != NoTicker;
+    }
+
     /// <summary>Only the ids of the time tickers the user may see.</summary>
     public async Task<List<Guid>> VisibleTimeTickerIdsAsync(ITickerPersistenceProvider<TTimeTicker, TCronTicker> provider, List<Guid> ids, CancellationToken cancellationToken)
     {
@@ -102,10 +117,13 @@ internal sealed class VisibilityScope<TTimeTicker, TCronTicker>
     }
 
     /// <summary>Reads the rule registered for the dashboard and applies it to the user of this request.</summary>
-    public static VisibilityScope<TTimeTicker, TCronTicker> For(HttpContext context)
+    public static VisibilityScope<TTimeTicker, TCronTicker> For(HttpContext context) => For(context.RequestServices, context.User);
+
+    /// <summary>Reads the rule registered in the given services and applies it to the given user.</summary>
+    public static VisibilityScope<TTimeTicker, TCronTicker> For(IServiceProvider services, ClaimsPrincipal user)
     {
-        var rule = context.RequestServices.GetService<ITickerVisibilityRule>();
-        return rule == null ? Unrestricted : new VisibilityScope<TTimeTicker, TCronTicker>(rule, context.User);
+        var rule = services.GetService<ITickerVisibilityRule>();
+        return rule == null ? Unrestricted : new VisibilityScope<TTimeTicker, TCronTicker>(rule, user);
     }
 }
 

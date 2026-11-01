@@ -42,7 +42,11 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 
                 // A visibility rule is resolved per request, so it can use the services of the application
                 if (dashboardConfig.VisibilityRuleType != null)
+                {
                     services.AddScoped(typeof(ITickerVisibilityRule), dashboardConfig.VisibilityRuleType);
+                    services.AddSingleton<HubConnections>();
+                    services.AddSingleton<IVisibilityGate, VisibilityGate<TTimeTicker, TCronTicker>>();
+                }
 
                 // Register authentication system
                 services.AddSingleton(dashboardConfig.Auth);
