@@ -6,6 +6,9 @@ import { buildStatusChartOption, buildStatusTimeSeries } from '@/utilities/statu
 import { useDialog } from '@/composables/useDialog'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
+import RowActionsMenu from '@/components/common/RowActionsMenu.vue'
+import { cronTickerMenuActions, cronRunNowReason } from '@/utilities/rowActions'
+import { useAlert } from '@/composables/useAlert'
 import { sleep } from '@/utilities/sleep'
 import {
   GetCronTickerGraphDataRangeResponse,
@@ -16,41 +19,80 @@ import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
-import cronstrue from 'cronstrue'
-
-// Helper function to get readable cron expression
-const getReadableCronExpression = (expression: string): string => {
-  try {
-    // cronstrue expects 6-part format with seconds
-    return cronstrue.toString(expression)
-  } catch (error) {
-    return 'Invalid cron expression'
-  }
-}
+import { describeSchedule } from '@/utilities/cronSchedule'
+import { nextRunText, statusName } from '@/utilities/cronRunSummary'
+import { relativeTime } from '@/utilities/relativeTime'
+import { runInitialLoad } from '@/utilities/initialLoad'
+import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
+import { copyText } from '@/utilities/clipboard'
 
 const getCronTickerRangeGraphData = cronTickerService.getTimeTickersGraphDataRange()
 const getCronTickersPaginated = cronTickerService.getCronTickersPaginated()
+const getDisabledCount = cronTickerService.getDisabledCount()
 const getCronTickerRangeGraphDataById = cronTickerService.getTimeTickersGraphDataRangeById()
 const getCronTickersGraphDataAndParseToGraph = cronTickerService.getTimeTickersGraphData()
 const deleteCronTicker = cronTickerService.deleteCronTicker()
 const runCronTickerOnDemand = cronTickerService.runCronTickerOnDemand()
 const toggleCronTicker = cronTickerService.toggleCronTicker()
 
+// The scheduler evaluates an expression in its own time zone, so the sentence names that zone
+const scheduleText = (expression: string) =>
+  describeSchedule(expression, timeZoneStore.schedulerTimeZone)
+
+// A disabled cron is muted, so it stands out in the list without hiding that it exists
+const cronRowProps = ({ item }: { item: { isEnabled?: boolean } }) => ({
+  class: item.isEnabled === false ? 'cron-row-disabled' : '',
+})
+
 // Pagination state
 const currentPage = ref(1)
 const pageSize = ref(20)
 const totalCount = ref(0)
 
+// The list can be limited to the disabled crons, so a cron that was switched off by mistake is easy to find
+const showOnlyDisabled = ref(false)
+const disabledCount = ref(0)
+
+const loadDisabledCount = async () => {
+  try {
+    disabledCount.value = await getDisabledCount.requestAsync()
+  } catch {
+    // the chip keeps its last count
+  }
+}
+
 // Load page data with pagination
 const loadPageData = async () => {
   try {
-    const response = await getCronTickersPaginated.requestAsync(currentPage.value, pageSize.value)
+    void loadDisabledCount()
+    const response = await getCronTickersPaginated.requestAsync(
+      currentPage.value,
+      pageSize.value,
+      showOnlyDisabled.value ? false : undefined,
+    )
     if (response) {
       totalCount.value = response.totalCount || 0
     }
   } catch (error) {
     console.error('Failed to load paginated data:', error)
   }
+}
+
+const toggleDisabledFilter = async () => {
+  showOnlyDisabled.value = !showOnlyDisabled.value
+  currentPage.value = 1
+  await loadPageData()
+}
+
+// Copies the raw cron expression of a row
+const copiedExpression = ref('')
+const copyExpression = async (expression: string) => {
+  if (!(await copyText(expression))) return
+
+  copiedExpression.value = expression
+  setTimeout(() => {
+    if (copiedExpression.value === expression) copiedExpression.value = ''
+  }, 1500)
 }
 
 // Handle page change
@@ -339,10 +381,39 @@ const ShowCronTickerOccurrenceGraphData = async (functionName: string, id: strin
   }
 }
 
+// The words in the Last Run and Next Run cells are relative to now, so they are recomputed as time passes
+const clock = ref(Date.now())
+const clockTimer = setInterval(() => (clock.value = Date.now()), 15_000)
+onUnmounted(() => clearInterval(clockTimer))
+
+const { showSuccess } = useAlert()
+const runningNow = ref(new Set<string>())
+
 const RunCronTickerOnDemand = async (id: string) => {
-  await runCronTickerOnDemand.requestAsync(id)
-  await sleep(1000)
-  await loadPageData()
+  if (runningNow.value.has(id)) return
+  runningNow.value.add(id)
+  try {
+    await runCronTickerOnDemand.requestAsync(id)
+    showSuccess('The cron ticker was queued to run now.')
+    await sleep(1000)
+    await loadPageData()
+  } finally {
+    runningNow.value.delete(id)
+  }
+}
+
+const onRowAction = (key: string, item: GetCronTickerResponse) => {
+  if (key === 'toggle') ToggleCronTickerEnabled(item.id, item.isEnabled)
+  else if (key === 'chart') void ShowCronTickerOccurrenceGraphData(item.function, item.id, -3, 3)
+  else if (key === 'occurrences')
+    cronOccurrenceDialog.open({ id: item.id, retries: item.retries, retryIntervals: item.retryIntervals })
+  else if (key === 'delete')
+    confirmDialog.open({
+      ...new ConfirmDialogProps(),
+      id: item.id,
+      showWarningAlert: item.initIdentifier != undefined,
+      warningAlertMessage: 'System-seeded ticker. To remove permanently, delete its cron expression from code.',
+    })
 }
 
 const ToggleCronTickerEnabled = (id: string, isEnabled: boolean) => {
@@ -375,66 +446,50 @@ const onSubmitToggleConfirmDialog = async () => {
   }
 }
 
-onMounted(async () => {
-  try {
-    isMounted.value = true
-    // Ensure WebSocket connection is established (only if not already initialized)
-    try {
-      const connectionStore = useConnectionStore()
+// The charts are built after the table has painted, so the table is what appears first
+const chartsReady = ref(false)
+
+const zoneGate = createZoneReloadGate(
+  () => timeZoneStore.whenSchedulerTimeZoneKnown(),
+  () => timeZoneStore.effectiveTimeZone,
+)
+
+onMounted(() => {
+  isMounted.value = true
+  const connectionStore = useConnectionStore()
+
+  // The dates are formatted with the time zone in use when they arrive, so the first load waits until that zone is
+  // final; the watcher below then ignores the change that made it final. See utilities/zoneReloadGate.ts.
+  const withZone = zoneGate.firstLoad
+
+  // The table, the chart data and the connection start together; see utilities/initialLoad.ts
+  runInitialLoad({
+    connect: async () => {
       if (!connectionStore.isInitialized) {
         await connectionStore.initializeConnectionWithRetry()
       }
-    } 
-    catch (error: any) {}
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load cron tickers data
-    try {
-      await loadPageData()
-    } catch (error: any) {
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load graph data range
-    try {
-      const res = await getCronTickerRangeGraphData.requestAsync(-3, 3)
-      GetCronTickerRangeGraphData(res)
-    } catch (error: any) {
-      if (error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED') {
-        return
-      }
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Load status distribution data
-    try {
-      await getTimeTickersGraphDataAndParseToGraph()
-    } catch (error: any) {
-    }
-    
-    // Check if still mounted before continuing
-    if (!isMounted.value) return
-    
-    // Add hub listeners
-    try {
-      await addHubListeners()
-    } catch (error: any) {
-    }
-    
-  } catch (error: any) {
-  }
+    },
+    loadTable: withZone(loadPageData),
+    loadCharts: [
+      withZone(async () => {
+        const res = await getCronTickerRangeGraphData.requestAsync(-3, 3)
+        if (isMounted.value) GetCronTickerRangeGraphData(res)
+      }),
+      withZone(getTimeTickersGraphDataAndParseToGraph),
+    ],
+    showCharts: () => {
+      chartsReady.value = true
+    },
+    attachListeners: addHubListeners,
+    isActive: () => isMounted.value,
+  })
 })
 
 // Reload data when display timezone changes
 watch(
   () => timeZoneStore.effectiveTimeZone,
-  async () => {
+  async (zone) => {
+    if (!zoneGate.shouldReload(zone)) return
     try {
       if (!isMounted.value) return
 
@@ -761,7 +816,10 @@ const headersWithoutReadable = computed(() => {
   // Define headers manually for paginated response
   return [
     { title: 'Function', key: 'function', sortable: true, visibility: true, minWidth: '180px' },
-    { title: 'Expression', key: 'expression', sortable: true, visibility: true },
+    { title: 'Enabled', key: 'isEnabled', sortable: false, visibility: true },
+    { title: 'Schedule', key: 'expression', sortable: true, visibility: true },
+    { title: 'Last Run', key: 'lastRun', sortable: false, visibility: true },
+    { title: 'Next Run', key: 'nextRun', sortable: false, visibility: true },
     { title: 'Request Type', key: 'requestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
     { title: 'Retry Configuration', key: 'retryIntervals', sortable: false, visibility: true },
@@ -874,11 +932,13 @@ const refreshData = async () => {
 
           <div class="chart-container">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="option"
               :key="`chart-${chartKey}`"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
 
@@ -908,11 +968,13 @@ const refreshData = async () => {
 
           <div class="chart-container">
             <v-chart
+              v-if="chartsReady"
               class="status-chart"
               :option="totalOption"
               :key="`pie-chart-${pieChartKey}`"
               autoresize
             />
+            <div v-else class="status-chart"></div>
           </div>
         </div>
       </div>
@@ -922,7 +984,7 @@ const refreshData = async () => {
         <div class="section-header">
           <h2 class="section-title">
             <v-icon class="section-icon" color="primary">mdi-table</v-icon>
-            Cron Ticker Operations
+            Cron Tickers
           </h2>
           <div class="table-controls">
             <!-- Primary Actions Group -->
@@ -960,6 +1022,19 @@ const refreshData = async () => {
                   getCronTickersPaginated.loader.value ? 'Loading...' : `${totalCount} total items`
                 }}
               </v-chip>
+              <v-chip
+                v-if="disabledCount > 0 || showOnlyDisabled"
+                :color="showOnlyDisabled ? 'warning' : undefined"
+                :variant="showOnlyDisabled ? 'flat' : 'tonal'"
+                size="small"
+                class="status-chip disabled-filter-chip"
+                :aria-pressed="showOnlyDisabled"
+                :title="showOnlyDisabled ? 'Show all crons' : 'Show only the disabled crons'"
+                @click="toggleDisabledFilter"
+              >
+                <v-icon size="small" class="mr-1">mdi-pause-circle-outline</v-icon>
+                Disabled {{ disabledCount }}
+              </v-chip>
             </div>
 
             <!-- Utility Actions Group -->
@@ -988,16 +1063,60 @@ const refreshData = async () => {
             :items-per-page="-1"
             hide-default-footer
             class="enhanced-table"
+            :row-props="cronRowProps"
           >
+            <template v-slot:item.isEnabled="{ item }">
+              <!-- Icon and text, so the state is not told by colour alone -->
+              <v-chip
+                size="small"
+                variant="tonal"
+                :color="item.isEnabled ? 'success' : 'warning'"
+                :prepend-icon="item.isEnabled ? 'mdi-check-circle-outline' : 'mdi-pause-circle-outline'"
+                class="enabled-chip"
+              >
+                {{ item.isEnabled ? 'Enabled' : 'Disabled' }}
+              </v-chip>
+            </template>
+
             <template v-slot:item.expression="{ item }">
-              <v-tooltip location="top">
-                <template #activator="{ props }">
-                  <span v-bind="props" class="expression-tooltip">
-                    {{ item.expression }}
-                  </span>
-                </template>
-                <span>{{ getReadableCronExpression(item.expression) }}</span>
-              </v-tooltip>
+              <div class="schedule-cell">
+                <span v-if="scheduleText(item.expression)" class="schedule-text">
+                  {{ scheduleText(item.expression) }}
+                </span>
+                <button
+                  type="button"
+                  class="schedule-expression"
+                  title="Copy the expression"
+                  @click="copyExpression(item.expression)"
+                >
+                  {{ copiedExpression === item.expression ? 'Copied' : item.expression }}
+                </button>
+              </div>
+            </template>
+
+            <template v-slot:item.lastRun="{ item }">
+              <button
+                v-if="item.lastRun"
+                type="button"
+                class="last-run-cell"
+                :title="item.lastRun + ' (click to open the occurrences)'"
+                @click="onRowAction('occurrences', item)"
+              >
+                <span class="last-run-status" :style="{ color: statusColors[item.lastStatus ?? -1] }">
+                  <v-icon size="10">mdi-circle</v-icon>
+                  {{ statusName(item.lastStatus) }}
+                </span>
+                <span class="last-run-time">{{ relativeTime(item.lastRunAt, clock) }}</span>
+              </button>
+              <span v-else class="no-intervals">—</span>
+            </template>
+
+            <template v-slot:item.nextRun="{ item }">
+              <span
+                :class="{ 'no-intervals': !item.isEnabled || !item.nextRun }"
+                :title="item.isEnabled ? item.nextRun : undefined"
+                >{{ nextRunText(item, clock) }}</span
+              >
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">
@@ -1017,123 +1136,37 @@ const refreshData = async () => {
 
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
-                <!-- Enable/Disable Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="ToggleCronTickerEnabled(item.id, item.isEnabled)"
-                        class="modern-action-btn"
-                        :class="item.isEnabled ? 'disable-btn' : 'enable-btn'"
-                      >
-                        <v-icon size="16">mdi-power</v-icon>
-                      </button>
-                    </template>
-                    <span>{{ item.isEnabled ? 'Disable' : 'Enable' }}</span>
-                  </v-tooltip>
+                <!-- Edit -->
+                <div class="action-btn-wrapper" title="Edit Ticker">
+                  <button
+                    @click="crudCronTickerDialog.open({ ...item, isFromDuplicate: false })"
+                    class="modern-action-btn edit-btn"
+                    aria-label="Edit ticker"
+                  >
+                    <v-icon size="16">mdi-pencil</v-icon>
+                  </button>
                 </div>
 
-                <!-- Chart Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="ShowCronTickerOccurrenceGraphData(item.function, item.id, -3, 3)"
-                        class="modern-action-btn chart-btn"
-                        :class="{ active: selectedCronTickerGraphData === item.id }"
-                        :disabled="chartLoading"
-                      >
-                        <v-icon v-if="chartLoading" size="16" class="loading-spin">mdi-loading</v-icon>
-                        <v-icon v-else size="16">mdi-chart-areaspline</v-icon>
-                      </button>
-                    </template>
-                    <span>View Occurrences</span>
-                  </v-tooltip>
+                <!-- Run now -->
+                <div class="action-btn-wrapper" :title="cronRunNowReason(item.isEnabled) ?? 'Run Now'">
+                  <button
+                    @click="RunCronTickerOnDemand(item.id)"
+                    class="modern-action-btn run-btn"
+                    :class="{ 'btn-disabled': !item.isEnabled }"
+                    :disabled="!item.isEnabled || runningNow.has(item.id)"
+                    aria-label="Run now"
+                  >
+                    <v-icon v-if="runningNow.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                    <v-icon v-else size="16">mdi-play-outline</v-icon>
+                  </button>
                 </div>
 
-                <!-- Occurrences Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          (event) => {
-                            cronOccurrenceDialog.open({
-                              id: item.id,
-                              retries: item.retries,
-                              retryIntervals: item.retryIntervals,
-                            });
-                          }
-                        "
-                        class="modern-action-btn occurrences-btn"
-                      >
-                        <v-icon size="16">mdi-folder-open</v-icon>
-                      </button>
-                    </template>
-                    <span>View Occurrences</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Edit Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="crudCronTickerDialog.open({ ...item, isFromDuplicate: false })"
-                        class="modern-action-btn edit-btn"
-                      >
-                        <v-icon size="16">mdi-pencil</v-icon>
-                      </button>
-                    </template>
-                    <span>Edit Ticker</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Run Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="RunCronTickerOnDemand(item.id)"
-                        class="modern-action-btn run-btn"
-                        :class="{ 'btn-disabled': !item.isEnabled }"
-                        :disabled="!item.isEnabled"
-                      >
-                        <v-icon size="16">mdi-play-outline</v-icon>
-                      </button>
-                    </template>
-                    <span>Run Now</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Delete Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          confirmDialog.open({
-                            ...new ConfirmDialogProps(),
-                            id: item.id,
-                            showWarningAlert: item.initIdentifier != undefined ? true : false,
-                            warningAlertMessage:
-                              'System-seeded ticker. To remove permanently, delete its cron expression from code.',
-                          })
-                        "
-                        class="modern-action-btn delete-btn"
-                      >
-                        <v-icon size="16">mdi-trash-can</v-icon>
-                      </button>
-                    </template>
-                    <span>Delete Ticker</span>
-                  </v-tooltip>
-                </div>
+                <!-- The rest, with delete last -->
+                <RowActionsMenu
+                  :actions="cronTickerMenuActions({ isEnabled: item.isEnabled, chartLoading })"
+                  :label="`More actions for ${item.function}`"
+                  @select="(key) => onRowAction(key, item)"
+                />
               </div>
             </template>
           </v-data-table>
@@ -1179,6 +1212,30 @@ const refreshData = async () => {
 </template> 
 
 <style scoped>
+.last-run-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 2px 0;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.last-run-cell:hover .last-run-time {
+  text-decoration: underline;
+}
+.last-run-status {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.last-run-time {
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+
 /* Dashboard Layout */
 .cron-ticker-dashboard {
   background: #212121;
@@ -1729,8 +1786,8 @@ const refreshData = async () => {
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
-  flex-wrap: wrap;
-  min-width: 76px; /* two buttons per row at the narrowest */
+  flex-wrap: nowrap;
+  min-width: 112px; /* two inline actions and the menu, in one row */
   align-items: center;
   gap: 6px;
   padding: 2px;
@@ -1866,18 +1923,48 @@ const refreshData = async () => {
   pointer-events: none;
 }
 
-.expression-tooltip {
-  cursor: help;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  color: #64b5f6;
-  transition: all 0.2s ease;
+.schedule-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
 }
 
-.expression-tooltip:hover {
-  color: #90caf9;
-  text-shadow: 0 0 8px rgba(100, 181, 246, 0.3);
+.schedule-text {
+  font-size: 0.8125rem;
+  color: #e0e0e0;
 }
+
+/* The raw expression stays visible and exact, but second to the sentence */
+.schedule-expression {
+  font-family: 'JetBrains Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 0.6875rem;
+  color: #9e9e9e;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: copy;
+  text-align: left;
+}
+
+.schedule-expression:hover,
+.schedule-expression:focus-visible {
+  color: #e0e0e0;
+}
+
+.disabled-filter-chip {
+  cursor: pointer;
+}
+
+.enabled-chip {
+  font-weight: 500;
+}
+
+/* Muted, but the state (second cell) and the actions (last cell, with the enable button) keep full strength */
+:deep(.cron-row-disabled td:not(:nth-child(2)):not(:last-child)) {
+  opacity: 0.55;
+}
+
 
 /* Clean Retry Intervals Display */
 .retry-display {

@@ -13,6 +13,13 @@ export class GetCronTickerResponse {
     updatedAt!:string;
     retries!:number;
     isEnabled!:boolean;
+    // Filled in after the page has loaded, by the run summary request
+    lastRunAt?:string;
+    nextRunAt?:string;
+    lastRun?:string;
+    lastStatus?:number;
+    lastOccurrenceId?:string;
+    nextRun?:string;
     actions:string|undefined = undefined;
 }
 

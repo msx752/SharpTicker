@@ -43,12 +43,12 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         }
 
-        public async Task<TTimeTicker[]> GetTimeTickersAsync(CancellationToken cancellationToken)
-            => await _persistenceProvider.GetTimeTickers(null, cancellationToken);
+        public async Task<TTimeTicker[]> GetTimeTickersAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
+            => await _persistenceProvider.GetTimeTickers(visibility?.TimeTickers, cancellationToken);
         
-        public async Task<PaginationResult<TTimeTicker>> GetTimeTickersPaginatedAsync(int pageNumber, int pageSize, TickerStatus? status = null, string search = null, CancellationToken cancellationToken = default)
+        public async Task<PaginationResult<TTimeTicker>> GetTimeTickersPaginatedAsync(int pageNumber, int pageSize, TickerStatus? status = null, string search = null, CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var predicate = BuildTimeTickerFilter(status, search);
+            var predicate = BuildTimeTickerFilter(status, search).And(visibility?.TimeTickers);
             return await _persistenceProvider.GetTimeTickersPaginated(predicate, pageNumber, pageSize, cancellationToken);
         }
 
@@ -71,9 +71,9 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             return null;
         }
 
-        public async Task<IList<Tuple<TickerStatus, int>>> GetTimeTickerFullDataAsync(CancellationToken cancellationToken)
+        public async Task<IList<Tuple<TickerStatus, int>>> GetTimeTickerFullDataAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var timeTickers = await _persistenceProvider.GetTimeTickers(null, cancellationToken: cancellationToken);
+            var timeTickers = await _persistenceProvider.GetTimeTickers(visibility?.TimeTickers, cancellationToken: cancellationToken);
 
             var allStatuses = Enum.GetValues<TickerStatus>();
 
@@ -103,16 +103,16 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         public async Task<IList<TickerGraphData>> GetTimeTickersGraphSpecificDataAsync(
             int pastDays,
             int futureDays,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
             var today = DateTime.UtcNow.Date;
             var startDate = today.AddDays(pastDays);
             var endDate = today.AddDays(futureDays);
 
-            var timeTickers = await _persistenceProvider.GetTimeTickers(x =>
-                    (x.ExecutionTime != null) &&
-                    (x.ExecutionTime.Value.Date >= startDate && x.ExecutionTime.Value.Date <= endDate),
-                cancellationToken);
+            Expression<Func<TTimeTicker, bool>> inRange = x =>
+                (x.ExecutionTime != null) &&
+                (x.ExecutionTime.Value.Date >= startDate && x.ExecutionTime.Value.Date <= endDate);
+            var timeTickers = await _persistenceProvider.GetTimeTickers(inRange.And(visibility?.TimeTickers), cancellationToken);
 
             // Get all possible statuses once
             var allStatuses = Enum.GetValues<TickerStatus>();
@@ -210,9 +210,10 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             return finalData;
         }
 
-        public async Task<IList<Tuple<TickerStatus, int>>> GetCronTickerFullDataAsync(CancellationToken cancellationToken)
+        public async Task<IList<Tuple<TickerStatus, int>>> GetCronTickerFullDataAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(null, cancellationToken: cancellationToken);
+            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
+                await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken), cancellationToken: cancellationToken);
             var allStatuses = Enum.GetValues<TickerStatus>();
 
             var rawData = cronTickerOccurrences
@@ -238,14 +239,15 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         public async Task<IList<TickerGraphData>> GetCronTickersGraphSpecificDataAsync(
             int pastDays,
             int futureDays,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
             var today = DateTime.UtcNow.Date;
             var startDate = today.AddDays(pastDays);
             var endDate = today.AddDays(futureDays);
 
+            Expression<Func<CronTickerOccurrenceEntity<TCronTicker>, bool>> inRange = x => x.ExecutionTime.Date >= startDate && x.ExecutionTime.Date <= endDate;
             var cronTickerOccurrences = await _persistenceProvider
-                .GetAllCronTickerOccurrences(x => x.ExecutionTime.Date >= startDate && x.ExecutionTime.Date <= endDate, cancellationToken: cancellationToken);
+                .GetAllCronTickerOccurrences(inRange.And(await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken)), cancellationToken: cancellationToken);
             
             var allStatuses = Enum.GetValues<TickerStatus>();
 
@@ -289,22 +291,23 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             return finalData;
         }
 
-        public async Task<IList<(int, int)>> GetLastWeekJobStatusesAsync(CancellationToken cancellationToken)
+        public async Task<IList<(int, int)>> GetLastWeekJobStatusesAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
             var endDate = DateTime.UtcNow.Date;
             var startDate = endDate.AddDays(-7);
 
-            var timeTickers = await _persistenceProvider.GetTimeTickers(x =>
-                    (x.ExecutionTime != null) &&
-                    (x.ExecutionTime.Value.Date >= startDate && x.ExecutionTime.Value.Date <= endDate)
-                , cancellationToken);
+            Expression<Func<TTimeTicker, bool>> timeInRange = x =>
+                (x.ExecutionTime != null) &&
+                (x.ExecutionTime.Value.Date >= startDate && x.ExecutionTime.Value.Date <= endDate);
+            var timeTickers = await _persistenceProvider.GetTimeTickers(timeInRange.And(visibility?.TimeTickers), cancellationToken);
             
             var timeTickerStatuses = timeTickers
                 .Select(x => x.Status)
                 .ToList();
 
+            Expression<Func<CronTickerOccurrenceEntity<TCronTicker>, bool>> occurrenceInRange = x => x.ExecutionTime.Date >= startDate && x.ExecutionTime.Date <= endDate;
             var cronTickerOccurrences = await _persistenceProvider
-                .GetAllCronTickerOccurrences(x => x.ExecutionTime.Date >= startDate && x.ExecutionTime.Date <= endDate, cancellationToken);
+                .GetAllCronTickerOccurrences(occurrenceInRange.And(await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken)), cancellationToken);
             
             var cronTickerStatuses = cronTickerOccurrences
                 .Select(x => x.Status)
@@ -316,25 +319,29 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             // Count per type
             var doneOrDueDoneCount = allStatuses.Count(x => x is TickerStatus.Done or TickerStatus.DueDone);
             var failedCount = allStatuses.Count(x => x == TickerStatus.Failed);
+            var cancelledCount = allStatuses.Count(x => x == TickerStatus.Cancelled);
             var totalCount = allStatuses.Count;
 
+            // Entry 3 was added so the dashboard can name the final jobs of the same week; entries 0 to 2 keep their meaning
             return new List<(int, int)>
             {
                 (0, doneOrDueDoneCount),
                 (1, failedCount),
-                (2, totalCount)
+                (2, totalCount),
+                (3, cancelledCount)
             };
         }
 
-        public async Task<IList<(TickerStatus, int)>> GetOverallJobStatusesAsync(CancellationToken cancellationToken)
+        public async Task<IList<(TickerStatus, int)>> GetOverallJobStatusesAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var timeTickers = await _persistenceProvider.GetTimeTickers(null, cancellationToken);
+            var timeTickers = await _persistenceProvider.GetTimeTickers(visibility?.TimeTickers, cancellationToken);
             var timeStatusCounts = timeTickers
                 .GroupBy(x => x.Status)
                 .Select(g => new { Status = g.Key, Count = g.Count() })
                 .ToList();
 
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(null, cancellationToken);
+            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
+                await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken), cancellationToken);
             var cronStatusCounts = cronTickerOccurrences
                 .GroupBy(x => x.Status)
                 .Select(g => new { Status = g.Key, Count = g.Count() })
@@ -365,15 +372,18 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
                 .ToList();
         }
 
-        public async Task<IList<(string, int)>> GetMachineJobsAsync(CancellationToken cancellationToken)
+        public async Task<IList<(string, int)>> GetMachineJobsAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var timeTickers = await _persistenceProvider.GetTimeTickers(x => x.LockedAt != null, cancellationToken);
+            Expression<Func<TTimeTicker, bool>> locked = x => x.LockedAt != null;
+            var timeTickers = await _persistenceProvider.GetTimeTickers(locked.And(visibility?.TimeTickers), cancellationToken);
             var timeTickerCounts = timeTickers
                 .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
                 .ToList();
 
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(x => x.LockedAt != null, cancellationToken);
+            Expression<Func<CronTickerOccurrenceEntity<TCronTicker>, bool>> occurrenceLocked = x => x.LockedAt != null;
+            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
+                occurrenceLocked.And(await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken)), cancellationToken);
             var cronTickerCounts = cronTickerOccurrences
                 .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
@@ -404,13 +414,34 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
                 .ToList();
         }
 
-        public async Task<CronTickerEntity[]> GetCronTickersAsync(CancellationToken cancellationToken)
-            => await _persistenceProvider.GetCronTickers(null, cancellationToken);
-        
-        public async Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken)
+        public async Task<CronTickerEntity[]> GetCronTickersAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
+            => await _persistenceProvider.GetCronTickers(visibility?.CronTickers, cancellationToken);
+
+        /// <summary>
+        /// The condition that keeps the occurrences of the crons the user may see, or null when nothing is restricted.
+        /// The visible cron ids are read first and the occurrences are matched on them, which every store can run, and
+        /// which does not depend on an occurrence having its cron loaded.
+        /// </summary>
+        private async Task<Expression<Func<CronTickerOccurrenceEntity<TCronTicker>, bool>>> OccurrencesOfVisibleCronsAsync(
+            TickerVisibility<TTimeTicker, TCronTicker> visibility, CancellationToken cancellationToken)
         {
+            if (visibility?.CronTickers == null)
+                return null;
+
+            var visibleIds = (await _persistenceProvider.GetCronTickers(visibility.CronTickers, cancellationToken))
+                .Select(x => x.Id)
+                .ToList(); // a List, so the store sees Enumerable.Contains
+
+            return x => visibleIds.Contains(x.CronTickerId);
+        }
+        
+        public async Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginatedAsync(int pageNumber, int pageSize, CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null, bool? isEnabled = null)
+        {
+            // Only the crons with this enabled state, when the caller asks for one
+            Expression<Func<TCronTicker, bool>> enabledState = isEnabled == true ? x => x.IsEnabled : isEnabled == false ? x => !x.IsEnabled : null;
+
             // We need to cast TCronTicker[] to CronTickerEntity[] for the pagination result
-            var result = await _persistenceProvider.GetCronTickersPaginated(null, pageNumber, pageSize, cancellationToken);
+            var result = await _persistenceProvider.GetCronTickersPaginated(enabledState.And(visibility?.CronTickers), pageNumber, pageSize, cancellationToken);
             return new PaginationResult<CronTickerEntity>(
                 result.Items.Cast<CronTickerEntity>(),
                 result.TotalCount,

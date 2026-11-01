@@ -54,8 +54,37 @@ export const useTimeZoneStore = defineStore('timeZone', () => {
     }
   }
 
+  // True once the dashboard has asked the server for its options, whether or not a zone came back
+  const schedulerTimeZoneSettled = ref(false)
+  const settledWaiters: Array<() => void> = []
+
+  function markSchedulerTimeZoneSettled() {
+    schedulerTimeZoneSettled.value = true
+    settledWaiters.splice(0).forEach((resolve) => resolve())
+  }
+
   function setSchedulerTimeZone(id: string | null | undefined) {
     schedulerTimeZone.value = id || null
+    markSchedulerTimeZoneSettled()
+  }
+
+  /**
+   * Resolves when the zone the dates are shown in is final: the scheduler's zone has been read, the server has said it
+   * has none, or the user has chosen a zone (then the scheduler's cannot change what is shown).
+   *
+   * A page that loads its data before this is true gets dates formatted in UTC and has to load again when the zone
+   * arrives. It never waits longer than `timeoutMs`, so a slow or failing options request cannot block a page.
+   */
+  function whenSchedulerTimeZoneKnown(timeoutMs = 3000): Promise<void> {
+    if (selectedTimeZone.value || schedulerTimeZoneSettled.value) return Promise.resolve()
+
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs)
+      settledWaiters.push(() => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
   }
 
   function setSelectedTimeZone(id: string | null) {
@@ -85,6 +114,8 @@ export const useTimeZoneStore = defineStore('timeZone', () => {
     availableTimeZones,
     effectiveTimeZone,
     setSchedulerTimeZone,
-    setSelectedTimeZone
+    setSelectedTimeZone,
+    markSchedulerTimeZoneSettled,
+    whenSchedulerTimeZoneKnown
   }
 })

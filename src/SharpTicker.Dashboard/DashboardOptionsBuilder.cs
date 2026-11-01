@@ -16,6 +16,9 @@ public class DashboardOptionsBuilder
     
     // Clean authentication system
     internal AuthConfig Auth { get; set; } = new();
+
+    /// <summary>The registered visibility rule, if any.</summary>
+    internal Type? VisibilityRuleType { get; set; }
     
     // Custom Middleware Integration
     public Action<IApplicationBuilder> CustomMiddleware { get; set; }
@@ -80,6 +83,16 @@ public class DashboardOptionsBuilder
         return this;
     }
     
+    /// <summary>
+    /// Limit what each signed-in user sees and can act on, see <see cref="ITickerVisibilityRule"/>. It needs
+    /// <see cref="WithHostAuthentication"/>; the application fails to start when it is combined with another mode.
+    /// </summary>
+    public DashboardOptionsBuilder WithVisibilityRule<TRule>() where TRule : class, ITickerVisibilityRule
+    {
+        VisibilityRuleType = typeof(TRule);
+        return this;
+    }
+
     /// <summary>Set session timeout in minutes</summary>
     public DashboardOptionsBuilder WithSessionTimeout(int minutes)
     {
@@ -91,5 +104,10 @@ public class DashboardOptionsBuilder
     internal void Validate()
     {
         Auth.Validate();
+
+        if (VisibilityRuleType != null && Auth.Mode != AuthMode.Host)
+            throw new InvalidOperationException(
+                $"The visibility rule {VisibilityRuleType.Name} needs the signed-in user of the host application. " +
+                $"Call WithHostAuthentication() on the dashboard, the current authentication mode is {Auth.Mode}.");
     }
 }

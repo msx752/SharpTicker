@@ -1,8 +1,14 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Security.Claims;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Dashboard.Infrastructure;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Interfaces;
@@ -18,22 +24,27 @@ namespace SharpTicker.Dashboard.Hubs
         private static readonly TimeSpan TimeTickerUpdateDebounce = TimeSpan.FromMilliseconds(100);
         private static readonly JsonSerializerOptions CamelCaseOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
-        public SharpTickerNotificationHubSender(IHubContext<SharpTickerNotificationHub> hubContext)
+        private readonly IServiceProvider? _services;
+
+        public SharpTickerNotificationHubSender(IHubContext<SharpTickerNotificationHub> hubContext, IServiceProvider? services = null)
         {
             _hubContext = hubContext ?? throw new ArgumentNullException(nameof(hubContext));
+            _services = services;
             _timeTickerUpdateTimer = new Timer(TimeTickerUpdateCallback, null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         }
 
         public async Task AddCronTickerNotifyAsync(object cronTicker)
         {
-            var json = JsonSerializer.SerializeToElement((CronTickerEntity)cronTicker, DashboardJsonSerializerContext.Default.CronTickerEntity);
-            await _hubContext.Clients.All.SendAsync("AddCronTickerNotification", json);
+            var entity = (CronTickerEntity)cronTicker;
+            var json = JsonSerializer.SerializeToElement(entity, DashboardJsonSerializerContext.Default.CronTickerEntity);
+            await SendToThoseWhoMaySeeAsync("AddCronTickerNotification", json, (rule, user) => rule.CronTickers(user), entity);
         }
 
         public async Task UpdateCronTickerNotifyAsync(object cronTicker)
         {
-            var json = JsonSerializer.SerializeToElement((CronTickerEntity)cronTicker, DashboardJsonSerializerContext.Default.CronTickerEntity);
-            await _hubContext.Clients.All.SendAsync("UpdateCronTickerNotification", json);
+            var entity = (CronTickerEntity)cronTicker;
+            var json = JsonSerializer.SerializeToElement(entity, DashboardJsonSerializerContext.Default.CronTickerEntity);
+            await SendToThoseWhoMaySeeAsync("UpdateCronTickerNotification", json, (rule, user) => rule.CronTickers(user), entity);
         }
 
         public async Task RemoveCronTickerNotifyAsync(Guid id)
@@ -53,13 +64,72 @@ namespace SharpTicker.Dashboard.Hubs
 
         public async Task UpdateTimeTickerNotifyAsync(object timeTicker)
         {
-            var json = JsonSerializer.SerializeToElement((TimeTickerEntity)timeTicker, DashboardJsonSerializerContext.Default.TimeTickerEntity);
-            await _hubContext.Clients.All.SendAsync("UpdateTimeTickerNotification", json);
+            var entity = (TimeTickerEntity)timeTicker;
+            var json = JsonSerializer.SerializeToElement(entity, DashboardJsonSerializerContext.Default.TimeTickerEntity);
+            if (_services?.GetService<HubConnections>() != null)
+                json = WithoutChildren(json); // the children can be tickers the receiver may not see
+            await SendToThoseWhoMaySeeAsync("UpdateTimeTickerNotification", json, (rule, user) => rule.TimeTickers(user), entity);
         }
 
         public async Task RemoveTimeTickerNotifyAsync(Guid id)
         {
             await _hubContext.Clients.All.SendAsync("RemoveTimeTickerNotification", id);
+        }
+
+        /// <summary>
+        /// Sends a notification that carries a ticker to every connection, or, when a visibility rule is registered, only
+        /// to the connections whose user may see that ticker. The rule is evaluated on the ticker in memory, so a
+        /// predicate that cannot be evaluated for it (it throws) counts as not visible.
+        /// </summary>
+        private async Task SendToThoseWhoMaySeeAsync<TEntity>(string method, JsonElement payload,
+            Func<ITickerVisibilityRule, ClaimsPrincipal, Expression<Func<TEntity, bool>>?> predicateOf, TEntity ticker)
+        {
+            var connections = _services?.GetService<HubConnections>();
+            if (connections == null)
+            {
+                await _hubContext.Clients.All.SendAsync(method, payload);
+                return;
+            }
+
+            using var scope = _services!.CreateScope();
+            var rule = scope.ServiceProvider.GetService<ITickerVisibilityRule>();
+            var receivers = new List<string>();
+            foreach (var connection in connections.Snapshot())
+            {
+                if (rule == null || MaySee(rule, connection.Value, predicateOf, ticker, method))
+                    receivers.Add(connection.Key);
+            }
+
+            if (receivers.Count > 0)
+                await _hubContext.Clients.Clients(receivers).SendAsync(method, payload);
+        }
+
+        private static JsonElement WithoutChildren(JsonElement ticker)
+        {
+            if (ticker.ValueKind != JsonValueKind.Object)
+                return ticker;
+
+            var node = System.Text.Json.Nodes.JsonNode.Parse(ticker.GetRawText())!.AsObject();
+            foreach (var key in node.Select(p => p.Key).Where(k => string.Equals(k, "children", StringComparison.OrdinalIgnoreCase)).ToList())
+                node.Remove(key);
+
+            return JsonSerializer.SerializeToElement(node);
+        }
+
+        private bool MaySee<TEntity>(ITickerVisibilityRule rule, ClaimsPrincipal user,
+            Func<ITickerVisibilityRule, ClaimsPrincipal, Expression<Func<TEntity, bool>>?> predicateOf, TEntity ticker, string method)
+        {
+            try
+            {
+                var predicate = predicateOf(rule, user);
+                return predicate == null || predicate.Compile()(ticker);
+            }
+            catch (Exception exception)
+            {
+                _services?.GetService<ILoggerFactory>()?.CreateLogger<SharpTickerNotificationHubSender>()
+                    .LogWarning(exception, "The visibility rule could not be evaluated for the notification {Method}; it was not sent to that user", method);
+                return false;
+            }
         }
 
         public void UpdateActiveThreads(string activeThreads)

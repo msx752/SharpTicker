@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using SharpTicker.Dashboard;
 using SharpTicker.Dashboard.Endpoints;
 using SharpTicker.Dashboard.Hubs;
 using SharpTicker.Dashboard.Infrastructure;
@@ -39,6 +40,14 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 // Validate configuration
                 dashboardConfig.Validate();
                 
+                // A visibility rule is resolved per request, so it can use the services of the application
+                if (dashboardConfig.VisibilityRuleType != null)
+                {
+                    services.AddScoped(typeof(ITickerVisibilityRule), dashboardConfig.VisibilityRuleType);
+                    services.AddSingleton<HubConnections>();
+                    services.AddSingleton<IVisibilityGate, VisibilityGate<TTimeTicker, TCronTicker>>();
+                }
+
                 // Register authentication system
                 services.AddSingleton(dashboardConfig.Auth);
                 services.AddScoped<IAuthService, AuthService>();

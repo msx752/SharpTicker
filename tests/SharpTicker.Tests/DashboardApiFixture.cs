@@ -55,6 +55,9 @@ public abstract class DashboardApiFixture : IAsyncLifetime
     public CapturedLogs Logs { get; } = new();
 
     public HttpClient Client { get; private set; } = null!;
+
+    /// <summary>The services of the running host, for tests that use the public managers instead of the HTTP API.</summary>
+    public IServiceProvider Services => _app!.Services;
     public ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store { get; private set; } = null!;
 
     public DateTime Today { get; } = DateTime.UtcNow.Date;
@@ -89,6 +92,7 @@ public abstract class DashboardApiFixture : IAsyncLifetime
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Logging.AddProvider(Logs);
+        ConfigureHostServices(builder.Services);
         builder.Services.AddSharpTicker(options =>
         {
             options.DisableBackgroundServices();
@@ -97,6 +101,7 @@ public abstract class DashboardApiFixture : IAsyncLifetime
         });
 
         _app = builder.Build();
+        UseBeforeSharpTicker(_app);
         _app.UseSharpTicker();
         await _app.StartAsync();
 
@@ -110,6 +115,7 @@ public abstract class DashboardApiFixture : IAsyncLifetime
 
         await ClearStoreAsync();
         await SeedAsync();
+        await SeedMoreAsync();
     }
 
     /// <summary>
@@ -128,6 +134,15 @@ public abstract class DashboardApiFixture : IAsyncLifetime
 
     /// <summary>Chooses how the dashboard authenticates. The default lets everyone in.</summary>
     protected virtual void ConfigureDashboard(DashboardOptionsBuilder dashboard) => dashboard.WithNoAuth();
+
+    /// <summary>Adds services of the host application, such as authentication, before the SharpTicker services.</summary>
+    protected virtual void ConfigureHostServices(IServiceCollection services) { }
+
+    /// <summary>Adds middleware of the host application that has to run before the dashboard, such as authentication.</summary>
+    protected virtual void UseBeforeSharpTicker(WebApplication app) { }
+
+    /// <summary>Adds data to the store after the standard seed.</summary>
+    protected virtual Task SeedMoreAsync() => Task.CompletedTask;
 
     /// <summary>Chooses the store the application runs on. The default is the in-memory store.</summary>
     protected virtual void ConfigureStore(TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity> options) { }
@@ -227,12 +242,12 @@ public abstract class DashboardApiFixture : IAsyncLifetime
 }
 
 /// <summary>The default store: tickers live in memory, shared by the whole process.</summary>
-public sealed class InMemoryDashboardApiFixture : DashboardApiFixture
+public class InMemoryDashboardApiFixture : DashboardApiFixture
 {
 }
 
 /// <summary>EF Core on SQLite, so the same API tests run against a relational store and its queries.</summary>
-public sealed class EfCoreDashboardApiFixture : DashboardApiFixture
+public class EfCoreDashboardApiFixture : DashboardApiFixture
 {
     private SqliteConnection? _connection;
 

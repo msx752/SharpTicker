@@ -290,6 +290,43 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     }
 
     [Fact]
+    public async Task CronRunSummary_GivesTheLastRunAndTheNextRun_OfAnEnabledCron()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids={DashboardApiFixture.CronId},{DashboardApiFixture.PausedCronId}");
+        var summaries = all.EnumerateArray().ToDictionary(c => c.GetProperty("id").GetGuid());
+        var enabled = summaries[DashboardApiFixture.CronId];
+
+        Assert.Equal(2, summaries.Count);
+        // The latest occurrence that ran is the failed one of today; the queued one of tomorrow has not run
+        Assert.Equal(Failed, enabled.GetProperty("lastStatus").GetInt32());
+        Assert.Equal(DashboardApiFixture.OccurrenceFailedId, enabled.GetProperty("lastOccurrenceId").GetGuid());
+        Assert.NotEqual(JsonValueKind.Null, enabled.GetProperty("lastRun").ValueKind);
+        // "0 * * * * *" fires every minute, so the next run is within a minute from now
+        var next = enabled.GetProperty("nextRun").GetDateTime();
+        Assert.InRange((next.ToUniversalTime() - DateTime.UtcNow).TotalSeconds, -5, 65);
+    }
+
+    [Fact]
+    public async Task CronRunSummary_HasNoNextRun_ForADisabledCronAndNoLastRun_ForOneThatNeverRan()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids={DashboardApiFixture.PausedCronId}");
+        var paused = Assert.Single(all.EnumerateArray().ToArray());
+
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("nextRun").ValueKind);
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("lastRun").ValueKind);
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("lastStatus").ValueKind);
+    }
+
+    [Fact]
+    public async Task CronRunSummary_IgnoresUnknownAndMalformedIds()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids=not-a-guid,{Guid.NewGuid()},,{DashboardApiFixture.CronId}");
+
+        Assert.Equal(DashboardApiFixture.CronId, Assert.Single(Ids(all)));
+        Assert.Empty((await _api.GetAsync("/cron-tickers/run-summary")).EnumerateArray());
+    }
+
+    [Fact]
     public async Task CronTickersPaginated_SplitsTheListIntoPages()
     {
         var first = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=1");
@@ -300,6 +337,31 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
         Assert.Single(first.GetProperty("items").EnumerateArray());
         Assert.Single(second.GetProperty("items").EnumerateArray());
         Assert.NotEqual(Ids(first.GetProperty("items")), Ids(second.GetProperty("items")));
+    }
+
+    [Theory]
+    [InlineData("false", false)]
+    [InlineData("true", true)]
+    public async Task CronTickersPaginated_CanListOnlyTheDisabledOrOnlyTheEnabledCrons(string isEnabled, bool expected)
+    {
+        var page = await _api.GetAsync($"/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled={isEnabled}");
+
+        var items = page.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal(items.Length, page.GetProperty("totalCount").GetInt32());
+        Assert.NotEmpty(items);
+        Assert.All(items, item => Assert.Equal(expected, item.GetProperty("isEnabled").GetBoolean()));
+    }
+
+    [Fact]
+    public async Task CronTickersPaginated_ListsEveryCron_WhenNoEnabledStateIsAsked()
+    {
+        var all = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20");
+        var disabled = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=false");
+        var enabled = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=true");
+        var nonsense = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=20&isEnabled=maybe");
+
+        Assert.Equal(all.GetProperty("totalCount").GetInt32(), disabled.GetProperty("totalCount").GetInt32() + enabled.GetProperty("totalCount").GetInt32());
+        Assert.Equal(all.GetProperty("totalCount").GetInt32(), nonsense.GetProperty("totalCount").GetInt32());
     }
 
     [Fact]
@@ -405,13 +467,14 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     [Fact]
     public async Task LastWeekJobStatuses_ReportDone_Failed_AndTheTotalUpToToday()
     {
-        // Entry 0 is Done and DueDone, entry 1 is Failed, entry 2 is every status. Tomorrow's Queued ones are not
+        // Entry 0 is Done and DueDone, entry 1 is Failed, entry 2 is every status, entry 3 is Cancelled. Tomorrow's Queued ones are not
         // in the last week, so they are not in the total.
         var counts = Counts(await _api.GetAsync("/ticker/statuses/get-last-week"));
 
         Assert.Equal(2, counts[0]);
         Assert.Equal(2, counts[1]);
         Assert.Equal(4, counts[2]);
+        Assert.Equal(0, counts[3]);
     }
 
     [Fact]

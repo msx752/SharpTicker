@@ -297,9 +297,13 @@ namespace SharpTicker.Utilities.Managers
         private async Task<TickerResult<TTimeTicker>> DeleteTimeTickerAsync(Guid id, CancellationToken cancellationToken = default)
         {
             var affectedRows = await _persistenceProvider.RemoveTimeTickers([id], cancellationToken: cancellationToken);
-            
+
             if(affectedRows > 0 && _executionContext.Functions.Any(x => x.TickerId == id))
                 _sharpTickerHostScheduler.Restart();
+
+            // The dashboard list refreshes on this notification; without it a deleted row stays on screen until a reload
+            if (affectedRows > 0)
+                await _notificationHubSender.RemoveTimeTickerNotifyAsync(id).ConfigureAwait(false);
 
             return new TickerResult<TTimeTicker>(affectedRows);
         }
@@ -536,7 +540,7 @@ namespace SharpTicker.Utilities.Managers
             
             try 
             {
-                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var ids = validTickers.Select(x => x.Id).Distinct().ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF Core on net8 cannot translate
                 var existing = (await _persistenceProvider.GetTimeTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
                     .Select(x => x.Id).ToHashSet();
                 if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)
@@ -617,7 +621,7 @@ namespace SharpTicker.Utilities.Managers
             
             try
             {
-                var ids = validTickers.Select(x => x.Id).Distinct().ToArray();
+                var ids = validTickers.Select(x => x.Id).Distinct().ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF Core on net8 cannot translate
                 var existing = (await _persistenceProvider.GetCronTickers(x => ids.Contains(x.Id), cancellationToken).ConfigureAwait(false))
                     .Select(x => x.Id).ToHashSet();
                 if (ids.Where(id => !existing.Contains(id)).Cast<Guid?>().FirstOrDefault() is { } missing)

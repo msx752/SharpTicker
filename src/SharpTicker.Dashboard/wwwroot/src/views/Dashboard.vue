@@ -1,6 +1,8 @@
 <script lang="ts" setup>
 import { tickerService } from '@/http/services/tickerService'
 import { formatDate } from '@/utilities/dateTimeParser'
+import { summarizeJobStatuses, formatShare } from '@/utilities/jobStatistics'
+import { priorityNote } from '@/utilities/priorityNote'
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { useFunctionNameStore } from '@/stores/functionNames'
@@ -39,8 +41,7 @@ onMounted(async () => {
       if (status) {
         status.count = item.item2
         // Calculate percentage of total
-        const raw = ((item.item2 / total) * 100).toFixed(1)
-        status.percentage = raw.endsWith('.0') ? raw.slice(0, -2) : raw
+        status.percentage = formatShare(item.item2, total)
       }
     })
   })
@@ -60,7 +61,7 @@ onMounted(async () => {
   await functionNamesStore.loadData().then((res) => {
     functionItems.value = [] // Clear existing items
     res.value?.forEach((item) => {
-      const request = item.functionRequestNamespace == '' ? 'N/A' : item.functionRequestNamespace
+      const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
       functionItems.value.push({
         function: item.functionName,
         request: request,
@@ -85,31 +86,8 @@ onMounted(async () => {
   })
 })
 
-// Function to calculate successful count (only Done and DueDone jobs)
-function getSuccessfulCount(): number {
-  const doneStatus = statuses.value.find((s) => s.name === 'Done')
-  const dueDoneStatus = statuses.value.find((s) => s.name === 'DueDone')
-
-  const doneCount = doneStatus ? doneStatus.count : 0
-  const dueDoneCount = dueDoneStatus ? dueDoneStatus.count : 0
-
-  return doneCount + dueDoneCount
-}
-
-// Function to calculate total final jobs count (Done, DueDone, Failed, Cancelled)
-function getTotalFinalJobsCount(): number {
-  const doneStatus = statuses.value.find((s) => s.name === 'Done')
-  const dueDoneStatus = statuses.value.find((s) => s.name === 'DueDone')
-  const failedStatus = statuses.value.find((s) => s.name === 'Failed')
-  const cancelledStatus = statuses.value.find((s) => s.name === 'Cancelled')
-
-  const doneCount = doneStatus ? doneStatus.count : 0
-  const dueDoneCount = dueDoneStatus ? dueDoneStatus.count : 0
-  const failedCount = failedStatus ? failedStatus.count : 0
-  const cancelledCount = cancelledStatus ? cancelledStatus.count : 0
-
-  return doneCount + dueDoneCount + failedCount + cancelledCount
-}
+// One scope for the whole statistics section: the past week answer of the server
+const weekStats = computed(() => summarizeJobStatuses(getJobStatusesPastWeek.response.value))
 
 onUnmounted(() => {
   TickerNotificationHub.stopReceiver(methodName.onReceiveThreadsActive)
@@ -317,15 +295,8 @@ const getVisiblePageNumbers = () => {
           </div>
           <div class="metric-content">
             <h3 class="metric-label">Success Rate</h3>
-            <p
-              class="metric-value success-text"
-              v-if="getJobStatusesPastWeek.response.value !== undefined"
-            >
-              {{
-                getTotalFinalJobsCount() > 0
-                  ? Math.round((getSuccessfulCount() / getTotalFinalJobsCount()) * 100)
-                  : 0
-              }}%
+            <p class="metric-value success-text" v-if="weekStats">
+              {{ weekStats.successRate === null ? '—' : weekStats.successRate + '%' }}
             </p>
             <div v-else class="skeleton-text metric-value-skeleton"></div>
           </div>
@@ -345,11 +316,8 @@ const getVisiblePageNumbers = () => {
               <v-icon color="success" size="20">mdi-check-circle</v-icon>
               <span class="stat-title">Successful</span>
             </div>
-            <div
-              class="stat-number success-number"
-              v-if="getJobStatusesPastWeek.response.value !== undefined"
-            >
-              {{ getSuccessfulCount() }}
+            <div class="stat-number success-number" v-if="weekStats">
+              {{ weekStats.successful }}
             </div>
             <div v-else class="skeleton-text stat-number-skeleton"></div>
             <div class="stat-trend">
@@ -363,11 +331,8 @@ const getVisiblePageNumbers = () => {
               <v-icon color="error" size="20">mdi-close-circle</v-icon>
               <span class="stat-title">Failed</span>
             </div>
-            <div
-              class="stat-number error-number"
-              v-if="getJobStatusesPastWeek.response.value !== undefined"
-            >
-              {{ getJobStatusesPastWeek.response.value[1].item2 }}
+            <div class="stat-number error-number" v-if="weekStats">
+              {{ weekStats.failed }}
             </div>
             <div v-else class="skeleton-text stat-number-skeleton"></div>
             <div class="stat-trend">
@@ -381,11 +346,8 @@ const getVisiblePageNumbers = () => {
               <v-icon color="info" size="20">mdi-information</v-icon>
               <span class="stat-title">Final Jobs</span>
             </div>
-            <div
-              class="stat-number info-number"
-              v-if="getJobStatusesPastWeek.response.value !== undefined"
-            >
-              {{ getTotalFinalJobsCount() }}
+            <div class="stat-number info-number" v-if="weekStats">
+              {{ weekStats.finalJobs }}
             </div>
             <div v-else class="skeleton-text stat-number-skeleton"></div>
             <div class="stat-trend">
@@ -405,7 +367,7 @@ const getVisiblePageNumbers = () => {
               <v-icon class="title-icon" color="primary">mdi-chart-donut-variant</v-icon>
               Status Distribution
             </h2>
-            <p class="card-subtitle">Current job status breakdown</p>
+            <p class="card-subtitle">All-time job status breakdown</p>
           </div>
 
           <div class="status-compact-list">
@@ -478,6 +440,7 @@ const getVisiblePageNumbers = () => {
                 <div
                   class="priority-badge"
                   :class="`priority-${item.priority.toLowerCase().replace('longrunning', 'long')}`"
+                  :title="priorityNote(item.priority)"
                 >
                   {{ item.priority }}
                 </div>
@@ -507,7 +470,7 @@ const getVisiblePageNumbers = () => {
               <v-icon class="title-icon" color="primary">mdi-server-network</v-icon>
               Machines
             </h2>
-            <p class="card-subtitle">{{ machineItems.length }} machine instances</p>
+            <p class="card-subtitle">{{ machineItems.length }} lock holders, jobs counted all time</p>
           </div>
 
           <div class="machines-list">

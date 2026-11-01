@@ -5,6 +5,7 @@ import { AddCronTickerRequest, GetCronTickerGraphDataRangeResponse, GetCronTicke
 import { nameof } from '@/utilities/nameof';
 import { useFunctionNameStore } from '@/stores/functionNames';
 import { useTimeZoneStore } from '@/stores/timeZoneStore';
+import { toRunFields, type CronRunSummaryResponse } from '@/utilities/cronRunSummary';
 
 interface PaginatedCronTickerResponse {
     items: GetCronTickerResponse[]
@@ -19,7 +20,7 @@ const getCronTickers = () => {
 
     const baseHttp = useBaseHttpService<GetCronTickerRequest, GetCronTickerResponse>('array')
         .FixToResponseModel(GetCronTickerResponse, response => {
-            response.requestType = functionNamesStore.getNamespaceOrNull(response.function) ?? 'N/A';
+            response.requestType = functionNamesStore.getNamespaceOrNull(response.function) ?? '—';
             response.createdAt = formatDate(response.createdAt, true, timeZoneStore.effectiveTimeZone);
             response.updatedAt = formatDate(response.updatedAt, true, timeZoneStore.effectiveTimeZone);
             response.initIdentifier = response.initIdentifier?.split("_").slice(0, 2).join("_");
@@ -60,7 +61,7 @@ const getCronTickersPaginated = () => {
             // Process items in the paginated response
             if (response && response.items && Array.isArray(response.items)) {
                 response.items = response.items.map((item: GetCronTickerResponse) => {
-                    item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? 'N/A';
+                    item.requestType = functionNamesStore.getNamespaceOrNull(item.function) ?? '—';
                     item.createdAt = formatDate(item.createdAt, true, timeZoneStore.effectiveTimeZone);
                     item.updatedAt = formatDate(item.updatedAt, true, timeZoneStore.effectiveTimeZone);
                     item.initIdentifier = item.initIdentifier?.split("_").slice(0, 2).join("_");
@@ -78,17 +79,57 @@ const getCronTickersPaginated = () => {
             return response;
     };
     
-    const requestAsync = async (pageNumber: number = 1, pageSize: number = 20) => {
+    // The last run and the next run come from a second request for the crons on the page, so the table does not wait
+    // for them. A failure leaves those cells empty; the table itself is already shown.
+    const summaryHttp = useBaseHttpService<object, CronRunSummaryResponse>('array');
+
+    const loadRunSummary = async (response: PaginatedCronTickerResponse) => {
+        const items = response?.items;
+        if (!Array.isArray(items) || items.length === 0) return;
+        const zone = timeZoneStore.effectiveTimeZone;
+        try {
+            const summaries = await summaryHttp.sendAsync("GET", "cron-tickers/run-summary", {
+                paramData: { ids: items.map((x: GetCronTickerResponse) => x.id).join(',') },
+                suppressAlert: true,
+            }) as CronRunSummaryResponse[];
+            // The page may have changed while the request ran; fill in only the rows that are still there
+            const byId = new Map(summaries.map(x => [x.id, x]));
+            for (const item of items as GetCronTickerResponse[]) {
+                const summary = byId.get(item.id);
+                if (summary) Object.assign(item, toRunFields(summary, zone));
+            }
+        } catch {
+            // the cells stay empty
+        }
+    };
+
+    // isEnabled lists only the enabled (true) or only the disabled (false) crons; leave it out for all of them
+    const requestAsync = async (pageNumber: number = 1, pageSize: number = 20, isEnabled?: boolean) => {
         const response = await baseHttp.sendAsync("GET", "cron-tickers/paginated", { 
-            paramData: { pageNumber, pageSize } 
+            paramData: isEnabled === undefined ? { pageNumber, pageSize } : { pageNumber, pageSize, isEnabled }
         });
-        return processResponse(response);
+        const processed = processResponse(response);
+        void loadRunSummary(processed);
+        return processed;
     };
     
     return {
         ...baseHttp,
         requestAsync
     };
+}
+
+// How many crons are disabled, for the filter chip above the table. One item per page is enough: only the total is read.
+const getDisabledCount = () => {
+    const baseHttp = useBaseHttpService<object, PaginatedCronTickerResponse>('single');
+    const requestAsync = async () => {
+        const response = await baseHttp.sendAsync("GET", "cron-tickers/paginated", {
+            paramData: { pageNumber: 1, pageSize: 1, isEnabled: false }
+        });
+        return response?.totalCount ?? 0;
+    };
+
+    return { requestAsync };
 }
 
 const updateCronTicker = () => {
@@ -191,6 +232,7 @@ const toggleCronTicker = () => {
 export const cronTickerService = {
     getCronTickers,
     getCronTickersPaginated,
+    getDisabledCount,
     updateCronTicker,
     addCronTicker,
     deleteCronTicker,

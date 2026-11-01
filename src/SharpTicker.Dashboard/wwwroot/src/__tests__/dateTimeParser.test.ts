@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getDateFormatRegion, buildDatePart, formatDate, formatTime, formatExecutedAt, parseDuration } from '../utilities/dateTimeParser';
+import { getDateFormatRegion, buildDatePart, formatDate, formatTime, describeExecution, parseDuration } from '../utilities/dateTimeParser';
 
 describe('getDateFormatRegion', () => {
     it('returns "us" for America/ prefixed IANA timezone', () => {
@@ -154,18 +154,41 @@ describe('formatTime', () => {
     });
 });
 
-describe('formatExecutedAt', () => {
+describe('describeExecution', () => {
+    const blank = { executedAt: '', executedAgo: '', duration: '' };
+
     it.each(['0001-01-01T00:00:00', '0001-01-01T00:00:00Z'])('reads as blank for the empty date %s', (value) => {
-        expect(formatExecutedAt(value, 0)).toBe('');
+        expect(describeExecution(value, 0)).toEqual(blank);
     });
 
     it('reads as blank for an empty Date', () => {
-        expect(formatExecutedAt(new Date('0001-01-01T00:00:00Z'), 0)).toBe('');
+        expect(describeExecution(new Date('0001-01-01T00:00:00Z'), 0)).toEqual(blank);
     });
 
-    it('shows how long ago and how long it took for a real date', () => {
+    it('gives the exact time first, then how long ago and how long it took', () => {
         const recent = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-        expect(formatExecutedAt(recent, 1500)).toMatch(/ago \(took .+\)$/);
+        const texts = describeExecution(recent, 1500, 'UTC');
+
+        expect(texts.executedAt).toBe(formatDate(recent, true, 'UTC'));
+        expect(texts.executedAgo).toMatch(/ago$/);
+        expect(texts.duration).toBe(formatTime(1500, true));
+    });
+
+    it.each(['Skipped', 7])('reads as blank for a skipped job (%s): it never ran', (status) => {
+        const stamped = new Date(Date.now() - 60 * 1000).toISOString();
+        expect(describeExecution(stamped, 0, 'UTC', status)).toEqual(blank);
+    });
+
+    it('still shows the time of a job that ran', () => {
+        const stamped = new Date(Date.now() - 60 * 1000).toISOString();
+        expect(describeExecution(stamped, 20, 'UTC', 'Done').executedAt).not.toBe('');
+    });
+
+    it('reads a time without an offset as UTC, as the server sends it', () => {
+        const texts = describeExecution('2026-11-01T10:00:00.5', 20, 'UTC');
+
+        expect(texts.executedAt).toBe(formatDate('2026-11-01T10:00:00.5', true, 'UTC'));
+        expect(texts.executedAt).toContain('10');
     });
 });
 

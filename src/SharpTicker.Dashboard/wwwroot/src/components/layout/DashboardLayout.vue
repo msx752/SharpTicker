@@ -55,6 +55,9 @@ let stopTicker: any = null
   const confirmDialog = useDialog<ConfirmDialogProps>().withComponent(
     () => import('../common/ConfirmDialog.vue'),
   )
+  const restartConfirmDialog = useDialog<ConfirmDialogProps>().withComponent(
+    () => import('../common/ConfirmDialog.vue'),
+  )
 
 
 // Initialize stores and services lazily
@@ -104,7 +107,10 @@ const initializeServices = async () => {
 
 // Load initial data
 const loadInitialData = async () => {
-  if (!getOptions || !getTickerHostStatus) return
+  if (!getOptions || !getTickerHostStatus) {
+    timeZoneStore.markSchedulerTimeZoneSettled()
+    return
+  }
 
   try {
     // Wait for options to be loaded
@@ -125,6 +131,10 @@ const loadInitialData = async () => {
       lastHostExceptionMessage.value = ''
     }
 
+    // The pages wait for this before their first load (they format dates with the zone); a server that sent no zone,
+    // or no options at all, must not keep them waiting
+    timeZoneStore.markSchedulerTimeZoneSettled()
+
     // Wait for host status to be loaded
     await getTickerHostStatus.requestAsync()
 
@@ -136,6 +146,7 @@ const loadInitialData = async () => {
     // Failed to load initial data
     currentMachine.value = 'Error'
     tickerHostStatus.value = false
+    timeZoneStore.markSchedulerTimeZoneSettled()
   }
 }
 
@@ -168,7 +179,20 @@ onMounted(async () => {
   }
 })
 
-// Restart handler ensures at least 1s animation and until request completes
+// Restart asks first, as Stop System does. The animation lasts at least 1s and until the request completes.
+function askRestart() {
+  if (restartIsAnimating.value) return
+  restartConfirmDialog?.open({
+    ...new ConfirmDialogProps(),
+    icon: 'mdi-restart',
+    iconColor: '#FF9800',
+    title: 'Restart the scheduler',
+    text: 'The scheduler wakes up and plans its next jobs again from the stored schedule.',
+    confirmText: 'Restart',
+    confirmColor: '#FF9800',
+  })
+}
+
 async function handleRestart() {
   if (!restartTicker) return
   restartIsAnimating.value = true
@@ -464,43 +488,38 @@ const handleForceUIUpdate = () => {
               </v-btn>
 
               <template v-if="tickerHostStatus && isServicesReady">
-                <v-btn
-                  color="warning"
-                  variant="outlined"
-                  size="small"
-                  @click="handleRestart"
-                  :loading="restartTicker?.loader?.value"
-                  class="action-btn restart-btn"
-                  :disabled="restartIsAnimating"
-                  :class="{ 'restart-animating': restartIsAnimating }"
-                >
-                  <span class="btn-content">
-                    <v-icon
-                      class="restart-icon"
-                      :class="{ 'rotating': restartIsAnimating }"
+                <!-- Restart and Stop are rare and affect every job, so they sit in one menu instead of two strong buttons -->
+                <v-menu location="bottom end">
+                  <template #activator="{ props: menuProps }">
+                    <v-btn
+                      v-bind="menuProps"
+                      variant="outlined"
+                      size="small"
+                      prepend-icon="mdi-cog-outline"
+                      append-icon="mdi-chevron-down"
+                      :loading="restartIsAnimating || stopTicker?.loader?.value"
+                      class="action-btn system-menu-btn"
+                      aria-label="System actions"
                     >
-                      mdi-restart
-                    </v-icon>
-                    <span class="btn-text">Restart</span>
-                  </span>
-
-                  <!-- Ripple Effect -->
-                  <div class="ripple-container">
-                    <div class="ripple" v-if="restartIsAnimating"></div>
-                  </div>
-                </v-btn>
-
-                <v-btn
-                  color="error"
-                  variant="outlined"
-                  size="small"
-                  prepend-icon="mdi-stop-circle"
-                  @click="confirmDialog?.open({...new ConfirmDialogProps(), confirmText: 'Stop' })"
-                  :loading="stopTicker?.loader?.value"
-                  class="action-btn stop-btn"
-                >
-                  Stop System
-                </v-btn>
+                      System
+                    </v-btn>
+                  </template>
+                  <v-list density="compact" class="system-menu-list">
+                    <v-list-item
+                      prepend-icon="mdi-restart"
+                      title="Restart"
+                      :disabled="restartIsAnimating"
+                      @click="askRestart"
+                    />
+                    <v-divider />
+                    <v-list-item
+                      prepend-icon="mdi-stop-circle"
+                      title="Stop System"
+                      base-color="error"
+                      @click="confirmDialog?.open({...new ConfirmDialogProps(), confirmText: 'Stop' })"
+                    />
+                  </v-list>
+                </v-menu>
             </template>
 
             <!-- Loading State for Actions -->
@@ -550,6 +569,17 @@ const handleForceUIUpdate = () => {
             stopTicker.loader.value = false;
           })
         })
+      "
+    />
+    <component
+      v-if="restartConfirmDialog && restartConfirmDialog.isOpen"
+      :is="restartConfirmDialog.Component"
+      :is-open="restartConfirmDialog.isOpen"
+      @close="restartConfirmDialog.close()"
+      :dialog-props="restartConfirmDialog.propData"
+      @confirm="
+        restartConfirmDialog.close();
+        handleRestart();
       "
     />
   </Teleport>
@@ -757,6 +787,7 @@ const handleForceUIUpdate = () => {
 }
 
 .status-pulse {
+  position: relative;
   width: 12px;
   height: 12px;
   border-radius: 50%;
@@ -765,26 +796,61 @@ const handleForceUIUpdate = () => {
 
 .pulse-active {
   background: #4caf50;
-  animation: pulse-success 2s infinite;
-  box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 2.67;
 }
+
 
 .pulse-inactive {
   background: #f44336;
-  animation: pulse-error 2s infinite;
-  box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 2.67;
 }
 
-@keyframes pulse-success {
-  0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
-  70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+
+/*
+ * The status dots pulse with a ring that grows and fades. It is drawn with transform and opacity, which the browser
+ * runs on the compositor; animating box-shadow made it repaint the header on every frame, on every page, for as long
+ * as the page was open.
+ */
+.pulse-active::after,
+.pulse-inactive::after,
+.websocket-connected::after,
+.websocket-connecting::after,
+.websocket-disconnected::after,
+.websocket-warning::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: inherit;
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: pulse-ring var(--pulse-duration, 2s) infinite;
 }
 
-@keyframes pulse-error {
-  0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7); }
-  70% { box-shadow: 0 0 0 10px rgba(244, 67, 54, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }
+@keyframes pulse-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  70%,
+  100% {
+    transform: scale(var(--pulse-scale, 2.5));
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-active::after,
+  .pulse-inactive::after,
+  .websocket-connected::after,
+  .websocket-connecting::after,
+  .websocket-disconnected::after,
+  .websocket-warning::after {
+    animation: none;
+  }
 }
 
 .system-details {
@@ -825,6 +891,7 @@ const handleForceUIUpdate = () => {
 }
 
 .websocket-indicator {
+  position: relative;
   width: 8px;
   height: 8px;
   border-radius: 50%;
@@ -833,33 +900,31 @@ const handleForceUIUpdate = () => {
 
 .websocket-connected {
   background: #4caf50;
-  animation: pulse-success 2s infinite;
-  box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 3.5;
 }
+
 
 .websocket-connecting {
   background: #ff9800;
-  animation: pulse-warning 1.5s infinite;
-  box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7);
+  --pulse-duration: 1.5s;
+  --pulse-scale: 2.5;
 }
+
 
 .websocket-disconnected {
   background: #f44336;
-  animation: pulse-error 2s infinite;
-  box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.7);
+  --pulse-duration: 2s;
+  --pulse-scale: 3.5;
 }
+
 
 .websocket-warning {
   background: #ff9800;
-  animation: pulse-warning 1.5s infinite;
-  box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7);
+  --pulse-duration: 1.5s;
+  --pulse-scale: 2.5;
 }
 
-@keyframes pulse-warning {
-  0% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.7); }
-  70% { box-shadow: 0 0 0 6px rgba(255, 152, 0, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0); }
-}
 
 .websocket-text {
   font-size: 0.75rem;
@@ -914,130 +979,6 @@ const handleForceUIUpdate = () => {
   font-size: 0.75rem;
   color: #bdbdbd;
   font-weight: 500;
-}
-
-/* Restart Button Animations */
-.restart-btn {
-  position: relative;
-  overflow: hidden;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  transform-origin: center;
-}
-
-.restart-btn:hover {
-  box-shadow: 0 8px 25px rgba(255, 152, 0, 0.3);
-}
-
-.restart-btn:active {
-  transform: translateY(0) scale(0.98);
-  transition: transform 0.1s ease;
-}
-
-.restart-btn.restart-animating {
-  animation: restart-pulse 1.5s ease-in-out infinite;
-  background: linear-gradient(45deg, #ff9800, #ff5722, #ff9800);
-  background-size: 200% 200%;
-  animation: restart-pulse 1.5s ease-in-out infinite, gradient-shift 2s ease-in-out infinite;
-}
-
-.btn-content {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  position: relative;
-  z-index: 1;
-}
-
-.restart-icon {
-  transition: transform 0.3s ease;
-}
-
-.restart-icon.rotating {
-  animation: rotate-360 1s linear infinite;
-}
-
-.btn-text {
-  font-weight: 600;
-  transition: all 0.3s ease;
-}
-
-.restart-btn.restart-animating .btn-text {
-  animation: text-glow 1.5s ease-in-out infinite;
-}
-
-/* Restart Button Keyframe Animations */
-@keyframes restart-pulse {
-  0%, 100% {
-    transform: scale(1);
-    box-shadow: 0 4px 12px rgba(255, 152, 0, 0.3);
-  }
-  50% {
-    box-shadow: 0 8px 25px rgba(255, 152, 0, 0.5);
-  }
-}
-
-@keyframes rotate-360 {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes gradient-shift {
-  0%, 100% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 100% 50%;
-  }
-}
-
-@keyframes text-glow {
-  0%, 100% {
-    text-shadow: 0 0 5px rgba(255, 152, 0, 0.5);
-  }
-  50% {
-    text-shadow: 0 0 20px rgba(255, 152, 0, 0.8), 0 0 30px rgba(255, 152, 0, 0.6);
-  }
-}
-
-/* Ripple Effect */
-.ripple-container {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  border-radius: inherit;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.ripple {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 0;
-  height: 0;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.3);
-  transform: translate(-50%, -50%);
-  animation: ripple-expand 1.5s ease-out infinite;
-}
-
-@keyframes ripple-expand {
-  0% {
-    width: 0;
-    height: 0;
-    opacity: 1;
-  }
-  100% {
-    width: 300px;
-    height: 300px;
-    opacity: 0;
-  }
 }
 
 /* Responsive Design */

@@ -66,7 +66,7 @@
       "_appTitle": "SharpTicker",
       "_appLogoPath": "images/logo.svg",
       "_appFaviconPath": "images/logo.svg",
-      "_appFooter": "SharpTicker is dual-licensed under MIT or Apache-2.0.",
+      "_appFooter": "SharpTicker is dual-licensed under MIT or Apache-2.0. &middot; <a href=\"https://github.com/msx752/SharpTicker\">Star on GitHub</a> &middot; <a href=\"https://github.com/msx752/SharpTicker/fork\">Fork</a>",
       "_enableSearch": true,
       "_gitContribute": {
         "repo": "https://github.com/msx752/SharpTicker",

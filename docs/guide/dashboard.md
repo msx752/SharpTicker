@@ -30,6 +30,8 @@ The dashboard is served by the application at `/ticker/dashboard`. `UseSharpTick
 - **Retry intervals** are entered in seconds, one per retry, and are saved with the ticker.
 - **A refused action** keeps its dialog open with what you typed, and a notification shows the reason, such as an invalid cron expression.
 
+The dashboard uses three words. A **function** is the code you registered. A **ticker** is a scheduled entry that points at a function: a time ticker runs once, a cron ticker repeats. A **job** is one run of a ticker, with its status, and the actions that stop or count runs (cancel, statistics) say job.
+
 ## Authentication
 
 Pick one:
@@ -45,6 +47,45 @@ Pick one:
 `WithSessionTimeout(minutes)` sets the session length (default 60 minutes).
 
 `WithHostAuthentication` fits best when the application already has sign-in, because the dashboard then uses the same users, cookies or tokens and your authorization policies.
+
+## Limiting what a user sees
+
+By default every signed-in user sees every job. To limit that, for example one team per function prefix, register a rule. It needs `WithHostAuthentication`, because it needs the signed-in user; the application fails to start with another mode.
+
+```csharp
+public sealed class TeamRule : ITickerVisibilityRule
+{
+    public Expression<Func<TimeTickerEntity, bool>>? TimeTickers(ClaimsPrincipal user)
+        => IsAdmin(user) ? null : t => t.Function.StartsWith(Prefix(user));
+
+    public Expression<Func<CronTickerEntity, bool>>? CronTickers(ClaimsPrincipal user)
+        => IsAdmin(user) ? null : c => c.Function.StartsWith(Prefix(user));
+
+    public bool CanSeeFunction(ClaimsPrincipal user, string functionName)
+        => IsAdmin(user) || functionName.StartsWith(Prefix(user), StringComparison.Ordinal);
+
+    private static bool IsAdmin(ClaimsPrincipal user) => user.IsInRole("admin");
+    private static string Prefix(ClaimsPrincipal user) => user.FindFirst("team")?.Value + ".";
+}
+
+dashboard.WithHostAuthentication("SchedulerUsers").WithVisibilityRule<TeamRule>();
+```
+
+A predicate returning `null` allows everything. The rule is built from stored fields such as `Function` and `Description`, so it needs no schema change, and it is resolved for every request, so it can use your services.
+
+| Where | What the user gets |
+|---|---|
+| Lists, pages, charts, status counts, statistics | Only the tickers the rule allows. |
+| A single ticker or cron (occurrences, request data, update, toggle, run, delete, cancel) | The answer for a ticker that does not exist. |
+| Adding or updating a ticker | Refused when its function (or the function of a child) is not allowed by `CanSeeFunction`. |
+| Registered functions | Only the allowed ones. |
+| Live notifications | Sent only to the users who may see the ticker; the occurrence updates of a cron only reach users who may see that cron. |
+
+Notes:
+
+- The predicates run in the database on EF Core and MongoDB, and in memory on Redis and the in-memory store. For live notifications they always run in memory, so write them so that both give the same answer (compare text with an explicit ordinal comparison).
+- The scheduler controls (stop, start, restart), the host status and the node list are not tied to a ticker and are not limited by the rule, so every signed-in user can stop the scheduler. The authorization policy of `WithHostAuthentication` covers the whole dashboard, not single endpoints. To limit these paths (`/api/ticker-host/...`), add your own check with `PreDashboardMiddleware`.
+- A notification that only carries an id (a ticker was deleted, added or cancelled) goes to every connection.
 
 ## Path and hosting
 

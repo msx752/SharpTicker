@@ -10,7 +10,10 @@ import { methodName, type TickerNotificationHubType } from '@/hub/tickerNotifica
 import type { GetCronTickerOccurrenceResponse } from '@/http/services/types/cronTickerOccurrenceService.types'
 import { ConfirmDialogProps } from '@/components/common/ConfirmDialog.vue'
 import PaginationFooter from '@/components/PaginationFooter.vue'
-import { formatExecutedAt } from '@/utilities/dateTimeParser'
+import { describeExecution } from '@/utilities/dateTimeParser'
+import { useTimeZoneStore } from '@/stores/timeZoneStore'
+
+const timeZoneStore = useTimeZoneStore()
 
 const confirmDialog = useDialog<{ data: string }>().withComponent(
   () => import('@/components/common/ConfirmDialog.vue'),
@@ -33,7 +36,8 @@ const totalCount = ref(0)
 // Define headers manually for paginated response
 const headers = ref([
   { title: 'Status', key: 'status', sortable: true, visibility: true },
-  { title: 'Executed At (Elapsed Time)', key: 'executedAt', sortable: false, visibility: true },
+  { title: 'Executed At', key: 'executedAt', sortable: false, visibility: true },
+  { title: 'Duration', key: 'durationText', sortable: false, visibility: true, align: 'end' as const },
   { title: 'Execution Time', key: 'executionTimeFormatted', sortable: true, visibility: true },
   { title: 'Locked At', key: 'lockedAt', sortable: false, visibility: true },
   { title: 'Lock Holder', key: 'lockHolder', sortable: false, visibility: true },
@@ -105,12 +109,15 @@ const addHubListeners = async () => {
       const itemIndex = response.items.findIndex((item: GetCronTickerOccurrenceResponse) => item.id === val.id);
       if (itemIndex !== -1) {
         const currentItem = response.items[itemIndex];
+        const executionTexts = describeExecution(val.executedAt, val.elapsedTime as number, timeZoneStore.effectiveTimeZone, val.status);
         // Merge update while preserving lockedAt and lockHolder
         response.items[itemIndex] = {
           ...currentItem,
           ...val,
           status: Status[val.status as any],
-          executedAt: formatExecutedAt(val.executedAt, val.elapsedTime as number),
+          executedAt: executionTexts.executedAt,
+          executedAgo: executionTexts.executedAgo,
+          durationText: executionTexts.duration,
           retryIntervals: currentItem.retryIntervals,
           lockedAt: currentItem.lockedAt, // Preserve existing lockedAt
           lockHolder: currentItem.lockHolder,
@@ -367,27 +374,31 @@ const setRowProp = (propContext: any) => {
               </div>
             </template>
 
-            <!-- Executed At Column -->
-            <template v-slot:item.ExecutedAt="{ item }">
+            <!-- The exact time first, how long ago it was in the tooltip; the duration has its own column -->
+            <template v-slot:item.executedAt="{ item }">
               <div class="executed-at-cell">
                 <div v-if="hasStatus(item.status, Status.InProgress)" class="executing-indicator">
                   <v-icon size="16" class="spinning">mdi-loading</v-icon>
                   <span class="executing-text">Executing...</span>
                 </div>
                 <div v-else-if="hasStatus(item.status, Status.Cancelled) || hasStatus(item.status, Status.Queued)" class="na-text">
-                  N/A
+                  —
                 </div>
-                <div v-else class="execution-time">
-                  {{ item.executedAt }}
+                <div v-else class="execution-time" :title="item.executedAgo || undefined">
+                  {{ item.executedAt || '—' }}
                 </div>
               </div>
+            </template>
+
+            <template v-slot:item.durationText="{ item }">
+              <span class="execution-time">{{ hasStatus(item.status, Status.InProgress) ? '—' : item.durationText || '—' }}</span>
             </template>
 
             <!-- Retry Intervals Column -->
             <template v-slot:item.retryIntervals="{ item }">
               <div class="retry-intervals-cell">
                 <div v-if="!item.retryIntervals || item.retryIntervals.length === 0" class="no-retries">
-                  <span class="na-text">N/A</span>
+                  <span class="na-text">—</span>
                 </div>
                 <div v-else class="retry-timeline-compact">
                   <div 

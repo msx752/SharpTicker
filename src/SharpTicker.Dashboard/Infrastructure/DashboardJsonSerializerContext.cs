@@ -16,6 +16,8 @@ namespace SharpTicker.Dashboard.Infrastructure;
 // Dashboard response DTOs
 [JsonSerializable(typeof(AuthInfoResponse))]
 [JsonSerializable(typeof(AuthValidateResponse))]
+[JsonSerializable(typeof(CancelRefusedResponse))]
+[JsonSerializable(typeof(CronRunSummary[]))]
 [JsonSerializable(typeof(DashboardOptionsResponse))]
 [JsonSerializable(typeof(ActionResponse))]
 [JsonSerializable(typeof(ActionResponseWithId))]
@@ -76,6 +78,7 @@ namespace SharpTicker.Dashboard.Infrastructure;
 [JsonSerializable(typeof(int[]))]
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(System.Text.Json.JsonElement))]
+[JsonSerializable(typeof(HubConnectionStatus))]
 internal partial class DashboardJsonSerializerContext : JsonSerializerContext
 {
 }

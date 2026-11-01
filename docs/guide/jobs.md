@@ -147,7 +147,4 @@ builder.Services.MapTickerGroup("Reports", group => group
 `TickerTaskPriority` has four values:
 
 - **`LongRunning`** runs the job on its own thread instead of the scheduler's worker pool. Use it for jobs that block a thread for a long time.
-- **`High`, `Normal` and `Low`** order jobs that become due at the same moment: the scheduler hands higher priority jobs to the workers first. Priority does not pause or preempt jobs that are already running.
-
-> [!NOTE]
-> Today the order is applied when the main scheduler loop starts due jobs. Jobs started from the dashboard, run immediately or picked up again after a timeout are not ordered yet. This is tracked in [issue #4](https://github.com/msx752/SharpTicker/issues/4).
+- **`High`, `Normal` and `Low`** decide which waiting job a free worker takes. When more jobs are ready than there are workers (see `MaxConcurrency`), `High` jobs start before `Normal` ones and `Normal` before `Low` ones; jobs of one priority start in the order they became ready. A `Low` job is not held back for ever: after ten higher priority jobs have started in a row while it waits, one `Low` job goes next. Priority does not pause or preempt jobs that are already running, and it does not change when a job becomes due. It applies to every job that goes through the worker pool, however it was started: by the scheduler, from the dashboard, or picked up again after a timeout.

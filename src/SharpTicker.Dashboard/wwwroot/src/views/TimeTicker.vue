@@ -14,7 +14,13 @@ import { buildRunAgainRequest } from '@/utilities/runAgain'
 import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import PaginationFooter from '@/components/PaginationFooter.vue'
+import RowActionsMenu from '@/components/common/RowActionsMenu.vue'
+import { timeTickerMenuActions } from '@/utilities/rowActions'
+import { useAlert } from '@/composables/useAlert'
 import VChart, { THEME_KEY } from 'vue-echarts'
+import { runInitialLoad } from '@/utilities/initialLoad'
+import { countFailedBelow, isPartiallyDone } from '@/utilities/partialOutcome'
+import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 import '@/utilities/echartsSetup'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
 
@@ -88,6 +94,7 @@ const timeZoneStore = useTimeZoneStore()
 
 // Adds a new ticker with the same function, request, retries and description, to run right away.
 // A time ticker runs once, so running it again is a new row.
+const { showSuccess } = useAlert()
 const runningAgain = ref(new Set<string>())
 
 const runAgain = async (item: GetTimeTickerResponse) => {
@@ -99,48 +106,51 @@ const runAgain = async (item: GetTimeTickerResponse) => {
       buildRunAgainRequest(item, stored?.result),
       timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone,
     )
+    showSuccess('A new time ticker was added with the same function and request.')
     await loadPageData()
   } finally {
     runningAgain.value.delete(item.id)
   }
 }
 
-onMounted(async () => {
-  // Initialize WebSocket connection
-  try {
-    const connectionStore = useConnectionStore()
-    if (!connectionStore.isInitialized) {
-      await connectionStore.initializeConnectionWithRetry()
-    }
-  } catch (error: any) {}
+// The charts are built after the table has painted, so the table is what appears first
+const chartsReady = ref(false)
 
-  // Load initial data with pagination
-  try {
-    await loadPageData()
-  } catch (error) {
-    // Failed to load time tickers
-  }
-  
-  // Load chart data
-  try {
-    await loadTimeSeriesChartData(-3, 3)
-    await loadPieChartData()
-  } catch (error) {
-    console.error('Failed to load chart data:', error)
-  }
-  
-  // Add hub listeners
-  try {
-    await addHubListeners()
-  } catch (error) {
-    // Failed to add hub listeners
-  }
+const zoneGate = createZoneReloadGate(
+  () => timeZoneStore.whenSchedulerTimeZoneKnown(),
+  () => timeZoneStore.effectiveTimeZone,
+)
+let pageActive = true
+
+onMounted(() => {
+  const connectionStore = useConnectionStore()
+
+  // The dates are formatted with the time zone in use when they arrive, so the first load waits until that zone is
+  // final; the watcher below then ignores the change that made it final. See utilities/zoneReloadGate.ts.
+  const withZone = zoneGate.firstLoad
+
+  // The table, the chart data and the connection start together; see utilities/initialLoad.ts
+  runInitialLoad({
+    connect: async () => {
+      if (!connectionStore.isInitialized) {
+        await connectionStore.initializeConnectionWithRetry()
+      }
+    },
+    loadTable: withZone(loadPageData),
+    loadCharts: [withZone(() => loadTimeSeriesChartData(-3, 3)), withZone(loadPieChartData)],
+    showCharts: () => {
+      chartsReady.value = true
+    },
+    attachListeners: addHubListeners,
+    isActive: () => pageActive,
+  })
 })
 
 // Reload data when display timezone changes
 watch(
   () => timeZoneStore.effectiveTimeZone,
-  async () => {
+  async (zone) => {
+    if (!zoneGate.shouldReload(zone)) return
     try {
       await loadPageData()
       await loadTimeSeriesChartData(-3, 3)
@@ -152,6 +162,7 @@ watch(
 )
 
 onUnmounted(() => {
+  pageActive = false
   TickerNotificationHub.stopReceiver(methodName.onReceiveAddTimeTicker)
   TickerNotificationHub.stopReceiver(methodName.onReceiveUpdateTimeTicker)
   TickerNotificationHub.stopReceiver(methodName.onReceiveDeleteTimeTicker)
@@ -473,7 +484,8 @@ const headersWithSelection = computed(() => {
     { title: 'Request Type', key: 'RequestType', sortable: false, visibility: true },
     { title: 'Description', key: 'description', sortable: true, visibility: true },
     { title: 'Execution Time', key: 'executionTimeFormatted', sortable: true, visibility: true },
-    { title: 'Executed At (Elapsed Time)', key: 'executedAt', sortable: false, visibility: true },
+    { title: 'Executed At', key: 'executedAt', sortable: false, visibility: true },
+    { title: 'Duration', key: 'durationText', sortable: false, visibility: true, align: 'end' as const },
     { title: 'Lock Holder', key: 'lockHolder', sortable: false, visibility: true },
     { title: 'Retry Status', key: 'retryIntervals', sortable: false, visibility: true },
     { title: 'Actions', key: 'actions', sortable: false, visibility: true },
@@ -629,6 +641,15 @@ const getRequestMatchType = computed(() => {
 })
 
 // Get the actual hex color for a status
+// A chain that ended Done but has a failed or cancelled job below it reads PartiallyDone, in amber. See utilities/partialOutcome.ts.
+const chipColor = (item: { status: string | number; children?: any[] | null }) =>
+  isPartiallyDone(item) ? '#FFB300' : getStatusHexColor(item.status)
+
+const partialHint = (item: { children?: any[] | null }) => {
+  const failed = countFailedBelow(item)
+  return `Done, but ${failed} ${failed === 1 ? 'job' : 'jobs'} below it failed or ${failed === 1 ? 'was' : 'were'} cancelled`
+}
+
 const getStatusHexColor = (status: string | number) => {
   // Convert numeric status to string name
   const statusStr = typeof status === 'number' ? Status[status] : status
@@ -728,8 +749,20 @@ const getRetryStatus = (index: number, item: any) => {
   }
 }
 
+// A refused cancel is explained by the alert the HTTP layer shows (the server says why); here the row only gets
+// the Force delete entry, so an operator can remove a row that no node runs.
 const requestCancel = async (id: string) => {
-  await requestCancelTicker.requestAsync(id)
+  try {
+    await requestCancelTicker.requestAsync(id)
+    showSuccess('Cancel requested. The job stops when it next checks for cancellation.')
+  } catch {
+    canBeForceDeleted.value.push(id)
+  }
+}
+
+const onRowAction = (key: string, item: GetTimeTickerResponse) => {
+  if (key === 'cancel') void requestCancel(item.id)
+  else if (key === 'delete') confirmDialog.open({ id: item.id })
 }
 
 const onSubmitConfirmDialog = async () => {
@@ -777,12 +810,14 @@ const canBeForceDeleted = ref<string[]>([])
         <div v-if="activeChart === 'line'" class="chart-section">
           <div class="chart-wrapper">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="lineChartOption"
               :key="`chart-${chartKey}`"
               :loading="chartLoading"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
 
@@ -790,12 +825,14 @@ const canBeForceDeleted = ref<string[]>([])
         <div v-if="activeChart === 'pie'" class="chart-section">
           <div class="chart-wrapper">
             <v-chart
+              v-if="chartsReady"
               class="chart-compact"
               :option="pieChartOption"
               :key="`pie-${pieChartKey}`"
               :loading="chartLoading"
               autoresize
             />
+            <div v-else class="chart-compact"></div>
           </div>
         </div>
       </div>
@@ -805,7 +842,7 @@ const canBeForceDeleted = ref<string[]>([])
         <div class="section-header">
           <h2 class="section-title">
             <v-icon class="section-icon" color="primary">mdi-table</v-icon>
-            Time Ticker Operations
+            Time Tickers
           </h2>
           <div class="table-controls">
             <!-- Primary Actions Group -->
@@ -1103,13 +1140,14 @@ const canBeForceDeleted = ref<string[]>([])
               <div class="d-flex align-center">
                 <v-chip
                   :style="{ 
-                    backgroundColor: getStatusHexColor(item.status) + '20', 
-                    color: getStatusHexColor(item.status) + ' !important', 
-                    borderColor: getStatusHexColor(item.status),
-                    border: '1px solid ' + getStatusHexColor(item.status)
+                    backgroundColor: chipColor(item) + '20', 
+                    color: chipColor(item) + ' !important', 
+                    borderColor: chipColor(item),
+                    border: '1px solid ' + chipColor(item)
                   }"
                   size="x-small"
                   class="status-chip"
+                  :title="isPartiallyDone(item) ? partialHint(item) : undefined"
                   @click="
                         hasStatus(item.status, Status.Failed) || hasStatus(item.status, Status.Skipped)
                       ? exceptionDialog.open({
@@ -1127,9 +1165,10 @@ const canBeForceDeleted = ref<string[]>([])
                   <v-icon size="x-small" class="mr-1" v-if="hasStatus(item.status, Status.Failed)">
                     mdi-bug-outline
                   </v-icon>
+                  <v-icon size="x-small" class="mr-1" v-else-if="isPartiallyDone(item)"> mdi-alert-circle-check-outline </v-icon>
                   <v-icon size="x-small" class="mr-1" v-else-if="hasStatus(item.status, Status.Done) || hasStatus(item.status, Status.DueDone)"> mdi-check-circle </v-icon>
                   <v-icon size="x-small" class="mr-1" v-else-if="hasStatus(item.status, Status.Skipped)"> mdi-debug-step-over </v-icon>
-                  <span class="font-weight-medium text-caption">{{ item.status }}</span>
+                  <span class="font-weight-medium text-caption">{{ isPartiallyDone(item) ? 'PartiallyDone' : item.status }}</span>
                 </v-chip>
               </div>
             </template>
@@ -1153,7 +1192,8 @@ const canBeForceDeleted = ref<string[]>([])
               </v-badge>
             </template>
 
-            <template v-slot:item.ExecutedAt="{ item }">
+            <!-- A running job has no time yet, so it shows the moving dots; a job that never ran shows a dash -->
+            <template v-slot:item.executedAt="{ item }">
               <div
                 v-if="hasStatus(item.status, Status.InProgress)"
                 class="snippet"
@@ -1163,13 +1203,11 @@ const canBeForceDeleted = ref<string[]>([])
                   <div class="dot-carousel"></div>
                 </div>
               </div>
-              <div v-else class="text-caption">
-                {{
-                  hasStatus(item.status, Status.Cancelled) || hasStatus(item.status, Status.Queued)
-                    ? ''
-                    : item.executedAt
-                }}
-              </div>
+              <span v-else class="text-caption" :title="item.executedAgo || undefined">{{ item.executedAt || '—' }}</span>
+            </template>
+
+            <template v-slot:item.durationText="{ item }">
+              <span class="text-caption">{{ hasStatus(item.status, Status.InProgress) ? '—' : item.durationText || '—' }}</span>
             </template>
 
             <template v-slot:item.retryIntervals="{ item }">
@@ -1180,6 +1218,7 @@ const canBeForceDeleted = ref<string[]>([])
                 <span class="retry-sequence" v-if="getRetryIntervalsArray(item.retryIntervals)?.length">
                   <template v-for="(interval, index) in getDisplayIntervals(item)" :key="index">
                     <span class="retry-item" :class="getRetryStatus(interval.originalIndex, item)"
+                      :title="`Retry ${interval.originalIndex + 1}: waits ${interval.value} after the previous attempt (${getRetryStatus(interval.originalIndex, item) === 'active' ? 'running now' : getRetryStatus(interval.originalIndex, item) === 'completed' ? 'done' : 'not reached'})`"
                       >{{ interval.originalIndex + 1 }}:{{ interval.value }}</span
                     >
                   </template>
@@ -1193,136 +1232,75 @@ const canBeForceDeleted = ref<string[]>([])
             </template>
 
             <template v-slot:item.lockHolder="{ item }">
-              <span class="text-caption">{{ item.lockHolder }}</span>
-              <v-tooltip v-if="item.lockHolder != ''" activator="parent" location="left">
-                <span>Locked At: {{ formatDate(item.lockedAt, true, timeZoneStore.effectiveTimeZone) }}</span>
-              </v-tooltip>
+              <span
+                class="text-caption"
+                :title="item.lockHolder ? `Locked At: ${formatDate(item.lockedAt, true, timeZoneStore.effectiveTimeZone)}` : undefined"
+                >{{ item.lockHolder }}</span
+              >
             </template>
 
             <template v-slot:item.actions="{ item }">
               <div class="action-buttons-container">
-                <!-- Cancel Button -->
+                <!-- Edit (not started yet) or Duplicate -->
                 <div
                   class="action-btn-wrapper"
-                  :class="{ 'action-btn-disabled': !hasStatus(item.status, Status.InProgress) }"
+                  :title="hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle) ? 'Edit' : 'Duplicate'"
                 >
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="
-                          requestCancel(item.id).catch(() => {
-                            canBeForceDeleted.push(item.id)
-                          })
-                        "
-                        :disabled="
-                          !hasStatus(item.status, Status.InProgress) ||
-                          canBeForceDeleted.includes(item.id)
-                        "
-                        class="modern-action-btn cancel-btn"
-                        :class="{ active: hasStatus(item.status, Status.InProgress) }"
-                      >
-                        <v-icon size="16">mdi-cancel</v-icon>
-                      </button>
-                    </template>
-                    <span>Cancel Operation</span>
-                  </v-tooltip>
+                  <button
+                    v-if="hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle)"
+                    @click="
+                      crudTimeTickerDialog.open({
+                        ...item,
+                        executionTime: item.executionTime,
+                        isFromDuplicate: false,
+                      })
+                    "
+                    class="modern-action-btn edit-btn"
+                    aria-label="Edit"
+                  >
+                    <v-icon size="16">mdi-pencil</v-icon>
+                  </button>
+                  <button
+                    v-else
+                    @click="
+                      crudTimeTickerDialog.open({
+                        ...item,
+                        executionTime: item.executionTime,
+                        isFromDuplicate: true,
+                      })
+                    "
+                    class="modern-action-btn duplicate-btn"
+                    aria-label="Duplicate"
+                  >
+                    <v-icon size="16">mdi-content-copy</v-icon>
+                  </button>
                 </div>
 
-                <!-- Edit/Duplicate Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        v-if="
-                          hasStatus(item.status, Status.Queued) ||
-                          hasStatus(item.status, Status.Idle)
-                        "
-                        @click="
-                          crudTimeTickerDialog.open({
-                            ...item,
-                            executionTime: item.executionTime,
-                            isFromDuplicate: false,
-                          })
-                        "
-                        class="modern-action-btn edit-btn"
-                      >
-                        <v-icon size="16">mdi-pencil</v-icon>
-                      </button>
-                      <button
-                        v-else
-                        v-bind="props"
-                        @click="
-                          crudTimeTickerDialog.open({
-                            ...item,
-                            executionTime: item.executionTime,
-                            isFromDuplicate: true,
-                          })
-                        "
-                        class="modern-action-btn duplicate-btn"
-                      >
-                        <v-icon size="16">mdi-content-copy</v-icon>
-                      </button>
-                    </template>
-                    <span>{{
-                      hasStatus(item.status, Status.Queued) || hasStatus(item.status, Status.Idle)
-                        ? 'Edit'
-                        : 'Duplicate'
-                    }}</span>
-                  </v-tooltip>
+                <!-- Run Again -->
+                <div class="action-btn-wrapper" title="Run again">
+                  <button
+                    @click="runAgain(item)"
+                    class="modern-action-btn run-btn"
+                    :class="{ busy: runningAgain.has(item.id) }"
+                    :disabled="runningAgain.has(item.id)"
+                    aria-label="Run again"
+                  >
+                    <v-icon v-if="runningAgain.has(item.id)" size="16" class="loading-spin">mdi-loading</v-icon>
+                    <v-icon v-else size="16">mdi-play-outline</v-icon>
+                  </button>
                 </div>
 
-                <!-- Run Again Button -->
-                <div class="action-btn-wrapper">
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="runAgain(item)"
-                        class="modern-action-btn run-btn"
-                        :disabled="runningAgain.has(item.id)"
-                      >
-                        <v-icon size="16">mdi-play-outline</v-icon>
-                      </button>
-                    </template>
-                    <span>Run again</span>
-                  </v-tooltip>
-                </div>
-
-                <!-- Delete Button -->
-                <div
-                  class="action-btn-wrapper"
-                  :class="{
-                    'action-btn-disabled':
-                      hasStatus(item.status, Status.InProgress) &&
-                      !canBeForceDeleted.includes(item.id),
-                  }"
-                >
-                  <v-tooltip location="top">
-                    <template v-slot:activator="{ props }">
-                      <button
-                        v-bind="props"
-                        @click="confirmDialog.open({ id: item.id })"
-                        :disabled="
-                          hasStatus(item.status, Status.InProgress) &&
-                          !canBeForceDeleted.includes(item.id)
-                        "
-                        class="modern-action-btn delete-btn"
-                        :class="{
-                          active:
-                            !hasStatus(item.status, Status.InProgress) ||
-                            canBeForceDeleted.includes(item.id),
-                        }"
-                      >
-                        <v-icon size="16">mdi-trash-can</v-icon>
-                      </button>
-                    </template>
-                    <span>{{
-                      canBeForceDeleted.includes(item.id) ? 'Force Delete Ticker' : 'Delete Ticker'
-                    }}</span>
-                  </v-tooltip>
-                </div>
+                <!-- Cancel and delete live in the menu -->
+                <RowActionsMenu
+                  :actions="
+                    timeTickerMenuActions({
+                      isInProgress: hasStatus(item.status, Status.InProgress),
+                      canBeForceDeleted: canBeForceDeleted.includes(item.id),
+                    })
+                  "
+                  :label="`More actions for ${item.function}`"
+                  @select="(key) => onRowAction(key, item)"
+                />
               </div>
             </template>
 
@@ -1481,6 +1459,19 @@ const canBeForceDeleted = ref<string[]>([])
 </template>
 
 <style scoped>
+.loading-spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 /* Enhanced Tree Table Styles */
 .tree-cell {
   position: relative;
@@ -1866,8 +1857,8 @@ const canBeForceDeleted = ref<string[]>([])
 /* Modern Action Buttons */
 .action-buttons-container {
   display: flex;
-  flex-wrap: wrap;
-  min-width: 76px; /* two buttons per row at the narrowest */
+  flex-wrap: nowrap;
+  min-width: 112px; /* two inline actions and the menu, in one row */
   align-items: center;
   gap: 6px;
   padding: 2px;
@@ -2357,7 +2348,7 @@ const canBeForceDeleted = ref<string[]>([])
 }
 
 :deep(.red-badge .v-badge__badge) {
-  color: red !important;
+  color: #E57373 !important;
 }
 
 :deep(.grey-badge .v-badge__badge) {

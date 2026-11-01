@@ -31,6 +31,8 @@ Set through `options.ConfigureScheduler(scheduler => ...)`:
 | `FallbackIntervalChecker` | 30 seconds | How often missed or timed-out jobs are looked for. |
 | `SchedulerTimeZone` | `TimeZoneInfo.Local` | Time zone for cron expressions; see [Scheduling](scheduling.md#time-zone). |
 
+The default `NodeIdentifier` is the machine name, which in a container is the container id and changes with every new container. Jobs keep the identifier of the node that locked them, so the Machines panel of the dashboard lists every identifier that ever locked a job, with its job count since the beginning, not only the nodes that are running now (the one marked Current is this node). Set a stable name, such as the pod name of a StatefulSet or a fixed name per service, to keep that list short, and so that jobs left running by a node that stopped can be released.
+
 To limit how many runs of one function execute at the same time on an instance, use `maxConcurrency` on `[TickerFunction]` or `WithMaxConcurrency` on code-first registrations.
 
 ## Start modes

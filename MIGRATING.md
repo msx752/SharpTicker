@@ -129,7 +129,7 @@ dotnet ef migrations add VerifySharpTicker
 ```
 
 - Snapshot generated with TickerQ 10.4.0: the migration is **empty**. Remove it with `dotnet ef migrations remove`, or keep it to record the new type names in the snapshot.
-- Snapshot generated with an older TickerQ version: the migration may add the `IsEnabled` and `IsSystemPaused` columns to `CronTickers`. That comes from the 10.4.0 schema, not from the rename, and is safe to apply.
+- Snapshot generated with an older TickerQ version: the migration may add the `IsEnabled` and `IsSystemPaused` columns to `CronTickers`. That comes from the 10.4.0 schema, not from the rename. **Before you apply it, edit the generated `AddColumn` for `IsEnabled` so that existing rows stay enabled:** change `defaultValue: false` to `defaultValue: true`. EF writes `false` because the column has no store default, so applied as generated, every existing cron is disabled and the scheduler skips it. If you already applied it, run `UPDATE` on `CronTickers` to set `IsEnabled` to true (check first that none of the crons were paused on purpose).
 - **Stop if the migration drops, renames or creates any `ticker` table or column other than those two.** That means something else changed, for example the schema name or a custom configuration.
 
 If you create the schema with `EnsureCreated()` or `GenerateCreateScript()` instead of migrations, the generated schema is identical.
@@ -175,7 +175,7 @@ Never rename the database itself as part of this migration.
 - [ ] Every `TickerQ*` package is replaced by its `SharpTicker*` counterpart, all on the same version.
 - [ ] The solution builds, and no project references a `TickerQ*` package, directly or transitively.
 - [ ] Your tests pass.
-- [ ] EF Core: `dotnet ef migrations add VerifySharpTicker` is empty, or only adds `IsEnabled`/`IsSystemPaused`.
+- [ ] EF Core: `dotnet ef migrations add VerifySharpTicker` is empty, or only adds `IsEnabled`/`IsSystemPaused` (with `IsEnabled` set to `defaultValue: true`, see above).
 - [ ] The dashboard opens at the expected URL.
 - [ ] Tracing dashboards and alerts use the `SharpTicker` source and `sharpticker.*` names.
 - [ ] Existing cron jobs fire and their history shows in the dashboard.
@@ -218,7 +218,7 @@ Then verify:
 - Confirm no TickerQ* package remains in any project.assets.json.
 - Run the tests that cover scheduling and the job store.
 - If EF Core migrations are used, run "dotnet ef migrations add VerifySharpTicker" and show me the Up()
-  method. It must be empty or only add the IsEnabled/IsSystemPaused columns to CronTickers.
+  method. It must be empty or only add the IsEnabled/IsSystemPaused columns to CronTickers, and the AddColumn for IsEnabled must use defaultValue: true (EF generates false, which would disable every existing cron; change it before applying).
   If it drops, renames or creates anything else, stop and report.
 
 Finish with a summary: files changed, the names you deliberately left unchanged (rule 3),
