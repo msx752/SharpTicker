@@ -488,43 +488,38 @@ const handleForceUIUpdate = () => {
               </v-btn>
 
               <template v-if="tickerHostStatus && isServicesReady">
-                <v-btn
-                  color="warning"
-                  variant="outlined"
-                  size="small"
-                  @click="askRestart"
-                  :loading="restartTicker?.loader?.value"
-                  class="action-btn restart-btn"
-                  :disabled="restartIsAnimating"
-                  :class="{ 'restart-animating': restartIsAnimating }"
-                >
-                  <span class="btn-content">
-                    <v-icon
-                      class="restart-icon"
-                      :class="{ 'rotating': restartIsAnimating }"
+                <!-- Restart and Stop are rare and affect every job, so they sit in one menu instead of two strong buttons -->
+                <v-menu location="bottom end">
+                  <template #activator="{ props: menuProps }">
+                    <v-btn
+                      v-bind="menuProps"
+                      variant="outlined"
+                      size="small"
+                      prepend-icon="mdi-cog-outline"
+                      append-icon="mdi-chevron-down"
+                      :loading="restartIsAnimating || stopTicker?.loader?.value"
+                      class="action-btn system-menu-btn"
+                      aria-label="System actions"
                     >
-                      mdi-restart
-                    </v-icon>
-                    <span class="btn-text">Restart</span>
-                  </span>
-
-                  <!-- Ripple Effect -->
-                  <div class="ripple-container">
-                    <div class="ripple" v-if="restartIsAnimating"></div>
-                  </div>
-                </v-btn>
-
-                <v-btn
-                  color="error"
-                  variant="outlined"
-                  size="small"
-                  prepend-icon="mdi-stop-circle"
-                  @click="confirmDialog?.open({...new ConfirmDialogProps(), confirmText: 'Stop' })"
-                  :loading="stopTicker?.loader?.value"
-                  class="action-btn stop-btn"
-                >
-                  Stop System
-                </v-btn>
+                      System
+                    </v-btn>
+                  </template>
+                  <v-list density="compact" class="system-menu-list">
+                    <v-list-item
+                      prepend-icon="mdi-restart"
+                      title="Restart"
+                      :disabled="restartIsAnimating"
+                      @click="askRestart"
+                    />
+                    <v-divider />
+                    <v-list-item
+                      prepend-icon="mdi-stop-circle"
+                      title="Stop System"
+                      base-color="error"
+                      @click="confirmDialog?.open({...new ConfirmDialogProps(), confirmText: 'Stop' })"
+                    />
+                  </v-list>
+                </v-menu>
             </template>
 
             <!-- Loading State for Actions -->
@@ -984,130 +979,6 @@ const handleForceUIUpdate = () => {
   font-size: 0.75rem;
   color: #bdbdbd;
   font-weight: 500;
-}
-
-/* Restart Button Animations */
-.restart-btn {
-  position: relative;
-  overflow: hidden;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  transform-origin: center;
-}
-
-.restart-btn:hover {
-  box-shadow: 0 8px 25px rgba(255, 152, 0, 0.3);
-}
-
-.restart-btn:active {
-  transform: translateY(0) scale(0.98);
-  transition: transform 0.1s ease;
-}
-
-.restart-btn.restart-animating {
-  animation: restart-pulse 1.5s ease-in-out infinite;
-  background: linear-gradient(45deg, #ff9800, #ff5722, #ff9800);
-  background-size: 200% 200%;
-  animation: restart-pulse 1.5s ease-in-out infinite, gradient-shift 2s ease-in-out infinite;
-}
-
-.btn-content {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  position: relative;
-  z-index: 1;
-}
-
-.restart-icon {
-  transition: transform 0.3s ease;
-}
-
-.restart-icon.rotating {
-  animation: rotate-360 1s linear infinite;
-}
-
-.btn-text {
-  font-weight: 600;
-  transition: all 0.3s ease;
-}
-
-.restart-btn.restart-animating .btn-text {
-  animation: text-glow 1.5s ease-in-out infinite;
-}
-
-/* Restart Button Keyframe Animations */
-@keyframes restart-pulse {
-  0%, 100% {
-    transform: scale(1);
-    box-shadow: 0 4px 12px rgba(255, 152, 0, 0.3);
-  }
-  50% {
-    box-shadow: 0 8px 25px rgba(255, 152, 0, 0.5);
-  }
-}
-
-@keyframes rotate-360 {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes gradient-shift {
-  0%, 100% {
-    background-position: 0% 50%;
-  }
-  50% {
-    background-position: 100% 50%;
-  }
-}
-
-@keyframes text-glow {
-  0%, 100% {
-    text-shadow: 0 0 5px rgba(255, 152, 0, 0.5);
-  }
-  50% {
-    text-shadow: 0 0 20px rgba(255, 152, 0, 0.8), 0 0 30px rgba(255, 152, 0, 0.6);
-  }
-}
-
-/* Ripple Effect */
-.ripple-container {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  border-radius: inherit;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-.ripple {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 0;
-  height: 0;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.3);
-  transform: translate(-50%, -50%);
-  animation: ripple-expand 1.5s ease-out infinite;
-}
-
-@keyframes ripple-expand {
-  0% {
-    width: 0;
-    height: 0;
-    opacity: 1;
-  }
-  100% {
-    width: 300px;
-    height: 300px;
-    opacity: 0;
-  }
 }
 
 /* Responsive Design */
