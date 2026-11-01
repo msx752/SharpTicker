@@ -2,6 +2,7 @@
 import { tickerService } from '@/http/services/tickerService'
 import { formatDate } from '@/utilities/dateTimeParser'
 import { summarizeJobStatuses, formatShare } from '@/utilities/jobStatistics'
+import { priorityNote, isPriorityApplied } from '@/utilities/priorityNote'
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { useFunctionNameStore } from '@/stores/functionNames'
@@ -438,7 +439,11 @@ const getVisiblePageNumbers = () => {
               <template v-slot:item.priority="{ item }">
                 <div
                   class="priority-badge"
-                  :class="`priority-${item.priority.toLowerCase().replace('longrunning', 'long')}`"
+                  :class="[
+                    `priority-${item.priority.toLowerCase().replace('longrunning', 'long')}`,
+                    { 'priority-not-applied': !isPriorityApplied(item.priority) },
+                  ]"
+                  :title="priorityNote(item.priority)"
                 >
                   {{ item.priority }}
                 </div>
@@ -937,6 +942,12 @@ const getVisiblePageNumbers = () => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.priority-not-applied {
+  opacity: 0.6;
+  outline: 1px dashed currentColor;
+  outline-offset: -1px;
 }
 
 .priority-badge {
