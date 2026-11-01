@@ -19,7 +19,7 @@ import { useConnectionStore } from '@/stores/connectionStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import '@/utilities/echartsSetup'
-import { describeSchedule } from '@/utilities/cronSchedule'
+import { describeSchedule, scheduleTimeZoneNote } from '@/utilities/cronSchedule'
 import { nextRunText, statusName } from '@/utilities/cronRunSummary'
 import { relativeTime } from '@/utilities/relativeTime'
 import { runInitialLoad } from '@/utilities/initialLoad'
@@ -35,9 +35,11 @@ const deleteCronTicker = cronTickerService.deleteCronTicker()
 const runCronTickerOnDemand = cronTickerService.runCronTickerOnDemand()
 const toggleCronTicker = cronTickerService.toggleCronTicker()
 
-// The scheduler evaluates an expression in its own time zone, so the sentence names that zone
-const scheduleText = (expression: string) =>
-  describeSchedule(expression, timeZoneStore.schedulerTimeZone)
+const scheduleText = (expression: string) => describeSchedule(expression)
+
+// The scheduler evaluates an expression in its own time zone: the sentence stays short and the zone is on hover
+const scheduleNote = (expression: string) =>
+  scheduleTimeZoneNote(expression, timeZoneStore.schedulerTimeZone) ?? undefined
 
 // A disabled cron is muted, so it stands out in the list without hiding that it exists
 const cronRowProps = ({ item }: { item: { isEnabled?: boolean } }) => ({
@@ -1080,7 +1082,7 @@ const refreshData = async () => {
 
             <template v-slot:item.expression="{ item }">
               <div class="schedule-cell">
-                <span v-if="scheduleText(item.expression)" class="schedule-text">
+                <span v-if="scheduleText(item.expression)" class="schedule-text" :title="scheduleNote(item.expression)">
                   {{ scheduleText(item.expression) }}
                 </span>
                 <button
