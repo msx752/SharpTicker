@@ -1206,6 +1206,7 @@ const canBeForceDeleted = ref<string[]>([])
                 <span class="retry-sequence" v-if="getRetryIntervalsArray(item.retryIntervals)?.length">
                   <template v-for="(interval, index) in getDisplayIntervals(item)" :key="index">
                     <span class="retry-item" :class="getRetryStatus(interval.originalIndex, item)"
+                      :title="`Retry ${interval.originalIndex + 1}: waits ${interval.value} after the previous attempt (${getRetryStatus(interval.originalIndex, item) === 'active' ? 'running now' : getRetryStatus(interval.originalIndex, item) === 'completed' ? 'done' : 'not reached'})`"
                       >{{ interval.originalIndex + 1 }}:{{ interval.value }}</span
                     >
                   </template>
