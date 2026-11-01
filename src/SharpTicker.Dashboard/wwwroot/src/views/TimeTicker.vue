@@ -19,6 +19,7 @@ import { timeTickerMenuActions } from '@/utilities/rowActions'
 import { useAlert } from '@/composables/useAlert'
 import VChart, { THEME_KEY } from 'vue-echarts'
 import { runInitialLoad } from '@/utilities/initialLoad'
+import { countFailedBelow, isPartiallyDone } from '@/utilities/partialOutcome'
 import { createZoneReloadGate } from '@/utilities/zoneReloadGate'
 import '@/utilities/echartsSetup'
 import type { GetTimeTickerGraphDataRangeResponse } from '@/http/services/types/timeTickerService.types'
@@ -640,6 +641,15 @@ const getRequestMatchType = computed(() => {
 })
 
 // Get the actual hex color for a status
+// A chain that ended Done but has a failed or cancelled job below it reads PartiallyDone, in amber. See utilities/partialOutcome.ts.
+const chipColor = (item: { status: string | number; children?: any[] | null }) =>
+  isPartiallyDone(item) ? '#FFB300' : getStatusHexColor(item.status)
+
+const partialHint = (item: { children?: any[] | null }) => {
+  const failed = countFailedBelow(item)
+  return `Done, but ${failed} ${failed === 1 ? 'job' : 'jobs'} below it failed or ${failed === 1 ? 'was' : 'were'} cancelled`
+}
+
 const getStatusHexColor = (status: string | number) => {
   // Convert numeric status to string name
   const statusStr = typeof status === 'number' ? Status[status] : status
@@ -1130,13 +1140,14 @@ const canBeForceDeleted = ref<string[]>([])
               <div class="d-flex align-center">
                 <v-chip
                   :style="{ 
-                    backgroundColor: getStatusHexColor(item.status) + '20', 
-                    color: getStatusHexColor(item.status) + ' !important', 
-                    borderColor: getStatusHexColor(item.status),
-                    border: '1px solid ' + getStatusHexColor(item.status)
+                    backgroundColor: chipColor(item) + '20', 
+                    color: chipColor(item) + ' !important', 
+                    borderColor: chipColor(item),
+                    border: '1px solid ' + chipColor(item)
                   }"
                   size="x-small"
                   class="status-chip"
+                  :title="isPartiallyDone(item) ? partialHint(item) : undefined"
                   @click="
                         hasStatus(item.status, Status.Failed) || hasStatus(item.status, Status.Skipped)
                       ? exceptionDialog.open({
@@ -1154,9 +1165,10 @@ const canBeForceDeleted = ref<string[]>([])
                   <v-icon size="x-small" class="mr-1" v-if="hasStatus(item.status, Status.Failed)">
                     mdi-bug-outline
                   </v-icon>
+                  <v-icon size="x-small" class="mr-1" v-else-if="isPartiallyDone(item)"> mdi-alert-circle-check-outline </v-icon>
                   <v-icon size="x-small" class="mr-1" v-else-if="hasStatus(item.status, Status.Done) || hasStatus(item.status, Status.DueDone)"> mdi-check-circle </v-icon>
                   <v-icon size="x-small" class="mr-1" v-else-if="hasStatus(item.status, Status.Skipped)"> mdi-debug-step-over </v-icon>
-                  <span class="font-weight-medium text-caption">{{ item.status }}</span>
+                  <span class="font-weight-medium text-caption">{{ isPartiallyDone(item) ? 'PartiallyDone' : item.status }}</span>
                 </v-chip>
               </div>
             </template>
