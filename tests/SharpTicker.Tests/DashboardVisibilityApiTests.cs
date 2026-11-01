@@ -407,6 +407,21 @@ public abstract class DashboardVisibilityApiTests<TFixture> : IClassFixture<TFix
         await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/time-ticker/delete?id={id}");
     }
 
+    [Fact]
+    public async Task AnAdd_IgnoresTheIdInTheBody_SoItCannotReplaceATickerOfAnotherTeam()
+    {
+        var (_, time) = await _api.SendAsync(Billing, false, HttpMethod.Post, "/time-ticker/add", $$"""{"id":"{{OpsCleanupId}}","function":"billing.Invoices","executionTime":"{{InTwoDays}}","description":"taken"}""");
+        var (_, cron) = await _api.SendAsync(Billing, false, HttpMethod.Post, "/cron-ticker/add", $$"""{"id":"{{OpsCronId}}","function":"billing.Nightly","expression":"0 0 4 * * *","description":"taken"}""");
+
+        var ops = (await _api.GetAsAsync(Ops, "/time-tickers")).EnumerateArray().Single(t => t.GetProperty("id").GetGuid() == OpsCleanupId);
+        Assert.Equal("ops.Cleanup", ops.GetProperty("function").GetString());
+        Assert.Equal("ops.Nightly", (await CronAsync(OpsCronId)).GetProperty("function").GetString());
+
+        // What the adds made is removed again, so the other tests see the same data
+        await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/time-ticker/delete?id={time!.Value.GetProperty("tickerId").GetGuid()}");
+        await _api.SendAsync(Billing, false, HttpMethod.Delete, $"/cron-ticker/delete?id={cron!.Value.GetProperty("tickerId").GetGuid()}");
+    }
+
     #endregion
 }
 

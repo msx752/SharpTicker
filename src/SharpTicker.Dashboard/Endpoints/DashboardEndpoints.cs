@@ -258,6 +258,16 @@ public static class DashboardEndpoints
         return ticker.Children?.Select(child => FirstHiddenFunction(scope, child)).FirstOrDefault(found => found != null);
     }
 
+    private static void ClearIds<TTimeTicker>(TTimeTicker? ticker) where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+    {
+        if (ticker == null)
+            return;
+
+        ticker.Id = Guid.Empty;
+        foreach (var child in ticker.Children ?? Array.Empty<TTimeTicker>())
+            ClearIds(child);
+    }
+
     private const string HiddenParentMessage = "You are not allowed to put a ticker under a ticker you cannot see";
 
     private static string HiddenFunctionMessage(string function) => $"You are not allowed to use the function '{function}'";
@@ -447,6 +457,11 @@ public static class DashboardEndpoints
             await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenParentMessage }, dashboardOptions.DashboardJsonOptions);
             return;
         }
+
+        // An id in the body would let an add replace a ticker that already has it (the Redis store overwrites), so
+        // with a rule the ids are made by the manager.
+        if (scope.HasRule)
+            ClearIds(chainRoot);
 
         var result = await timeTickerManager.AddAsync(chainRoot, cancellationToken);
 
@@ -759,6 +774,9 @@ public static class DashboardEndpoints
             await WriteJson(context, new ActionResponseWithId { Success = false, Message = HiddenFunctionMessage(addedFunction) }, dashboardOptions.DashboardJsonOptions);
             return;
         }
+
+        if (VisibilityScope<TTimeTicker, TCronTicker>.For(context).HasRule && cronTicker != null)
+            cronTicker.Id = Guid.Empty;
 
         var result = await cronTickerManager.AddAsync(cronTicker, cancellationToken);
 
