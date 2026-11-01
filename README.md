@@ -12,6 +12,8 @@
 
 <p align="center">
   <a href="https://github.com/msx752/SharpTicker/actions/workflows/ci.yml"><img src="https://github.com/msx752/SharpTicker/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+  <a href="https://www.nuget.org/packages/SharpTicker"><img src="https://img.shields.io/nuget/v/SharpTicker?logo=nuget" alt="NuGet version" /></a>
+  <a href="https://www.nuget.org/packages/SharpTicker"><img src="https://img.shields.io/nuget/dt/SharpTicker?logo=nuget" alt="NuGet downloads" /></a>
 </p>
 
 ---
