@@ -23,9 +23,13 @@ export interface DayResults {
 
 export interface StatusLineSeries {
   name: string
-  type: 'bar'
+  type: 'line'
+  smooth: boolean
+  symbol: 'circle'
+  symbolSize: number
   itemStyle: { color: string }
-  barMaxWidth: number
+  lineStyle: { width: number; color: string }
+  areaStyle: { color: { type: 'linear'; x: number; y: number; x2: number; y2: number; colorStops: { offset: number; color: string }[] } }
   emphasis: { focus: 'series' }
   data: number[]
 }
@@ -41,7 +45,7 @@ export interface StatusTimeSeries {
 export const ZOOM_SLIDER_MIN_DAYS = 14
 
 /**
- * ECharts option for the status bars. Shared by the Time and Cron ticker pages so both
+ * ECharts option for the status lines. Shared by the Time and Cron ticker pages so both
  * charts look and behave the same, including the "nothing happened" state.
  */
 export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string) {
@@ -60,7 +64,7 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
     },
     tooltip: {
       trigger: 'axis',
-      axisPointer: { type: 'shadow' },
+      axisPointer: { type: 'cross' },
       backgroundColor: 'rgba(42, 42, 42, 0.95)',
       borderColor: '#666',
       borderWidth: 1,
@@ -85,6 +89,7 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
     xAxis: {
       type: 'category',
       data: chart.xAxisData,
+      boundaryGap: false,
       axisLabel: { color: '#bdbdbd', fontSize: 10, rotate: days > 8 ? 45 : 0 },
       axisLine: { lineStyle: { color: '#424242' } },
     },
@@ -130,8 +135,7 @@ export function buildStatusChartOption(chart: StatusTimeSeries, subtitle: string
 }
 
 /**
- * Turns the per-day status counts returned by the API into bar series. A day's count is a whole number of jobs, so it
- * is drawn as a bar, not as a curve through values that do not exist between two days.
+ * Turns the per-day status counts returned by the API into line series.
  *
  * Days keep the order the server sent them in (the date strings are locale formatted, so sorting
  * them as text would put 01/11 before 27/10). Statuses that never occur in the range are left out,
@@ -175,9 +179,25 @@ export function buildStatusTimeSeries(
       const color = STATUS_COLORS[status] ?? FALLBACK_COLOR
       return {
         name: statusName(status),
-        type: 'bar',
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 6,
         itemStyle: { color },
-        barMaxWidth: 28,
+        lineStyle: { width: 2, color },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: color + '30' },
+              { offset: 1, color: color + '05' },
+            ],
+          },
+        },
         emphasis: { focus: 'series' },
         data,
       }

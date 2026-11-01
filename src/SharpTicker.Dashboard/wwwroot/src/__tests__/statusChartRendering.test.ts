@@ -39,7 +39,7 @@ const day = (date: string, ...counts: [number, number][]): DayResults => ({
 })
 
 describe('status chart rendering', () => {
-  it('draws bars in the status colour and names the status in the legend', () => {
+  it('draws a line in the status colour and names the status in the legend', () => {
     const svg = render([day('27/10/2026', [3, 1]), day('28/10/2026', [3, 4]), day('29/10/2026', [3, 2])])
 
     expect(svg).toContain('<path')
@@ -54,7 +54,7 @@ describe('status chart rendering', () => {
     expect(svg).toContain('Job statuses for all Cron Tickers')
   })
 
-  it('draws a legend entry and a bar for each status that occurred, and nothing for the others', () => {
+  it('draws a legend entry and a line for each status that occurred, and nothing for the others', () => {
     const svg = render([day('d1', [3, 2], [5, 1], [7, 0])])
 
     expect(svg).toContain('>Done<')
