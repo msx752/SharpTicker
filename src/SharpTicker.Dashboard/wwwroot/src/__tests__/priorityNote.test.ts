@@ -1,16 +1,20 @@
 import { describe, it, expect } from 'vitest'
-import { priorityNote, isPriorityApplied } from '@/utilities/priorityNote'
+import { priorityNote } from '@/utilities/priorityNote'
 
 describe('priorityNote', () => {
-  it('says High, Normal and Low are not applied yet', () => {
-    for (const priority of ['High', 'Normal', 'Low']) {
-      expect(isPriorityApplied(priority)).toBe(false)
-      expect(priorityNote(priority)).toMatch(/not applied yet/i)
-    }
+  it('describes what each priority does when jobs are waiting', () => {
+    expect(priorityNote('High')).toMatch(/High jobs start first/)
+    expect(priorityNote('Normal')).toMatch(/after High and before Low/)
+    expect(priorityNote('Low')).toMatch(/after High and Normal/)
   })
 
   it('describes what LongRunning does', () => {
-    expect(isPriorityApplied('LongRunning')).toBe(true)
     expect(priorityNote('LongRunning')).toMatch(/outside the worker pool/)
+  })
+
+  it('never says a priority is not applied', () => {
+    for (const priority of ['High', 'Normal', 'Low', 'LongRunning']) {
+      expect(priorityNote(priority)).not.toMatch(/not applied/i)
+    }
   })
 })

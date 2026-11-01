@@ -1,13 +1,16 @@
 /**
- * What the Registered Functions table says about a priority.
- *
- * Only LongRunning has an effect today: the job runs outside the worker pool. High, Normal and Low are accepted but the
- * scheduler does not order jobs by them, so the table says so instead of implying an order that is not applied.
+ * What the Registered Functions table says about a priority. It decides which waiting job a free worker takes when more
+ * jobs are ready than there are workers; it does not change when a job becomes due and does not stop a running job.
  */
 export function priorityNote(priority: string): string {
-  return priority === 'LongRunning'
-    ? 'Runs outside the worker pool.'
-    : 'Not applied yet: this value does not change when the job runs.'
+  switch (priority) {
+    case 'LongRunning':
+      return 'Runs outside the worker pool.'
+    case 'High':
+      return 'When jobs are waiting for a worker, High jobs start first.'
+    case 'Low':
+      return 'When jobs are waiting for a worker, Low jobs start after High and Normal jobs.'
+    default:
+      return 'When jobs are waiting for a worker, Normal jobs start after High and before Low jobs.'
+  }
 }
-
-export const isPriorityApplied = (priority: string): boolean => priority === 'LongRunning'
