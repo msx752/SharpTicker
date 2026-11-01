@@ -290,6 +290,43 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     }
 
     [Fact]
+    public async Task CronRunSummary_GivesTheLastRunAndTheNextRun_OfAnEnabledCron()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids={DashboardApiFixture.CronId},{DashboardApiFixture.PausedCronId}");
+        var summaries = all.EnumerateArray().ToDictionary(c => c.GetProperty("id").GetGuid());
+        var enabled = summaries[DashboardApiFixture.CronId];
+
+        Assert.Equal(2, summaries.Count);
+        // The latest occurrence that ran is the failed one of today; the queued one of tomorrow has not run
+        Assert.Equal(Failed, enabled.GetProperty("lastStatus").GetInt32());
+        Assert.Equal(DashboardApiFixture.OccurrenceFailedId, enabled.GetProperty("lastOccurrenceId").GetGuid());
+        Assert.NotEqual(JsonValueKind.Null, enabled.GetProperty("lastRun").ValueKind);
+        // "0 * * * * *" fires every minute, so the next run is within a minute from now
+        var next = enabled.GetProperty("nextRun").GetDateTime();
+        Assert.InRange((next.ToUniversalTime() - DateTime.UtcNow).TotalSeconds, -5, 65);
+    }
+
+    [Fact]
+    public async Task CronRunSummary_HasNoNextRun_ForADisabledCronAndNoLastRun_ForOneThatNeverRan()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids={DashboardApiFixture.PausedCronId}");
+        var paused = Assert.Single(all.EnumerateArray().ToArray());
+
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("nextRun").ValueKind);
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("lastRun").ValueKind);
+        Assert.Equal(JsonValueKind.Null, paused.GetProperty("lastStatus").ValueKind);
+    }
+
+    [Fact]
+    public async Task CronRunSummary_IgnoresUnknownAndMalformedIds()
+    {
+        var all = await _api.GetAsync($"/cron-tickers/run-summary?ids=not-a-guid,{Guid.NewGuid()},,{DashboardApiFixture.CronId}");
+
+        Assert.Equal(DashboardApiFixture.CronId, Assert.Single(Ids(all)));
+        Assert.Empty((await _api.GetAsync("/cron-tickers/run-summary")).EnumerateArray());
+    }
+
+    [Fact]
     public async Task CronTickersPaginated_SplitsTheListIntoPages()
     {
         var first = await _api.GetAsync("/cron-tickers/paginated?pageNumber=1&pageSize=1");

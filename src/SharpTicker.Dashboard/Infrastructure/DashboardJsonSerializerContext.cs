@@ -17,6 +17,7 @@ namespace SharpTicker.Dashboard.Infrastructure;
 [JsonSerializable(typeof(AuthInfoResponse))]
 [JsonSerializable(typeof(AuthValidateResponse))]
 [JsonSerializable(typeof(CancelRefusedResponse))]
+[JsonSerializable(typeof(CronRunSummary[]))]
 [JsonSerializable(typeof(DashboardOptionsResponse))]
 [JsonSerializable(typeof(ActionResponse))]
 [JsonSerializable(typeof(ActionResponseWithId))]

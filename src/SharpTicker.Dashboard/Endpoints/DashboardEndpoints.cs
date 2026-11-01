@@ -113,6 +113,10 @@ public static class DashboardEndpoints
             .WithName("GetCronTickers")
             .WithSummary("Get all cron tickers");
 
+        apiGroup.MapGet("/cron-tickers/run-summary", GetCronRunSummary<TTimeTicker, TCronTicker>)
+            .WithName("GetCronRunSummary")
+            .WithSummary("Get the next run and the last run of the given cron tickers");
+
         apiGroup.MapGet("/cron-tickers/paginated", GetCronTickersPaginated<TTimeTicker, TCronTicker>)
             .WithName("GetCronTickersPaginated")
             .WithSummary("Get paginated cron tickers");
@@ -521,6 +525,55 @@ public static class DashboardEndpoints
 
         var result = await repository.GetCronTickersPaginatedAsync(pageNumber, pageSize, cancellationToken);
         await WriteJson(context, result, dashboardOptions.DashboardJsonOptions);
+    }
+
+    // The table asks for the crons on the page it shows, so the answer is bounded by the page size.
+    private const int MaxRunSummaryIds = 200;
+
+    private static async Task GetCronRunSummary<TTimeTicker, TCronTicker>(HttpContext context)
+        where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        where TCronTicker : CronTickerEntity, new()
+    {
+        var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+        var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
+        var cancellationToken = context.RequestAborted;
+
+        var ids = context.Request.Query["ids"].ToString()
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(text => Guid.TryParse(text, out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty)
+            .Distinct()
+            .Take(MaxRunSummaryIds)
+            .ToList(); // a List, not an array: with C# 14 Contains on an array binds to the span overload, which EF cannot translate on net8
+
+        var crons = ids.Count == 0
+            ? Array.Empty<TCronTicker>()
+            : await provider.CronTickersQuery().AsNoTracking().Where(x => ids.Contains(x.Id)).ToArrayAsync(cancellationToken);
+
+        var now = DateTime.UtcNow;
+        var summaries = new List<CronRunSummary>(crons.Length);
+        foreach (var cron in crons)
+        {
+            var latest = (await provider.CronTickerOccurrencesQuery()
+                .AsNoTracking()
+                .Where(x => x.CronTickerId == cron.Id && x.ExecutedAt != null)
+                .OrderByDescending(x => x.ExecutedAt)
+                .Take(1)
+                .ToArrayAsync(cancellationToken)).FirstOrDefault();
+
+            var next = cron.IsEnabled ? CronScheduleCache.GetNextOccurrenceOrDefault(cron.Expression, now) : null;
+
+            summaries.Add(new CronRunSummary
+            {
+                Id = cron.Id,
+                NextRun = next is { } n ? DateTime.SpecifyKind(n, DateTimeKind.Utc) : null,
+                LastRun = latest?.ExecutedAt is { } executedAt ? DateTime.SpecifyKind(executedAt, DateTimeKind.Utc) : null,
+                LastStatus = latest?.Status,
+                LastOccurrenceId = latest?.Id,
+            });
+        }
+
+        await WriteJson(context, summaries.ToArray(), dashboardOptions.DashboardJsonOptions);
     }
 
     private static async Task GetCronTickersGraphDataRange<TTimeTicker, TCronTicker>(HttpContext context)

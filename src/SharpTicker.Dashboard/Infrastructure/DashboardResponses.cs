@@ -24,6 +24,24 @@ internal class CancelRefusedResponse
     public string Message { get; set; }
 }
 
+/// <summary>
+/// What the Cron Tickers table shows about a cron beyond its stored row: when it fires next and how its latest run ended.
+/// Both are looked up for the crons on the page that is shown, not for every cron.
+/// </summary>
+internal class CronRunSummary
+{
+    public Guid Id { get; set; }
+
+    /// <summary>The next occurrence of the expression, in UTC. Null when the cron is disabled or the expression has none.</summary>
+    public DateTime? NextRun { get; set; }
+
+    /// <summary>When the latest run that started did so, in UTC. Null when it has not run.</summary>
+    public DateTime? LastRun { get; set; }
+
+    public TickerStatus? LastStatus { get; set; }
+    public Guid? LastOccurrenceId { get; set; }
+}
+
 internal class DashboardOptionsResponse
 {
     public int MaxConcurrency { get; set; }
