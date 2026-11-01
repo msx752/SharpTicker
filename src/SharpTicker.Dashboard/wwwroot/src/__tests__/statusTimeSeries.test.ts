@@ -48,13 +48,12 @@ describe('buildStatusTimeSeries', () => {
     expect(result.series.map((s) => s.data)).toEqual([[4, 1], [2, 0]])
   })
 
-  it('draws a line per status in the status colour', () => {
+  it('draws a bar series per status in the status colour', () => {
     const result = buildStatusTimeSeries([{ date: 'd1', results: [{ item1: 5, item2: 1 }] }], name)
 
     expect(result.series[0]).toMatchObject({
-      type: 'line',
+      type: 'bar',
       itemStyle: { color: STATUS_COLORS[5] },
-      lineStyle: { color: STATUS_COLORS[5] },
     })
   })
 

@@ -1,6 +1,6 @@
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart } from 'echarts/charts'
+import { BarChart, LineChart, PieChart } from 'echarts/charts'
 import {
   DataZoomComponent,
   GraphicComponent,
@@ -17,6 +17,7 @@ import {
 // the real options, so a missing one shows up as a failing test.
 use([
   CanvasRenderer,
+  BarChart,
   LineChart,
   PieChart,
   DataZoomComponent,
