@@ -419,6 +419,9 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.Equal(3, counts[0]);
         Assert.Equal(2, counts[1]);
         Assert.Equal(9, counts[2]);
+        // Entry 3 is Cancelled, so the dashboard can name the final jobs (Done, DueDone, Failed, Cancelled) of the
+        // same week without reading the all-time counts.
+        Assert.Equal(1, counts[3]);
     }
 
     #endregion

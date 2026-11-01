@@ -405,13 +405,14 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
     [Fact]
     public async Task LastWeekJobStatuses_ReportDone_Failed_AndTheTotalUpToToday()
     {
-        // Entry 0 is Done and DueDone, entry 1 is Failed, entry 2 is every status. Tomorrow's Queued ones are not
+        // Entry 0 is Done and DueDone, entry 1 is Failed, entry 2 is every status, entry 3 is Cancelled. Tomorrow's Queued ones are not
         // in the last week, so they are not in the total.
         var counts = Counts(await _api.GetAsync("/ticker/statuses/get-last-week"));
 
         Assert.Equal(2, counts[0]);
         Assert.Equal(2, counts[1]);
         Assert.Equal(4, counts[2]);
+        Assert.Equal(0, counts[3]);
     }
 
     [Fact]

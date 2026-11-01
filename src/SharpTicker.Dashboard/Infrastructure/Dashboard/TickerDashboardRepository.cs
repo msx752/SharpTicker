@@ -316,13 +316,16 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             // Count per type
             var doneOrDueDoneCount = allStatuses.Count(x => x is TickerStatus.Done or TickerStatus.DueDone);
             var failedCount = allStatuses.Count(x => x == TickerStatus.Failed);
+            var cancelledCount = allStatuses.Count(x => x == TickerStatus.Cancelled);
             var totalCount = allStatuses.Count;
 
+            // Entry 3 was added so the dashboard can name the final jobs of the same week; entries 0 to 2 keep their meaning
             return new List<(int, int)>
             {
                 (0, doneOrDueDoneCount),
                 (1, failedCount),
-                (2, totalCount)
+                (2, totalCount),
+                (3, cancelledCount)
             };
         }
 
