@@ -30,6 +30,8 @@ The dashboard is served by the application at `/ticker/dashboard`. `UseSharpTick
 - **Retry intervals** are entered in seconds, one per retry, and are saved with the ticker.
 - **A refused action** keeps its dialog open with what you typed, and a notification shows the reason, such as an invalid cron expression.
 
+The dashboard uses three words. A **function** is the code you registered. A **ticker** is a scheduled entry that points at a function: a time ticker runs once, a cron ticker repeats. A **job** is one run of a ticker, with its status, and the actions that stop or count runs (cancel, statistics) say job.
+
 ## Authentication
 
 Pick one:

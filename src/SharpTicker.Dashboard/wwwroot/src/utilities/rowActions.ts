@@ -35,7 +35,7 @@ export function timeTickerMenuActions(state: TimeTickerRowState): RowAction[] {
   const deleteReason = state.isInProgress && !state.canBeForceDeleted ? DELETE_WHILE_RUNNING : undefined
 
   return [
-    { key: 'cancel', label: 'Cancel operation', icon: 'mdi-cancel', disabledReason: cancelReason },
+    { key: 'cancel', label: 'Cancel job', icon: 'mdi-cancel', disabledReason: cancelReason },
     {
       key: 'delete',
       label: state.canBeForceDeleted ? 'Force delete' : 'Delete',

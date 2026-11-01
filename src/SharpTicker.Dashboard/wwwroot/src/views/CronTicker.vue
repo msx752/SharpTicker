@@ -984,7 +984,7 @@ const refreshData = async () => {
         <div class="section-header">
           <h2 class="section-title">
             <v-icon class="section-icon" color="primary">mdi-table</v-icon>
-            Cron Ticker Operations
+            Cron Tickers
           </h2>
           <div class="table-controls">
             <!-- Primary Actions Group -->

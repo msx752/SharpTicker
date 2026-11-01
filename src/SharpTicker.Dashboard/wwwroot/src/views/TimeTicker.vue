@@ -832,7 +832,7 @@ const canBeForceDeleted = ref<string[]>([])
         <div class="section-header">
           <h2 class="section-title">
             <v-icon class="section-icon" color="primary">mdi-table</v-icon>
-            Time Ticker Operations
+            Time Tickers
           </h2>
           <div class="table-controls">
             <!-- Primary Actions Group -->

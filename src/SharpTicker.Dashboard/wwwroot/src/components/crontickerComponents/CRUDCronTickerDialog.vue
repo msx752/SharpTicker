@@ -380,7 +380,7 @@ defineExpose({
                       item-value="functionName"
                       :items="functionNamesStore.data"
                       variant="outlined"
-                      label="Functions"
+                      label="Function"
                     ></v-select>
                   </v-col>
                   <v-col cols="6">
