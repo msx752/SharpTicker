@@ -17,6 +17,13 @@ internal class AuthValidateResponse
     public string Message { get; set; }
 }
 
+/// <summary>Body of the 400 answer to a cancel request that found no running job on this node.</summary>
+internal class CancelRefusedResponse
+{
+    public string Reason { get; set; }
+    public string Message { get; set; }
+}
+
 internal class DashboardOptionsResponse
 {
     public int MaxConcurrency { get; set; }

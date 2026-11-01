@@ -431,9 +431,12 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     [Fact]
     public async Task CancelTicker_IsRefused_ForATickerThatIsNotRunning()
     {
-        var (status, _) = await _api.SendAsync(HttpMethod.Post, $"/ticker/cancel?id={DashboardApiFixture.QueuedId}");
+        var (status, body) = await _api.SendAsync(HttpMethod.Post, $"/ticker/cancel?id={DashboardApiFixture.QueuedId}");
 
         Assert.Equal(400, status);
+        Assert.NotNull(body);
+        Assert.Equal("not-running-on-this-node", body.Value.GetProperty("reason").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(body.Value.GetProperty("message").GetString()));
         var queued = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == DashboardApiFixture.QueuedId);
         Assert.Equal(1, queued.GetProperty("status").GetInt32()); // still Queued
     }

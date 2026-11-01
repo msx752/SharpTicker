@@ -737,19 +737,28 @@ public static class DashboardEndpoints
         context.Response.StatusCode = 200;
     }
 
-    private static Task CancelTicker<TTimeTicker, TCronTicker>(HttpContext context)
+    private static async Task CancelTicker<TTimeTicker, TCronTicker>(HttpContext context)
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
         var repository = context.RequestServices.GetRequiredService<ITickerDashboardRepository<TTimeTicker, TCronTicker>>();
+        var dashboardOptions = context.RequestServices.GetRequiredService<DashboardOptionsBuilder>();
         var id = Guid.Parse(context.Request.Query["id"].ToString());
 
         if (repository.CancelTickerById(id))
+        {
             context.Response.StatusCode = 200;
-        else
-            context.Response.StatusCode = 400;
+            return;
+        }
 
-        return Task.CompletedTask;
+        // Only this node's running jobs can be cancelled here. The status code stays 400 as before; the body says why.
+        context.Response.StatusCode = 400;
+        await WriteJson(context, new CancelRefusedResponse
+        {
+            Reason = "not-running-on-this-node",
+            Message = "No job for this ticker is running on the node that answered. It may be running on another node, "
+                + "or the node that started it is gone.",
+        }, dashboardOptions.DashboardJsonOptions);
     }
 
     private static async Task GetTickerRequest<TTimeTicker, TCronTicker>(HttpContext context)
