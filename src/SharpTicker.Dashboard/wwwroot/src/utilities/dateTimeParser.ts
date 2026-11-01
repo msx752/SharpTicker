@@ -172,9 +172,17 @@ export interface ExecutionTexts {
 
 // A job that has not finished has no execution time yet and the server sends the empty date
 // (0001-01-01) for it. Showing "25 years ago" for that is wrong, so all three texts read as blank.
-export function describeExecution(executedAt: string | Date, elapsedTime: number, timeZone?: string): ExecutionTexts {
+// A skipped job never ran: the server stamps the moment it was skipped, but showing that as the time it ran (with
+// a duration of 0 ms) misleads, so it reads as blank too.
+export function describeExecution(
+    executedAt: string | Date,
+    elapsedTime: number,
+    timeZone?: string,
+    status?: string | number,
+): ExecutionTexts {
     const isUnset = typeof executedAt === 'string' ? executedAt.startsWith('0001-') : executedAt.getUTCFullYear() <= 1
-    if (isUnset) return { executedAt: '', executedAgo: '', duration: '' }
+    const wasSkipped = status === 'Skipped' || status === 7
+    if (isUnset || wasSkipped) return { executedAt: '', executedAgo: '', duration: '' }
 
     const iso = typeof executedAt === 'string' ? executedAt : executedAt.toISOString()
     return {
@@ -186,10 +194,10 @@ export function describeExecution(executedAt: string | Date, elapsedTime: number
 
 /** What a row needs to show when and how long it ran: the exact time first, the rest as separate fields. */
 export function applyExecution(
-    item: { executedAt: string; elapsedTime: string | number; executedAgo?: string; durationText?: string },
+    item: { executedAt: string; elapsedTime: string | number; status?: string | number; executedAgo?: string; durationText?: string },
     timeZone?: string,
 ): void {
-    const texts = describeExecution(item.executedAt, item.elapsedTime as number, timeZone)
+    const texts = describeExecution(item.executedAt, item.elapsedTime as number, timeZone, item.status)
     item.executedAt = texts.executedAt
     item.executedAgo = texts.executedAgo
     item.durationText = texts.duration

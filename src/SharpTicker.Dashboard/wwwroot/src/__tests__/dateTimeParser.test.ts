@@ -174,6 +174,16 @@ describe('describeExecution', () => {
         expect(texts.duration).toBe(formatTime(1500, true));
     });
 
+    it.each(['Skipped', 7])('reads as blank for a skipped job (%s): it never ran', (status) => {
+        const stamped = new Date(Date.now() - 60 * 1000).toISOString();
+        expect(describeExecution(stamped, 0, 'UTC', status)).toEqual(blank);
+    });
+
+    it('still shows the time of a job that ran', () => {
+        const stamped = new Date(Date.now() - 60 * 1000).toISOString();
+        expect(describeExecution(stamped, 20, 'UTC', 'Done').executedAt).not.toBe('');
+    });
+
     it('reads a time without an offset as UTC, as the server sends it', () => {
         const texts = describeExecution('2026-11-01T10:00:00.5', 20, 'UTC');
 

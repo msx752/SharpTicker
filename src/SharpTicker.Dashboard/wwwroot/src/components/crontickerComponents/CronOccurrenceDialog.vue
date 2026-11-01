@@ -109,7 +109,7 @@ const addHubListeners = async () => {
       const itemIndex = response.items.findIndex((item: GetCronTickerOccurrenceResponse) => item.id === val.id);
       if (itemIndex !== -1) {
         const currentItem = response.items[itemIndex];
-        const executionTexts = describeExecution(val.executedAt, val.elapsedTime as number, timeZoneStore.effectiveTimeZone);
+        const executionTexts = describeExecution(val.executedAt, val.elapsedTime as number, timeZoneStore.effectiveTimeZone, val.status);
         // Merge update while preserving lockedAt and lockHolder
         response.items[itemIndex] = {
           ...currentItem,
