@@ -46,6 +46,39 @@
   margin-top: 0;
 }
 
+/* Star and fork links on the landing page: plain links, no script, no third party. */
+.support {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.support-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 0.5rem;
+  color: var(--bs-body-color);
+  font-weight: 500;
+  text-decoration: none;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.support-btn:hover,
+.support-btn:focus-visible {
+  border-color: var(--sharpticker-accent);
+  color: var(--sharpticker-accent);
+  background-color: rgba(var(--bs-primary-rgb), 0.08);
+  text-decoration: none;
+}
+
+.support-icon {
+  flex: none;
+}
+
 @media (max-width: 576px) {
   .hero {
     flex-direction: column;
