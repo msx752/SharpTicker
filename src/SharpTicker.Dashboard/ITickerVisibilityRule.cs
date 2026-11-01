@@ -18,7 +18,7 @@ namespace SharpTicker.Dashboard;
 /// on Redis and in memory they run over the loaded tickers. The live notifications (a cron added or updated, a time
 /// ticker updated) are also sent only to the users who may see the ticker; there the predicate is run in memory on the
 /// ticker, so it should give the same answer in memory as in the store (for example, compare text with an explicit
-/// ordinal comparison). The scheduler controls (stop, start, restart) are not tied to a ticker and are not limited by the rule.
+/// ordinal comparison). The scheduler controls (stop, start, restart) are not tied to a ticker and are not limited by the rule; limit them with your own middleware.
 /// </remarks>
 public interface ITickerVisibilityRule
 {

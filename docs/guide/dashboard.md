@@ -82,7 +82,7 @@ A predicate returning `null` allows everything. The rule is built from stored fi
 Notes:
 
 - The predicates run in the database on EF Core and MongoDB, and in memory on Redis and the in-memory store. For live notifications they always run in memory, so write them so that both give the same answer (compare text with an explicit ordinal comparison).
-- The scheduler controls (stop, start, restart), the host status and the node list are not tied to a ticker and are not limited by the rule. Protect them with an authorization policy if only some users may use them.
+- The scheduler controls (stop, start, restart), the host status and the node list are not tied to a ticker and are not limited by the rule, so every signed-in user can stop the scheduler. The authorization policy of `WithHostAuthentication` covers the whole dashboard, not single endpoints. To limit these paths (`/api/ticker-host/...`), add your own check with `PreDashboardMiddleware`.
 - A notification that only carries an id (a ticker was deleted, added or cancelled) goes to every connection.
 
 ## Path and hosting
