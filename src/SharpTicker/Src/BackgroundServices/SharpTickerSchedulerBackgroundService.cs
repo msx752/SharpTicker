@@ -83,14 +83,18 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             catch (OperationCanceledException) when (_schedulerLoopCancellationTokenSource.Token.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
             {
                 // This is a restart request - release resources and continue loop
-                await _internalTickerManager.ReleaseAcquiredResources(_executionContext.Functions, stoppingToken);
+                await TryReleaseAcquiredResourcesAsync(_executionContext.Functions, stoppingToken);
                 // Small delay to allow resources to be released
                 await Task.Delay(100, stoppingToken);
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (Exception ex) when (stoppingToken.IsCancellationRequested)
             {
-                // Application is shutting down - release resources and exit
-                await _internalTickerManager.ReleaseAcquiredResources(_executionContext.Functions, CancellationToken.None);
+                // The application is stopping. What the stop cut off ends in an OperationCanceledException, or in a store call
+                // that fails because its connection was closed under it; either way it is part of a normal stop, not an error.
+                if (ex is not OperationCanceledException)
+                    _logger?.LogDebug(ex, "The scheduler loop was interrupted by the application stopping.");
+
+                await TryReleaseAcquiredResourcesAsync(_executionContext.Functions, CancellationToken.None, stopping: true);
                 break;
             }
             catch (Exception ex)
@@ -143,6 +147,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             var (timeRemaining, functions) =
                 await _internalTickerManager.GetNextTickers(cancellationToken);
 
+            RecordLoopRecovered();
+
             _executionContext.SetFunctions(functions);
 
             TimeSpan sleepDuration;
@@ -188,10 +194,111 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
     private async Task ReleaseAllResourcesAsync(Exception ex)
     {
-        if (ex != null && _executionContext.NotifyCoreAction != null)
-            _executionContext.NotifyCoreAction(ex.ToString(), CoreNotifyActionType.NotifyHostExceptionMessage);
+        var report = RecordLoopFailure(ex);
 
-        await _internalTickerManager.ReleaseAcquiredResources(null, CancellationToken.None);
+        // The notification reaches whatever handlers were attached to the context, so it is guarded for the same reason. Its
+        // failure only affects the dashboard, the scheduler goes on, so it is a warning.
+        try
+        {
+            if (ex != null)
+                _executionContext.NotifyCoreAction?.Invoke(ex.ToString(), CoreNotifyActionType.NotifyHostExceptionMessage);
+        }
+        catch (Exception notifyException)
+        {
+            if (report)
+                _logger?.LogWarning(notifyException, "The scheduler could not report its failure to the dashboard.");
+            else
+                _logger?.LogDebug(notifyException, "The scheduler could not report its failure to the dashboard.");
+        }
+
+        await TryReleaseAcquiredResourcesAsync(null, CancellationToken.None, report: report);
+    }
+
+    // The loop tries again every second while it fails, so an outage of the store would write two errors a second for as long
+    // as it lasts. It is logged by its changes instead: an error when the loop starts failing, a reminder with the attempts and
+    // the time so far once a minute while it goes on, and one line when it recovers, so the log tells how long jobs were not
+    // picked up. The attempts in between are written at Debug. A short outage heals by itself and is an error; one that lasts
+    // longer than CriticalFailureDuration means the store stays out of reach and needs someone, so its reminders are critical.
+    // Only the loop's own thread uses these fields.
+    internal static readonly TimeSpan FailureReminderInterval = TimeSpan.FromMinutes(1);
+    internal static readonly TimeSpan CriticalFailureDuration = TimeSpan.FromMinutes(5);
+    private DateTime? _failingSince;
+    private int _failedAttempts;
+    private DateTime _nextFailureReminder;
+
+    private DateTime Now => _clock?.UtcNow ?? DateTime.UtcNow;
+
+    private static TimeSpan ToWholeSeconds(TimeSpan duration) => TimeSpan.FromSeconds(Math.Round(duration.TotalSeconds));
+
+    /// <summary>Records a failure of the loop and logs it when the failure starts or a reminder is due. Returns whether it logged.</summary>
+    private bool RecordLoopFailure(Exception ex)
+    {
+        var now = Now;
+        _failedAttempts++;
+
+        if (_failingSince == null)
+        {
+            _failingSince = now;
+            _nextFailureReminder = now + FailureReminderInterval;
+            _logger?.LogError(ex, "The scheduler loop failed. No job is picked up until it recovers; it tries again every second.");
+            return true;
+        }
+
+        if (now < _nextFailureReminder)
+        {
+            _logger?.LogDebug(ex, "The scheduler loop failed again, attempt {Attempts}.", _failedAttempts);
+            return false;
+        }
+
+        _nextFailureReminder = now + FailureReminderInterval;
+        var failingFor = now - _failingSince.Value;
+        _logger?.Log(failingFor >= CriticalFailureDuration ? LogLevel.Critical : LogLevel.Error, ex,
+            "The scheduler loop is still failing: {Attempts} attempts in {Duration}. No job is picked up until it recovers.",
+            _failedAttempts, ToWholeSeconds(failingFor));
+        return true;
+    }
+
+    private void RecordLoopRecovered()
+    {
+        if (_failingSince == null)
+            return;
+
+        _logger?.LogInformation("The scheduler loop recovered after {Attempts} failed attempts in {Duration}.",
+            _failedAttempts, ToWholeSeconds(Now - _failingSince.Value));
+        _failingSince = null;
+        _failedAttempts = 0;
+    }
+
+    // Releasing what the loop held talks to the store, so it fails for the same reason a poll fails when the store cannot be
+    // reached. It runs inside the loop's error handling, where an exception would leave ExecuteAsync, and a background
+    // service that throws stops the whole host under the default HostOptions.BackgroundServiceExceptionBehavior (StopHost).
+    // A short database outage then ended the application. A failed release is logged and the loop goes on: the locks it
+    // could not release are this node's own and are acquired again by its next poll.
+    // When the application is stopping, a failed release is a warning: the stop itself goes on normally, and the locks stay
+    // with this node until it acquires them again.
+    // While the loop is failing, a failed release is part of the same outage and is logged only with the loop's own reports.
+    private async Task TryReleaseAcquiredResourcesAsync(InternalFunctionContext[] resources, CancellationToken cancellationToken, bool stopping = false, bool report = true)
+    {
+        try
+        {
+            await _internalTickerManager.ReleaseAcquiredResources(resources, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (stopping)
+        {
+            _logger?.LogWarning(ex, "The scheduler could not release the jobs it had acquired while the application was stopping.");
+        }
+        catch (Exception ex) when (!report)
+        {
+            _logger?.LogDebug(ex, "The scheduler could not release the jobs it had acquired.");
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "The scheduler could not release the jobs it had acquired.");
+        }
     }
 
     public void RestartIfNeeded(DateTime? dateTime)
