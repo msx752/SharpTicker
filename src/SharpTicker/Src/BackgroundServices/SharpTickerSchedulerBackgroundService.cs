@@ -213,7 +213,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Job {FunctionName} ({TickerId}) was claimed but the scheduler refused it, so no worker runs it. " +
-                                  "Its row stays InProgress until this node starts again or a dead node release frees it.",
+                                  "Its row stays InProgress with no worker running it.",
                 function.FunctionName, function.TickerId);
         }
     }
