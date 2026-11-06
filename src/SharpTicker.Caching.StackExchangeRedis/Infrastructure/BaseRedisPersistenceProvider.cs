@@ -561,8 +561,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
                 };
 
                 // The key is derived from the slot, so a node that lost the race finds it taken and skips the slot.
+                // If the winner's index update never landed (failure or lost ack), nothing else would ever find the row.
                 if (!await Serializer.TryCreateAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false))
+                {
+                    await IndexManager.HealOrphanCronOccurrenceIndexesAsync(occurrence.Id,
+                        () => Serializer.GetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(occurrence.Id))).ConfigureAwait(false);
                     continue;
+                }
 
                 await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
                 yield return occurrence;

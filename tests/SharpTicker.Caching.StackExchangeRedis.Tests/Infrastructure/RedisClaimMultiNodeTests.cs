@@ -787,21 +787,27 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var providers = Enumerable.Range(0, nodeCount).Select(i => CreateProvider($"node-{i}")).ToArray();
         var cronId = Guid.NewGuid();
         var yielded = new ConcurrentBag<Guid>();
+        var winner = string.Empty;
         using var start = new ManualResetEventSlim(false);
 
-        async Task Queue(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+        async Task Queue(int index)
         {
             start.Wait();
-            foreach (var row in await Drain(node.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)))
+            foreach (var row in await Drain(providers[index].QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)))
+            {
                 yielded.Add(row.Id);
+                winner = $"node-{index}";
+            }
         }
 
-        var tasks = providers.Select(node => Task.Run(() => Queue(node))).ToArray();
+        var tasks = Enumerable.Range(0, nodeCount).Select(i => Task.Run(() => Queue(i))).ToArray();
         start.Set();
         await Task.WhenAll(tasks);
 
-        Assert.Single(yielded);
-        Assert.Single(await providers[0].GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None));
+        var winnerId = Assert.Single(yielded);
+        var stored = Assert.Single(await providers[0].GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None));
+        Assert.Equal(winnerId, stored.Id);
+        Assert.Equal(winner, stored.LockHolder);
     }
 
     [Fact]
@@ -830,6 +836,104 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
         Assert.Equal(first.Id, again.Id);
         Assert.Equal("node-B", (await ReadOccurrence(nodeB, again.Id)).LockHolder);
+    }
+
+    // Simulates a failure after SET NX: the row key exists, the index batch never ran.
+    private async Task<Guid> QueueOrphanSlotRow(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> holder, Guid cronId)
+    {
+        var id = Assert.Single(await Drain(holder.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        var db = fixture.Database;
+        await db.SetRemoveAsync(RedisKeyBuilder.CronOccurrenceIdsKey, id.ToString());
+        await db.SetRemoveAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString());
+        await db.SortedSetRemoveAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString());
+        return id;
+    }
+
+    [Fact]
+    public async Task OrphanSlotRow_OtherNodeQueues_IsIndexedAndRecoverable()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var nodeC = CreateProvider("node-C");
+        var cronId = Guid.NewGuid();
+        var id = await QueueOrphanSlotRow(nodeA, cronId);
+
+        Assert.Empty(await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        var db = fixture.Database;
+        Assert.True(await db.SetContainsAsync(RedisKeyBuilder.CronOccurrenceIdsKey, id.ToString()));
+        Assert.True(await db.SetContainsAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString()));
+        // Held by node-A, so it is not pending for B yet.
+        Assert.Null(await db.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+
+        await nodeB.ReleaseDeadNodeOccurrenceResources("node-A", CancellationToken.None);
+
+        Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(nodeB, id)).Status);
+        Assert.NotNull(await db.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+
+        var found = await nodeB.GetEarliestAvailableCronOccurrence([cronId], CancellationToken.None);
+        Assert.Equal(id, found.Id);
+        var wins = 0;
+        async Task Claim(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+        {
+            var requeue = Slot(cronId);
+            requeue.Items[0].NextCronOccurrence = new NextCronOccurrence(id, T0);
+            if ((await Drain(node.QueueCronTickerOccurrences(requeue, CancellationToken.None))).Count == 1)
+                Interlocked.Increment(ref wins);
+        }
+
+        await Task.WhenAll(Task.Run(() => Claim(nodeB)), Task.Run(() => Claim(nodeC)));
+        Assert.Equal(1, wins);
+    }
+
+    [Fact]
+    public async Task OrphanSlotRow_HolderRetries_BecomesReachable()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var id = await QueueOrphanSlotRow(nodeA, cronId);
+
+        Assert.Empty(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+        var found = await nodeA.GetEarliestAvailableCronOccurrence([cronId], CancellationToken.None);
+        Assert.Equal(id, found.Id);
+        var requeue = Slot(cronId);
+        requeue.Items[0].NextCronOccurrence = new NextCronOccurrence(found.Id, found.CreatedAt);
+        Assert.Equal(id, Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(requeue, CancellationToken.None))).Id);
+    }
+
+    [Fact]
+    public async Task SlotLoser_DoesNotRemoveHoldersPendingEntry()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+
+        Assert.Empty(await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+        Assert.Equal("node-A", (await ReadOccurrence(nodeA, id)).LockHolder);
+    }
+
+    [Fact]
+    public async Task TerminalSlotRow_IsNotRecreated()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await nodeA.UpdateCronTickerOccurrence(StatusContext(id, TickerStatus.Done), CancellationToken.None);
+        var before = await ReadOccurrence(nodeA, id);
+
+        Assert.Empty(await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        var after = await ReadOccurrence(nodeA, id);
+        Assert.Equal(TickerStatus.Done, after.Status);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+        Assert.Equal(before.LockHolder, after.LockHolder);
+        Assert.Single(await nodeA.GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None));
     }
 
     #endregion
