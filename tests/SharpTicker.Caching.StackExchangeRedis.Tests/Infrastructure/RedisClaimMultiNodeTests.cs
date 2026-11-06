@@ -741,4 +741,96 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
     }
 
     #endregion
+
+    #region CronSlot
+
+    [Fact]
+    public void SlotId_IsStableAcrossNodes()
+    {
+        var cronId = Guid.Parse("11111111-2222-3333-4444-555555555555");
+        var slot = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+        var id = RedisKeyBuilder.SlotId(cronId, slot);
+
+        // Pinned: a change of the hash input layout would split the nodes of a mixed-version cluster.
+        Assert.Equal(Guid.Parse("9c2c48e9-8454-52c5-1b0d-16d82bef0f58"), id);
+        Assert.Equal(id, RedisKeyBuilder.SlotId(cronId, slot));
+        Assert.Equal(id, RedisKeyBuilder.SlotId(cronId, DateTime.SpecifyKind(slot, DateTimeKind.Unspecified)));
+        Assert.Equal(id, RedisKeyBuilder.SlotId(cronId, DateTime.SpecifyKind(slot, DateTimeKind.Local)));
+        Assert.NotEqual(id, RedisKeyBuilder.SlotId(cronId, slot.AddTicks(1)));
+        Assert.NotEqual(id, RedisKeyBuilder.SlotId(Guid.NewGuid(), slot));
+    }
+
+    [Fact]
+    public async Task CronSlot_TwoNodes_OneOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+
+        var byA = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+        var byB = await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None));
+
+        Assert.Empty(byB);
+        Assert.Equal(RedisKeyBuilder.SlotId(cronId, T0), byA.Id);
+        var stored = await nodeA.GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None);
+        var row = Assert.Single(stored);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(TickerStatus.Queued, row.Status);
+        Assert.Equal(1, await fixture.Database.SortedSetLengthAsync(RedisKeyBuilder.CronOccurrencePendingKey));
+    }
+
+    [Fact]
+    public async Task CronSlot_ManyNodesRacing_OneWinner()
+    {
+        const int nodeCount = 8;
+        var providers = Enumerable.Range(0, nodeCount).Select(i => CreateProvider($"node-{i}")).ToArray();
+        var cronId = Guid.NewGuid();
+        var yielded = new ConcurrentBag<Guid>();
+        using var start = new ManualResetEventSlim(false);
+
+        async Task Queue(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+        {
+            start.Wait();
+            foreach (var row in await Drain(node.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)))
+                yielded.Add(row.Id);
+        }
+
+        var tasks = providers.Select(node => Task.Run(() => Queue(node))).ToArray();
+        start.Set();
+        await Task.WhenAll(tasks);
+
+        Assert.Single(yielded);
+        Assert.Single(await providers[0].GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CronSlot_DifferentSlotsOfOneCron_BothCreated()
+    {
+        var node = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var later = (T0.AddMinutes(1), Slot(cronId).Items);
+
+        Assert.Single(await Drain(node.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+        Assert.Single(await Drain(node.QueueCronTickerOccurrences(later, CancellationToken.None)));
+
+        Assert.Equal(2, (await node.GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None)).Length);
+    }
+
+    [Fact]
+    public async Task CronSlot_RowDeleted_SameSlotCanBeCreatedAgain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+        var first = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        await nodeA.RemoveCronTickerOccurrences([first.Id], CancellationToken.None);
+        var again = Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.Equal(first.Id, again.Id);
+        Assert.Equal("node-B", (await ReadOccurrence(nodeB, again.Id)).LockHolder);
+    }
+
+    #endregion
 }

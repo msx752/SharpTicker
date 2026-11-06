@@ -101,6 +101,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
             .Returns(callInfo =>
             {
                 var key = (string)callInfo.ArgAt<RedisKey>(0);
+                if (callInfo.ArgAt<When>(4) == When.NotExists && _store.ContainsKey(key)) return false;
                 var value = (string)callInfo.ArgAt<RedisValue>(1);
                 _store[key] = value;
                 return true;

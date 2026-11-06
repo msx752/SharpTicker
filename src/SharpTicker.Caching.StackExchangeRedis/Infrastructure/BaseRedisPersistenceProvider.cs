@@ -542,7 +542,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             {
                 var occurrence = new CronTickerOccurrenceEntity<TCronTicker>
                 {
-                    Id = Guid.NewGuid(),
+                    Id = SlotId(item.Id, executionTime),
                     Status = TickerStatus.Queued,
                     LockHolder = LockHolder,
                     ExecutionTime = executionTime,
@@ -560,7 +560,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
                     }
                 };
 
-                await Serializer.SetAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false);
+                // The key is derived from the slot, so a node that lost the race finds it taken and skips the slot.
+                if (!await Serializer.TryCreateAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false))
+                    continue;
+
                 await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
                 yield return occurrence;
             }

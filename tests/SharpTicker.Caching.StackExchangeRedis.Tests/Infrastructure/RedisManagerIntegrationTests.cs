@@ -138,7 +138,9 @@ public class RedisManagerIntegrationTests : IAsyncLifetime, IDisposable
         _db.StringSetAsync(Arg.Any<RedisKey>(), Arg.Any<RedisValue>(), Arg.Any<TimeSpan?>(), Arg.Any<bool>(), Arg.Any<When>(), Arg.Any<CommandFlags>())
             .Returns(ci =>
             {
-                _store[(string)ci.ArgAt<RedisKey>(0)] = (string)ci.ArgAt<RedisValue>(1);
+                var key = (string)ci.ArgAt<RedisKey>(0);
+                if (ci.ArgAt<When>(4) == When.NotExists && _store.ContainsKey(key)) return false;
+                _store[key] = (string)ci.ArgAt<RedisValue>(1);
                 return true;
             });
 

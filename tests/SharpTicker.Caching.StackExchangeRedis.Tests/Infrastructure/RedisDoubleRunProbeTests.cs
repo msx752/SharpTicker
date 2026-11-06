@@ -110,34 +110,6 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal(TickerStatus.InProgress, (await Occurrence(node, occurrenceId)).Status);
     }
 
-    // R4: Redis has no unique key per (cron, slot). Node B does not see node A's Queued row as acquirable, so it
-    // believes the slot is empty and writes a second occurrence for the same slot; both run when due.
-    [Fact]
-    public async Task Probe_TwoNodesCreateTwoOccurrencesForOneSlot()
-    {
-        var clock = new FakeTickerClock(T0);
-        var nodeA = fixture.CreateProvider("node-A", clock);
-        var nodeB = fixture.CreateProvider("node-B", clock);
-        var cronId = Guid.NewGuid();
-        Guid[] cronIds = [cronId];
-
-        // Node A finds no stored occurrence for the slot and inserts one.
-        Assert.Null(await nodeA.GetEarliestAvailableCronOccurrence(cronIds, CancellationToken.None));
-        var byA = await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None));
-        Assert.Single(byA);
-
-        // Node B looks for an occurrence it can take, finds none (A's row is Queued by A), so it inserts too.
-        Assert.Null(await nodeB.GetEarliestAvailableCronOccurrence(cronIds, CancellationToken.None));
-        var byB = await Drain(nodeB.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None));
-        Assert.Single(byB);
-
-        var stored = await nodeA.GetAllCronTickerOccurrences(x => x.CronTickerId == cronId, CancellationToken.None);
-        Assert.Equal(2, stored.Length);
-        Assert.All(stored, row => Assert.Equal(T0, row.ExecutionTime));
-        Assert.NotEqual(byA[0].Id, byB[0].Id);
-        Assert.Equal(["node-A", "node-B"], stored.Select(x => x.LockHolder).Order().ToArray());
-    }
-
     // Side note from the findings: QueueTimeTickers compares UpdatedAt.ToString("O") (always seven fractional digits)
     // with the JSON text System.Text.Json stored (trailing zeros trimmed). A row whose UpdatedAt ends in a zero tick
     // never matches, so the main loop cannot queue it and only the fallback picks it up later.
