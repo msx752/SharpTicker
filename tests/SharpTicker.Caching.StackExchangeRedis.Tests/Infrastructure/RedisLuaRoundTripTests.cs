@@ -72,6 +72,23 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Contains("\"RetryIntervals\":[]", json);
     }
 
+    // A row stored with Children null (written by another client or an older version) made MapForQueue throw, and the
+    // poll that reads the earliest window failed for every row in it, every second.
+    [Fact]
+    public async Task GetEarliestTimeTickers_RowWithNullChildren_DoesNotStopThePoll()
+    {
+        var node = fixture.CreateProvider("node-A", new FakeTickerClock(T0));
+        var broken = NewTimeTicker("null-children");
+        broken.Children = null!;
+        var healthy = NewTimeTicker("healthy");
+        await node.AddTimeTickers([broken, healthy], CancellationToken.None);
+
+        var due = await node.GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal(2, due.Length);
+        Assert.Empty(due.Single(x => x.Id == broken.Id).Children);
+    }
+
     // Runs one script on a row that is stored in a form every script accepts, then reads the result back.
     [Theory]
     [MemberData(nameof(Scripts))]

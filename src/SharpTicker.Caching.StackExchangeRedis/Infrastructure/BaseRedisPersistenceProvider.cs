@@ -231,7 +231,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             Status = ticker.Status,
             LockHolder = ticker.LockHolder,
             LockedAt = ticker.LockedAt,
-            Children = ticker.Children.Select(ch => new TimeTickerEntity
+            Children = (ticker.Children ?? []).Select(ch => new TimeTickerEntity
             {
                 Id = ch.Id,
                 Function = ch.Function,
@@ -239,7 +239,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
                 RetryIntervals = ch.RetryIntervals,
                 RunCondition = ch.RunCondition,
                 ParentId = ch.ParentId,
-                Children = ch.Children.Select(gch => new TimeTickerEntity
+                Children = (ch.Children ?? []).Select(gch => new TimeTickerEntity
                 {
                     Id = gch.Id,
                     Function = gch.Function,
