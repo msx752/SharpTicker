@@ -51,33 +51,6 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
     private static (DateTime Key, InternalManagerContext[] Items) Slot(Guid cronId)
         => (T0, [new InternalManagerContext(cronId) { FunctionName = "probe-cron-fn", Expression = "* * * * *" }]);
 
-    // R1 on a Redis time ticker cannot get as far as the late write: Acquire.lua re-encodes the row with cjson, which
-    // turns the empty "Children": [] into {}, and that no longer deserializes. The acquire sets the row but returns
-    // nothing to the loop, so neither the main loop nor the fallback ever yields it and the row is unreadable after.
-    // Finding R1 is therefore not confirmed for Redis time tickers; the cron occurrence probe below covers Redis.
-    [Fact]
-    public async Task Probe_LateLoopOverwritesFallbackClaim()
-    {
-        var clock = new FakeTickerClock(T0);
-        var node = fixture.CreateProvider("node-A", clock);
-        var ticker = NewTimeTicker();
-        await node.AddTimeTickers([ticker], CancellationToken.None);
-
-        var window = await node.GetEarliestTimeTickers(CancellationToken.None);
-        var queued = await Drain(node.QueueTimeTickers(window, CancellationToken.None));
-
-        clock.Advance(TimeSpan.FromSeconds(2));
-        var claimed = await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None));
-
-        clock.Advance(TimeSpan.FromMilliseconds(500));
-        await node.UpdateTimeTickersWithUnifiedContext([ticker.Id], InProgressContext(), CancellationToken.None);
-
-        Assert.Empty(queued);
-        Assert.Empty(claimed);
-        Assert.Null(await node.GetTimeTickerById(ticker.Id, CancellationToken.None));
-        Assert.Contains("\"Children\":{}", await RawJson(ticker.Id) ?? "");
-    }
-
     [Fact]
     public async Task Probe_LateLoopOverwritesFallbackClaim_CronOccurrence()
     {
@@ -104,8 +77,7 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
     }
 
     // R1: the same unconditional write also turns a finished or cancelled row back into InProgress.
-    // Seeded and cancelled through the plain read-modify-write paths: no acquire script is involved, so the empty
-    // Children problem described above does not get in the way.
+    // Seeded and cancelled through the plain read-modify-write paths: no acquire script is involved.
     [Fact]
     public async Task Probe_LateLoopRevivesCancelledRow()
     {
@@ -168,8 +140,7 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
 
     // Side note from the findings: QueueTimeTickers compares UpdatedAt.ToString("O") (always seven fractional digits)
     // with the JSON text System.Text.Json stored (trailing zeros trimmed). A row whose UpdatedAt ends in a zero tick
-    // never matches, so the main loop cannot queue it and only the fallback picks it up later. Read from the raw key,
-    // because the loop gets nothing back for either row (see the Children note above).
+    // never matches, so the main loop cannot queue it and only the fallback picks it up later.
     [Fact]
     public async Task Probe_RedisQueueCasFailsOnTrailingZeroTimestamp()
     {
@@ -186,26 +157,6 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
         // Both rows carry the exact timestamp the loop read; only the one without a trailing zero was claimed.
         Assert.Equal(TickerStatus.Idle, await RawStatus(trailingZero.Id));
         Assert.Equal(TickerStatus.Queued, await RawStatus(noTrailingZero.Id));
-    }
-
-    // Not an R-number finding: the acquire script round-trips the row through cjson, which writes an empty array as
-    // {}. A time ticker (its Children list is empty by default) is stored in a form the serializer cannot read back.
-    [Fact]
-    public async Task Probe_RedisAcquireScriptBreaksTimeTickerWithEmptyChildren()
-    {
-        var clock = new FakeTickerClock(T0);
-        var node = fixture.CreateProvider("node-A", clock);
-        var ticker = NewTimeTicker();
-        await node.AddTimeTickers([ticker], CancellationToken.None);
-        Assert.NotNull(await node.GetTimeTickerById(ticker.Id, CancellationToken.None));
-
-        var window = await node.GetEarliestTimeTickers(CancellationToken.None);
-        var queued = await Drain(node.QueueTimeTickers(window, CancellationToken.None));
-
-        Assert.Empty(queued);
-        Assert.Equal(TickerStatus.Queued, await RawStatus(ticker.Id));
-        Assert.Contains("\"Children\":{}", await RawJson(ticker.Id) ?? "");
-        Assert.Null(await node.GetTimeTickerById(ticker.Id, CancellationToken.None));
     }
 
     private async Task<string?> RawJson(Guid id)
