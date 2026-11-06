@@ -250,6 +250,8 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
 
     private static int Rvi(RedisValue v) => int.Parse(v.ToString());
 
+    private static readonly string MarkInProgressScriptText = LuaScriptLoader.Load("MarkInProgress");
+
     private void SetupScriptOperations()
     {
         // ScriptEvaluateAsync handles Acquire/Release/RecoverDeadNode/MarkInProgress Lua scripts.
@@ -293,8 +295,8 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
                     return RedisResult.Create((RedisValue)updated);
                 }
 
-                // Same ARGV count as Release, told apart by the script text.
-                if (argv.Length == 4 && script.Contains("Fenced claim"))
+                // Same ARGV count as Release, told apart by the loaded script text.
+                if (script == MarkInProgressScriptText)
                 {
                     // MarkInProgress: ARGV[0]=lockHolder, ARGV[1]=now, ARGV[2]=statusQueued, ARGV[3]=statusInProgress
                     if (status != Rvi(argv[2]) || lockHolder != (string)argv[0])
@@ -699,6 +701,37 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
 
         var results = await _provider.AcquireImmediateTimeTickersAsync([ticker.Id], CancellationToken.None);
         Assert.Empty(results);
+    }
+
+    // The script has committed the claim when the index update runs; a failing index must not report a failed claim.
+    [Fact]
+    public async Task TryMarkTimeTickerInProgress_IndexUpdateFails_StillReturnsTrue()
+    {
+        var ticker = CreateTimeTicker(status: TickerStatus.Queued, lockHolder: NodeId, lockedAt: _fixedNow);
+        SeedTimeTicker(ticker);
+        _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
+
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkTimeTickerInProgress(ticker.Id);
+
+        Assert.True(marked);
+        Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:tt:{ticker.Id}"]).RootElement.GetProperty("Status").GetInt32());
+    }
+
+    [Fact]
+    public async Task TryMarkCronOccurrenceInProgress_IndexUpdateFails_StillReturnsTrue()
+    {
+        var occ = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = Guid.NewGuid(), Status = TickerStatus.Queued, LockHolder = NodeId,
+            LockedAt = _fixedNow, ExecutionTime = _fixedNow, CreatedAt = _fixedNow, UpdatedAt = _fixedNow
+        };
+        SeedCronOccurrence(occ);
+        _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
+
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkCronOccurrenceInProgress(occ.Id);
+
+        Assert.True(marked);
+        Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:co:{occ.Id}"]).RootElement.GetProperty("Status").GetInt32());
     }
 
     // =========================================================================

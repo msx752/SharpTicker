@@ -108,6 +108,31 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Empty(read.RetryIntervals!);
     }
 
+    // The block is copied into every script that re-encodes a row (EVAL cannot share code), and a script that misses
+    // it silently loses jobs. Every embedded script must carry the same block, and any new script must carry it too.
+    [Fact]
+    public void LuaScripts_ShareTheSameEmptyCollectionBlock()
+    {
+        var assembly = typeof(SharpTicker.Caching.StackExchangeRedis.Infrastructure.TickerRedisPersistenceProvider<,>).Assembly;
+        var names = assembly.GetManifestResourceNames().Where(x => x.EndsWith(".lua", StringComparison.Ordinal)).ToArray();
+        Assert.True(names.Length >= 4, "expected Acquire, Release, RecoverDeadNode and MarkInProgress");
+
+        var blocks = names.ToDictionary(name => name, name =>
+        {
+            using var reader = new StreamReader(assembly.GetManifestResourceStream(name)!);
+            var text = reader.ReadToEnd().Replace("\r\n", "\n");
+            var start = text.IndexOf("-- cjson writes an empty array", StringComparison.Ordinal);
+            var endMarker = "'\"RetryIntervals\":[]'))";
+            var end = text.IndexOf(endMarker, StringComparison.Ordinal);
+            return start >= 0 && end > start ? text[start..(end + endMarker.Length)] : "<block missing>";
+        });
+
+        Assert.DoesNotContain("<block missing>", blocks.Values);
+        Assert.Single(blocks.Values.Distinct());
+        Assert.Contains("\"Children\":{}", blocks.Values.First());
+        Assert.Contains("\"RetryIntervals\":{}", blocks.Values.First());
+    }
+
     [Fact]
     public async Task LuaScripts_KeepEmptyChildrenAsArray()
     {

@@ -18,7 +18,7 @@ namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 /// holder owns, so the late-loop cases that need a claim use the fallback of the same node.
 /// </summary>
 [Collection(RedisTestFixture.CollectionName)]
-public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
+public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractions.ITestOutputHelper output) : IAsyncLifetime
 {
     private static readonly DateTime T0 = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
 
@@ -547,12 +547,14 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
 
     #region Queue cron occurrence does not overwrite a claim (R5)
 
-    /// <summary>Forwards every call to the real database and runs a callback once after the next script call returns.</summary>
+    /// <summary>Forwards every call to the real database and runs a callback once after the next call of one method returns.</summary>
     public class HookedDatabase : DispatchProxy
     {
         public IDatabase Inner { get; set; } = null!;
 
-        public Func<Task>? AfterNextScript { get; set; }
+        public string HookOn { get; set; } = nameof(IDatabase.ScriptEvaluateAsync);
+
+        public Func<Task>? AfterNextCall { get; set; }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
@@ -566,21 +568,94 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
                 throw e.InnerException;
             }
 
-            if (targetMethod.Name == nameof(IDatabase.ScriptEvaluateAsync) && result is Task<RedisResult> script && AfterNextScript is not null)
-                return Run(script);
+            if (targetMethod.Name == HookOn && AfterNextCall is not null && result is Task task && task.GetType().IsGenericType)
+            {
+                return typeof(HookedDatabase).GetMethod(nameof(Run), BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .MakeGenericMethod(task.GetType().GetGenericArguments()[0])
+                    .Invoke(this, [task]);
+            }
             return result;
         }
 
-        private async Task<RedisResult> Run(Task<RedisResult> script)
+        private async Task<T> Run<T>(Task<T> call)
         {
-            var result = await script.ConfigureAwait(false);
-            var hook = AfterNextScript;
-            AfterNextScript = null;
+            var result = await call.ConfigureAwait(false);
+            var hook = AfterNextCall;
+            AfterNextCall = null;
             if (hook is not null)
                 await hook().ConfigureAwait(false);
             return result;
         }
     }
+
+    // UpdateCronTickerOccurrence / UpdateTimeTicker with a context that applies nothing (the manager sends only
+    // ExecutionTime when a cron is edited) used to read the row and write it back. A claim made between the read and
+    // the write was replaced by the older Queued copy. Now nothing is read or written. The claim is made right after
+    // the read when there is one, otherwise after the call; either way the stored JSON must equal the claimed row.
+    [Fact]
+    public async Task UpdateWithoutApplicableProps_DoesNotWriteTheRow_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var hooked = DispatchProxy.Create<IDatabase, HookedDatabase>();
+        var hook = (HookedDatabase)hooked;
+        hook.Inner = fixture.Database;
+        hook.HookOn = nameof(IDatabase.StringGetAsync);
+        var loop = fixture.CreateProvider("node-A", _clock, hooked);
+        string? claimedJson = null;
+        hook.AfterNextCall = async () =>
+        {
+            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+            claimedJson = await RawOccurrence(id);
+        };
+
+        await loop.UpdateCronTickerOccurrence(
+            new InternalFunctionContext { TickerId = id }.SetProperty(x => x.ExecutionTime, T0.AddMinutes(5)), CancellationToken.None);
+        if (claimedJson is null)
+        {
+            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+            claimedJson = await RawOccurrence(id);
+        }
+
+        Assert.Equal(claimedJson, await RawOccurrence(id));
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(nodeA, id)).Status);
+        Assert.Null(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+    }
+
+    [Fact]
+    public async Task UpdateWithoutApplicableProps_DoesNotWriteTheRow_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var hooked = DispatchProxy.Create<IDatabase, HookedDatabase>();
+        var hook = (HookedDatabase)hooked;
+        hook.Inner = fixture.Database;
+        hook.HookOn = nameof(IDatabase.StringGetAsync);
+        var loop = fixture.CreateProvider("node-A", _clock, hooked);
+        string? claimedJson = null;
+        hook.AfterNextCall = async () =>
+        {
+            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+            claimedJson = await RawTimeTickerJson(id);
+        };
+
+        await loop.UpdateTimeTicker(
+            new InternalFunctionContext { TickerId = id }.SetProperty(x => x.ExecutionTime, T0.AddMinutes(5)), CancellationToken.None);
+        if (claimedJson is null)
+        {
+            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+            claimedJson = await RawTimeTickerJson(id);
+        }
+
+        Assert.Equal(claimedJson, await RawTimeTickerJson(id));
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(nodeA, id)).Status);
+    }
+
+    private async Task<string> RawOccurrence(Guid id)
+        => (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.CronOccurrenceKey(id)))!;
+
+    private async Task<string> RawTimeTickerJson(Guid id)
+        => (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.TimeTickerKey(id)))!;
 
     // The main loop re-queues a stored occurrence. Between its acquire script and the end of the call this node's
     // fallback claims the same row; the loop must not write its older copy back over that claim.
@@ -595,7 +670,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
         ((HookedDatabase)hooked).Inner = fixture.Database;
         var loop = fixture.CreateProvider("node-A", _clock, hooked);
         var claimed = new List<CronTickerOccurrenceEntity<CronTickerEntity>>();
-        ((HookedDatabase)hooked).AfterNextScript = async () =>
+        ((HookedDatabase)hooked).AfterNextCall = async () =>
             claimed.AddRange(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)));
         var requeue = Slot(cronId);
         requeue.Items[0].NextCronOccurrence = new NextCronOccurrence(occurrenceId, T0);
@@ -627,16 +702,22 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
         var rows = Enumerable.Range(0, rowCount)
             .Select(i => NewTimeTicker(TickerStatus.Queued, lockHolder: $"node-{i % nodeCount}", executionTime: T0.AddSeconds(-20)))
             .ToArray();
-        await providers[0].AddTimeTickers(rows, CancellationToken.None);
+        // Each row goes in through its holder, so the pending index lists it for that node's fallback too.
+        for (var i = 0; i < rowCount; i++)
+            await providers[i % nodeCount].AddTimeTickers([rows[i]], CancellationToken.None);
         var ids = rows.Select(x => x.Id).ToArray();
         var winners = new ConcurrentBag<Guid>();
+        var fallbackWins = 0;
         using var start = new ManualResetEventSlim(false);
 
         async Task Fallback(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
         {
             start.Wait();
             await foreach (var row in node.QueueTimedOutTimeTickers(CancellationToken.None))
+            {
                 winners.Add(row.Id);
+                Interlocked.Increment(ref fallbackWins);
+            }
         }
 
         async Task TryMark(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
@@ -651,6 +732,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture) : IAsyncLifetime
         start.Set();
         await Task.WhenAll(tasks);
 
+        output.WriteLine($"fallback wins: {fallbackWins} of {rowCount}");
         var perRow = winners.GroupBy(x => x).ToDictionary(g => g.Key, g => g.Count());
         Assert.Equal(rowCount, perRow.Count);
         Assert.All(perRow, pair => Assert.Equal(1, pair.Value));

@@ -23,6 +23,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
     protected readonly string LockHolder;
     protected readonly RedisSerializer Serializer;
     protected readonly RedisIndexManager<TTimeTicker, TCronTicker> IndexManager;
+    private readonly ILogger _logger;
 
     // Lua status constants matching TickerStatus enum values
     private static readonly RedisValue LuaStatusIdle = (int)TickerStatus.Idle;
@@ -56,7 +57,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         if (redisOptions?.JsonSerializerContext != null)
             jsonOptions.TypeInfoResolverChain.Insert(0, redisOptions.JsonSerializerContext);
 
-        Serializer = new RedisSerializer(db, jsonOptions, logger ?? throw new ArgumentNullException(nameof(logger)));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        Serializer = new RedisSerializer(db, jsonOptions, _logger);
         IndexManager = new RedisIndexManager<TTimeTicker, TCronTicker>(db, LockHolder);
     }
 
@@ -99,6 +101,20 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
         if (result.IsNull) return null;
         return Serializer.DeserializeOrNull<T>((string)result);
+    }
+
+    // The script has committed the claim, so an index failure must not turn into a failed claim: the caller would not
+    // run a row that is already InProgress. A stale pending entry is harmless, Acquire.lua rejects it.
+    private async Task TryUpdateIndexAfterClaim(Guid id, Func<Task> updateIndex)
+    {
+        try
+        {
+            await updateIndex().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Row {Id} was claimed InProgress but its pending index entry could not be updated.", id);
+        }
     }
 
     // Fenced Queued -> InProgress claim. Claimed is true when the script moved the row; Row can still be null if the
@@ -159,6 +175,20 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             releaseLock();
 
         setUpdatedAt(Clock.UtcNow);
+    }
+
+    // Mirrors what ApplyFunctionContext applies. A context with none of these (for example one that only carries
+    // ExecutionTime) would still rewrite the whole row to touch UpdatedAt, and that read-modify-write can put back
+    // a Queued copy over a claim made in between.
+    private static bool HasApplicableProps(InternalFunctionContext context)
+    {
+        var props = context.GetPropsToUpdate();
+        return props.Contains(nameof(InternalFunctionContext.Status)) ||
+               props.Contains(nameof(InternalFunctionContext.ExecutedAt)) ||
+               (props.Contains(nameof(InternalFunctionContext.ExceptionDetails)) && context.Status != TickerStatus.Skipped) ||
+               props.Contains(nameof(InternalFunctionContext.ElapsedTime)) ||
+               props.Contains(nameof(InternalFunctionContext.RetryCount)) ||
+               props.Contains(nameof(InternalFunctionContext.ReleaseLock));
     }
 
     protected void ApplyFunctionContextToTicker(TTimeTicker ticker, InternalFunctionContext context)
@@ -294,7 +324,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         if (!claimed) return false;
 
         if (row != null)
-            await IndexManager.AddTimeTickerIndexesAsync(row).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(id, () => IndexManager.AddTimeTickerIndexesAsync(row)).ConfigureAwait(false);
         return true;
     }
 
@@ -323,6 +353,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
     public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContexts, CancellationToken cancellationToken = default)
     {
+        if (!HasApplicableProps(functionContexts)) return 0;
+
         var ticker = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(functionContexts.TickerId)).ConfigureAwait(false);
         if (ticker == null) return 0;
 
@@ -589,12 +621,14 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         if (!claimed) return false;
 
         if (row != null)
-            await IndexManager.AddCronOccurrenceIndexesAsync(row).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(id, () => IndexManager.AddCronOccurrenceIndexesAsync(row)).ConfigureAwait(false);
         return true;
     }
 
     public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
     {
+        if (!HasApplicableProps(functionContext)) return;
+
         var occurrence = await Serializer.GetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(functionContext.TickerId)).ConfigureAwait(false);
         if (occurrence == null) return;
 
