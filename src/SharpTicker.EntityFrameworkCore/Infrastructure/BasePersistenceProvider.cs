@@ -254,26 +254,36 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
         var now = _clock.UtcNow;
-        var idList = ids.ToList();
+        var set = dbContext.Set<TTimeTicker>();
+        var won = new List<Guid>(ids.Length);
 
-        // Acquire and mark InProgress in a single update
-        var affected = await dbContext.Set<TTimeTicker>()
-            .Where(x => idList.Contains(x.Id))
-            .WhereCanAcquire(_lockHolder)
-            .ExecuteUpdateAsync(setter => setter
-                .SetProperty(x => x.LockHolder, _lockHolder)
-                .SetProperty(x => x.LockedAt, now)
-                .SetProperty(x => x.Status, TickerStatus.InProgress)
-                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-            .ConfigureAwait(false);
+        // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
+        // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+        foreach (var id in ids.Distinct())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
 
-        if (affected == 0)
+            var affected = await set
+                .Where(x => x.Id == id)
+                .WhereCanAcquire(_lockHolder)
+                .ExecuteUpdateAsync(setter => setter
+                    .SetProperty(x => x.LockHolder, _lockHolder)
+                    .SetProperty(x => x.LockedAt, now)
+                    .SetProperty(x => x.Status, TickerStatus.InProgress)
+                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (affected > 0)
+                won.Add(id);
+        }
+
+        if (won.Count == 0)
             return [];
 
         // Return the acquired tickers for immediate execution, with children
-        return await dbContext.Set<TTimeTicker>()
+        return await set
             .AsNoTracking()
-            .Where(x => idList.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
+            .Where(x => won.Contains(x.Id))
             .Include(x => x.Children.Where(y => y.ExecutionTime == null))
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
             .ToArrayAsync(cancellationToken)

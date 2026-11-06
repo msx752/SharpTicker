@@ -236,25 +236,30 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
 
-            var filter = fb.And(
-                fb.In(x => x.Id, ids),
-                MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
-
             var update = Builders<TTimeTicker>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
                 .Set(x => x.UpdatedAt, now);
 
-            var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (result.ModifiedCount == 0) return Array.Empty<TimeTickerEntity>();
+            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
+            // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+            var won = new List<Guid>(ids.Length);
+            foreach (var id in ids.Distinct())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            var acquiredFilter = fb.And(
-                fb.In(x => x.Id, ids),
-                fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress));
+                var result = await coll.UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
+                    update,
+                    cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
+                if (result.ModifiedCount > 0) won.Add(id);
+            }
+
+            if (won.Count == 0) return Array.Empty<TimeTickerEntity>();
+
+            var rows = await coll.Find(fb.In(x => x.Id, won)).ToListAsync(cancellationToken).ConfigureAwait(false);
             var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
         }

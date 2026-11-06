@@ -296,6 +296,71 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     #endregion
 
+    #region Immediate acquire
+
+    // R6: a row this node's own fallback took earlier, or one another node holds, is not won by the call and must not
+    // come back, or the row is handed to a worker twice.
+    [Fact]
+    public async Task AcquireImmediate_Batch_ReturnsOnlyRowsThisCallAcquired()
+    {
+        var node = CreateProvider("node-A");
+        var takenByFallback = await SeedTimeTicker(executionTime: T0.AddSeconds(-5));
+        var heldByOther = await SeedTimeTicker(TickerStatus.Queued, lockHolder: "node-B");
+        var fresh = await SeedTimeTicker(executionTime: T0.AddHours(1));
+        var freshToo = await SeedTimeTicker(executionTime: T0.AddHours(1));
+        Assert.Equal(takenByFallback, Assert.Single(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None))).Id);
+        var fallbackRow = await ReadTimeTicker(takenByFallback);
+        var otherRow = await ReadTimeTicker(heldByOther);
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync([takenByFallback, heldByOther, fresh, freshToo], CancellationToken.None);
+
+        Assert.Equal(new[] { fresh, freshToo }.Order(), acquired.Select(x => x.Id).Order());
+        Assert.Equal(fallbackRow.UpdatedAt, (await ReadTimeTicker(takenByFallback)).UpdatedAt);
+        Assert.Equal(otherRow.UpdatedAt, (await ReadTimeTicker(heldByOther)).UpdatedAt);
+        Assert.Equal("node-B", (await ReadTimeTicker(heldByOther)).LockHolder);
+        foreach (var id in new[] { fresh, freshToo })
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.InProgress, row.Status);
+            Assert.Equal("node-A", row.LockHolder);
+        }
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_NothingWon_ReturnsEmpty()
+    {
+        var node = CreateProvider("node-A");
+        var heldByOther = await SeedTimeTicker(TickerStatus.Queued, lockHolder: "node-B");
+
+        Assert.Empty(await node.AcquireImmediateTimeTickersAsync([heldByOther, Guid.NewGuid()], CancellationToken.None));
+        Assert.Equal(TickerStatus.Queued, (await ReadTimeTicker(heldByOther)).Status);
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_SingleId_ReturnsTheRow()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker();
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None);
+
+        Assert.Equal(id, Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_DuplicateIds_ReturnsTheRowOnce()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker();
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync([id, id], CancellationToken.None);
+
+        Assert.Equal(id, Assert.Single(acquired).Id);
+    }
+
+    #endregion
+
     #region Late loop, clock skew, shared identifier
 
     // R1: the loop that queued a row wakes late; the fallback (this node's own or another's) has already claimed it.

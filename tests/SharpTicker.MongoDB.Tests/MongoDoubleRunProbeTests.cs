@@ -192,24 +192,4 @@ public class MongoDoubleRunProbeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(occurrenceId)).Status);
     }
-
-    // R6: a batch "run now" acquire returns every row of the batch that is InProgress for this node, including a row
-    // this node's fallback took earlier, so that row is handed to a worker a second time.
-    [Fact]
-    public async Task Probe_ImmediateBatchReturnsRowTheFallbackTook()
-    {
-        var clock = new FakeClock(T0);
-        var node = CreateProvider("node-A", clock);
-        var takenByFallback = await SeedTimeTicker(executionTime: T0.AddSeconds(-5));
-        var fresh = await SeedTimeTicker(executionTime: T0.AddHours(1));
-
-        var fallback = await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None));
-        Assert.Equal(takenByFallback, Assert.Single(fallback).Id);
-
-        var acquired = await node.AcquireImmediateTimeTickersAsync([takenByFallback, fresh], CancellationToken.None);
-
-        // Only the fresh row was acquired by this call, yet both come back.
-        Assert.Contains(acquired, row => row.Id == fresh);
-        Assert.Contains(acquired, row => row.Id == takenByFallback);
-    }
 }
