@@ -476,8 +476,14 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         manager.BeforeClaimNumber = 3;
         manager.BeforeClaimWithToken = async ct =>
         {
+            var loopSource = (SafeCancellationTokenSource)typeof(SharpTickerSchedulerBackgroundService)
+                .GetField("_schedulerLoopCancellationTokenSource", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service)!;
             service.Restart();
-            await Task.Delay(300, ct);
+            // Wait until the restart really cancelled the loop's token, not for a fixed time: a starved debounce timer
+            // would otherwise let a claim bound to the loop token pass.
+            Assert.True(await WaitUntilAsync(() => loopSource.IsCancellationRequested), "the restart never cancelled the loop token");
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
         };
         context.SetFunctions(batch);
 
