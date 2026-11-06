@@ -26,4 +26,15 @@ public static class TickerQueryExtensions
                 ((e.Status == TickerStatus.Idle || e.Status == TickerStatus.Queued) && e.LockedAt == null)
             );
     }
+
+    // The fenced claim: the row must still be Queued and held by this node. Internal on purpose, no public surface.
+    internal static IQueryable<TTimeTicker> WhereQueuedBy<TTimeTicker>(this IQueryable<TTimeTicker> q, string lockHolder) where TTimeTicker : TimeTickerEntity<TTimeTicker>
+    {
+        return q.Where(e => e.Status == TickerStatus.Queued && e.LockHolder == lockHolder);
+    }
+
+    internal static IQueryable<CronTickerOccurrenceEntity<TCronTicker>> WhereQueuedBy<TCronTicker>(this IQueryable<CronTickerOccurrenceEntity<TCronTicker>> q, string lockHolder) where TCronTicker : CronTickerEntity
+    {
+        return q.Where(e => e.Status == TickerStatus.Queued && e.LockHolder == lockHolder);
+    }
 }

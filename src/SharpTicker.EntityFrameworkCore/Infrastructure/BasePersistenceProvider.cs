@@ -56,6 +56,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             var updatedTicker = await context
                 .Where(x => x.Id == timeTicker.Id)
                 .Where(x => x.UpdatedAt == timeTicker.UpdatedAt)
+                .WhereCanAcquire(_lockHolder)
                 .ExecuteUpdateAsync(prop => prop
                     .SetProperty(x => x.LockHolder, _lockHolder)
                     .SetProperty(x => x.LockedAt, now)
@@ -97,6 +98,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
             var affected = await context
                 .Where(x => x.Id == timeTicker.Id && x.UpdatedAt <= timeTicker.UpdatedAt)
+                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
                 .ExecuteUpdateAsync(setter => setter
                     .SetProperty(x => x.LockHolder, _lockHolder)
                     .SetProperty(x => x.LockedAt, now)
@@ -130,6 +132,23 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .SetProperty(x => x.UpdatedAt, _ => now), cancellationToken).ConfigureAwait(false);;
     }
         
+    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
+        var affected = await dbContext.Set<TTimeTicker>()
+            .Where(x => x.Id == id)
+            .WhereQueuedBy(_lockHolder)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.InProgress)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
     public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContexts, CancellationToken cancellationToken)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -414,6 +433,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
             var affected = await context
                 .Where(x => x.Id == cronTickerOccurrence.Id && x.UpdatedAt == cronTickerOccurrence.UpdatedAt)
+                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
                 .ExecuteUpdateAsync(setter => setter
                     .SetProperty(x => x.LockHolder, _lockHolder)
                     .SetProperty(x => x.LockedAt, now)
@@ -428,6 +448,22 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         }
     }
     
+    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        var affected = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.Id == id)
+            .WhereQueuedBy(_lockHolder)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.InProgress)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
     public async Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
     {
         var now = _clock.UtcNow;
