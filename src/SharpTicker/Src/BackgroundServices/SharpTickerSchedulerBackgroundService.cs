@@ -119,10 +119,11 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         {
             if (_executionContext.Functions.Length != 0)
             {
-                await _internalTickerManager.SetTickersInProgress(_executionContext.Functions, cancellationToken);
-
                 foreach (var function in _executionContext.Functions.OrderBy(x => x.CachedPriority))
                 {
+                    if (!await TryHandOverAsync(function, cancellationToken))
+                        continue;
+
                     var semaphore = _concurrencyGate.GetSemaphoreOrNull(function.FunctionName, function.CachedMaxConcurrency);
 
                     _ = _taskScheduler.QueueAsync(async ct =>
@@ -178,6 +179,30 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
             await Task.Delay(sleepDuration, cancellationToken);
         }
+    }
+
+    // A job goes to a worker only when this node won the claim on its row. The fallback or a cancel may have taken the row while
+    // the loop slept, and then the job is not ours to run. The notification is for the dashboard and does not decide the job.
+    private async Task<bool> TryHandOverAsync(InternalFunctionContext function, CancellationToken cancellationToken)
+    {
+        if (!await _internalTickerManager.TryClaimDueTicker(function, cancellationToken))
+        {
+            _logger?.LogInformation("Job {FunctionName} ({TickerId}) was already taken by another claim and is not run by this loop.",
+                function.FunctionName, function.TickerId);
+            return false;
+        }
+
+        try
+        {
+            await _internalTickerManager.NotifyInProgress(function);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) is running but the dashboard could not be notified.",
+                function.FunctionName, function.TickerId);
+        }
+
+        return true;
     }
 
     private static TimeSpan ResolveMinPollingInterval(SchedulerOptionsBuilder schedulerOptions)

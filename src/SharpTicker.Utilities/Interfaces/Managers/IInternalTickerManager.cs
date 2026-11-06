@@ -11,7 +11,8 @@ namespace SharpTicker.Utilities.Interfaces.Managers
     {
         Task<(TimeSpan TimeRemaining, InternalFunctionContext[] Functions)> GetNextTickers(CancellationToken cancellationToken = default);
         Task ReleaseAcquiredResources(InternalFunctionContext[] context, CancellationToken cancellationToken = default);
-        Task SetTickersInProgress(InternalFunctionContext[] context, CancellationToken cancellationToken = default);
+        Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default); // sets Status on a win
+        Task NotifyInProgress(InternalFunctionContext function);
         Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);
