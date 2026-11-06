@@ -105,7 +105,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
     // The script has committed the claim, so an index failure must not turn into a failed claim: the caller would not
     // run a row that is already InProgress. A stale pending entry is harmless, Acquire.lua rejects it.
-    private async Task TryUpdateIndexAfterClaim(Guid id, Func<Task> updateIndex)
+    protected async Task TryUpdateIndexAfterClaim(Guid id, Func<Task> updateIndex)
     {
         try
         {
@@ -267,7 +267,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
             if (acquired == null) continue;
 
-            await IndexManager.AddTimeTickerIndexesAsync(acquired).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
 
             timeTicker.LockHolder = acquired.LockHolder;
             timeTicker.LockedAt = acquired.LockedAt;
@@ -295,7 +295,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
             if (acquired == null) continue;
 
-            await IndexManager.AddTimeTickerIndexesAsync(acquired).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
 
             yield return MapForQueue(acquired);
         }
@@ -400,7 +400,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
             if (ticker == null) continue;
 
-            await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
             acquired.Add(MapForQueue(ticker));
         }
 
@@ -598,7 +598,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
                 // Not written back: the acquire script already stored the row, and a full write here would overwrite a
                 // fallback claim made since. ExecutionTime and CronTicker are set on the returned copy only.
-                await IndexManager.AddCronOccurrenceIndexesAsync(acquired).ConfigureAwait(false);
+                await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(acquired)).ConfigureAwait(false);
                 yield return acquired;
             }
         }
@@ -620,7 +620,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
             if (acquired == null) continue;
 
-            await IndexManager.AddCronOccurrenceIndexesAsync(acquired).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(acquired)).ConfigureAwait(false);
             yield return acquired;
         }
     }

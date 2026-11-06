@@ -735,6 +735,72 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:co:{occ.Id}"]).RootElement.GetProperty("Status").GetInt32());
     }
 
+    // A claim the Lua script committed must reach the caller even when the pending index cannot be updated: the row is
+    // InProgress, nothing else would run it, and in the fallback one failure must not drop the rows already won.
+    private CronTickerOccurrenceEntity<CronTickerEntity> SeedClaimableOccurrence(TickerStatus status = TickerStatus.Idle)
+    {
+        var occ = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = Guid.NewGuid(), Status = status, ExecutionTime = _fixedNow.AddMinutes(-5),
+            CreatedAt = _fixedNow, UpdatedAt = _fixedNow
+        };
+        SeedCronOccurrence(occ);
+        return occ;
+    }
+
+    private void FailIndexUpdates()
+        => _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
+
+    [Fact]
+    public async Task AcquireImmediateTimeTickersAsync_IndexUpdateFails_StillReturnsTheClaimedRow()
+    {
+        var ticker = CreateTimeTicker(status: TickerStatus.Idle, lockHolder: null, lockedAt: null);
+        SeedTimeTicker(ticker);
+        FailIndexUpdates();
+
+        var results = await _provider.AcquireImmediateTimeTickersAsync([ticker.Id], CancellationToken.None);
+
+        Assert.Equal(ticker.Id, Assert.Single(results).Id);
+    }
+
+    [Fact]
+    public async Task AcquireImmediateCronOccurrencesAsync_IndexUpdateFails_StillReturnsTheClaimedRow()
+    {
+        var occ = SeedClaimableOccurrence();
+        FailIndexUpdates();
+
+        var results = await _provider.AcquireImmediateCronOccurrencesAsync([occ.Id], CancellationToken.None);
+
+        Assert.Equal(occ.Id, Assert.Single(results).Id);
+    }
+
+    [Fact]
+    public async Task QueueTimedOutTimeTickers_IndexUpdateFails_KeepsEveryClaimedRow()
+    {
+        var first = CreateTimeTicker(status: TickerStatus.Idle, lockHolder: null, lockedAt: null);
+        var second = CreateTimeTicker(status: TickerStatus.Idle, lockHolder: null, lockedAt: null);
+        first.ExecutionTime = _fixedNow.AddMinutes(-10);
+        second.ExecutionTime = _fixedNow.AddMinutes(-9);
+        SeedTimeTicker(first);
+        SeedTimeTicker(second);
+        FailIndexUpdates();
+
+        var results = await ToListAsync(_provider.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Equal(2, results.Count);
+    }
+
+    [Fact]
+    public async Task QueueTimedOutCronTickerOccurrences_IndexUpdateFails_KeepsTheClaimedRow()
+    {
+        var occ = SeedClaimableOccurrence();
+        FailIndexUpdates();
+
+        var results = await ToListAsync(_provider.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
+
+        Assert.Equal(occ.Id, Assert.Single(results).Id);
+    }
+
     // =========================================================================
     // 7. ReleaseAcquiredTimeTickers
     // =========================================================================
