@@ -118,6 +118,21 @@ namespace SharpTicker.MongoDB.Infrastructure
             return fb.And(statusOk, ownerOrFree);
         }
 
+        // The fenced claim: the row must still be Queued and held by this node. Internal on purpose, no public surface.
+        public static FilterDefinition<TTimeTicker> QueuedByTimeTicker<TTimeTicker>(string lockHolder)
+            where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        {
+            var fb = Builders<TTimeTicker>.Filter;
+            return fb.And(fb.Eq(x => x.Status, TickerStatus.Queued), fb.Eq(x => x.LockHolder, lockHolder));
+        }
+
+        public static FilterDefinition<CronTickerOccurrenceEntity<TCronTicker>> QueuedByCronOccurrence<TCronTicker>(string lockHolder)
+            where TCronTicker : CronTickerEntity, new()
+        {
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            return fb.And(fb.Eq(x => x.Status, TickerStatus.Queued), fb.Eq(x => x.LockHolder, lockHolder));
+        }
+
         private static UpdateDefinition<T> Combine<T>(UpdateDefinition<T> a, UpdateDefinition<T> b)
             => a is null ? b : Builders<T>.Update.Combine(a, b);
     }

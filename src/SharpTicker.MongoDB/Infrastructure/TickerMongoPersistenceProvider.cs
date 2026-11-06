@@ -53,7 +53,10 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var filter = fb.And(fb.Eq(x => x.Id, ticker.Id), fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt));
+                var filter = fb.And(
+                    fb.Eq(x => x.Id, ticker.Id),
+                    fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt),
+                    MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
@@ -92,9 +95,12 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // The status check keeps a row another node already moved to InProgress out of reach, even when
+                // that node's clock is behind and wrote an earlier UpdatedAt.
                 var filter = fb.And(
                     fb.Eq(x => x.Id, candidate.Id),
-                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt));
+                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
@@ -169,6 +175,23 @@ namespace SharpTicker.MongoDB.Infrastructure
 
             var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
+        }
+
+        public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
+            // The status changes on every match, so ModifiedCount equals the matched count.
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    Builders<TTimeTicker>.Filter.And(
+                        Builders<TTimeTicker>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByTimeTicker<TTimeTicker>(_lockHolder)),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
         }
 
         public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
@@ -500,7 +523,8 @@ namespace SharpTicker.MongoDB.Infrastructure
 
                 var filter = fb.And(
                     fb.Eq(x => x.Id, occ.Id),
-                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt));
+                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, _lockHolder)
@@ -523,6 +547,21 @@ namespace SharpTicker.MongoDB.Infrastructure
                 }
                 yield return occ;
             }
+        }
+
+        public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.And(
+                        Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByCronOccurrence<TCronTicker>(_lockHolder)),
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
         }
 
         public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)

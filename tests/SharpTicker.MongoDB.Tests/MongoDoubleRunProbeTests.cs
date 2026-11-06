@@ -193,40 +193,6 @@ public class MongoDoubleRunProbeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(occurrenceId)).Status);
     }
 
-    // R2: the fallback's compare-and-set is "UpdatedAt <= value read", with no status check. Row y is read by node A,
-    // claimed by node B whose clock is behind (so it writes an earlier UpdatedAt), and node A's claim still goes through.
-    [Fact]
-    public async Task Probe_FallbackClaimsInProgressRow_WhenClockIsBehind()
-    {
-        var aheadClock = new FakeClock(T0.AddSeconds(10));
-        var behindClock = new FakeClock(T0);
-        var nodeA = CreateProvider("node-A", aheadClock);
-        var nodeB = CreateProvider("node-B", behindClock);
-
-        // Both rows were last written by a node whose clock is ahead of node B's.
-        var written = T0.AddSeconds(10);
-        var x = await SeedTimeTicker(executionTime: T0.AddSeconds(-5), updatedAt: written);
-        var y = await SeedTimeTicker(executionTime: T0.AddSeconds(-5), updatedAt: written);
-
-        await using var aEnumerator = nodeA.QueueTimedOutTimeTickers(CancellationToken.None).GetAsyncEnumerator();
-        // Node A reads both candidates and claims the first one.
-        Assert.True(await aEnumerator.MoveNextAsync());
-        var firstOfA = aEnumerator.Current.Id;
-        var second = firstOfA == x ? y : x;
-
-        // Node B now runs a full pass: it sees only the second row (the first is InProgress) and claims it.
-        var claimedByB = await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None));
-        Assert.Equal(second, Assert.Single(claimedByB).Id);
-        var afterB = await ReadTimeTicker(second);
-        Assert.Equal(TickerStatus.InProgress, afterB.Status);
-        Assert.Equal("node-B", afterB.LockHolder);
-
-        // Node A carries on with its stale read: its claim of the InProgress row succeeds too.
-        Assert.True(await aEnumerator.MoveNextAsync());
-        Assert.Equal(second, aEnumerator.Current.Id);
-        Assert.Equal("node-A", (await ReadTimeTicker(second)).LockHolder);
-    }
-
     // R6: a batch "run now" acquire returns every row of the batch that is InProgress for this node, including a row
     // this node's fallback took earlier, so that row is handed to a worker a second time.
     [Fact]
