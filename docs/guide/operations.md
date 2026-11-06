@@ -2,7 +2,7 @@
 
 ## Several instances
 
-Instances that use the same shared store ([EF Core, MongoDB or Redis](storage.md)) work as one scheduler. When a job becomes due, an instance claims it with a conditional update on the stored record and marks itself as the lock holder, so each run happens once.
+Instances that use the same shared store ([EF Core, MongoDB or Redis](storage.md)) work as one scheduler. When a job becomes due, an instance claims it with a conditional update on the stored record and marks itself as the lock holder, so one instance wins each claim. [What is guaranteed](#what-is-guaranteed) lists where a job can still run more than once.
 
 Give every running instance a stable name that no other running instance uses. The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine. The name is the lock holder on a job, and a starting instance treats every job held under its own name as left behind (see the next paragraph), so two running instances with one name release each other's running jobs:
 
@@ -16,18 +16,23 @@ builder.Services.AddSharpTicker(options =>
 });
 ```
 
-When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`), and with Redis when its heartbeat stops. MongoDB has no release step, so a job left `InProgress` stays so until you change it.
+When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`), and with Redis when its heartbeat stops (a node counts as stopped when its heartbeat entry has expired, which takes `NodeHeartbeatInterval` plus 20 seconds, so a restart inside that time under the same name is not seen as a stop and its `InProgress` rows stay as they are). MongoDB has no release step, so a job left `InProgress` stays so until you change it.
 
 ### What is guaranteed
 
-Of all instances that try to start a due job, one wins: the job goes to a worker only after its row was moved from `Queued` to `InProgress` by a conditional write that names this node as the holder. A node that loses the claim logs it at `Information` level and does not run the job. With Redis, a cron expression also produces one occurrence per time slot, however many instances create it.
+Of all instances that try to start a due job, one wins: the job goes to a worker only after a conditional write moved its row to `InProgress` and that write was the winner. The regular claim needs the row to be `Queued` and held by this node. The fallback for missed jobs takes a row that is `Idle` or `Queued` (held by any node with EF Core and MongoDB, unlocked or held by this node with Redis), and "run now" takes an `Idle` or `Queued` row that is unlocked or held by this node. A node that loses a claim logs it at `Information` level and does not run the job. With Redis, a cron expression also produces one occurrence per time slot, however many instances create it, provided the cron itself exists once (see below).
+
+While instances of the previous version still run against the store (see [Migrating](https://github.com/msx752/SharpTicker/blob/main/MIGRATING.md#rolling-deployment)), none of this holds: a job can run twice until the last of them is gone.
 
 A job can still run more than once, or twice at about the same time, in these cases:
 
+- A process dies while a job runs, or the job finishes and its final write to the store fails. After a restart (EF Core) or the heartbeat release (Redis) the job runs again, and a repeated parent repeats its children.
 - A Redis node that stopped sending heartbeats (a long pause, a network split) has its `InProgress` jobs released while they may still be running.
 - An instance starts with the name of another running instance, with EF Core: its startup release frees the jobs that instance is running.
 - A write the store acknowledged is lost, for example MongoDB with a write concern of `w:1` after a primary change, or Redis after a failover to a replica that had not received it.
-- A job record is updated with the whole object (`UpdateTimeTickers`, which the manager's update methods call) while the job runs. EF Core, MongoDB and Redis write every field, so a copy loaded before the claim puts the old `Status` and lock back and the job can be claimed again.
+- A job record is updated with the whole object (`UpdateTimeTickers`, which the manager's update methods call, and the edit dialog of the dashboard) while the job runs, or a dialog opened before the job started is saved after it ran. EF Core, MongoDB and Redis write every field, so a copy loaded before the claim puts the old `Status` and lock back and the job can be claimed again.
+
+- Two instances start a new cron function at the same time. Seeding reads the existing crons and then inserts a new one with a new id, and none of the stores has a unique constraint on the function, so both can insert it and each cron then creates its own occurrences. Start new cron functions on one instance first, or check for duplicate crons afterwards.
 
 Write jobs so that a second run does no harm: key side effects on the ticker id or on your own business key, and skip work that is already done.
 

@@ -27,7 +27,7 @@ dotnet add package SharpTicker
 - **Pluggable persistence.** In-memory by default, or Entity Framework Core, MongoDB or Redis.
 - **Built-in dashboard.** A real-time UI to watch, run and manage jobs.
 - **Retries and chains.** Per-job retry counts and intervals, and child jobs that run depending on how their parent ended.
-- **Several nodes, one store.** Instances that share a store coordinate through locks, so a job runs once.
+- **Several nodes, one store.** Instances that share a store claim each job with a conditional write, so one of them runs it.
 - **.NET 8, 9 and 10.** Every package contains a separate build for each target.
 
 ## Where to start
