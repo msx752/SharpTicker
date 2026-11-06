@@ -279,6 +279,8 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         /// <summary>Runs before the n-th claim is forwarded, which then goes on.</summary>
         public int BeforeClaimNumber { get; set; }
         public Func<Task>? BeforeClaim { get; set; }
+        /// <summary>Like <see cref="BeforeClaim"/>, but waits on the token the claim was given, as a store call does.</summary>
+        public Func<CancellationToken, Task>? BeforeClaimWithToken { get; set; }
         public bool UseHold { get; set; }
         /// <summary>When set, the held first poll returns this instead of what the store has.</summary>
         public (TimeSpan, InternalFunctionContext[])? CannedFirstPoll { get; set; }
@@ -310,6 +312,8 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             }
             if (claim == BeforeClaimNumber && BeforeClaim != null)
                 await BeforeClaim();
+            if (claim == BeforeClaimNumber && BeforeClaimWithToken != null)
+                await BeforeClaimWithToken(cancellationToken);
 
             var won = await inner.TryClaimDueTicker(function, cancellationToken);
             ClaimResults.Enqueue(won);
@@ -455,6 +459,43 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(3, scheduler.QueuedCount);
         foreach (var id in ids)
             await handler.Received(1).ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == id), false, Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Handover_RestartMidBatch_DoesNotInterruptClaim()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
+        var batch = await QueueBatch(node, ids);
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var manager = new HookedManager(CreateRealManager(node));
+        var (service, context) = CreateService(manager, scheduler, handler);
+        // The claim waits on its own token while the restart fires. A claim bound to the loop's token would be cancelled here.
+        manager.BeforeClaimNumber = 3;
+        manager.BeforeClaimWithToken = async ct =>
+        {
+            service.Restart();
+            await Task.Delay(300, ct);
+        };
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            await manager.Released.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+        await scheduler.WhenAllIdleAsync();
+
+        Assert.Equal([true, true, true], manager.ClaimResults.ToArray());
+        foreach (var id in ids)
+            Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+        Assert.Equal(3, scheduler.QueuedCount);
     }
 
     [Fact]
