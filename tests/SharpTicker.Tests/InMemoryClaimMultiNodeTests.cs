@@ -138,7 +138,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TryMark_RowHeldByAnotherNode_ReturnsFalseAndLeavesRow_TimeTicker()
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_TimeTicker()
     {
         var nodeA = CreateProvider("node-A");
         var nodeB = CreateProvider("node-B");
@@ -156,7 +156,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TryMark_RowHeldByAnotherNode_ReturnsFalseAndLeavesRow_CronOccurrence()
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_CronOccurrence()
     {
         var nodeA = CreateProvider("node-A");
         var nodeB = CreateProvider("node-B");
@@ -171,6 +171,52 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal("node-B", after.LockHolder);
         Assert.Equal(before.Status, after.Status);
         Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    // The status clause alone cannot tell these apart: the row is Queued again, but for another node.
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueTimeTickerOn(nodeA);
+        await nodeA.ReleaseAcquiredTimeTickers([id], CancellationToken.None);
+        var window = await nodeB.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
+        var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+
+        var untouched = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.Equal(TickerStatus.InProgress, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+        var slot = (T0, new[] { new InternalManagerContext(cronId) { FunctionName = "claim-cron-fn", Expression = "* * * * *" } });
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(slot, CancellationToken.None))).Id;
+        _occurrenceIds.Add(id);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        slot.Item2[0].NextCronOccurrence = new NextCronOccurrence(id, T0);
+        Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(slot, CancellationToken.None)));
+        var before = await Occurrence(nodeA, id);
+
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+
+        var untouched = await Occurrence(nodeA, id);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.Equal(TickerStatus.InProgress, (await Occurrence(nodeA, id)).Status);
     }
 
     // Finished rows keep the lock holder, so even the owning node must not move them back to InProgress.

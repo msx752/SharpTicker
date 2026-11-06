@@ -167,7 +167,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TryMark_RowHeldByAnotherNode_ReturnsFalseAndLeavesRow_TimeTicker()
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_TimeTicker()
     {
         var nodeA = CreateProvider("node-A");
         var nodeB = CreateProvider("node-B");
@@ -185,7 +185,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TryMark_RowHeldByAnotherNode_ReturnsFalseAndLeavesRow_CronOccurrence()
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_CronOccurrence()
     {
         var nodeA = CreateProvider("node-A");
         var nodeB = CreateProvider("node-B");
@@ -200,6 +200,52 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal("node-B", after.LockHolder);
         Assert.Equal(before.Status, after.Status);
         Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    // The status clause alone cannot tell these apart: the row is Queued again, but for another node. Only the
+    // holder clause stops the first node's late write, and the new holder's own write must still go through.
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueTimeTickerOn(nodeA);
+        await nodeA.ReleaseAcquiredTimeTickers([id], CancellationToken.None);
+        var window = await nodeB.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
+        var before = await ReadTimeTicker(id);
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+
+        var untouched = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = await SeedCronTicker();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        var requeue = Slot(cronId);
+        requeue.Items[0].NextCronOccurrence = new NextCronOccurrence(id, T0);
+        Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(requeue, CancellationToken.None)));
+        var before = await ReadOccurrence(id);
+
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+
+        var untouched = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
     }
 
     // Finished rows keep the lock holder, so even the owning node must not move them back to InProgress.
@@ -323,6 +369,8 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.NotEqual("node-fallback", untouched.LockHolder);
     }
 
+    // The cron compare-and-set is "UpdatedAt ==", so the row only passes it when the behind clock writes the same
+    // UpdatedAt the fallback read (both nodes queued at that clock value).
     [Fact]
     public async Task Fallback_DoesNotClaimInProgressRow_WhenItsUpdatedAtIsEarlier_CronOccurrence()
     {
