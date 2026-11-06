@@ -58,9 +58,9 @@ public sealed class RedisTestFixture : IAsyncLifetime
             await Connection.GetServer(endpoint).FlushAllDatabasesAsync();
     }
 
-    internal TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, ITickerClock clock)
+    internal TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, ITickerClock clock, IDatabase? database = null)
         => new(
-            Database,
+            database ?? Database,
             clock,
             new SchedulerOptionsBuilder { NodeIdentifier = nodeIdentifier },
             new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default },

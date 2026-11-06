@@ -29,7 +29,7 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
 
     public Task DisposeAsync() => Task.CompletedTask;
 
-    public static TheoryData<string> Scripts => new() { "Acquire", "Release", "RecoverDeadNode" };
+    public static TheoryData<string> Scripts => new() { "Acquire", "Release", "RecoverDeadNode", "MarkInProgress" };
 
     private static async Task<List<T>> Drain<T>(IAsyncEnumerable<T> source)
     {
@@ -79,8 +79,8 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
     {
         var node = fixture.CreateProvider("node-A", new FakeTickerClock(T0));
         var ticker = NewTimeTicker(
-            status: script == "RecoverDeadNode" ? TickerStatus.Queued : TickerStatus.Idle,
-            lockHolder: script == "RecoverDeadNode" ? "node-dead" : null);
+            status: script is "RecoverDeadNode" or "MarkInProgress" ? TickerStatus.Queued : TickerStatus.Idle,
+            lockHolder: script switch { "RecoverDeadNode" => "node-dead", "MarkInProgress" => "node-A", _ => null });
         await node.AddTimeTickers([ticker], CancellationToken.None);
 
         switch (script)
@@ -90,6 +90,9 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
                 break;
             case "Release":
                 await node.ReleaseAcquiredTimeTickers([ticker.Id], CancellationToken.None);
+                break;
+            case "MarkInProgress":
+                Assert.True(await node.TryMarkTimeTickerInProgress(ticker.Id, CancellationToken.None));
                 break;
             default:
                 await node.ReleaseDeadNodeTimeTickerResources("node-dead", CancellationToken.None);

@@ -252,7 +252,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
 
     private void SetupScriptOperations()
     {
-        // ScriptEvaluateAsync handles Acquire/Release/RecoverDeadNode Lua scripts.
+        // ScriptEvaluateAsync handles Acquire/Release/RecoverDeadNode/MarkInProgress Lua scripts.
         // We simulate the Lua behavior in C# by inspecting the script + args.
         _db.ScriptEvaluateAsync(Arg.Any<string>(), Arg.Any<RedisKey[]?>(), Arg.Any<RedisValue[]?>(), Arg.Any<CommandFlags>())
             .Returns(callInfo =>
@@ -291,6 +291,22 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
                     });
                     _store[entityKey] = updated;
                     return RedisResult.Create((RedisValue)updated);
+                }
+
+                // Same ARGV count as Release, told apart by the script text.
+                if (argv.Length == 4 && script.Contains("Fenced claim"))
+                {
+                    // MarkInProgress: ARGV[0]=lockHolder, ARGV[1]=now, ARGV[2]=statusQueued, ARGV[3]=statusInProgress
+                    if (status != Rvi(argv[2]) || lockHolder != (string)argv[0])
+                        return RedisResult.Create(RedisValue.Null);
+
+                    var marked = SetJsonProperties(json, new Dictionary<string, object>
+                    {
+                        ["Status"] = Rvi(argv[3]),
+                        ["UpdatedAt"] = (string)argv[1]
+                    });
+                    _store[entityKey] = marked;
+                    return RedisResult.Create((RedisValue)marked);
                 }
 
                 if (argv.Length == 4)

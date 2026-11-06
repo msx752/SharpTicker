@@ -33,6 +33,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
     private static readonly string AcquireScript = LuaScriptLoader.Load("Acquire");
     private static readonly string ReleaseScript = LuaScriptLoader.Load("Release");
     private static readonly string RecoverDeadNodeScript = LuaScriptLoader.Load("RecoverDeadNode");
+    private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
 
     protected BaseRedisPersistenceProvider(
         IDatabase db,
@@ -98,6 +99,21 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
         if (result.IsNull) return null;
         return Serializer.DeserializeOrNull<T>((string)result);
+    }
+
+    // Fenced Queued -> InProgress claim. Claimed is true when the script moved the row; Row can still be null if the
+    // stored JSON does not deserialize, which does not undo the claim.
+    protected async Task<(bool Claimed, T Row)> TryMarkInProgressAsync<T>(string key) where T : class
+    {
+        var now = Clock.UtcNow;
+        var result = await Db.ScriptEvaluateAsync(
+            MarkInProgressScript,
+            [(RedisKey)key],
+            [(RedisValue)LockHolder, (RedisValue)now.ToString("O"), LuaStatusQueued, LuaStatusInProgress]
+        ).ConfigureAwait(false);
+
+        if (result.IsNull) return (false, null);
+        return (true, Serializer.DeserializeOrNull<T>((string)result));
     }
     #endregion
 
@@ -234,7 +250,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
     public async IAsyncEnumerable<TimeTickerEntity> QueueTimedOutTimeTickers([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var threshold = Clock.UtcNow.AddMilliseconds(-100);
+        var threshold = Clock.UtcNow.AddSeconds(-1);
 
         var dueIds = await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, double.NegativeInfinity, ToScore(threshold)).ConfigureAwait(false);
 
@@ -270,6 +286,16 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
             await IndexManager.AddTimeTickerIndexesAsync(released).ConfigureAwait(false);
         }
+    }
+
+    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+    {
+        var (claimed, row) = await TryMarkInProgressAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+        if (!claimed) return false;
+
+        if (row != null)
+            await IndexManager.AddTimeTickerIndexesAsync(row).ConfigureAwait(false);
+        return true;
     }
 
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken = default)
@@ -528,7 +554,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
                     };
                 }
 
-                await Serializer.SetAsync(CronOccurrenceKey(acquired.Id), acquired).ConfigureAwait(false);
+                // Not written back: the acquire script already stored the row, and a full write here would overwrite a
+                // fallback claim made since. ExecutionTime and CronTicker are set on the returned copy only.
                 await IndexManager.AddCronOccurrenceIndexesAsync(acquired).ConfigureAwait(false);
                 yield return acquired;
             }
@@ -537,7 +564,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
     public async IAsyncEnumerable<CronTickerOccurrenceEntity<TCronTicker>> QueueTimedOutCronTickerOccurrences([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var threshold = Clock.UtcNow.AddMilliseconds(-100);
+        var threshold = Clock.UtcNow.AddSeconds(-1);
 
         var dueIds = await Db.SortedSetRangeByScoreAsync(CronOccurrencePendingKey, double.NegativeInfinity, ToScore(threshold)).ConfigureAwait(false);
         foreach (var redisValue in dueIds)
@@ -554,6 +581,16 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             await IndexManager.AddCronOccurrenceIndexesAsync(acquired).ConfigureAwait(false);
             yield return acquired;
         }
+    }
+
+    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+    {
+        var (claimed, row) = await TryMarkInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id)).ConfigureAwait(false);
+        if (!claimed) return false;
+
+        if (row != null)
+            await IndexManager.AddCronOccurrenceIndexesAsync(row).ConfigureAwait(false);
+        return true;
     }
 
     public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
