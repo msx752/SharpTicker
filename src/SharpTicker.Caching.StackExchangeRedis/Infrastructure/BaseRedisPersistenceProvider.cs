@@ -390,7 +390,9 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         var acquired = new List<TimeTickerEntity>();
         foreach (var id in ids)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+            // dispatched, the rows not written yet stay Idle for the fallback.
+            if (cancellationToken.IsCancellationRequested) break;
 
             var ticker = await TryAcquireAsync<TTimeTicker>(
                 TimeTickerKey(id),

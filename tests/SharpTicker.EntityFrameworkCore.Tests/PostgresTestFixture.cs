@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
@@ -59,8 +60,12 @@ public sealed class PostgresTestFixture : IAsyncLifetime
         await context.Set<TimeTickerEntity>().ExecuteDeleteAsync();
     }
 
-    internal TestableProvider CreateProvider(string nodeIdentifier, ITickerClock clock)
+    internal TestableProvider CreateProvider(string nodeIdentifier, ITickerClock clock, IInterceptor? interceptor = null)
     {
+        var options = interceptor is null
+            ? Options
+            : new DbContextOptionsBuilder<TestSharpTickerDbContext>().UseNpgsql(Container.GetConnectionString()).AddInterceptors(interceptor).Options;
+
         var redisContext = Substitute.For<ISharpTickerRedisContext>();
         redisContext.HasRedisConnection.Returns(false);
         redisContext.GetOrSetArrayAsync(
@@ -72,7 +77,7 @@ public sealed class PostgresTestFixture : IAsyncLifetime
 
         var services = new ServiceCollection();
         services.AddSingleton<IDbContextFactory<TestSharpTickerDbContext>>(
-            new PooledDbContextFactory<TestSharpTickerDbContext>(Options));
+            new PooledDbContextFactory<TestSharpTickerDbContext>(options));
 
         return new TestableProvider(
             services.BuildServiceProvider(),

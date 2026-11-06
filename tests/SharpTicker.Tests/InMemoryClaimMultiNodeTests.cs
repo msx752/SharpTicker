@@ -107,6 +107,27 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         TickerStatus.Failed, TickerStatus.Cancelled, TickerStatus.Skipped
     };
 
+    // The in-memory provider has no hook between two row writes, so the token is cancelled before the call: the loop
+    // must end without writing and the rows must stay Idle. The mid-batch case is covered on the other providers.
+    [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker() };
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync(ids, cts.Token);
+
+        Assert.Empty(acquired);
+        foreach (var id in ids)
+        {
+            var row = await node.GetTimeTickerById(id, CancellationToken.None);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
     [Fact]
     public async Task TryMark_OwnQueuedRow_ReturnsTrueAndWritesInProgress_TimeTicker()
     {

@@ -259,9 +259,12 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
         // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
         // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
-        foreach (var id in ids.Distinct())
+        foreach (var id in ids)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
+            // returned to be dispatched, the rows not written yet stay Idle for the fallback.
+            if (cancellationToken.IsCancellationRequested)
+                break;
 
             var affected = await set
                 .Where(x => x.Id == id)
@@ -270,7 +273,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                     .SetProperty(x => x.LockHolder, _lockHolder)
                     .SetProperty(x => x.LockedAt, now)
                     .SetProperty(x => x.Status, TickerStatus.InProgress)
-                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+                    .SetProperty(x => x.UpdatedAt, now), CancellationToken.None)
                 .ConfigureAwait(false);
 
             if (affected > 0)
@@ -283,10 +286,10 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         // Return the acquired tickers for immediate execution, with children
         return await set
             .AsNoTracking()
-            .Where(x => won.Contains(x.Id))
+            .Where(x => won.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
             .Include(x => x.Children.Where(y => y.ExecutionTime == null))
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
-            .ToArrayAsync(cancellationToken)
+            .ToArrayAsync(CancellationToken.None)
             .ConfigureAwait(false);
     }
         

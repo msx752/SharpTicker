@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Configuration;
+using MongoDB.Driver.Core.Events;
 using SharpTicker.MongoDB.Infrastructure;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
@@ -295,8 +297,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     public async Task AcquireImmediate_Batch_ReturnsOnlyRowsThisCallAcquired()
     {
         var node = CreateProvider("node-A");
+        var heldByOther = await QueueTimeTickerOn(CreateProvider("node-B"));
         var takenByFallback = await SeedTimeTicker(executionTime: T0.AddSeconds(-5));
-        var heldByOther = await SeedTimeTicker(TickerStatus.Queued, lockHolder: "node-B");
         var fresh = await SeedTimeTicker(executionTime: T0.AddHours(1));
         var freshToo = await SeedTimeTicker(executionTime: T0.AddHours(1));
         Assert.Equal(takenByFallback, Assert.Single(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None))).Id);
@@ -321,7 +323,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     public async Task AcquireImmediate_NothingWon_ReturnsEmpty()
     {
         var node = CreateProvider("node-A");
-        var heldByOther = await SeedTimeTicker(TickerStatus.Queued, lockHolder: "node-B");
+        var heldByOther = await QueueTimeTickerOn(CreateProvider("node-B"));
 
         Assert.Empty(await node.AcquireImmediateTimeTickersAsync([heldByOther, Guid.NewGuid()], CancellationToken.None));
         Assert.Equal(TickerStatus.Queued, (await ReadTimeTicker(heldByOther)).Status);
@@ -337,6 +339,37 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
         Assert.Equal(id, Assert.Single(acquired).Id);
         Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+    }
+
+    // The caller's token fires between two row writes. The rows won so far are InProgress and must come back to be
+    // dispatched; the rest must stay Idle. A command event subscriber cancels right after the first update.
+    [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
+    {
+        using var cts = new CancellationTokenSource();
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(e =>
+        {
+            if (e.CommandName == "update")
+                cts.Cancel();
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        var node = new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker(), await SeedTimeTicker() };
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
     }
 
     [Fact]
