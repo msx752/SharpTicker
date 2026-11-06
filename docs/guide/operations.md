@@ -4,7 +4,7 @@
 
 Instances that use the same shared store ([EF Core, MongoDB or Redis](storage.md)) work as one scheduler. When a job becomes due, an instance claims it with a conditional update on the stored record and marks itself as the lock holder, so each run happens once.
 
-Give every instance a stable, unique name. The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine:
+Give every running instance a stable name that no other running instance uses. The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine. The name is the lock holder on a job, and a starting instance treats every job held under its own name as left behind (see the next paragraph), so two running instances with one name release each other's running jobs:
 
 ```csharp
 builder.Services.AddSharpTicker(options =>
@@ -16,7 +16,24 @@ builder.Services.AddSharpTicker(options =>
 });
 ```
 
-When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again, and with Redis when its heartbeat stops.
+When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`), and with Redis when its heartbeat stops. MongoDB has no release step, so a job left `InProgress` stays so until you change it.
+
+### What is guaranteed
+
+Of all instances that try to start a due job, one wins: the job goes to a worker only after its row was moved from `Queued` to `InProgress` by a conditional write that names this node as the holder. A node that loses the claim logs it at `Information` level and does not run the job. With Redis, a cron expression also produces one occurrence per time slot, however many instances create it.
+
+A job can still run more than once, or twice at about the same time, in these cases:
+
+- A Redis node that stopped sending heartbeats (a long pause, a network split) has its `InProgress` jobs released while they may still be running.
+- An instance starts with the name of another running instance, with EF Core: its startup release frees the jobs that instance is running.
+- A write the store acknowledged is lost, for example MongoDB with a write concern of `w:1` after a primary change, or Redis after a failover to a replica that had not received it.
+- A job record is updated with the whole object (`UpdateTimeTickers`, which the manager's update methods call) while the job runs. EF Core, MongoDB and Redis write every field, so a copy loaded before the claim puts the old `Status` and lock back and the job can be claimed again.
+
+Write jobs so that a second run does no harm: key side effects on the ticker id or on your own business key, and skip work that is already done.
+
+### Clocks
+
+Due times are compared against each instance's own clock. The scheduler picks a job up when it is due and treats it as missed one second later. Keep the clocks of all instances in sync with NTP. With a difference of one second or more, an instance with a fast clock starts a job earlier than the others expect, and an instance with a slow clock finds the job already taken and does not run it. The claim still has one winner either way.
 
 ## Scheduler options
 
