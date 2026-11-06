@@ -119,14 +119,27 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         {
             if (_executionContext.Functions.Length != 0)
             {
-                foreach (var function in _executionContext.Functions.OrderBy(x => x.CachedPriority))
+                var batch = _executionContext.Functions.OrderBy(x => x.CachedPriority).ToArray();
+                for (var i = 0; i < batch.Length; i++)
                 {
-                    if (!await TryHandOverAsync(function, cancellationToken))
+                    var function = batch[i];
+
+                    // A row claimed after the scheduler stopped taking work would be InProgress with no worker to run it. The rows
+                    // not reached stay Queued and are released here; a stop, a manual freeze or a disposal all end the hand-over.
+                    if (stoppingToken.IsCancellationRequested || _taskScheduler.IsFrozen || _taskScheduler.IsDisposed)
+                    {
+                        await TryReleaseAcquiredResourcesAsync(batch[i..], CancellationToken.None, stopping: stoppingToken.IsCancellationRequested);
+                        break;
+                    }
+
+                    // The claim follows the application's token, not the loop's: a restart request must not cut a hand-over
+                    // short, it takes effect at the next wait on the loop's token.
+                    if (!await TryHandOverAsync(function, stoppingToken))
                         continue;
 
                     var semaphore = _concurrencyGate.GetSemaphoreOrNull(function.FunctionName, function.CachedMaxConcurrency);
 
-                    _ = _taskScheduler.QueueAsync(async ct =>
+                    ObserveQueueing(function, _taskScheduler.QueueAsync(async ct =>
                     {
                         if (semaphore != null)
                             await semaphore.WaitAsync(ct).ConfigureAwait(false);
@@ -139,7 +152,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                         {
                             semaphore?.Release();
                         }
-                    }, function.CachedPriority, stoppingToken);
+                    }, function.CachedPriority, stoppingToken));
                 }
                 
                 _executionContext.SetFunctions(null);
@@ -181,13 +194,37 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         }
     }
 
+    // QueueAsync is async, so a refusal (the scheduler froze or was disposed after the claim) comes back in the task and not as
+    // a throw. The row is already InProgress and has no worker, so it is reported instead of being discarded.
+    private void ObserveQueueing(InternalFunctionContext function, ValueTask queued)
+    {
+        if (queued.IsCompletedSuccessfully)
+            return;
+
+        _ = ObserveQueueingAsync(function, queued);
+    }
+
+    private async Task ObserveQueueingAsync(InternalFunctionContext function, ValueTask queued)
+    {
+        try
+        {
+            await queued.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Job {FunctionName} ({TickerId}) was claimed but the scheduler refused it, so no worker runs it. " +
+                                  "Its row stays InProgress until this node starts again or a dead node release frees it.",
+                function.FunctionName, function.TickerId);
+        }
+    }
+
     // A job goes to a worker only when this node won the claim on its row. The fallback or a cancel may have taken the row while
     // the loop slept, and then the job is not ours to run. The notification is for the dashboard and does not decide the job.
     private async Task<bool> TryHandOverAsync(InternalFunctionContext function, CancellationToken cancellationToken)
     {
         if (!await _internalTickerManager.TryClaimDueTicker(function, cancellationToken))
         {
-            _logger?.LogInformation("Job {FunctionName} ({TickerId}) was already taken by another claim and is not run by this loop.",
+            _logger?.LogInformation("Job {FunctionName} ({TickerId}) is no longer this node's to run (taken by another claim, cancelled or removed) and is not run by this loop.",
                 function.FunctionName, function.TickerId);
             return false;
         }
