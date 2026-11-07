@@ -23,9 +23,11 @@ namespace SharpTicker.Utilities.Interfaces
         Task UpdateTimeTickersWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default);
         Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default);
 
-        // true: this call moved the row from Queued (held by this node) to InProgress; the caller may run the job.
-        // Default bodies keep the unfenced behaviour for custom providers.
-        async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        // true: this call moved the row from Queued (held by this node) to InProgress and wrote claimMarker as its UpdatedAt;
+        // the caller may run the job. The marker comes from the node's clock (ClaimMarkers) and is unique per node, so the
+        // claim can be found again and put back if the job never starts, even when this call failed after the write landed.
+        // Default bodies keep the unfenced behaviour for custom providers and do not write the marker.
+        async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
@@ -60,7 +62,7 @@ namespace SharpTicker.Utilities.Interfaces
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => Task.FromResult(0);
 
         // Same contract as TryMarkTimeTickerInProgress, for a cron occurrence row.
-        async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;

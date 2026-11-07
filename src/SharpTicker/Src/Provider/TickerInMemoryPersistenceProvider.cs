@@ -114,7 +114,7 @@ namespace SharpTicker.Provider
                         var updatedTicker = CloneTicker(existingTicker);
                         updatedTicker.LockHolder = _lockHolder;
                         updatedTicker.LockedAt = now;
-                        updatedTicker.UpdatedAt = now;
+                        updatedTicker.UpdatedAt = _clock.NextClaimMarker();
                         updatedTicker.Status = TickerStatus.InProgress;
 
                         if (TimeTickers.TryUpdate(ticker.Id, updatedTicker, existingTicker))
@@ -240,7 +240,7 @@ namespace SharpTicker.Provider
             return Task.CompletedTask;
         }
 
-        public Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        public Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             // Queued plus our own lock is the claim token: a fallback that took the row, a cancel or a finished run all fail it.
             if (!TimeTickers.TryGetValue(id, out var ticker) || ticker.Status != TickerStatus.Queued || ticker.LockHolder != _lockHolder)
@@ -248,7 +248,7 @@ namespace SharpTicker.Provider
 
             var updatedTicker = CloneTicker(ticker);
             updatedTicker.Status = TickerStatus.InProgress;
-            updatedTicker.UpdatedAt = _clock.UtcNow;
+            updatedTicker.UpdatedAt = claimMarker;
 
             return Task.FromResult(TimeTickers.TryUpdate(id, updatedTicker, ticker));
         }
@@ -278,7 +278,7 @@ namespace SharpTicker.Provider
                 updatedTicker.LockHolder = _lockHolder;
                 updatedTicker.LockedAt = now;
                 updatedTicker.Status = TickerStatus.InProgress;
-                updatedTicker.UpdatedAt = now;
+                updatedTicker.UpdatedAt = _clock.NextClaimMarker();
 
                 if (TimeTickers.TryUpdate(id, updatedTicker, ticker))
                 {
@@ -786,7 +786,7 @@ namespace SharpTicker.Provider
                         var updatedOccurrence = CloneCronOccurrence(existingOccurrence);
                         updatedOccurrence.LockHolder = _lockHolder;
                         updatedOccurrence.LockedAt = now;
-                        updatedOccurrence.UpdatedAt = now;
+                        updatedOccurrence.UpdatedAt = _clock.NextClaimMarker();
                         updatedOccurrence.Status = TickerStatus.InProgress;
 
                         if (CronOccurrences.TryUpdate(occurrence.Id, updatedOccurrence, existingOccurrence))
@@ -868,14 +868,14 @@ namespace SharpTicker.Provider
             return Task.CompletedTask;
         }
 
-        public Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        public Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             if (!CronOccurrences.TryGetValue(id, out var occurrence) || occurrence.Status != TickerStatus.Queued || occurrence.LockHolder != _lockHolder)
                 return Task.FromResult(false);
 
             var updatedOccurrence = CloneCronOccurrence(occurrence);
             updatedOccurrence.Status = TickerStatus.InProgress;
-            updatedOccurrence.UpdatedAt = _clock.UtcNow;
+            updatedOccurrence.UpdatedAt = claimMarker;
 
             return Task.FromResult(CronOccurrences.TryUpdate(id, updatedOccurrence, occurrence));
         }
@@ -1030,7 +1030,7 @@ namespace SharpTicker.Provider
                 updated.LockHolder = _lockHolder;
                 updated.LockedAt = now;
                 updated.Status = TickerStatus.InProgress;
-                updated.UpdatedAt = now;
+                updated.UpdatedAt = _clock.NextClaimMarker();
 
                 if (CronOccurrences.TryUpdate(id, updated, occurrence))
                 {

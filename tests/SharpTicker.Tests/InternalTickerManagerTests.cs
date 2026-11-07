@@ -749,14 +749,14 @@ public class InternalTickerManagerTests
     {
         var timeTickerId = Guid.NewGuid();
         var function = new InternalFunctionContext { TickerId = timeTickerId, Type = TickerType.TimeTicker, FunctionName = "Func1" };
-        _persistence.TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<CancellationToken>()).Returns(true);
+        _persistence.TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
 
         Assert.True(won);
         Assert.Equal(TickerStatus.InProgress, function.Status);
-        await _persistence.Received(1).TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<CancellationToken>());
-        await _persistence.DidNotReceive().TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<CancellationToken>());
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -764,14 +764,14 @@ public class InternalTickerManagerTests
     {
         var cronId = Guid.NewGuid();
         var function = new InternalFunctionContext { TickerId = cronId, Type = TickerType.CronTickerOccurrence, FunctionName = "CronFunc" };
-        _persistence.TryMarkCronOccurrenceInProgress(cronId, Arg.Any<CancellationToken>()).Returns(true);
+        _persistence.TryMarkCronOccurrenceInProgress(cronId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
 
         Assert.True(won);
         Assert.Equal(TickerStatus.InProgress, function.Status);
-        await _persistence.Received(1).TryMarkCronOccurrenceInProgress(cronId, Arg.Any<CancellationToken>());
-        await _persistence.DidNotReceive().TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<CancellationToken>());
+        await _persistence.Received(1).TryMarkCronOccurrenceInProgress(cronId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
     }
 
     [Theory]
@@ -780,8 +780,8 @@ public class InternalTickerManagerTests
     public async Task TryClaimDueTicker_LostClaim_ReturnsFalseAndLeavesStatusAlone(TickerType type)
     {
         var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = type, FunctionName = "Func1", Status = TickerStatus.Queued };
-        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<CancellationToken>()).Returns(false);
-        _persistence.TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<CancellationToken>()).Returns(false);
+        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
+        _persistence.TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
 
         var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
 
@@ -794,11 +794,27 @@ public class InternalTickerManagerTests
     {
         using var cts = new CancellationTokenSource();
         var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" };
-        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<CancellationToken>()).Returns(true);
+        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         await _manager.TryClaimDueTicker(function, cts.Token);
 
-        await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, cts.Token);
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, Arg.Any<DateTime>(), cts.Token);
+    }
+
+    // Each claim hands the provider a marker of its own, taken from the node's clock, so a claim can be found again by
+    // it; two claims at the same clock reading still get different markers.
+    [Fact]
+    public async Task TryClaimDueTicker_PassesAFreshClaimMarkerFromTheNodeClock()
+    {
+        var markers = new List<DateTime>();
+        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Do<DateTime>(markers.Add), Arg.Any<CancellationToken>()).Returns(true);
+
+        await _manager.TryClaimDueTicker(new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" });
+        await _manager.TryClaimDueTicker(new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" });
+
+        Assert.Equal(2, markers.Count);
+        Assert.Equal(_now, markers[0]);
+        Assert.True(markers[1] > markers[0]);
     }
 
     [Fact]

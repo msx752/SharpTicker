@@ -135,7 +135,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         var id = await QueueTimeTickerOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var row = await nodeA.GetTimeTickerById(id, CancellationToken.None);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -150,7 +150,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         var id = await QueueOccurrenceOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var row = await Occurrence(nodeA, id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -168,7 +168,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Contains(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
         var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await nodeA.GetTimeTickerById(id, CancellationToken.None);
         Assert.Equal("node-B", after.LockHolder);
@@ -186,7 +186,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Contains(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
         var before = await Occurrence(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await Occurrence(nodeA, id);
         Assert.Equal("node-B", after.LockHolder);
@@ -206,13 +206,13 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
         var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await nodeA.GetTimeTickerById(id, CancellationToken.None);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
     }
 
@@ -230,13 +230,13 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(slot, CancellationToken.None)));
         var before = await Occurrence(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await Occurrence(nodeA, id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await Occurrence(nodeA, id)).Status);
     }
 
@@ -250,7 +250,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         await nodeA.UpdateTimeTickersWithUnifiedContext([id], StatusContext(status), CancellationToken.None);
         var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await nodeA.GetTimeTickerById(id, CancellationToken.None);
         Assert.Equal(status, after.Status);
@@ -266,7 +266,7 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         await nodeA.UpdateCronTickerOccurrencesWithUnifiedContext([id], StatusContext(status), CancellationToken.None);
         var before = await Occurrence(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await Occurrence(nodeA, id);
         Assert.Equal(status, after.Status);
@@ -278,8 +278,8 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
     {
         var nodeA = CreateProvider("node-A");
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid()));
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     // The fallback scans a snapshot, then re-reads each row. A row that another node moved to InProgress between the
@@ -386,8 +386,8 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.DoesNotContain(fallback, x => x.Id == childId);
         var taken = Assert.Single(fallback, x => x.Id == parentId);
         Assert.Equal([childId], taken.Children.Select(x => x.Id));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, _clock.NextClaimMarker()));
         Assert.DoesNotContain(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parentId || x.Id == childId);
         Assert.DoesNotContain(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parentId || x.Id == childId);
     }
@@ -401,8 +401,8 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         var timeId = Guid.NewGuid();
         var occurrenceId = Guid.NewGuid();
 
-        Assert.True(await contract.TryMarkTimeTickerInProgress(timeId));
-        Assert.True(await contract.TryMarkCronOccurrenceInProgress(occurrenceId));
+        Assert.True(await contract.TryMarkTimeTickerInProgress(timeId, _clock.NextClaimMarker()));
+        Assert.True(await contract.TryMarkCronOccurrenceInProgress(occurrenceId, _clock.NextClaimMarker()));
 
         var timeWrite = Assert.Single(provider.TimeTickerWrites);
         Assert.Equal([timeId], timeWrite.Ids);

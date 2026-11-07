@@ -145,7 +145,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         var id = await QueueTimeTickerOn(nodeA);
         Clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()));
 
         var row = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -161,7 +161,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         var id = await QueueOccurrenceOn(nodeA);
         Clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker()));
 
         var row = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -180,7 +180,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Contains(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -198,7 +198,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Contains(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -219,13 +219,13 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()));
 
         var untouched = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
     }
 
@@ -242,13 +242,13 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(requeue, CancellationToken.None)));
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker()));
 
         var untouched = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
     }
 
@@ -261,7 +261,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         var id = await SeedTimeTicker(status, lockHolder: "node-A");
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal(status, after.Status);
@@ -282,7 +282,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal(status, after.Status);
@@ -294,8 +294,8 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     {
         var nodeA = CreateProvider("node-A");
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid()));
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), Clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), Clock.NextClaimMarker()));
     }
 
     #endregion
@@ -411,7 +411,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(fallbackNode.QueueTimedOutTimeTickers(CancellationToken.None));
         Clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -431,7 +431,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
         Clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id, Clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -535,7 +535,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
         var claimedByFaster = await Drain(faster.QueueTimedOutTimeTickers(CancellationToken.None));
         slowClock.Advance(TimeSpan.FromMilliseconds(300));
-        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id);
+        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFaster).Id);
         Assert.False(lateOwnerWon);
@@ -556,11 +556,11 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Clock.Advance(TimeSpan.FromSeconds(2));
 
         // Row 1: one TryMark wins, the twin's fallback then finds nothing to claim for it.
-        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst);
-        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst);
+        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst, Clock.NextClaimMarker());
+        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst, Clock.NextClaimMarker());
         // Row 2: the twin's fallback wins, the other's TryMark then loses.
         var claimedByTwin = await Drain(twin.QueueTimedOutTimeTickers(CancellationToken.None));
-        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst);
+        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst, Clock.NextClaimMarker());
 
         Assert.True(tryMarkWon);
         Assert.False(twinTryMarkWon);
@@ -632,13 +632,13 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     {
         var nodeA = CreateProvider("node-A");
         var leftByEarlierRun = await QueueOccurrenceOn(nodeA);
-        await nodeA.TryMarkCronOccurrenceInProgress(leftByEarlierRun);
+        await nodeA.TryMarkCronOccurrenceInProgress(leftByEarlierRun, Clock.NextClaimMarker());
         Clock.Advance(TimeSpan.FromMinutes(1));
         var start = Clock.UtcNow;
         Clock.Advance(TimeSpan.FromMilliseconds(5));
         var queuedSince = await QueueOccurrenceOn(nodeA);
         var claimedSince = await QueueOccurrenceOn(nodeA);
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(claimedSince));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(claimedSince, Clock.NextClaimMarker()));
 
         await nodeA.ReleaseDeadNodeOccurrenceResources("node-A", start, CancellationToken.None);
 
@@ -704,8 +704,8 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.DoesNotContain(fallback, x => x.Id == childId);
         var taken = Assert.Single(fallback, x => x.Id == parentId);
         Assert.Equal([childId], taken.Children.Select(x => x.Id));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, Clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, Clock.NextClaimMarker()));
         Assert.Empty(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)));
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
@@ -796,7 +796,7 @@ public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITes
         {
             start.Wait();
             foreach (var id in ids)
-                if (await node.TryMarkTimeTickerInProgress(id))
+                if (await node.TryMarkTimeTickerInProgress(id, Clock.NextClaimMarker()))
                     winners.Add(id);
         }
 
@@ -832,14 +832,14 @@ public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITes
         var queued = await Drain(node.QueueTimeTickers(window, CancellationToken.None));
         var claimed = 0;
         foreach (var row in queued)
-            if (await node.TryMarkTimeTickerInProgress(row.Id))
+            if (await node.TryMarkTimeTickerInProgress(row.Id, Clock.NextClaimMarker()))
                 claimed++;
         watch.Stop();
         output.WriteLine($"{rowCount} rows in one second: window read, queue and claim took {watch.ElapsedMilliseconds} ms");
 
         var again = 0;
         foreach (var row in queued)
-            if (await node.TryMarkTimeTickerInProgress(row.Id))
+            if (await node.TryMarkTimeTickerInProgress(row.Id, Clock.NextClaimMarker()))
                 again++;
 
         Assert.Equal(rowCount, window.Length);

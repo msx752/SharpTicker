@@ -137,7 +137,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await QueueTimeTickerOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -153,7 +153,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await QueueOccurrenceOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -172,7 +172,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Contains(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -190,7 +190,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Contains(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -211,13 +211,13 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
     }
 
@@ -234,13 +234,13 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(requeue, CancellationToken.None)));
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
     }
 
@@ -253,7 +253,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await SeedTimeTicker(status, lockHolder: "node-A");
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal(status, after.Status);
@@ -271,7 +271,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
             Builders<CronTickerOccurrenceEntity<CronTickerEntity>>.Update.Set(x => x.Status, status));
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal(status, after.Status);
@@ -283,8 +283,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     {
         var nodeA = CreateProvider("node-A");
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid()));
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     #endregion
@@ -400,7 +400,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(fallbackNode.QueueTimedOutTimeTickers(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -420,7 +420,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -520,7 +520,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
         var claimedByFaster = await Drain(faster.QueueTimedOutTimeTickers(CancellationToken.None));
         slowClock.Advance(TimeSpan.FromMilliseconds(300));
-        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id);
+        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFaster).Id);
         Assert.False(lateOwnerWon);
@@ -541,11 +541,11 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
 
         // Row 1: one TryMark wins, the twin's fallback then finds nothing to claim for it.
-        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst);
-        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst);
+        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
+        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
         // Row 2: the twin's fallback wins, the other's TryMark then loses.
         var claimedByTwin = await Drain(twin.QueueTimedOutTimeTickers(CancellationToken.None));
-        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst);
+        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst, _clock.NextClaimMarker());
 
         Assert.True(tryMarkWon);
         Assert.False(twinTryMarkWon);
@@ -613,8 +613,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.DoesNotContain(fallback, x => x.Id == childId);
         var taken = Assert.Single(fallback, x => x.Id == parentId);
         Assert.Equal([childId], taken.Children.Select(x => x.Id));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, _clock.NextClaimMarker()));
         Assert.Empty(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)));
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
@@ -654,7 +654,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         {
             start.Wait();
             foreach (var id in ids)
-                if (await node.TryMarkTimeTickerInProgress(id))
+                if (await node.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()))
                     winners.Add(id);
         }
 

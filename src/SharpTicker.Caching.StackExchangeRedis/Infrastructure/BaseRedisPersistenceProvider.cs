@@ -65,7 +65,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
     #region Lua script operations
     protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "") where T : class
     {
-        var now = Clock.UtcNow;
+        // A move to InProgress (the fallback, run-now) carries this node's next claim marker, like every InProgress write.
+        var now = targetStatus == TickerStatus.InProgress ? Clock.NextClaimMarker() : Clock.UtcNow;
         var result = await Db.ScriptEvaluateAsync(
             AcquireScript,
             [(RedisKey)key],
@@ -119,13 +120,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
     // Fenced Queued -> InProgress claim. Claimed is true when the script moved the row; Row can still be null if the
     // stored JSON does not deserialize, which does not undo the claim.
-    protected async Task<(bool Claimed, T Row)> TryMarkInProgressAsync<T>(string key) where T : class
+    protected async Task<(bool Claimed, T Row)> TryMarkInProgressAsync<T>(string key, DateTime claimMarker) where T : class
     {
-        var now = Clock.UtcNow;
         var result = await Db.ScriptEvaluateAsync(
             MarkInProgressScript,
             [(RedisKey)key],
-            [(RedisValue)LockHolder, (RedisValue)now.ToString("O"), LuaStatusQueued, LuaStatusInProgress]
+            [(RedisValue)LockHolder, (RedisValue)claimMarker.ToString("O"), LuaStatusQueued, LuaStatusInProgress]
         ).ConfigureAwait(false);
 
         if (result.IsNull) return (false, null);
@@ -318,9 +318,9 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         }
     }
 
-    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
     {
-        var (claimed, row) = await TryMarkInProgressAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+        var (claimed, row) = await TryMarkInProgressAsync<TTimeTicker>(TimeTickerKey(id), claimMarker).ConfigureAwait(false);
         if (!claimed) return false;
 
         if (row != null)
@@ -625,9 +625,9 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
         }
     }
 
-    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
     {
-        var (claimed, row) = await TryMarkInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id)).ConfigureAwait(false);
+        var (claimed, row) = await TryMarkInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id), claimMarker).ConfigureAwait(false);
         if (!claimed) return false;
 
         if (row != null)

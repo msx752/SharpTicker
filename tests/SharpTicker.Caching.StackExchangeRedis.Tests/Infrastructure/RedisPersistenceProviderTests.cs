@@ -712,7 +712,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         SeedTimeTicker(ticker);
         _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
 
-        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkTimeTickerInProgress(ticker.Id);
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkTimeTickerInProgress(ticker.Id, _clock.NextClaimMarker());
 
         Assert.True(marked);
         Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:tt:{ticker.Id}"]).RootElement.GetProperty("Status").GetInt32());
@@ -729,7 +729,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         SeedCronOccurrence(occ);
         _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
 
-        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkCronOccurrenceInProgress(occ.Id);
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkCronOccurrenceInProgress(occ.Id, _clock.NextClaimMarker());
 
         Assert.True(marked);
         Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:co:{occ.Id}"]).RootElement.GetProperty("Status").GetInt32());

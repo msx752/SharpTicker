@@ -296,9 +296,10 @@ namespace SharpTicker.Utilities.Managers
         // A node whose loop woke late finds the row taken by the fallback, or cancelled, and gets false.
         public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default)
         {
+            var claimMarker = _clock.NextClaimMarker();
             var won = function.Type == TickerType.TimeTicker
-                ? await _persistenceProvider.TryMarkTimeTickerInProgress(function.TickerId, cancellationToken).ConfigureAwait(false)
-                : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, cancellationToken).ConfigureAwait(false);
+                ? await _persistenceProvider.TryMarkTimeTickerInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false)
+                : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
 
             if (won)
                 function.Status = TickerStatus.InProgress;

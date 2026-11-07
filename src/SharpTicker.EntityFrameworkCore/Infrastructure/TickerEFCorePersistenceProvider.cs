@@ -352,12 +352,13 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
                 .WhereCanAcquire(_lockHolder);
 
             // Lock and mark InProgress
+            var claimMarker = _clock.NextClaimMarker();
             var affected = await query
                 .ExecuteUpdateAsync(setter => setter
                     .SetProperty(x => x.LockHolder, _lockHolder)
                     .SetProperty(x => x.LockedAt, now)
                     .SetProperty(x => x.Status, TickerStatus.InProgress)
-                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+                    .SetProperty(x => x.UpdatedAt, claimMarker), cancellationToken)
                 .ConfigureAwait(false);
 
             if (affected == 0)

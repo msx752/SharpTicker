@@ -102,10 +102,11 @@ namespace SharpTicker.MongoDB.Infrastructure
                     fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt),
                     fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
+                // Every InProgress write of this node carries its own claim marker (see ClaimMarkers).
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, now)
+                    .Set(x => x.UpdatedAt, _clock.NextClaimMarker())
                     .Set(x => x.Status, TickerStatus.InProgress);
 
                 var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -177,7 +178,7 @@ namespace SharpTicker.MongoDB.Infrastructure
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
         }
 
-        public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        public async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
             // The status changes on every match, so ModifiedCount equals the matched count.
@@ -188,7 +189,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                         MongoUpdateBuilders.QueuedByTimeTicker<TTimeTicker>(_lockHolder)),
                     Builders<TTimeTicker>.Update
                         .Set(x => x.Status, TickerStatus.InProgress)
-                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                        .Set(x => x.UpdatedAt, claimMarker),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             return result.ModifiedCount > 0;
@@ -236,11 +237,12 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
 
+            // One marker for this call: markers must differ between claims of one row, not between rows.
             var update = Builders<TTimeTicker>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, now);
+                .Set(x => x.UpdatedAt, _clock.NextClaimMarker());
 
             // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
             // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
@@ -538,7 +540,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, now)
+                    .Set(x => x.UpdatedAt, _clock.NextClaimMarker())
                     .Set(x => x.Status, TickerStatus.InProgress);
 
                 var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -558,7 +560,7 @@ namespace SharpTicker.MongoDB.Infrastructure
             }
         }
 
-        public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             var result = await _context.CronTickerOccurrences
                 .UpdateOneAsync(
@@ -567,7 +569,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                         MongoUpdateBuilders.QueuedByCronOccurrence<TCronTicker>(_lockHolder)),
                     Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                         .Set(x => x.Status, TickerStatus.InProgress)
-                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                        .Set(x => x.UpdatedAt, claimMarker),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             return result.ModifiedCount > 0;
@@ -918,7 +920,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, now);
+                .Set(x => x.UpdatedAt, _clock.NextClaimMarker());
 
             var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (result.ModifiedCount == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
