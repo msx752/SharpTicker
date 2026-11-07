@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.BackgroundServices;
 using SharpTicker.Utilities;
@@ -154,19 +155,19 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
     [Fact]
     public async Task TheConcurrencyLimit_IsReleased_EvenWhenTheJobFails()
     {
-        var parent = Job("Fallback.Parent");          // limit of 2
-        ReturnOnce(parent);
+        // Three jobs of a function with a limit of 2. Each claim starts its job once, so each job is its own queued work.
+        ReturnOnce(Job("Fallback.Parent"), Job("Fallback.Parent"), Job("Fallback.Parent"));
         _handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromException(new InvalidOperationException("the job failed")));
 
         await _service.StartAsync(CancellationToken.None);
-        Assert.True(await WaitUntilAsync(() => !_queued.IsEmpty));
-        _queued.TryPeek(out var queued);
+        Assert.True(await WaitUntilAsync(() => _queued.Count == 3));
 
-        // More failing runs than the limit allows: if a slot leaked, the third would wait forever.
-        for (var i = 0; i < 3; i++)
+        // More failing runs than the limit allows, one after the other: if a slot leaked, the third would wait forever.
+        foreach (var queued in _queued)
             await Assert.ThrowsAsync<InvalidOperationException>(() => queued.Work(CancellationToken.None))
                 .WaitAsync(TimeSpan.FromSeconds(5));
+        await _handler.Received(3).ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), true, Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -211,6 +212,37 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
         await _service.StartAsync(CancellationToken.None);
 
         Assert.True(await WaitUntilAsync(() => Polls() >= 3), "the loop gave up after the store failed");
+    }
+
+    // An outage of the safety net must not be silent: the first failure is an error, the attempts while it goes on are at
+    // Debug, and the recovery is written once.
+    [Fact]
+    public async Task AFailureOfTheStore_IsLoggedOnceAsAnError_AndTheRecoveryIsLogged()
+    {
+        var logs = new CapturedLogs();
+        using var loggerFactory = new LoggerFactory(new[] { logs });
+        var failures = 3;
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(_ => failures-- > 0
+            ? Task.FromException<InternalFunctionContext[]>(new InvalidOperationException("the store is down"))
+            : Task.FromResult(Array.Empty<InternalFunctionContext>()));
+        using var service = new SharpTickerFallbackBackgroundService(
+            _manager, new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) },
+            _handler, _scheduler, new TickerFunctionConcurrencyGate(), loggerFactory.CreateLogger<SharpTickerFallbackBackgroundService>());
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => logs.Entries.Any(e => e.Level == LogLevel.Information)), "the recovery was not logged");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        var error = Assert.Single(logs.Entries, e => e.Level >= LogLevel.Error);
+        Assert.Equal("the store is down", error.Exception?.Message);
+        Assert.Equal(2, logs.Entries.Count(e => e.Level == LogLevel.Debug));
+        Assert.Contains("recovered", Assert.Single(logs.Entries, e => e.Level == LogLevel.Information).Message);
     }
 
     [Fact]

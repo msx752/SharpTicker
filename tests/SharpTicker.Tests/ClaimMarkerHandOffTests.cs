@@ -175,6 +175,39 @@ public class ClaimMarkerHandOffTests : IAsyncLifetime
         Assert.Equal(stored.UpdatedAt, context.ClaimMarker);
     }
 
+    // Run-now marked the row InProgress, then the job cannot start: the scheduler takes no work (manual start mode, a stop)
+    // or the application is stopping. The row is put back for the fallback, and the call succeeds: the ticker is stored and
+    // will run, so a caller that retries on a failure would only add it twice.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RunNow_WhenTheJobCannotStart_PutsTheRowBack_AndTheCallSucceeds(bool applicationStopping)
+    {
+        var node = CreateProvider("node-A");
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        await using var scheduler = new SharpTicker.SharpTickerThreadPool.SharpTickerTaskScheduler(2);
+        if (!applicationStopping)
+            scheduler.Freeze();
+        var lifetime = Substitute.For<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
+        lifetime.ApplicationStopping.Returns(new CancellationToken(applicationStopping));
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new SharpTicker.BackgroundServices.ClaimedWorkQueue(InternalManager(node), scheduler, handler, gate);
+        var dispatcher = new SharpTicker.Dispatcher.SharpTickerDispatcher(scheduler, handler, gate, lifetime, null, work);
+        ITimeTickerManager<TimeTickerEntity> manager = new TickerManager<TimeTickerEntity, CronTickerEntity>(
+            node, Substitute.For<ISharpTickerHostScheduler>(), _clock, Hub(), new TickerExecutionContext(), dispatcher);
+        var ticker = new TimeTickerEntity { Id = Guid.NewGuid(), Function = "HandOff.Fn", Request = [] };
+        _timeTickerIds.Add(ticker.Id);
+
+        var result = await manager.AddAsync(ticker);
+
+        Assert.True(result.IsSucceeded, result.Exception?.ToString());
+        var row = await node.GetTimeTickerById(ticker.Id, CancellationToken.None);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Equal(0, work.Claims.Count);
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+    }
+
     private static async Task<List<T>> Drain<T>(IAsyncEnumerable<T> source)
     {
         var list = new List<T>();

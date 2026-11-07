@@ -136,6 +136,36 @@ public class ImmediateJobLifetimeTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Done, stored!.Status);
     }
 
+    // A job run now waits for its function's only slot, which a running job holds, and the application stops meanwhile. The
+    // waiting job never started; its row was marked InProgress when it was dispatched and is put back, not left InProgress
+    // with no worker running it.
+    [Fact]
+    public async Task StoppingWhileARunNowJobWaitsForItsConcurrencySlot_PutsItsRowBack()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        new ServiceCollection().MapTicker<LifetimeOrder>("Lifetime.OneAtATime", async (ctx, ct) =>
+        {
+            firstStarted.TrySetResult();
+            await Task.Delay(Timeout.Infinite, ct);
+        }).WithMaxConcurrency(1);
+        TickerFunctionProvider.Build();
+        await StartHostAsync();
+        var store = _app!.Services.GetRequiredService<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+
+        var first = await Times.AddAsync(new TimeTickerEntity { Function = "Lifetime.OneAtATime", ExecutionTime = DateTime.UtcNow });
+        Assert.True(first.IsSucceeded, first.Exception?.ToString());
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        var second = await Times.AddAsync(new TimeTickerEntity { Function = "Lifetime.OneAtATime", ExecutionTime = DateTime.UtcNow });
+        Assert.True(second.IsSucceeded, second.Exception?.ToString());
+        Assert.Equal(TickerStatus.InProgress, (await WaitForStatusAsync(second.Result.Id, TickerStatus.InProgress))!.Status);
+
+        await _app.StopAsync();
+
+        var row = await store.GetTimeTickerById(second.Result.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
     [Fact]
     public async Task TheDispatcher_GivesTheJobATokenThatTheCallersTokenDoesNotCancel()
     {

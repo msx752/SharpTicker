@@ -308,6 +308,8 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         public Guid? ThrowAfterClaimOf { get; set; }
         /// <summary>The first this-many put-backs throw, as when the store cannot be reached.</summary>
         public int FailPutBacks { get; set; }
+        /// <summary>The first this-many put-backs reach the store and land, then throw (a lost reply).</summary>
+        public int LandThenFailPutBacks { get; set; }
         /// <summary>When set, replaces what the store says about concurrent claims.</summary>
         public int? FanOut { get; set; }
         /// <summary>How long each claim takes, so concurrent claims overlap.</summary>
@@ -361,6 +363,11 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             var putBack = await inner.TryReleaseClaim(function, claimMarker, cancellationToken);
             if (putBack)
                 PutBacks.Enqueue(function.TickerId);
+            if (LandThenFailPutBacks > 0)
+            {
+                LandThenFailPutBacks--;
+                throw new TimeoutException("the reply of the put-back was lost");
+            }
             return putBack;
         }
 
@@ -543,6 +550,50 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(id.ToString()) && e.Message.Contains("put back"));
         Assert.Equal(0, service.Claims.Count);
+    }
+
+    // A loop job waits for its slot while another stopping service sweeps the claims of this node. The put-back lands but its
+    // reply is lost, so the row is Idle and the fallback may run the job. When the slot frees up, the waiting worker must not
+    // run it as well.
+    [Fact]
+    public async Task APutBackWhoseReplyWasLost_TheWaitingJobNeverStarts()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker("Handover.LostReply");
+        var batch = await QueueBatch(node, id);
+        batch[0].CachedMaxConcurrency = 1;
+        var manager = new HookedManager(CreateRealManager(node)) { LandThenFailPutBacks = 1 };
+        var gate = new TickerFunctionConcurrencyGate();
+        var slot = gate.GetSemaphoreOrNull("Handover.LostReply", 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        await using var scheduler = new SharpTickerTaskScheduler(4);
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        var context = new TickerExecutionContext();
+        var service = new SharpTickerSchedulerBackgroundService(context, handler, scheduler, manager,
+            new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(10) }, gate, null, _clock, null, work)
+        { ShutdownWaitLimit = TimeSpan.FromMilliseconds(200) };
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.ClaimResults.Contains(true)), "the job was never claimed");
+            await Task.Delay(100);
+
+            await work.PutBackUnstartedAsync();
+            Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+            slot.Release();
+            await Task.Delay(300);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
     }
 
     // The store cannot be reached when the claim is put back: the row stays InProgress, the failure is an error, and the loop
@@ -942,6 +993,94 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         await foreach (var item in source)
             list.Add(item);
         return list;
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // The fallback's claims
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private static readonly TickerFunctionDelegate NoOp = (_, _, _) => Task.CompletedTask;
+
+    private static void RegisterFunction(string name, int maxConcurrency)
+    {
+        TickerFunctionProvider.RegisterFunctions(new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)>
+        {
+            [name] = ("", TickerTaskPriority.Normal, NoOp, maxConcurrency)
+        });
+        TickerFunctionProvider.Build();
+    }
+
+    private static ITickerExecutionTaskHandler CountingHandler(ConcurrentDictionary<Guid, int> runs)
+    {
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(call =>
+        {
+            runs.AddOrUpdate(call.Arg<InternalFunctionContext>().TickerId, 1, (_, n) => n + 1);
+            return Task.CompletedTask;
+        });
+        return handler;
+    }
+
+    // The fallback took a row whose function's only slot is held by another run, and the application stops while the job waits
+    // for it. The job never started, so its row is put back instead of staying InProgress with nothing to run it.
+    [Fact]
+    public async Task Fallback_StopWhileAClaimedJobWaitsForItsConcurrencySlot_PutsTheRowBack()
+    {
+        RegisterFunction("Fallback.Gate", 1);
+        var id = await SeedTimeTicker("Fallback.Gate");
+        var node = CreateProvider("node-B");
+        var gate = new TickerFunctionConcurrencyGate();
+        var slot = gate.GetSemaphoreOrNull("Fallback.Gate", 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        var runs = new ConcurrentDictionary<Guid, int>();
+        await using var scheduler = new SharpTickerTaskScheduler(4);
+        var fallback = new SharpTickerFallbackBackgroundService(CreateRealManager(node),
+            new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) }, CountingHandler(runs), scheduler, gate);
+        _clock.Advance(TimeSpan.FromSeconds(2)); // the row is past the fallback's threshold
+
+        await fallback.StartAsync(CancellationToken.None);
+        Assert.True(await WaitUntilAsync(() => StatusOf(node, id).Result == TickerStatus.InProgress), "the fallback never took the row");
+        await Task.Delay(100);
+        scheduler.Freeze();
+        await fallback.StopAsync(CancellationToken.None);
+        slot.Release();
+        await Task.Delay(100);
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.Null((await node.GetTimeTickerById(id, CancellationToken.None)).LockHolder);
+        Assert.False(runs.ContainsKey(id));
+    }
+
+    // The scheduler is frozen while the fallback hands over the rows it took. The rows it could not hand over were already
+    // InProgress for this node; they are put back instead of being left with no worker.
+    [Fact]
+    public async Task Fallback_SchedulerFrozenMidPass_RowsNotHandedOverArePutBack()
+    {
+        var ids = new[] { await SeedTimeTicker("Fallback.Batch"), await SeedTimeTicker("Fallback.Batch"), await SeedTimeTicker("Fallback.Batch") };
+        var node = CreateProvider("node-B");
+        var runs = new ConcurrentDictionary<Guid, int>();
+        var scheduler = new RecordingTaskScheduler();
+        scheduler.OnQueued = n => { if (n == 1) scheduler.Freeze(); };
+        using var fallback = new SharpTickerFallbackBackgroundService(CreateRealManager(node),
+            new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) }, CountingHandler(runs), scheduler,
+            new TickerFunctionConcurrencyGate());
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        await fallback.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => ids.Count(id => StatusOf(node, id).Result == TickerStatus.Idle) == 2),
+                "the rows not handed over were not put back");
+        }
+        finally
+        {
+            await fallback.StopAsync(CancellationToken.None);
+        }
+        await scheduler.WhenAllIdleAsync();
+
+        var handedOver = Assert.Single(runs.Keys);
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, handedOver));
+        Assert.Equal(1, scheduler.QueuedCount);
     }
 
     [Fact]

@@ -62,6 +62,14 @@ namespace SharpTicker.DependencyInjection
             // Only register background services if enabled (default is true)
             if (optionInstance.RegisterBackgroundServices)
             {
+                // One queue of claimed work for the loop, the fallback and run-now, so every claim whose job does not
+                // start is put back and a failed put-back is tried again by the loop.
+                services.AddSingleton(sp => new ClaimedWorkQueue(
+                    sp.GetRequiredService<IInternalTickerManager>(),
+                    sp.GetRequiredService<ISharpTickerTaskScheduler>(),
+                    sp.GetRequiredService<ITickerExecutionTaskHandler>(),
+                    sp.GetRequiredService<ITickerFunctionConcurrencyGate>(),
+                    sp.GetService<ILoggerFactory>()?.CreateLogger<ClaimedWorkQueue>()));
                 services.AddSingleton<SharpTickerSchedulerBackgroundService>();
                 services.AddSingleton<ISharpTickerHostScheduler>(provider =>
                     provider.GetRequiredService<SharpTickerSchedulerBackgroundService>());

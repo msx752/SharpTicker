@@ -43,7 +43,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ITickerFunctionConcurrencyGate concurrencyGate,
         ILogger<SharpTickerSchedulerBackgroundService> logger = null,
         ITickerClock clock = null,
-        IOptions<HostOptions> hostOptions = null)
+        IOptions<HostOptions> hostOptions = null,
+        ClaimedWorkQueue claimedWork = null)
     {
         _logger = logger;
         _clock = clock;
@@ -54,6 +55,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _internalTickerManager = internalTickerManager ?? throw new ArgumentNullException(nameof(internalTickerManager));
         _concurrencyGate = concurrencyGate;
         _minPollingInterval = ResolveMinPollingInterval(schedulerOptions);
+        _work = claimedWork ?? new ClaimedWorkQueue(_internalTickerManager, taskScheduler, taskHandler, concurrencyGate, logger);
         _restartThrottle = new RestartThrottleManager(() => _schedulerLoopCancellationTokenSource?.Cancel());
     }
     
@@ -118,7 +120,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     {
         while (!stoppingToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            await RetryFailedPutBacksAsync();
+            // The put-backs of every claim of this node (loop, fallback, run-now) are tried again here.
+            await _work.RetryFailedPutBacksAsync();
 
             if (_executionContext.Functions.Length != 0)
             {
@@ -156,7 +159,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
 
             // A put-back that failed is tried again on the loop's next pass, and an idle loop could sleep up to a day.
-            if (sleepDuration > PutBackRetryInterval && _claims.PendingPutBacks().Count > 0)
+            if (sleepDuration > PutBackRetryInterval && _work.Claims.PendingPutBacks().Count > 0)
                 sleepDuration = PutBackRetryInterval;
 
             var notify = _executionContext.NotifyCoreAction;
@@ -176,10 +179,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         Failed
     }
 
-    // The claims this loop won and whose job has not started. Each one ends as a started job or as a row put back.
-    private readonly ClaimLedger _claims = new();
+    // Hands won claims to the workers and puts back those whose job does not start; shared with the fallback and run-now.
+    private readonly ClaimedWorkQueue _work;
 
-    internal ClaimLedger Claims => _claims;
+    internal ClaimLedger Claims => _work.Claims;
 
     /// <summary>How long the loop sleeps at most while a put-back is waiting to be tried again. Tests shorten it.</summary>
     internal TimeSpan PutBackRetryInterval { get; set; } = TimeSpan.FromSeconds(5);
@@ -212,7 +215,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         // whose call fails after its write landed is still found and put back.
         await Parallel.ForEachAsync(Enumerable.Range(0, batch.Length), new ParallelOptions { MaxDegreeOfParallelism = fanOut }, async (i, _) =>
         {
-            var entry = _claims.Record(batch[i], _internalTickerManager.NextClaimMarker());
+            var entry = _work.Record(batch[i], _internalTickerManager.NextClaimMarker());
             entries[i] = entry;
             try
             {
@@ -241,50 +244,24 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
                 case ClaimOutcome.Failed:
                     firstFailure ??= failures[i];
-                    await PutBackAsync(entries[i], "its claim call failed", failures[i], quietWhenNothingToPutBack: true);
+                    await _work.PutBackAsync(entries[i], "its claim call failed", failures[i], quietWhenNothingToPutBack: true);
                     break;
 
                 default:
                     if (!CanHandOver(stoppingToken))
                     {
-                        await PutBackAsync(entries[i], "the scheduler stopped taking work before its worker got it");
+                        await _work.PutBackAsync(entries[i], "the scheduler stopped taking work before its worker got it");
                         break;
                     }
 
                     await NotifyInProgressAsync(function);
-                    QueueWork(entries[i], stoppingToken);
+                    _work.QueueWork(entries[i], isDue: false, stoppingToken);
                     break;
             }
         }
 
         if (firstFailure != null)
             ExceptionDispatchInfo.Capture(firstFailure).Throw();
-    }
-
-    private void QueueWork(ClaimLedger.Entry entry, CancellationToken stoppingToken)
-    {
-        var function = entry.Function;
-        var semaphore = _concurrencyGate.GetSemaphoreOrNull(function.FunctionName, function.CachedMaxConcurrency);
-
-        ObserveQueueing(entry, _taskScheduler.QueueAsync(async ct =>
-        {
-            // A stop while the job waits for its slot ends the wait here; the claim is still pending and the stop puts it back.
-            if (semaphore != null)
-                await semaphore.WaitAsync(ct).ConfigureAwait(false);
-
-            try
-            {
-                // The job counts as started only once it holds its slot. A claim that is being put back does not start.
-                if (!entry.TryStart())
-                    return;
-
-                await _taskHandler.ExecuteTaskAsync(function, false, ct).ConfigureAwait(false);
-            }
-            finally
-            {
-                semaphore?.Release();
-            }
-        }, function.CachedPriority, stoppingToken));
     }
 
     private async Task NotifyInProgressAsync(InternalFunctionContext function)
@@ -299,95 +276,6 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) is running but the dashboard could not be notified.",
                 function.FunctionName, function.TickerId);
         }
-    }
-
-    // QueueAsync is async, so a refusal (the scheduler froze or was disposed after the claim) comes back in the task and not as
-    // a throw. The row is already InProgress and has no worker, so it is put back.
-    private void ObserveQueueing(ClaimLedger.Entry entry, ValueTask queued)
-    {
-        if (queued.IsCompletedSuccessfully)
-            return;
-
-        _ = ObserveQueueingAsync(entry, queued);
-    }
-
-    private async Task ObserveQueueingAsync(ClaimLedger.Entry entry, ValueTask queued)
-    {
-        try
-        {
-            await queued.ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            await PutBackAsync(entry, "the scheduler refused it", ex);
-        }
-    }
-
-    // Puts back a claim whose job did not start: the fenced write moves the row back to Idle only while it is still this
-    // claim (InProgress, this node, this marker), and the fallback then runs the job once. A job that started meanwhile, or a
-    // row that moved on, is left alone. When the store cannot be reached the claim stays in the ledger and is tried again.
-    private async Task PutBackAsync(ClaimLedger.Entry entry, string reason, Exception cause = null, bool quietWhenNothingToPutBack = false)
-    {
-        if (!entry.TryBeginRevert())
-            return;
-
-        var function = entry.Function;
-        bool putBack;
-        try
-        {
-            putBack = await _internalTickerManager.TryReleaseClaim(function, entry.ClaimMarker, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            entry.RevertFailed();
-            // Tried again every PutBackRetryInterval while the store is out of reach: the first failure is the error, the
-            // attempts after it are written at Debug, and the put-back that works says so.
-            _logger?.Log(entry.FailedPutBacks == 1 ? LogLevel.Error : LogLevel.Debug, ex,
-                "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}), and it could not be put back. " +
-                "Its row stays InProgress with no worker running it; the scheduler tries again.",
-                function.FunctionName, function.TickerId, reason);
-            return;
-        }
-
-        entry.RevertSucceeded();
-
-        if (!putBack)
-        {
-            if (quietWhenNothingToPutBack)
-                _logger?.LogDebug(cause, "Job {FunctionName} ({TickerId}) did not start ({Reason}); its row was not this claim, so there was nothing to put back.",
-                    function.FunctionName, function.TickerId, reason);
-            else
-                _logger?.LogInformation(cause, "Job {FunctionName} ({TickerId}) did not start ({Reason}); its row had already moved on, so there was nothing to put back.",
-                    function.FunctionName, function.TickerId, reason);
-            return;
-        }
-
-        _logger?.LogWarning(cause, "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}). It was put back and runs once the fallback picks it up.",
-            function.FunctionName, function.TickerId, reason);
-
-        try
-        {
-            await _internalTickerManager.NotifyStatusChanged(function);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was put back but the dashboard could not be notified.",
-                function.FunctionName, function.TickerId);
-        }
-    }
-
-    private async Task RetryFailedPutBacksAsync()
-    {
-        foreach (var entry in _claims.PendingPutBacks())
-            await PutBackAsync(entry, "a put-back that failed earlier");
-    }
-
-    // After the stop, no worker starts a job of this loop any more: what is still pending (a job that waited for its slot,
-    // or one the stopped scheduler never ran) is put back.
-    private async Task PutBackUnstartedClaimsAsync()
-    {
-        foreach (var entry in _claims.Pending())
-            await PutBackAsync(entry, "the application stopped before its worker started it");
     }
 
     private static TimeSpan ResolveMinPollingInterval(SchedulerOptionsBuilder schedulerOptions)
@@ -548,7 +436,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
         await WaitForRunningJobsAsync(cancellationToken);
-        await PutBackUnstartedClaimsAsync();
+        // After the stop no worker starts a job of this node any more: what is still pending is put back.
+        await _work.PutBackUnstartedAsync();
     }
 
     // The jobs run on the scheduler's workers, not inside this service, so stopping the service did not wait for them. The
