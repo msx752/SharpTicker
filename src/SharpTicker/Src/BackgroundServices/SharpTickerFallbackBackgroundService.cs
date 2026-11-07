@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SharpTicker.Utilities;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Models;
@@ -69,6 +70,22 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
                 {
                     await Task.Delay(_fallbackJobPeriod, stoppingToken);
                 }
+            }
+            catch (ClaimsInterruptedException interrupted)
+            {
+                // The store failed after some rows were claimed: they are InProgress for this node and are handed over (or
+                // put back, when the application is stopping). The failure is then reported like any other.
+                foreach (var function in interrupted.Claimed)
+                {
+                    CacheFunctionReferences(function);
+                    await HandOverAsync(function, stoppingToken);
+                }
+
+                if (stoppingToken.IsCancellationRequested)
+                    break;
+
+                RecordFailure(interrupted.InnerException);
+                await Task.Delay(_fallbackJobPeriod, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

@@ -245,6 +245,74 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
         Assert.Contains("recovered", Assert.Single(logs.Entries, e => e.Level == LogLevel.Information).Message);
     }
 
+    // The store failed after the fallback had claimed a row: the row comes back with the failure. It is run, not left
+    // InProgress, and the failure is still reported.
+    [Fact]
+    public async Task TheStoreFailsAfterARowWasClaimed_TheRowIsStillRun_AndTheFailureIsLogged()
+    {
+        var logs = new CapturedLogs();
+        using var loggerFactory = new LoggerFactory(new[] { logs });
+        var claimed = Job("Fallback.Parent");
+        claimed.ClaimMarker = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var failure = new InvalidOperationException("the connection dropped");
+        var first = true;
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            if (!first) return Task.FromResult(Array.Empty<InternalFunctionContext>());
+            first = false;
+            return Task.FromException<InternalFunctionContext[]>(new SharpTicker.Utilities.Exceptions.ClaimsInterruptedException([claimed], failure));
+        });
+        using var service = new SharpTickerFallbackBackgroundService(
+            _manager, new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) },
+            _handler, _scheduler, new TickerFunctionConcurrencyGate(), loggerFactory.CreateLogger<SharpTickerFallbackBackgroundService>());
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => _queued.Count == 1), "the claimed row was not handed over");
+            await _queued.Single().Work(CancellationToken.None);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        await _handler.Received(1).ExecuteTaskAsync(claimed, true, Arg.Any<CancellationToken>());
+        Assert.Same(failure, Assert.Single(logs.Entries, e => e.Level >= LogLevel.Error).Exception);
+    }
+
+    // The stop cancels the claim call after it claimed a row: the row is put back, not handed to a scheduler that stops.
+    [Fact]
+    public async Task TheStopInterruptsTheClaimCall_TheClaimedRowIsPutBack()
+    {
+        var claimed = Job("Fallback.Parent");
+        claimed.ClaimMarker = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var calling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(async call =>
+        {
+            var token = call.Arg<CancellationToken>();
+            calling.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.Infinite, token);
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new SharpTicker.Utilities.Exceptions.ClaimsInterruptedException([claimed], ex);
+            }
+            return Array.Empty<InternalFunctionContext>();
+        });
+        _manager.TryReleaseClaim(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
+
+        await _service.StartAsync(CancellationToken.None);
+        await calling.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await _service.StopAsync(CancellationToken.None);
+
+        await _manager.Received(1).TryReleaseClaim(claimed, claimed.ClaimMarker.Value, Arg.Any<CancellationToken>());
+        Assert.True(_queued.IsEmpty);
+        await _handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+    }
+
     [Fact]
     public async Task AfterStopping_TheServiceCanBeStartedAgain()
     {

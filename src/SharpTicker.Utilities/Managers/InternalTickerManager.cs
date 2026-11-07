@@ -6,7 +6,9 @@ using System.Text.Json.Serialization.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpTicker.Utilities.Entities;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Models;
@@ -20,15 +22,26 @@ namespace SharpTicker.Utilities.Managers
         private readonly ITickerPersistenceProvider<TTimeTicker, TCronTicker> _persistenceProvider;
         private readonly ITickerClock _clock;
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
+        private readonly ILogger _logger;
 
         public InternalTickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
             ITickerClock clock,
             ISharpTickerNotificationHubSender notificationHubSender)
+            : this(persistenceProvider, clock, notificationHubSender, null)
+        {
+        }
+
+        public InternalTickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger)
         {
             _persistenceProvider = persistenceProvider;
             _clock = clock ?? throw new ArgumentNullException(nameof(clock));
             _notificationHubSender = notificationHubSender;
+            _logger = logger;
         }
         
         public async Task<(TimeSpan TimeRemaining, InternalFunctionContext[] Functions)> GetNextTickers(CancellationToken cancellationToken = default)
@@ -419,10 +432,42 @@ namespace SharpTicker.Utilities.Managers
                 : TickerHelper.ReadTickerRequest(request, typeInfo);
         }
 
+        // The stores claim the overdue rows one by one while they are enumerated, so a failure in the middle (a dropped
+        // connection, a cancelled token) comes after some rows were claimed. Those rows are InProgress for this node; they are
+        // handed back with the failure so the fallback runs them, instead of being dropped with the list.
         public async Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default)
         {
             var results = new List<InternalFunctionContext>();
-            
+
+            try
+            {
+                await ClaimTimedOutTickersAsync(results, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (results.Count > 0)
+            {
+                throw new ClaimsInterruptedException(results.ToArray(), ex);
+            }
+
+            return results.ToArray();
+        }
+
+        // The notification is for the dashboard and does not decide the job: a hub that fails must not drop a claimed row or
+        // end the pass.
+        private async Task NotifyClaimedAsync(Func<Task> notify, InternalFunctionContext function)
+        {
+            try
+            {
+                await notify().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was taken by the fallback but the dashboard could not be notified.",
+                    function.FunctionName, function.TickerId);
+            }
+        }
+
+        private async Task ClaimTimedOutTickersAsync(List<InternalFunctionContext> results, CancellationToken cancellationToken)
+        {
             await foreach(var timedOutTimeTicker in _persistenceProvider.QueueTimedOutTimeTickers(cancellationToken).ConfigureAwait(false))
             {
                 results.Add(new InternalFunctionContext
@@ -457,7 +502,7 @@ namespace SharpTicker.Utilities.Managers
                     }).ToList()
                 });
 
-                await _notificationHubSender.UpdateTimeTickerNotifyAsync(timedOutTimeTicker).ConfigureAwait(false);
+                await NotifyClaimedAsync(() => _notificationHubSender.UpdateTimeTickerNotifyAsync(timedOutTimeTicker), results[^1]).ConfigureAwait(false);
             }
 
             await foreach (var timedOutCronTicker in _persistenceProvider.QueueTimedOutCronTickerOccurrences(cancellationToken).ConfigureAwait(false))
@@ -475,10 +520,9 @@ namespace SharpTicker.Utilities.Managers
                 };
                 
                 results.Add(functionContext);
-                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext).ConfigureAwait(false);
+                await NotifyClaimedAsync(() => _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext), functionContext)
+                    .ConfigureAwait(false);
             }
-            
-            return results.ToArray();
         }
         
         public async Task MigrateDefinedCronTickers((string, string)[] cronExpressions, CancellationToken cancellationToken = default)

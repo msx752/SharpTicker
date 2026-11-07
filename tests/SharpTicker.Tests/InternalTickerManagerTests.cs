@@ -9,6 +9,7 @@ using NSubstitute;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Managers;
@@ -1118,6 +1119,85 @@ public class InternalTickerManagerTests
         await _manager.RunTimedOutTickers(CancellationToken.None);
 
         await _notificationHub.Received(1).UpdateTimeTickerNotifyAsync(timedOutTimeTicker);
+    }
+
+    private static TimeTickerEntity TimedOut(string function = "Func") => new()
+    {
+        Id = Guid.NewGuid(), Function = function, ExecutionTime = new DateTime(2025, 6, 15, 11, 59, 0, DateTimeKind.Utc),
+        RetryIntervals = Array.Empty<int>(), Children = new List<TimeTickerEntity>()
+    };
+
+    private static async IAsyncEnumerable<T> YieldThenThrow<T>(IEnumerable<T> items, Exception failure)
+    {
+        foreach (var item in items)
+        {
+            await Task.Yield();
+            yield return item;
+        }
+        throw failure;
+    }
+
+    // The fallback's store call fails after it claimed some rows (the connection drops in the middle). Those rows are
+    // InProgress for this node; they come back with the failure so the fallback can run them, instead of staying InProgress.
+    [Fact]
+    public async Task RunTimedOutTickers_StoreFailsAfterSomeRowsWereClaimed_HandsBackTheClaimedRowsWithTheFailure()
+    {
+        var claimed = TimedOut();
+        var failure = new InvalidOperationException("the connection dropped");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(YieldThenThrow(new[] { claimed }, failure));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+
+        var interrupted = await Assert.ThrowsAsync<ClaimsInterruptedException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, interrupted.InnerException);
+        var context = Assert.Single(interrupted.Claimed);
+        Assert.Equal(claimed.Id, context.TickerId);
+        Assert.Equal(claimed.UpdatedAt, context.ClaimMarker);
+    }
+
+    [Fact]
+    public async Task RunTimedOutTickers_CronStoreFailsAfterTimeTickersWereClaimed_HandsBackTheTimeTickers()
+    {
+        var claimed = TimedOut();
+        var failure = new InvalidOperationException("the connection dropped");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(new[] { claimed }));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(YieldThenThrow(Array.Empty<CronTickerOccurrenceEntity<FakeCronTicker>>(), failure));
+
+        var interrupted = await Assert.ThrowsAsync<ClaimsInterruptedException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, interrupted.InnerException);
+        Assert.Equal(claimed.Id, Assert.Single(interrupted.Claimed).TickerId);
+    }
+
+    // Nothing was claimed yet: the failure is the store's own, as before.
+    [Fact]
+    public async Task RunTimedOutTickers_StoreFailsBeforeAnyClaim_ThrowsTheStoresException()
+    {
+        var failure = new InvalidOperationException("the store is down");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(YieldThenThrow(Array.Empty<TimeTickerEntity>(), failure));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, thrown);
+    }
+
+    // The dashboard notification does not decide the job: a hub that fails must not lose the rows that were claimed, nor
+    // end the pass after one row.
+    [Fact]
+    public async Task RunTimedOutTickers_DashboardNotificationFails_EveryClaimedRowIsStillReturned()
+    {
+        var rows = new[] { TimedOut(), TimedOut() };
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(rows));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+        _notificationHub.UpdateTimeTickerNotifyAsync(Arg.Any<object>())
+            .Returns(Task.FromException(new InvalidOperationException("the hub is down")));
+
+        var results = await _manager.RunTimedOutTickers(CancellationToken.None);
+
+        Assert.Equal(rows.Select(x => x.Id), results.Select(x => x.TickerId));
     }
 
     [Fact]
