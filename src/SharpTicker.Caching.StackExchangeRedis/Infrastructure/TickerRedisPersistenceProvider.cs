@@ -252,7 +252,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             if (occurrence.CronTicker == null && occurrence.CronTickerId != Guid.Empty)
                 occurrence.CronTicker = await Serializer.GetAsync<TCronTicker>(CronKey(occurrence.CronTickerId)).ConfigureAwait(false);
 
-            await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
+            await TryUpdateIndexAfterClaim(occurrence.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(occurrence)).ConfigureAwait(false);
             acquired.Add(occurrence);
         }
 

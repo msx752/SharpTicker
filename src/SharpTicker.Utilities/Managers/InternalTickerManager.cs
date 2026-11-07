@@ -292,37 +292,26 @@ namespace SharpTicker.Utilities.Managers
             return (min.Value, finalWinners);
         }
 
-        public async Task SetTickersInProgress(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
+        // The row is handed to a worker only when this call moved it from Queued (held by this node) to InProgress.
+        // A node whose loop woke late finds the row taken by the fallback, or cancelled, and gets false.
+        public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default)
         {
-            var unifiedFunctionContext = new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress);
-            
-            var cronTickerIds = resources.Where(x => x.Type == TickerType.CronTickerOccurrence).Select(x => x.TickerId).ToArray();
-            var timeTickerIds = resources.Where(x => x.Type == TickerType.TimeTicker).Select(x => x.TickerId).ToArray();
+            var won = function.Type == TickerType.TimeTicker
+                ? await _persistenceProvider.TryMarkTimeTickerInProgress(function.TickerId, cancellationToken).ConfigureAwait(false)
+                : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, cancellationToken).ConfigureAwait(false);
 
-            if (cronTickerIds.Length != 0 && timeTickerIds.Length != 0)
-            {
-                var updateCronTickerOccurrencesTask = _persistenceProvider.UpdateCronTickerOccurrencesWithUnifiedContext(cronTickerIds, unifiedFunctionContext, cancellationToken);
-                var updateTimeTickersTask = _persistenceProvider.UpdateTimeTickersWithUnifiedContext(timeTickerIds, unifiedFunctionContext, cancellationToken);
-                await Task.WhenAll(updateCronTickerOccurrencesTask, updateTimeTickersTask).ConfigureAwait(false);
-            }
+            if (won)
+                function.Status = TickerStatus.InProgress;
+
+            return won;
+        }
+
+        public async Task NotifyInProgress(InternalFunctionContext function)
+        {
+            if (function.Type == TickerType.TimeTicker)
+                await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(function).ConfigureAwait(false);
             else
-            {
-                if (cronTickerIds.Length != 0)                 
-                    await _persistenceProvider.UpdateCronTickerOccurrencesWithUnifiedContext(cronTickerIds, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
-            
-                if (timeTickerIds.Length != 0)
-                    await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(timeTickerIds, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
-            }
-            
-            foreach (var resource in resources)
-            {
-                resource.Status = TickerStatus.InProgress;
-                
-                if(resource.Type == TickerType.TimeTicker)
-                    await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(resource).ConfigureAwait(false);
-                else
-                    await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(resource).ConfigureAwait(false);
-            }
+                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(function).ConfigureAwait(false);
         }
 
         public async Task ReleaseAcquiredResources(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
@@ -483,7 +472,17 @@ namespace SharpTicker.Utilities.Managers
         public async Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default)
             => await _persistenceProvider.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken).ConfigureAwait(false);
 
-        public async Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+        public Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+            => ReleaseBothAsync(
+                () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken),
+                () => _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken));
+
+        public Task ReleaseEarlierRunResources(string nodeIdentifier, DateTime runStartedAt, CancellationToken cancellationToken = default)
+            => ReleaseBothAsync(
+                () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(nodeIdentifier, runStartedAt, cancellationToken),
+                () => _persistenceProvider.ReleaseDeadNodeTimeTickerResources(nodeIdentifier, runStartedAt, cancellationToken));
+
+        private static async Task ReleaseBothAsync(Func<Task> releaseOccurrences, Func<Task> releaseTimeTickers)
         {
             // One after the other: a store behind a single connection, such as an in-memory SQLite database, cannot run two
             // operations at once, and these are two short statements. They do not depend on each other, so the second runs
@@ -492,7 +491,7 @@ namespace SharpTicker.Utilities.Managers
 
             try
             {
-                await _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+                await releaseOccurrences().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -501,7 +500,7 @@ namespace SharpTicker.Utilities.Managers
 
             try
             {
-                await _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+                await releaseTimeTickers().ConfigureAwait(false);
             }
             catch (Exception ex)
             {

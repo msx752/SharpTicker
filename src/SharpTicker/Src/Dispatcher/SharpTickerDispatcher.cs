@@ -52,7 +52,7 @@ namespace SharpTicker.Dispatcher
             {
                 _logger?.LogWarning(
                     "The application is stopping, so {JobCount} dispatched job(s) will not start: {Jobs}. Their tickers were already marked InProgress " +
-                    "and stay InProgress until this node starts again or a dead node release frees them.",
+                    "and stay InProgress with no worker running them.",
                     contexts.Length,
                     string.Join(", ", contexts.Select(c => $"{c.FunctionName} ({c.TickerId})")));
             }

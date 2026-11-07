@@ -4,6 +4,7 @@ using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Utilities.Interfaces
@@ -21,12 +22,26 @@ namespace SharpTicker.Utilities.Interfaces
         Task<byte[]> GetTimeTickerRequest(Guid id, CancellationToken cancellationToken);
         Task UpdateTimeTickersWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default);
         Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default);
+
+        // true: this call moved the row from Queued (held by this node) to InProgress; the caller may run the job.
+        // Default bodies keep the unfenced behaviour for custom providers.
+        async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
         #endregion
         
         #region Cron_Ticker_Core_Methods
         Task MigrateDefinedCronTickers((string Function, string Expression)[] cronTickers, CancellationToken cancellationToken = default);
         Task<CronTickerEntity[]> GetAllCronTickerExpressions(CancellationToken cancellationToken);
         Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default);
+
+        // Releases only what the node locked before lockedBefore. A node that releases what an earlier run of itself left
+        // behind passes the moment this run started, so rows it has claimed since are kept and not run a second time.
+        // The default body keeps the unfenced release for custom providers.
+        Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+            => ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken);
         #endregion
         
         #region Cron_TickerOccurrence_Core_Methods
@@ -38,7 +53,18 @@ namespace SharpTicker.Utilities.Interfaces
         Task<byte[]> GetCronTickerOccurrenceRequest(Guid tickerId, CancellationToken cancellationToken = default);
         Task UpdateCronTickerOccurrencesWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default);
         Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default);
+
+        // Same contract as the time ticker overload with lockedBefore.
+        Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+            => ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken);
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => Task.FromResult(0);
+
+        // Same contract as TryMarkTimeTickerInProgress, for a cron occurrence row.
+        async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            return true;
+        }
         #endregion
         
         #region Queryable

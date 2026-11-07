@@ -53,7 +53,10 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var filter = fb.And(fb.Eq(x => x.Id, ticker.Id), fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt));
+                var filter = fb.And(
+                    fb.Eq(x => x.Id, ticker.Id),
+                    fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt),
+                    MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
@@ -92,9 +95,12 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // The status check keeps a row another node already moved to InProgress out of reach, even when
+                // that node's clock is behind and wrote an earlier UpdatedAt.
                 var filter = fb.And(
                     fb.Eq(x => x.Id, candidate.Id),
-                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt));
+                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
@@ -171,6 +177,23 @@ namespace SharpTicker.MongoDB.Infrastructure
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
         }
 
+        public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
+            // The status changes on every match, so ModifiedCount equals the matched count.
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    Builders<TTimeTicker>.Filter.And(
+                        Builders<TTimeTicker>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByTimeTicker<TTimeTicker>(_lockHolder)),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
+        }
+
         public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
             var update = MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(functionContext, _clock.UtcNow);
@@ -213,26 +236,35 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
 
-            var filter = fb.And(
-                fb.In(x => x.Id, ids),
-                MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
-
             var update = Builders<TTimeTicker>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
                 .Set(x => x.UpdatedAt, now);
 
-            var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (result.ModifiedCount == 0) return Array.Empty<TimeTickerEntity>();
+            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
+            // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+            var won = new List<Guid>(ids.Length);
+            foreach (var id in ids)
+            {
+                // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
+                // returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested) break;
 
-            var acquiredFilter = fb.And(
-                fb.In(x => x.Id, ids),
-                fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress));
+                var result = await coll.UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
+                    update,
+                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
 
-            var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
+                if (result.ModifiedCount > 0) won.Add(id);
+            }
+
+            if (won.Count == 0) return Array.Empty<TimeTickerEntity>();
+
+            var rows = await coll
+                .Find(fb.And(fb.In(x => x.Id, won), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), CancellationToken.None).ConfigureAwait(false);
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
         }
 
@@ -500,7 +532,8 @@ namespace SharpTicker.MongoDB.Infrastructure
 
                 var filter = fb.And(
                     fb.Eq(x => x.Id, occ.Id),
-                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt));
+                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, _lockHolder)
@@ -523,6 +556,21 @@ namespace SharpTicker.MongoDB.Infrastructure
                 }
                 yield return occ;
             }
+        }
+
+        public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        {
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.And(
+                        Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByCronOccurrence<TCronTicker>(_lockHolder)),
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
         }
 
         public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)

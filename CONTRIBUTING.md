@@ -41,7 +41,7 @@ dotnet build SharpTicker.slnx -c Release
 dotnet test SharpTicker.slnx -c Release
 ```
 
-The test projects run on net8.0, net9.0 and net10.0. The dashboard UI has its own tests: `npm test` in `src/SharpTicker.Dashboard/wwwroot`.
+The test projects run on net8.0, net9.0 and net10.0. The EF Core, MongoDB and Redis tests start PostgreSQL, MongoDB and Redis containers, so Docker must be running. The dashboard UI has its own tests: `npm test` in `src/SharpTicker.Dashboard/wwwroot`.
 
 ### Working with multiple target frameworks
 

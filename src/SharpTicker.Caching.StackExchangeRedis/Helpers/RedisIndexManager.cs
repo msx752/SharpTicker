@@ -76,6 +76,25 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return Task.WhenAll(t1, t2, t3);
     }
 
+    // For a node that lost the slot's SET NX. Add-only on purpose: AddCronOccurrenceIndexesAsync decides "pending"
+    // relative to the caller and would ZREM the holder's healthy entry. SADD returning false means the row is
+    // already indexed (the normal case) and nothing else is touched. True means the winner never finished
+    // indexing, so the row is added to every set a normal update writes. Returns true when it healed.
+    internal async Task<bool> HealOrphanCronOccurrenceIndexesAsync(Guid id, Func<Task<CronTickerOccurrenceEntity<TCronTicker>>> loadRow)
+    {
+        var idStr = (RedisValue)id.ToString();
+        if (!await _db.SetAddAsync(CronOccurrenceIdsKey, idStr).ConfigureAwait(false))
+            return false;
+
+        var row = await loadRow().ConfigureAwait(false);
+        if (row == null) return true;
+
+        await _db.SetAddAsync(CronOccurrencesByCronKey(row.CronTickerId), idStr).ConfigureAwait(false);
+        if (CanAcquire(row.Status, row.LockHolder, _lockHolder))
+            await _db.SortedSetAddAsync(CronOccurrencePendingKey, idStr, ToScore(row.ExecutionTime)).ConfigureAwait(false);
+        return true;
+    }
+
     internal Task RemoveCronOccurrenceIndexesAsync(Guid id, Guid cronTickerId)
     {
         var batch = _db.CreateBatch();

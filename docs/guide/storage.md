@@ -85,6 +85,15 @@ options.AddStackExchangeRedis(redis =>
 - `InstanceName` (default `sharpticker:`) is the prefix under which nodes report that they are alive. Job data uses its own `tq:*` keys.
 - Each node sends a heartbeat every `NodeHeartbeatInterval` (default one minute). Jobs held by a node that stopped sending heartbeats are released for others.
 - For trimmed or AOT applications, set `JsonSerializerContext`.
+- A custom entity can add properties, but Redis rewrites the stored record when a job is claimed, and an empty collection comes back readable only for `Children` and `RetryIntervals`, and only under those exact (PascalCase) names. A custom entity with another collection property, or a camelCase JSON context, can leave a record that cannot be read after a claim, so avoid both with Redis.
+
+## Claiming jobs
+
+With every built-in store a job is claimed per row by a conditional write that has one winner, and the job starts only if that write won. The regular claim needs the row to be `Queued` and held by the claiming node. The fallback takes `Idle` or `Queued` rows, and "run now" takes `Idle` or `Queued` rows that are unlocked or held by this node. "Run now" on several jobs at once writes one row at a time, so a large selection costs one round trip for each job.
+
+## Custom persistence providers
+
+A provider that implements `ITickerPersistenceProvider` gets two methods with default bodies: `TryMarkTimeTickerInProgress` and `TryMarkCronOccurrenceInProgress`. The default writes `InProgress` without checking the current state and always returns `true`, so a provider that keeps the defaults can run a job that another node already took. Implement both so that they change the row only while it is `Queued` and held by this node, and return `true` only for the call that changed it. A class that wraps a built-in provider must forward both methods too, or it gets the unfenced defaults without any error.
 
 ## Choosing a store
 

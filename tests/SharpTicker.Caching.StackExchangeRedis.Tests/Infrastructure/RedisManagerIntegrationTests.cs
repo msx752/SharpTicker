@@ -138,7 +138,9 @@ public class RedisManagerIntegrationTests : IAsyncLifetime, IDisposable
         _db.StringSetAsync(Arg.Any<RedisKey>(), Arg.Any<RedisValue>(), Arg.Any<TimeSpan?>(), Arg.Any<bool>(), Arg.Any<When>(), Arg.Any<CommandFlags>())
             .Returns(ci =>
             {
-                _store[(string)ci.ArgAt<RedisKey>(0)] = (string)ci.ArgAt<RedisValue>(1);
+                var key = (string)ci.ArgAt<RedisKey>(0);
+                if (ci.ArgAt<When>(4) == When.NotExists && _store.ContainsKey(key)) return false;
+                _store[key] = (string)ci.ArgAt<RedisValue>(1);
                 return true;
             });
 
@@ -234,6 +236,7 @@ public class RedisManagerIntegrationTests : IAsyncLifetime, IDisposable
         _db.ScriptEvaluateAsync(Arg.Any<string>(), Arg.Any<RedisKey[]?>(), Arg.Any<RedisValue[]?>(), Arg.Any<CommandFlags>())
             .Returns(ci =>
             {
+                var script = ci.ArgAt<string>(0);
                 var keys = ci.ArgAt<RedisKey[]>(1);
                 var argv = ci.ArgAt<RedisValue[]>(2);
                 var entityKey = (string)keys[0];
@@ -253,6 +256,13 @@ public class RedisManagerIntegrationTests : IAsyncLifetime, IDisposable
                     var updated = SetJsonProps(json, new() { ["LockHolder"] = null, ["LockedAt"] = null, ["Status"] = int.Parse(argv[2].ToString()), ["UpdatedAt"] = (string)argv[1] });
                     _store[entityKey] = updated;
                     return RedisResult.Create((RedisValue)updated);
+                }
+                if (script == LuaScriptLoader.Load("MarkInProgress")) // same ARGV count as Release
+                {
+                    if (status != int.Parse(argv[2].ToString()) || lockHolder != (string)argv[0]) return RedisResult.Create(RedisValue.Null);
+                    var marked = SetJsonProps(json, new() { ["Status"] = int.Parse(argv[3].ToString()), ["UpdatedAt"] = (string)argv[1] });
+                    _store[entityKey] = marked;
+                    return RedisResult.Create((RedisValue)marked);
                 }
                 if (argv.Length == 4) // Release
                 {
