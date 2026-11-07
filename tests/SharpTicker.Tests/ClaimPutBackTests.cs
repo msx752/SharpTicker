@@ -35,7 +35,7 @@ public class ClaimPutBackTests
         var releaseError = new TimeoutException("release failed");
         var released = new List<Guid>();
 
-        var thrown = await Assert.ThrowsAsync<AggregateException>(() => ClaimPutBack.PutBackOrThrowAsync(
+        var thrown = await Assert.ThrowsAsync<ClaimPutBackFailedException>(() => ClaimPutBack.PutBackOrThrowAsync(
             new Dictionary<Guid, DateTime> { [a] = MarkerA, [b] = MarkerB },
             failure,
             (id, _, _) =>

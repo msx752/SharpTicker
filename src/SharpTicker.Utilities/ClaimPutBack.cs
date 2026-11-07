@@ -45,8 +45,16 @@ internal static class ClaimPutBack
         }
 
         if (releaseFailures != null)
-            throw new AggregateException(
-                $"The claim call failed after it had won {won.Count} row(s), and {releaseFailures.Count - 1} of them could not be put back; they stay InProgress until this node starts again.",
-                releaseFailures);
+            throw new ClaimPutBackFailedException(won.Count, releaseFailures);
     }
 }
+
+/// <summary>
+/// A claim call failed after it had claimed rows, and some of them could not be put back. The first inner exception is the
+/// failure of the claim call, the others are the failed put-backs; those rows stay InProgress until the store releases the
+/// rows of this node.
+/// </summary>
+internal sealed class ClaimPutBackFailedException(int claimed, IEnumerable<Exception> failures)
+    : AggregateException(
+        $"The claim call failed after it had claimed {claimed} row(s), and some of them could not be put back; they stay InProgress until the store releases the rows of this node.",
+        failures);
