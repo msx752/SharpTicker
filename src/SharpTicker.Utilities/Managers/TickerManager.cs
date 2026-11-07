@@ -341,9 +341,15 @@ namespace SharpTicker.Utilities.Managers
             }
         }
 
+        // Each acquired row carries the marker its claim wrote; only the row itself was claimed, not its children.
         private static InternalFunctionContext[] BuildImmediateContextsFromNonGeneric(IEnumerable<TimeTickerEntity> tickers)
         {
-            return tickers.Select(BuildContextFromNonGeneric).ToArray();
+            return tickers.Select(ticker =>
+            {
+                var context = BuildContextFromNonGeneric(ticker);
+                context.ClaimMarker = ticker.UpdatedAt;
+                return context;
+            }).ToArray();
         }
 
         private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker)

@@ -483,7 +483,8 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
                     Type = TickerType.CronTickerOccurrence,
                     Retries = occurrence.CronTicker.Retries,
                     RetryIntervals = occurrence.CronTicker.RetryIntervals,
-                    ExecutionTime = occurrence.ExecutionTime
+                    ExecutionTime = occurrence.ExecutionTime,
+                    ClaimMarker = occurrence.UpdatedAt
                 };
 
                 // Populate cached delegate and priority so the dispatcher can execute the job

@@ -434,6 +434,7 @@ namespace SharpTicker.Utilities.Managers
                     RetryIntervals = timedOutTimeTicker.RetryIntervals,
                     ParentId = timedOutTimeTicker.ParentId,
                     ExecutionTime = timedOutTimeTicker.ExecutionTime ?? _clock.UtcNow,
+                    ClaimMarker = timedOutTimeTicker.UpdatedAt,
                     TimeTickerChildren = timedOutTimeTicker.Children.Select(ch => new InternalFunctionContext
                     {
                         FunctionName = ch.Function,
@@ -469,7 +470,8 @@ namespace SharpTicker.Utilities.Managers
                     Retries = timedOutCronTicker.CronTicker.Retries,
                     RetryIntervals = timedOutCronTicker.CronTicker.RetryIntervals,
                     ParentId = timedOutCronTicker.CronTickerId,
-                    ExecutionTime = timedOutCronTicker.ExecutionTime
+                    ExecutionTime = timedOutCronTicker.ExecutionTime,
+                    ClaimMarker = timedOutCronTicker.UpdatedAt
                 };
                 
                 results.Add(functionContext);

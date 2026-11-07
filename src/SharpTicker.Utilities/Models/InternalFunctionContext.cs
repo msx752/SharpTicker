@@ -37,6 +37,12 @@ namespace SharpTicker.Utilities.Models
         public RunCondition RunCondition { get; set; }
         public List<InternalFunctionContext> TimeTickerChildren { get; set; } = [];
 
+        /// <summary>
+        /// The marker the claim that handed this job out wrote to its row (the fallback, run-now), or null when the job was
+        /// not handed out by such a claim (a child, which runs inside its parent). A job that never starts is put back with it.
+        /// </summary>
+        internal DateTime? ClaimMarker { get; set; }
+
         [DynamicDependency(DynamicallyAccessedMemberTypes.PublicProperties, typeof(InternalFunctionContext))]
         public InternalFunctionContext SetProperty<T>(Expression<Func<InternalFunctionContext, T>> property, T value)
         {
