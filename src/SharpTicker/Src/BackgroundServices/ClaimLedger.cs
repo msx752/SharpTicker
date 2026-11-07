@@ -19,9 +19,14 @@ internal sealed class ClaimLedger
 
     internal int Count => _entries.Count;
 
-    internal Entry Record(InternalFunctionContext function, DateTime claimMarker)
+    /// <summary>
+    /// Records a claim. <paramref name="claimInFlight"/>: the claim call has not returned yet, so the claim is not pending
+    /// until <see cref="Entry.ClaimSettled"/> (or <see cref="Entry.Forget"/>); a sweep in the meantime leaves it to the
+    /// caller, which then starts its job or puts it back.
+    /// </summary>
+    internal Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
     {
-        var entry = new Entry(this, function, claimMarker);
+        var entry = new Entry(this, function, claimMarker, claimInFlight);
         _entries.TryAdd(entry, 0);
         return entry;
     }
@@ -41,16 +46,23 @@ internal sealed class ClaimLedger
         // A put-back was tried and failed. It may still have landed, so the job must not start any more; only another
         // put-back can end the claim.
         private const int PutBackFailedState = 4;
+        // The claim call has not returned: whether there is anything to start or put back is not known yet, and only the
+        // caller that made the call decides it.
+        private const int ClaimInFlightState = 5;
 
         private readonly ClaimLedger _ledger;
-        private int _state = PendingState;
+        private int _state;
 
-        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker)
+        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
         {
             _ledger = ledger;
             Function = function;
             ClaimMarker = claimMarker;
+            _state = claimInFlight ? ClaimInFlightState : PendingState;
         }
+
+        /// <summary>The claim call returned (won, or failed after its write may have landed): the claim is now pending.</summary>
+        internal void ClaimSettled() => Interlocked.CompareExchange(ref _state, PendingState, ClaimInFlightState);
 
         internal InternalFunctionContext Function { get; }
 
@@ -88,7 +100,11 @@ internal sealed class ClaimLedger
         }
 
         /// <summary>The claim was lost (another claim took the row first): nothing to start, nothing to put back.</summary>
-        internal void Forget() => Leave(PendingState, GoneState);
+        internal void Forget()
+        {
+            if (!Leave(ClaimInFlightState, GoneState))
+                Leave(PendingState, GoneState);
+        }
 
         private bool Leave(int from, int to)
         {

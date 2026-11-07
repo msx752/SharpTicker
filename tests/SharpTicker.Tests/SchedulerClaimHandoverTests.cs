@@ -596,6 +596,44 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
     }
 
+    // The fallback stops first (the host stops services in reverse order) and sweeps the shared ledger while the loop's claim
+    // call is still in flight. The claim has no outcome yet, so the sweep must leave it to the loop: once it is won, the job
+    // runs instead of the row staying InProgress with neither a worker nor a put-back.
+    [Fact]
+    public async Task ASweepWhileAClaimIsInFlight_LeavesItToTheLoop_TheJobRuns()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker("Handover.Sweep");
+        var batch = await QueueBatch(node, id);
+        var manager = new HookedManager(CreateRealManager(node));
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        manager.BeforeClaimNumber = 1;
+        manager.BeforeClaim = () => work.PutBackUnstartedAsync();
+        var context = new TickerExecutionContext();
+        var service = new SharpTickerSchedulerBackgroundService(context, handler, scheduler, manager,
+            new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(10) }, gate, null, _clock, null, work);
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.ClaimResults.Contains(true)), "the job was never claimed");
+            Assert.True(await WaitUntilAsync(() => handler.ReceivedCalls().Any()), "the won claim was never started");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+        await scheduler.WhenAllIdleAsync();
+
+        await handler.Received(1).ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == id), false, Arg.Any<CancellationToken>());
+        Assert.Equal(0, work.Claims.Count);
+    }
+
     // The store cannot be reached when the claim is put back: the row stays InProgress, the failure is an error, and the loop
     // tries again on its next pass until it works.
     [Fact]

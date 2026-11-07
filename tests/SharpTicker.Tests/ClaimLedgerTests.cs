@@ -19,6 +19,47 @@ public class ClaimLedgerTests
 
     private static InternalFunctionContext Function() => new() { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "fn" };
 
+    // While the claim call is in flight, a sweep (Pending) and a put-back must leave the claim alone, and its job cannot
+    // start: only the caller knows yet whether there is anything to start or put back.
+    [Fact]
+    public void AClaimInFlight_IsNotPending_CannotBePutBackOrStarted()
+    {
+        var ledger = new ClaimLedger();
+        var entry = ledger.Record(Function(), Marker, claimInFlight: true);
+
+        Assert.Empty(ledger.Pending());
+        Assert.Empty(ledger.PendingPutBacks());
+        Assert.False(entry.TryBeginRevert());
+        Assert.False(entry.TryStart());
+        Assert.Equal(1, ledger.Count);
+    }
+
+    [Fact]
+    public void AClaimInFlight_OnceSettled_IsPendingAndCanStart()
+    {
+        var ledger = new ClaimLedger();
+        var entry = ledger.Record(Function(), Marker, claimInFlight: true);
+
+        entry.ClaimSettled();
+
+        Assert.Same(entry, Assert.Single(ledger.Pending()));
+        Assert.True(entry.TryStart());
+        Assert.Equal(0, ledger.Count);
+    }
+
+    [Fact]
+    public void AClaimInFlight_ThatWasLost_LeavesTheLedger()
+    {
+        var ledger = new ClaimLedger();
+        var entry = ledger.Record(Function(), Marker, claimInFlight: true);
+
+        entry.Forget();
+
+        Assert.Equal(0, ledger.Count);
+        Assert.False(entry.TryStart());
+        Assert.False(entry.TryBeginRevert());
+    }
+
     [Fact]
     public void AStartedClaim_CannotBePutBack_AndLeavesTheLedger()
     {

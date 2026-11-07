@@ -43,7 +43,8 @@ internal sealed class ClaimedWorkQueue
     /// <summary>Whether the scheduler takes work: a claim won while it does not is put back, not queued.</summary>
     internal bool SchedulerTakesWork => !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
 
-    internal ClaimLedger.Entry Record(InternalFunctionContext function, DateTime claimMarker) => Claims.Record(function, claimMarker);
+    internal ClaimLedger.Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
+        => Claims.Record(function, claimMarker, claimInFlight);
 
     /// <summary>
     /// Queues the job of a won claim. The job counts as started only once it holds its function's concurrency slot; a stop

@@ -212,10 +212,11 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
         // The claim follows the application's token, not the loop's: a restart request must not cut a hand-over short, it
         // takes effect at the next wait on the loop's token. The marker is chosen and recorded before the call, so a claim
-        // whose call fails after its write landed is still found and put back.
+        // whose call fails after its write landed is still found and put back. Until the call returns, a sweep by another
+        // stopping service leaves the claim alone; the outcomes below decide it.
         await Parallel.ForEachAsync(Enumerable.Range(0, batch.Length), new ParallelOptions { MaxDegreeOfParallelism = fanOut }, async (i, _) =>
         {
-            var entry = _work.Record(batch[i], _internalTickerManager.NextClaimMarker());
+            var entry = _work.Record(batch[i], _internalTickerManager.NextClaimMarker(), claimInFlight: true);
             entries[i] = entry;
             try
             {
@@ -244,10 +245,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
                 case ClaimOutcome.Failed:
                     firstFailure ??= failures[i];
+                    entries[i].ClaimSettled();
                     await _work.PutBackAsync(entries[i], "its claim call failed", failures[i], quietWhenNothingToPutBack: true);
                     break;
 
                 default:
+                    entries[i].ClaimSettled();
                     if (!CanHandOver(stoppingToken))
                     {
                         await _work.PutBackAsync(entries[i], "the scheduler stopped taking work before its worker got it");
