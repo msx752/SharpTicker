@@ -1089,6 +1089,51 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.False(runs.ContainsKey(id));
     }
 
+    // The host stops the fallback before the scheduler. A claim of the loop or of run-now that waits for its worker is not the
+    // fallback's: the scheduler, still running, may yet start it, and its own stop puts it back if not. The fallback's stop
+    // must leave it alone.
+    [Fact]
+    public async Task Fallback_Stop_LeavesClaimsItDidNotMake()
+    {
+        var node = CreateProvider("node-B");
+        var manager = new HookedManager(CreateRealManager(node));
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        var notTheFallbacks = work.Record(Function("Fallback.NotMine"), manager.NextClaimMarker());
+        var fallback = new SharpTickerFallbackBackgroundService(manager,
+            new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) }, handler, scheduler, gate, null, work);
+
+        await fallback.StartAsync(CancellationToken.None);
+        await fallback.StopAsync(CancellationToken.None);
+
+        Assert.True(notTheFallbacks.IsPending);
+        Assert.Equal(1, work.Claims.Count);
+        Assert.Empty(manager.PutBacks);
+        await work.PutBackUnstartedAsync();
+        Assert.Equal(0, work.Claims.Count);
+    }
+
+    // A put-back failed during the run (an Error, then the loop retries at Debug). At the stop it fails once more: nothing
+    // tries again after that and the row stays InProgress until its store releases it, so that last failure is an Error too.
+    [Fact]
+    public async Task APutBackThatFailsAtTheStop_IsLoggedAsAnError()
+    {
+        var node = CreateProvider("node-A");
+        var manager = new HookedManager(CreateRealManager(node)) { FailPutBacks = 2 };
+        var logger = new RecordingLogger();
+        var work = new ClaimedWorkQueue(manager, new RecordingTaskScheduler(), Substitute.For<ITickerExecutionTaskHandler>(),
+            new TickerFunctionConcurrencyGate(), logger);
+        var entry = work.Record(Function("PutBack.Final"), manager.NextClaimMarker());
+
+        await work.PutBackAsync(entry, "the scheduler refused it");
+        await work.PutBackUnstartedAsync();
+
+        Assert.Equal(2, logger.Entries.Count(e => e.Level == LogLevel.Error && e.Message.Contains(entry.Function.TickerId.ToString())));
+        Assert.True(entry.NeedsPutBack);
+    }
+
     // The scheduler is frozen while the fallback hands over the rows it took. The rows it could not hand over were already
     // InProgress for this node; they are put back instead of being left with no worker.
     [Fact]

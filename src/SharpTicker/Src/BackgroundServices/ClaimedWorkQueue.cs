@@ -43,8 +43,8 @@ internal sealed class ClaimedWorkQueue
     /// <summary>Whether the scheduler takes work: a claim won while it does not is put back, not queued.</summary>
     internal bool SchedulerTakesWork => !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
 
-    internal ClaimLedger.Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
-        => Claims.Record(function, claimMarker, claimInFlight);
+    internal ClaimLedger.Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false, object owner = null)
+        => Claims.Record(function, claimMarker, claimInFlight, owner);
 
     /// <summary>
     /// Queues the job of a won claim. The job counts as started only once it holds its function's concurrency slot; a stop
@@ -113,7 +113,8 @@ internal sealed class ClaimedWorkQueue
     /// claim (InProgress, this node, this marker), and the fallback then runs the job once. A job that started meanwhile, or
     /// a row that moved on, is left alone. When the store cannot be reached the claim stays in the ledger and is tried again.
     /// </summary>
-    internal async Task PutBackAsync(ClaimLedger.Entry entry, string reason, Exception cause = null, bool quietWhenNothingToPutBack = false)
+    internal async Task PutBackAsync(ClaimLedger.Entry entry, string reason, Exception cause = null, bool quietWhenNothingToPutBack = false,
+        bool lastAttempt = false)
     {
         if (!entry.TryBeginRevert())
             return;
@@ -127,6 +128,16 @@ internal sealed class ClaimedWorkQueue
         catch (Exception ex)
         {
             entry.RevertFailed();
+            if (lastAttempt)
+            {
+                // Nothing tries again after a stop: the row stays InProgress until its store releases this node's rows.
+                _logger?.LogError(ex,
+                    "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}), and it could not be put back. " +
+                    "Its row stays InProgress until the store releases the rows of this node.",
+                    function.FunctionName, function.TickerId, reason);
+                return;
+            }
+
             // Tried again every PutBackRetryInterval while the store is out of reach: the first failure is the error, the
             // attempts after it are written at Debug, and the put-back that works says so.
             _logger?.Log(entry.FailedPutBacks == 1 ? LogLevel.Error : LogLevel.Debug, ex,
@@ -171,11 +182,14 @@ internal sealed class ClaimedWorkQueue
 
     /// <summary>
     /// After a stop, no worker starts these jobs any more: what is still pending (a job that waited for its slot, or one the
-    /// stopped scheduler never ran) is put back.
+    /// stopped scheduler never ran) is put back. With <paramref name="owner"/>, only the claims that owner recorded: the
+    /// fallback stops before the scheduler, which may still start the others, and the scheduler's stop puts back the rest.
     /// </summary>
-    internal async Task PutBackUnstartedAsync()
+    internal async Task PutBackUnstartedAsync(object owner = null)
     {
-        foreach (var entry in Claims.Pending())
-            await PutBackAsync(entry, "the application stopped before its worker started it").ConfigureAwait(false);
+        foreach (var entry in Claims.Pending(owner))
+            // The sweep of every claim is the scheduler's, which stops last: no one tries after it. While the scheduler still
+            // runs, its loop retries what fails in the fallback's sweep.
+            await PutBackAsync(entry, "the application stopped before its worker started it", lastAttempt: owner == null).ConfigureAwait(false);
     }
 }

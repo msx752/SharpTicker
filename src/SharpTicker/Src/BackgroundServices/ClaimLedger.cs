@@ -24,15 +24,19 @@ internal sealed class ClaimLedger
     /// until <see cref="Entry.ClaimSettled"/> (or <see cref="Entry.Forget"/>); a sweep in the meantime leaves it to the
     /// caller, which then starts its job or puts it back.
     /// </summary>
-    internal Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
+    internal Entry Record(InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false, object owner = null)
     {
-        var entry = new Entry(this, function, claimMarker, claimInFlight);
+        var entry = new Entry(this, function, claimMarker, claimInFlight, owner);
         _entries.TryAdd(entry, 0);
         return entry;
     }
 
-    /// <summary>The claims that are neither started nor being put back right now.</summary>
-    internal IReadOnlyList<Entry> Pending() => _entries.Keys.Where(x => x.IsPending).ToArray();
+    /// <summary>
+    /// The claims that are neither started nor being put back right now; with <paramref name="owner"/>, only the claims that
+    /// owner recorded.
+    /// </summary>
+    internal IReadOnlyList<Entry> Pending(object owner = null)
+        => _entries.Keys.Where(x => x.IsPending && (owner == null || ReferenceEquals(x.Owner, owner))).ToArray();
 
     /// <summary>The pending claims whose put-back failed and has to be tried again; a claim waiting for its worker is not one.</summary>
     internal IReadOnlyList<Entry> PendingPutBacks() => _entries.Keys.Where(x => x.IsPending && x.NeedsPutBack).ToArray();
@@ -53,13 +57,17 @@ internal sealed class ClaimLedger
         private readonly ClaimLedger _ledger;
         private int _state;
 
-        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false)
+        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false, object owner = null)
         {
             _ledger = ledger;
             Function = function;
             ClaimMarker = claimMarker;
+            Owner = owner;
             _state = claimInFlight ? ClaimInFlightState : PendingState;
         }
+
+        /// <summary>The service that recorded the claim, so its stop puts back only its own claims; null for run-now.</summary>
+        internal object Owner { get; }
 
         /// <summary>The claim call returned (won, or failed after its write may have landed): the claim is now pending.</summary>
         internal void ClaimSettled() => Interlocked.CompareExchange(ref _state, PendingState, ClaimInFlightState);

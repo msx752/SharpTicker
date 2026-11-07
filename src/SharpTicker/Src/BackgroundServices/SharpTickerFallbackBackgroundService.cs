@@ -107,7 +107,7 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
     // because the scheduler froze or the application is stopping, is put back, and so is one the scheduler refuses.
     private async Task HandOverAsync(InternalFunctionContext function, CancellationToken stoppingToken)
     {
-        var entry = _work.Record(function, function.ClaimMarker ?? default);
+        var entry = _work.Record(function, function.ClaimMarker ?? default, owner: this);
 
         if (stoppingToken.IsCancellationRequested || !_work.SchedulerTakesWork)
         {
@@ -174,7 +174,7 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
         // The loop has ended: a job it handed over that has not started (one that waits for its concurrency slot, which the
-        // stop ends) is put back instead of staying InProgress.
-        await _work.PutBackUnstartedAsync();
+        // stop ends) is put back instead of staying InProgress. Only its own: the scheduler stops later and handles the rest.
+        await _work.PutBackUnstartedAsync(owner: this);
     }
 }
