@@ -441,8 +441,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
         await WaitForRunningJobsAsync(cancellationToken);
-        // After the stop no worker starts a job of this node any more: what is still pending is put back.
-        await _work.PutBackUnstartedAsync();
+        // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
+        // the host gives the stop.
+        await _work.PutBackUnstartedAsync(cancellationToken: cancellationToken);
     }
 
     // The jobs run on the scheduler's workers, not inside this service, so stopping the service did not wait for them. The

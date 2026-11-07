@@ -107,19 +107,20 @@ internal sealed class ClaimedWorkQueue
     /// <summary>
     /// Puts back a claim whose job did not start: the fenced write moves the row back to Idle only while it is still this
     /// claim (InProgress, this node, this marker), and the fallback then runs the job once. A job that started meanwhile, or
-    /// a row that moved on, is left alone. When the store cannot be reached the claim stays in the ledger and is tried again.
+    /// a row that moved on, is left alone. When the store cannot be reached, or <paramref name="cancellationToken"/> ends the
+    /// wait for it, the claim stays in the ledger and is tried again. Returns false only in that case.
     /// </summary>
-    internal async Task PutBackAsync(ClaimLedger.Entry entry, string reason, Exception cause = null, bool quietWhenNothingToPutBack = false,
-        bool lastAttempt = false)
+    internal async Task<bool> PutBackAsync(ClaimLedger.Entry entry, string reason, Exception cause = null, bool quietWhenNothingToPutBack = false,
+        bool lastAttempt = false, CancellationToken cancellationToken = default)
     {
         if (!entry.TryBeginRevert())
-            return;
+            return true;
 
         var function = entry.Function;
         bool putBack;
         try
         {
-            putBack = await _internalTickerManager.TryReleaseClaim(function, entry.ClaimMarker, CancellationToken.None).ConfigureAwait(false);
+            putBack = await _internalTickerManager.TryReleaseClaim(function, entry.ClaimMarker, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -131,7 +132,7 @@ internal sealed class ClaimedWorkQueue
                     "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}), and it could not be put back. " +
                     "Its row stays InProgress until the store releases the rows of this node.",
                     function.FunctionName, function.TickerId, reason);
-                return;
+                return false;
             }
 
             // Tried again every PutBackRetryInterval while the store is out of reach: the first failure is the error, the
@@ -140,7 +141,7 @@ internal sealed class ClaimedWorkQueue
                 "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}), and it could not be put back. " +
                 "Its row stays InProgress with no worker running it; the scheduler tries again.",
                 function.FunctionName, function.TickerId, reason);
-            return;
+            return false;
         }
 
         entry.RevertSucceeded();
@@ -153,7 +154,7 @@ internal sealed class ClaimedWorkQueue
             else
                 _logger?.LogInformation(cause, "Job {FunctionName} ({TickerId}) did not start ({Reason}); its row had already moved on, so there was nothing to put back.",
                     function.FunctionName, function.TickerId, reason);
-            return;
+            return true;
         }
 
         _logger?.LogWarning(cause, "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}). It was put back and runs once the fallback picks it up.",
@@ -168,24 +169,41 @@ internal sealed class ClaimedWorkQueue
             _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was put back but the dashboard could not be notified.",
                 function.FunctionName, function.TickerId);
         }
+
+        return true;
     }
 
+    /// <summary>How long one retried put-back may wait for the store before the loop goes on.</summary>
+    internal TimeSpan PutBackAttemptLimit { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Tries the failed put-backs again, each for at most <see cref="PutBackAttemptLimit"/>. The first that fails again ends
+    /// the round: the store is still out of reach, and waiting for it once per row would hold the loop that long. The rest
+    /// are tried on the next pass.
+    /// </summary>
     internal async Task RetryFailedPutBacksAsync()
     {
         foreach (var entry in Claims.PendingPutBacks())
-            await PutBackAsync(entry, "a put-back that failed earlier").ConfigureAwait(false);
+        {
+            using var limit = new CancellationTokenSource(PutBackAttemptLimit);
+            if (!await PutBackAsync(entry, "a put-back that failed earlier", cancellationToken: limit.Token).ConfigureAwait(false))
+                return;
+        }
     }
 
     /// <summary>
     /// After a stop, no worker starts these jobs any more: what is still pending (a job that waited for its slot, or one the
     /// stopped scheduler never ran) is put back. With <paramref name="owner"/>, only the claims that owner recorded: the
     /// fallback stops before the scheduler, which may still start the others, and the scheduler's stop puts back the rest.
+    /// <paramref name="cancellationToken"/> is the stop's: once the host's time for the stop is used up, the put-backs that
+    /// have not answered give up and are logged, instead of each waiting for the store's own timeout.
     /// </summary>
-    internal async Task PutBackUnstartedAsync(object owner = null)
+    internal async Task PutBackUnstartedAsync(object owner = null, CancellationToken cancellationToken = default)
     {
         foreach (var entry in Claims.Pending(owner))
             // The sweep of every claim is the scheduler's, which stops last: no one tries after it. While the scheduler still
             // runs, its loop retries what fails in the fallback's sweep.
-            await PutBackAsync(entry, "the application stopped before its worker started it", lastAttempt: owner == null).ConfigureAwait(false);
+            await PutBackAsync(entry, "the application stopped before its worker started it", lastAttempt: owner == null,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 }

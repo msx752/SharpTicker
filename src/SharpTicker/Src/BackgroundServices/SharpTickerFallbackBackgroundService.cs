@@ -177,6 +177,6 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
         await base.StopAsync(cancellationToken);
         // The loop has ended: a job it handed over that has not started (one that waits for its concurrency slot, which the
         // stop ends) is put back instead of staying InProgress. Only its own: the scheduler stops later and handles the rest.
-        await _work.PutBackUnstartedAsync(owner: this);
+        await _work.PutBackUnstartedAsync(owner: this, cancellationToken: cancellationToken);
     }
 }

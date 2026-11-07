@@ -7,6 +7,7 @@ using System.Text.Json.Serialization.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.BackgroundServices;
@@ -352,8 +353,16 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             }
         }
 
+        /// <summary>Every put-back waits until its token is cancelled, as with a store that does not answer.</summary>
+        public bool HangPutBacks { get; set; }
+        private int _putBackAttempts;
+        public int PutBackAttempts => Volatile.Read(ref _putBackAttempts);
+
         public async Task<bool> TryReleaseClaim(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
+            Interlocked.Increment(ref _putBackAttempts);
+            if (HangPutBacks)
+                await Task.Delay(Timeout.Infinite, cancellationToken);
             if (FailPutBacks > 0)
             {
                 FailPutBacks--;
@@ -1132,6 +1141,84 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
 
         Assert.Equal(2, logger.Entries.Count(e => e.Level == LogLevel.Error && e.Message.Contains(entry.Function.TickerId.ToString())));
         Assert.True(entry.NeedsPutBack);
+    }
+
+    private ClaimedWorkQueue WorkWith(HookedManager manager, RecordingLogger? logger = null)
+        => new(manager, new RecordingTaskScheduler(), Substitute.For<ITickerExecutionTaskHandler>(), new TickerFunctionConcurrencyGate(), logger);
+
+    // Three put-backs failed while the store was out of reach. The loop's retry stops at the first one that fails again, so a
+    // pass waits for at most one store timeout instead of one per row; the others are tried on the next pass.
+    [Fact]
+    public async Task RetryOfFailedPutBacks_StopsAtTheFirstFailure()
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A"))) { FailPutBacks = 10 };
+        var work = WorkWith(manager);
+        var entries = Enumerable.Range(0, 3).Select(_ => work.Record(Function("PutBack.Retry"), manager.NextClaimMarker())).ToArray();
+        foreach (var entry in entries)
+            await work.PutBackAsync(entry, "the scheduler refused it");
+        var before = manager.PutBackAttempts;
+
+        await work.RetryFailedPutBacksAsync();
+
+        Assert.Equal(before + 1, manager.PutBackAttempts);
+        Assert.All(entries, e => Assert.True(e.NeedsPutBack));
+    }
+
+    // A store that does not answer must not hold the loop: each retried put-back has its own time limit.
+    [Fact]
+    public async Task RetryOfFailedPutBacks_DoesNotWaitLongerThanItsLimit()
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A"))) { FailPutBacks = 1 };
+        var work = WorkWith(manager);
+        work.PutBackAttemptLimit = TimeSpan.FromMilliseconds(100);
+        var entry = work.Record(Function("PutBack.Hang"), manager.NextClaimMarker());
+        await work.PutBackAsync(entry, "the scheduler refused it");
+        manager.HangPutBacks = true;
+
+        await work.RetryFailedPutBacksAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(entry.NeedsPutBack);
+    }
+
+    // The host's stop gives the services a limited time. When it is used up, the put-backs that have not answered give up:
+    // each is logged as an Error, and the stop returns instead of waiting for every store timeout.
+    [Fact]
+    public async Task PutBackAtTheStop_GivesUpWhenTheStopTimeIsUsedUp()
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A"))) { HangPutBacks = true };
+        var logger = new RecordingLogger();
+        var work = WorkWith(manager, logger);
+        var entries = Enumerable.Range(0, 3).Select(_ => work.Record(Function("PutBack.Stop"), manager.NextClaimMarker())).ToArray();
+        using var stopTime = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        await work.PutBackUnstartedAsync(cancellationToken: stopTime.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(3, logger.Entries.Count(e => e.Level == LogLevel.Error));
+        Assert.All(entries, e => Assert.True(e.NeedsPutBack));
+    }
+
+    // Both services hand the host's stop time to their put-backs: with that time used up, a store that does not answer
+    // does not hold the stop.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StopAsync_WhenTheStopTimeIsUsedUp_DoesNotWaitForPutBacks(bool fallback)
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A"))) { HangPutBacks = true };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        IHostedService service = fallback
+            ? new SharpTickerFallbackBackgroundService(manager,
+                new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) }, handler, scheduler, gate, null, work)
+            : new SharpTickerSchedulerBackgroundService(new TickerExecutionContext(), handler, scheduler, manager,
+                new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(10) }, gate, null, _clock, null, work);
+        work.Record(Function("PutBack.StopToken"), manager.NextClaimMarker(), owner: fallback ? service : null);
+
+        await service.StopAsync(new CancellationToken(canceled: true)).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, manager.PutBackAttempts);
     }
 
     // The scheduler is frozen while the fallback hands over the rows it took. The rows it could not hand over were already
