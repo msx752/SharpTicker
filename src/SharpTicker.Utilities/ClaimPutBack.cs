@@ -17,6 +17,14 @@ internal static class ClaimPutBack
     /// <see cref="AggregateException"/> with <paramref name="failure"/> first and the release errors after it is thrown,
     /// so that loss is not hidden.
     /// </summary>
+    /// <summary>
+    /// For one claim whose own write failed: the write may have landed before the call failed (its reply was lost, or a stop
+    /// cancelled it), so it is put back like a won row. When it did not land, the fenced release finds nothing to change.
+    /// </summary>
+    internal static Task PutBackOrThrowAsync(Guid id, DateTime claimMarker, Exception failure,
+        Func<Guid, DateTime, CancellationToken, Task<bool>> release)
+        => PutBackOrThrowAsync(new Dictionary<Guid, DateTime> { [id] = claimMarker }, failure, release);
+
     internal static async Task PutBackOrThrowAsync(
         IReadOnlyDictionary<Guid, DateTime> won,
         Exception failure,

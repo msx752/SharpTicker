@@ -110,7 +110,17 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
-                var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                UpdateResult result;
+                try
+                {
+                    result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(candidate.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                    throw;
+                }
+
                 if (result.ModifiedCount <= 0)
                     continue;
 
@@ -283,10 +293,20 @@ namespace SharpTicker.MongoDB.Infrastructure
                     // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
                     if (cancellationToken.IsCancellationRequested) break;
 
-                    var result = await coll.UpdateOneAsync(
-                        fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
-                        update,
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    UpdateResult result;
+                    try
+                    {
+                        result = await coll.UpdateOneAsync(
+                            fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
+                            update,
+                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
 
                     if (result.ModifiedCount > 0) won[id] = claimMarker;
                 }
@@ -581,7 +601,17 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
-                var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                UpdateResult result;
+                try
+                {
+                    result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(occ.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                    throw;
+                }
+
                 if (result.ModifiedCount <= 0) continue;
 
                 // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
@@ -991,10 +1021,20 @@ namespace SharpTicker.MongoDB.Infrastructure
                         .Set(x => x.Status, TickerStatus.InProgress)
                         .Set(x => x.UpdatedAt, claimMarker);
 
-                    var result = await coll.UpdateOneAsync(
-                        fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
-                        update,
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    UpdateResult result;
+                    try
+                    {
+                        result = await coll.UpdateOneAsync(
+                            fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
+                            update,
+                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
 
                     if (result.ModifiedCount > 0) won[id] = claimMarker;
                 }

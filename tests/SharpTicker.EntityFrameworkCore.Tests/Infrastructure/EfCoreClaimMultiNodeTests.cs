@@ -444,6 +444,73 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
     }
 
+    // A claim's write reaches the store and lands, then its reply is lost (the call throws). The row is InProgress for this
+    // node, but the caller has nothing to run, so the row must be put back like a row that was won. Covers run-now on time
+    // tickers and cron occurrences, and the fallback on both.
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_IsPutBack(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seed = CreateProvider("node-A");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seed);
+            if (path.StartsWith("immediate"))
+                await seed.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker();
+        }
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        var node = CreateProvider("node-A", Clock, new LandThenFailOnce());
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        // PostgreSQL runs with a retrying execution strategy, which wraps the failure.
+        await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        if (cron)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+        else
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // The first write runs and lands, then the call throws as if its reply was lost; every later command runs normally.
+    private sealed class LandThenFailOnce : DbCommandInterceptor
+    {
+        private bool _failed;
+
+        public override ValueTask<int> NonQueryExecutedAsync(
+            DbCommand command, CommandExecutedEventData eventData, int result, CancellationToken cancellationToken = default)
+        {
+            if (!_failed)
+            {
+                _failed = true;
+                throw new TimeoutException("the reply of the claim was lost");
+            }
+            return base.NonQueryExecutedAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
     // Throws once, on the n-th write or on the first read; every later command runs normally.
     private sealed class FailOnce : DbCommandInterceptor
     {

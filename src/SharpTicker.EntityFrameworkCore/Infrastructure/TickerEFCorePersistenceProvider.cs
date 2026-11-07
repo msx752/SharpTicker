@@ -360,15 +360,25 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
                         break;
 
                     var claimMarker = _clock.NextClaimMarker();
-                    var affected = await set
-                        .Where(x => x.Id == id)
-                        .WhereCanAcquire(_lockHolder)
-                        .ExecuteUpdateAsync(setter => setter
-                            .SetProperty(x => x.LockHolder, _lockHolder)
-                            .SetProperty(x => x.LockedAt, now)
-                            .SetProperty(x => x.Status, TickerStatus.InProgress)
-                            .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
-                        .ConfigureAwait(false);
+                    int affected;
+                    try
+                    {
+                        affected = await set
+                            .Where(x => x.Id == id)
+                            .WhereCanAcquire(_lockHolder)
+                            .ExecuteUpdateAsync(setter => setter
+                                .SetProperty(x => x.LockHolder, _lockHolder)
+                                .SetProperty(x => x.LockedAt, now)
+                                .SetProperty(x => x.Status, TickerStatus.InProgress)
+                                .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
 
                     if (affected > 0)
                         won[id] = claimMarker;

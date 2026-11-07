@@ -67,10 +67,28 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     }
 
     #region Lua script operations
-    protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "") where T : class
+    // A claim to InProgress (the fallback, run-now). The marker is chosen before the script runs: when the call fails, the
+    // script may have landed (a lost reply), so the row is put back with that marker before the failure goes on. When it
+    // did not land, the fenced release finds nothing to change.
+    protected async Task<T> TryClaimInProgressAsync<T>(string key, Guid id, Func<Guid, DateTime, CancellationToken, Task<bool>> release)
+        where T : class
+    {
+        var claimMarker = Clock.NextClaimMarker();
+        try
+        {
+            return await TryAcquireAsync<T>(key, TickerStatus.InProgress, claimMarker: claimMarker).ConfigureAwait(false);
+        }
+        catch (Exception failure)
+        {
+            await ClaimPutBack.PutBackOrThrowAsync(id, claimMarker, failure, release).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "", DateTime? claimMarker = null) where T : class
     {
         // A move to InProgress (the fallback, run-now) carries this node's next claim marker, like every InProgress write.
-        var now = targetStatus == TickerStatus.InProgress ? Clock.NextClaimMarker() : Clock.UtcNow;
+        var now = claimMarker ?? (targetStatus == TickerStatus.InProgress ? Clock.NextClaimMarker() : Clock.UtcNow);
         var result = await Db.ScriptEvaluateAsync(
             AcquireScript,
             [(RedisKey)key],
@@ -321,9 +339,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             cancellationToken.ThrowIfCancellationRequested();
             if (!Guid.TryParse(redisValue.ToString(), out var id)) continue;
 
-            var acquired = await TryAcquireAsync<TTimeTicker>(
-                TimeTickerKey(id),
-                TickerStatus.InProgress).ConfigureAwait(false);
+            var acquired = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
             if (acquired == null) continue;
 
@@ -437,9 +453,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested) break;
 
-                var ticker = await TryAcquireAsync<TTimeTicker>(
-                    TimeTickerKey(id),
-                    TickerStatus.InProgress).ConfigureAwait(false);
+                var ticker = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
                 if (ticker == null) continue;
 
@@ -665,9 +679,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             cancellationToken.ThrowIfCancellationRequested();
             if (!Guid.TryParse(redisValue.ToString(), out var id)) continue;
 
-            var acquired = await TryAcquireAsync<CronTickerOccurrenceEntity<TCronTicker>>(
-                CronOccurrenceKey(id),
-                TickerStatus.InProgress).ConfigureAwait(false);
+            var acquired = await TryClaimInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(
+                CronOccurrenceKey(id), id, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
 
             if (acquired == null) continue;
 

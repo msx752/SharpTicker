@@ -443,6 +443,66 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         }
     }
 
+    // A claim's write lands, then its reply is lost (the call throws). The row is InProgress for this node with nothing to
+    // run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron occurrences.
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_IsPutBack(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seed = CreateProvider("node-A");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seed);
+            if (path.StartsWith("immediate"))
+                await seed.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker();
+        }
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var failed = 0;
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(e =>
+        {
+            if (e.CommandName == "update" && Interlocked.Exchange(ref failed, 1) == 0)
+                throw new TimeoutException("the reply of the claim was lost");
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        var node = new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        if (cron)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+        else
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
     // A node whose n-th command of the given name throws before it is sent, once; every later command runs normally.
     private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateFailingNode(string commandName, int n)
     {

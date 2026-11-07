@@ -993,28 +993,89 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         }
     }
 
-    // Throws on the n-th call of one method, once, before it reaches Redis; every other call goes through.
+    // A claim's script runs and lands, then its reply is lost (the call throws). The row is InProgress for this node with
+    // nothing to run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron
+    // occurrences.
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_IsPutBack(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seeder = CreateProvider("seed");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seeder);
+            await seeder.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker(seeder);
+        }
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 1, landFirst: true));
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        await Assert.ThrowsAsync<RedisConnectionException>(claim);
+
+        if (cron)
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+        else
+        {
+            var row = await ReadTimeTicker(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // Throws on the n-th call of one method, once; every other call goes through. By default the call fails before it
+    // reaches Redis; with landFirst (ScriptEvaluateAsync only) it runs and lands, then its reply is lost.
     public class FailingDatabase : DispatchProxy
     {
         private IDatabase _inner = null!;
         private string _method = "";
         private int _failAt;
         private int _seen;
+        private bool _landFirst;
 
-        public static IDatabase Create(IDatabase inner, string method, int failAt)
+        public static IDatabase Create(IDatabase inner, string method, int failAt, bool landFirst = false)
         {
             var proxy = DispatchProxy.Create<IDatabase, FailingDatabase>();
             var failing = (FailingDatabase)(object)proxy;
             failing._inner = inner;
             failing._method = method;
             failing._failAt = failAt;
+            failing._landFirst = landFirst;
             return proxy;
+        }
+
+        private static async Task<RedisResult> LandThenFail(Task<RedisResult> call)
+        {
+            await call.ConfigureAwait(false);
+            throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "the reply was lost");
         }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
             if (targetMethod!.Name == _method && ++_seen == _failAt)
+            {
+                if (_landFirst)
+                    return LandThenFail((Task<RedisResult>)targetMethod.Invoke(_inner, args)!);
                 throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
+            }
 
             try
             {

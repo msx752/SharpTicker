@@ -248,9 +248,8 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested) break;
 
-                var occurrence = await TryAcquireAsync<CronTickerOccurrenceEntity<TCronTicker>>(
-                    CronOccurrenceKey(id),
-                    TickerStatus.InProgress).ConfigureAwait(false);
+                var occurrence = await TryClaimInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(
+                    CronOccurrenceKey(id), id, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
 
                 if (occurrence == null) continue;
 

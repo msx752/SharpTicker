@@ -116,15 +116,24 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             // Every InProgress write of this node carries its own claim marker, so a claim of the loop is never mistaken
             // for this one when it is put back.
             var claimMarker = _clock.NextClaimMarker();
-            var affected = await context
-                .Where(x => x.Id == timeTicker.Id && x.UpdatedAt <= timeTicker.UpdatedAt)
-                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.UpdatedAt, claimMarker)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
-                
+            int affected;
+            try
+            {
+                affected = await context
+                    .Where(x => x.Id == timeTicker.Id && x.UpdatedAt <= timeTicker.UpdatedAt)
+                    .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                    .ExecuteUpdateAsync(setter => setter
+                        .SetProperty(x => x.LockHolder, _lockHolder)
+                        .SetProperty(x => x.LockedAt, now)
+                        .SetProperty(x => x.UpdatedAt, claimMarker)
+                        .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                throw;
+            }
+
             if(affected <= 0)
                 continue;
 
@@ -323,15 +332,25 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                     break;
 
                 var claimMarker = _clock.NextClaimMarker();
-                var affected = await set
-                    .Where(x => x.Id == id)
-                    .WhereCanAcquire(_lockHolder)
-                    .ExecuteUpdateAsync(setter => setter
-                        .SetProperty(x => x.LockHolder, _lockHolder)
-                        .SetProperty(x => x.LockedAt, now)
-                        .SetProperty(x => x.Status, TickerStatus.InProgress)
-                        .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
-                    .ConfigureAwait(false);
+                int affected;
+                try
+                {
+                    affected = await set
+                        .Where(x => x.Id == id)
+                        .WhereCanAcquire(_lockHolder)
+                        .ExecuteUpdateAsync(setter => setter
+                            .SetProperty(x => x.LockHolder, _lockHolder)
+                            .SetProperty(x => x.LockedAt, now)
+                            .SetProperty(x => x.Status, TickerStatus.InProgress)
+                            .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The write may have landed before its reply was lost: put it back with the rows already won.
+                    won[id] = claimMarker;
+                    throw;
+                }
 
                 if (affected > 0)
                     won[id] = claimMarker;
@@ -515,16 +534,25 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             cancellationToken.ThrowIfCancellationRequested();
 
             var claimMarker = _clock.NextClaimMarker();
-            var affected = await context
-                .Where(x => x.Id == cronTickerOccurrence.Id && x.UpdatedAt == cronTickerOccurrence.UpdatedAt)
-                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.UpdatedAt, claimMarker)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken)
-                .ConfigureAwait(false);
-                
+            int affected;
+            try
+            {
+                affected = await context
+                    .Where(x => x.Id == cronTickerOccurrence.Id && x.UpdatedAt == cronTickerOccurrence.UpdatedAt)
+                    .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                    .ExecuteUpdateAsync(setter => setter
+                        .SetProperty(x => x.LockHolder, _lockHolder)
+                        .SetProperty(x => x.LockedAt, now)
+                        .SetProperty(x => x.UpdatedAt, claimMarker)
+                        .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                throw;
+            }
+
             if(affected <= 0)
                 continue;
 
