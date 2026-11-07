@@ -115,7 +115,9 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
             return;
         }
 
-        _work.QueueWork(entry, isDue: true, stoppingToken);
+        // Waits until the scheduler accepted the job, so a full scheduler keeps the fallback from claiming more rows than
+        // this node can run.
+        await _work.QueueWork(entry, isDue: true, stoppingToken);
     }
 
     private static void CacheFunctionReferences(InternalFunctionContext function)

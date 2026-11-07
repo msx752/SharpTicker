@@ -94,6 +94,31 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
         return condition();
     }
 
+    // The task scheduler is full and has not accepted the job yet. The fallback waits for it before it claims more, so it
+    // does not take every overdue row of the cluster onto this node while it cannot run them.
+    [Fact]
+    public async Task WhileTheSchedulerHasNotAcceptedTheJob_TheFallbackClaimsNoMore()
+    {
+        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _scheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
+            .Returns(_ => new ValueTask(accepted.Task));
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>())
+            .Returns(_ => [new InternalFunctionContext { TickerId = Guid.NewGuid(), FunctionName = "Fallback.Parent", ClaimMarker = DateTime.UtcNow }]);
+
+        await _service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => Polls() >= 1));
+            await Task.Delay(300);
+
+            Assert.Equal(1, Polls());
+        }
+        finally
+        {
+            accepted.TrySetResult();
+        }
+    }
+
     [Fact]
     public async Task AJobAndItsChildren_GetTheirDelegateAndPriorityFromTheRegistry()
     {

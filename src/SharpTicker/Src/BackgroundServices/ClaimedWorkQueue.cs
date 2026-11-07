@@ -49,9 +49,10 @@ internal sealed class ClaimedWorkQueue
     /// <summary>
     /// Queues the job of a won claim. The job counts as started only once it holds its function's concurrency slot; a stop
     /// that ends the wait for the slot leaves the claim pending, and the stop puts it back. A refusal by the scheduler puts
-    /// the claim back.
+    /// the claim back. The returned task completes when the scheduler has accepted the job, or when a refused claim has been
+    /// put back; it never faults. Awaiting it lets a full scheduler hold the caller back before it claims more.
     /// </summary>
-    internal void QueueWork(ClaimLedger.Entry entry, bool isDue, CancellationToken jobToken)
+    internal Task QueueWork(ClaimLedger.Entry entry, bool isDue, CancellationToken jobToken)
     {
         var function = entry.Function;
         var semaphore = _concurrencyGate.GetSemaphoreOrNull(function.FunctionName, function.CachedMaxConcurrency);
@@ -83,18 +84,13 @@ internal sealed class ClaimedWorkQueue
             queued = new ValueTask(Task.FromException(ex));
         }
 
-        ObserveQueueing(entry, queued);
+        return ObserveQueueing(entry, queued);
     }
 
     // QueueAsync is async, so a refusal (the scheduler froze or was disposed after the claim) comes back in the task and not as
     // a throw. The row is already InProgress and has no worker, so it is put back.
-    private void ObserveQueueing(ClaimLedger.Entry entry, ValueTask queued)
-    {
-        if (queued.IsCompletedSuccessfully)
-            return;
-
-        _ = ObserveQueueingAsync(entry, queued);
-    }
+    private Task ObserveQueueing(ClaimLedger.Entry entry, ValueTask queued)
+        => queued.IsCompletedSuccessfully ? Task.CompletedTask : ObserveQueueingAsync(entry, queued);
 
     private async Task ObserveQueueingAsync(ClaimLedger.Entry entry, ValueTask queued)
     {

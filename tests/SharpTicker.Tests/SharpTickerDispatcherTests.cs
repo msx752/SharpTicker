@@ -19,6 +19,28 @@ public class SharpTickerDispatcherTests
         _dispatcher = new SharpTickerDispatcher(_taskScheduler, _taskHandler, new TickerFunctionConcurrencyGate());
     }
 
+    // A claimed run-now job returns to its caller only once the task scheduler has accepted it, as an unclaimed one does,
+    // so a full scheduler slows the callers down instead of piling up claimed rows.
+    [Fact]
+    public async Task DispatchAsync_ClaimedJob_WaitsUntilTheSchedulerAcceptsIt()
+    {
+        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _taskScheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
+            .Returns(_ => new ValueTask(accepted.Task));
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new SharpTicker.BackgroundServices.ClaimedWorkQueue(
+            Substitute.For<SharpTicker.Utilities.Interfaces.Managers.IInternalTickerManager>(), _taskScheduler, _taskHandler, gate);
+        var dispatcher = new SharpTickerDispatcher(_taskScheduler, _taskHandler, gate, null, null, work);
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), FunctionName = "fn", ClaimMarker = DateTime.UtcNow };
+
+        var dispatch = dispatcher.DispatchAsync([context]);
+        await Task.Delay(100);
+        Assert.False(dispatch.IsCompleted);
+
+        accepted.SetResult();
+        await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     [Fact]
     public void Constructor_ThrowsArgumentNullException_WhenTaskSchedulerIsNull()
     {

@@ -68,7 +68,8 @@ namespace SharpTicker.Dispatcher
                         continue;
                     }
 
-                    _work.QueueWork(entry, isDue: false, jobToken);
+                    // Returns once the scheduler accepted the job, like the unclaimed path below.
+                    await _work.QueueWork(entry, isDue: false, jobToken).ConfigureAwait(false);
                 }
             }
 

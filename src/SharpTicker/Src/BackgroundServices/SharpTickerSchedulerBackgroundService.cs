@@ -258,7 +258,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                     }
 
                     await NotifyInProgressAsync(function);
-                    _work.QueueWork(entries[i], isDue: false, stoppingToken);
+                    // Not awaited, as before: the loop hands the whole batch over in priority order and is not held by a
+                    // full scheduler. A refusal is still put back.
+                    _ = _work.QueueWork(entries[i], isDue: false, stoppingToken);
                     break;
             }
         }
