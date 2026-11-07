@@ -428,23 +428,34 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         if (ids == null || ids.Length == 0) return [];
 
         var acquired = new List<TimeTickerEntity>();
-        foreach (var id in ids)
+        var won = new Dictionary<Guid, DateTime>(ids.Length);
+        try
         {
-            // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
-            // dispatched, the rows not written yet stay Idle for the fallback.
-            if (cancellationToken.IsCancellationRequested) break;
+            foreach (var id in ids)
+            {
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested) break;
 
-            var ticker = await TryAcquireAsync<TTimeTicker>(
-                TimeTickerKey(id),
-                TickerStatus.InProgress).ConfigureAwait(false);
+                var ticker = await TryAcquireAsync<TTimeTicker>(
+                    TimeTickerKey(id),
+                    TickerStatus.InProgress).ConfigureAwait(false);
 
-            if (ticker == null) continue;
+                if (ticker == null) continue;
 
-            await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
-            acquired.Add(MapForQueue(ticker));
+                won[ticker.Id] = ticker.UpdatedAt;
+                await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
+                acquired.Add(MapForQueue(ticker));
+            }
+
+            return acquired.ToArray();
         }
-
-        return acquired.ToArray();
+        catch (Exception failure) when (won.Count > 0)
+        {
+            // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            throw;
+        }
     }
 
     public async Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)

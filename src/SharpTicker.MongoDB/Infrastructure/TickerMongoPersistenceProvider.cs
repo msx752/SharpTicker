@@ -265,36 +265,46 @@ namespace SharpTicker.MongoDB.Infrastructure
             var fb = Builders<TTimeTicker>.Filter;
 
             // One marker for this call: markers must differ between claims of one row, not between rows.
+            var claimMarker = _clock.NextClaimMarker();
             var update = Builders<TTimeTicker>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, _clock.NextClaimMarker());
+                .Set(x => x.UpdatedAt, claimMarker);
 
-            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
-            // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
-            var won = new List<Guid>(ids.Length);
-            foreach (var id in ids)
+            var won = new Dictionary<Guid, DateTime>(ids.Length);
+            try
             {
-                // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
-                // returned to be dispatched, the rows not written yet stay Idle for the fallback.
-                if (cancellationToken.IsCancellationRequested) break;
+                // One conditional write per row, so the rows this call won are known exactly. A batch update followed by
+                // a read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+                foreach (var id in ids)
+                {
+                    // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must
+                    // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                    if (cancellationToken.IsCancellationRequested) break;
 
-                var result = await coll.UpdateOneAsync(
-                    fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
-                    update,
-                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    var result = await coll.UpdateOneAsync(
+                        fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
+                        update,
+                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
 
-                if (result.ModifiedCount > 0) won.Add(id);
+                    if (result.ModifiedCount > 0) won[id] = claimMarker;
+                }
+
+                if (won.Count == 0) return Array.Empty<TimeTickerEntity>();
+
+                var rows = await coll
+                    .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                    .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+                var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), CancellationToken.None).ConfigureAwait(false);
+                return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
             }
-
-            if (won.Count == 0) return Array.Empty<TimeTickerEntity>();
-
-            var rows = await coll
-                .Find(fb.And(fb.In(x => x.Id, won), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
-                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
-            var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), CancellationToken.None).ConfigureAwait(false);
-            return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
+            catch (Exception failure) when (won.Count > 0)
+            {
+                // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                throw;
+            }
         }
 
         public async Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
@@ -963,40 +973,49 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.CronTickerOccurrences;
             var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
 
-            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a read
-            // of "InProgress for this node" also returned a row this node's fallback was already running.
             var won = new Dictionary<Guid, DateTime>(occurrenceIds.Length);
-            foreach (var id in occurrenceIds)
+            try
             {
-                // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
-                // returned to be dispatched, the rows not written yet stay Idle for the fallback.
-                if (cancellationToken.IsCancellationRequested) break;
+                // One conditional write per row, so the rows this call won are known exactly. A batch update followed by
+                // a read of "InProgress for this node" also returned a row this node's fallback was already running.
+                foreach (var id in occurrenceIds)
+                {
+                    // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must
+                    // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                    if (cancellationToken.IsCancellationRequested) break;
 
-                var claimMarker = _clock.NextClaimMarker();
-                var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
-                    .Set(x => x.LockHolder, _lockHolder)
-                    .Set(x => x.LockedAt, now)
-                    .Set(x => x.Status, TickerStatus.InProgress)
-                    .Set(x => x.UpdatedAt, claimMarker);
+                    var claimMarker = _clock.NextClaimMarker();
+                    var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.LockHolder, _lockHolder)
+                        .Set(x => x.LockedAt, now)
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, claimMarker);
 
-                var result = await coll.UpdateOneAsync(
-                    fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
-                    update,
-                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    var result = await coll.UpdateOneAsync(
+                        fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
+                        update,
+                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
 
-                if (result.ModifiedCount > 0) won[id] = claimMarker;
+                    if (result.ModifiedCount > 0) won[id] = claimMarker;
+                }
+
+                if (won.Count == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+
+                var rows = await coll
+                    .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                    .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+
+                // Each row is handed back with the marker its claim wrote, for a put-back.
+                foreach (var row in rows)
+                    row.UpdatedAt = won[row.Id];
+                return rows.ToArray();
             }
-
-            if (won.Count == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
-
-            var rows = await coll
-                .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
-                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
-
-            // Each row is handed back with the marker its claim wrote, for a put-back.
-            foreach (var row in rows)
-                row.UpdatedAt = won[row.Id];
-            return rows.ToArray();
+            catch (Exception failure) when (won.Count > 0)
+            {
+                // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                throw;
+            }
         }
 
         // ===================================================================

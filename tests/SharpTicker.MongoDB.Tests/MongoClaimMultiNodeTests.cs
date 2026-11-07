@@ -403,6 +403,63 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         }
     }
 
+    // The store fails once after the call has won rows: either the write of a later row or the read of the won rows.
+    // Nobody gets the won rows to run, so they must be put back (Idle, no holder) for the fallback, and the call must throw.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows(bool readFails)
+    {
+        var node = CreateFailingNode(readFails ? "find" : "update", readFails ? 1 : 2);
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker(), await SeedTimeTicker() };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateTimeTickersAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence(bool readFails)
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = CreateFailingNode(readFails ? "find" : "update", readFails ? 1 : 2);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // A node whose n-th command of the given name throws before it is sent, once; every later command runs normally.
+    private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateFailingNode(string commandName, int n)
+    {
+        var seen = 0;
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(e =>
+        {
+            if (e.CommandName == commandName && ++seen == n)
+                throw new InvalidOperationException("store failed");
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        return new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+    }
+
     [Fact]
     public async Task AcquireImmediate_DuplicateIds_ReturnsTheRowOnce()
     {

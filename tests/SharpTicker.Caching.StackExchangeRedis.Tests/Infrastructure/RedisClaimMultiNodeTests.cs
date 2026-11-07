@@ -956,6 +956,77 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         }
     }
 
+    // The store fails once after the call has won a row: the acquire script of the next row throws. Nobody gets the
+    // won row to run, so it must be put back (Idle, no holder) for the fallback, and the call must throw.
+    [Fact]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await SeedTimeTicker(seeder), await SeedTimeTicker(seeder), await SeedTimeTicker(seeder) };
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 2));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateTimeTickersAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadTimeTicker(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder) };
+        await seeder.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 2));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // Throws on the n-th call of one method, once, before it reaches Redis; every other call goes through.
+    public class FailingDatabase : DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _method = "";
+        private int _failAt;
+        private int _seen;
+
+        public static IDatabase Create(IDatabase inner, string method, int failAt)
+        {
+            var proxy = DispatchProxy.Create<IDatabase, FailingDatabase>();
+            var failing = (FailingDatabase)(object)proxy;
+            failing._inner = inner;
+            failing._method = method;
+            failing._failAt = failAt;
+            return proxy;
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            if (targetMethod!.Name == _method && ++_seen == _failAt)
+                throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
+
+            try
+            {
+                return targetMethod.Invoke(_inner, args);
+            }
+            catch (TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
+    }
+
     private async Task<string> RawOccurrence(Guid id)
         => (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.CronOccurrenceKey(id)))!;
 

@@ -404,6 +404,87 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
     }
 
+    // The store fails once after the call has won rows: either the write of a later row or the final read. Nobody
+    // gets the won rows to run, so they must be put back (Idle, no holder) for the fallback, and the call must throw.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows(bool readFails)
+    {
+        var node = CreateProvider("node-A", Clock, readFails ? FailOnce.FirstRead() : FailOnce.NonQuery(2));
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker(), await SeedTimeTicker() };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateTimeTickersAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence(bool readFails)
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = CreateProvider("node-A", Clock, readFails ? FailOnce.FirstRead() : FailOnce.NonQuery(2));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // Throws once, on the n-th write or on the first read; every later command runs normally.
+    private sealed class FailOnce : DbCommandInterceptor
+    {
+        private readonly int _failAtNonQuery;
+        private readonly bool _failFirstRead;
+        private int _nonQueries;
+        private bool _failed;
+
+        private FailOnce(int failAtNonQuery, bool failFirstRead)
+        {
+            _failAtNonQuery = failAtNonQuery;
+            _failFirstRead = failFirstRead;
+        }
+
+        public static FailOnce NonQuery(int n) => new(n, false);
+
+        public static FailOnce FirstRead() => new(0, true);
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (!_failed && ++_nonQueries == _failAtNonQuery)
+                Fail();
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            if (!_failed && _failFirstRead)
+                Fail();
+            return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        private void Fail()
+        {
+            _failed = true;
+            throw new InvalidOperationException("store failed");
+        }
+    }
+
     [Fact]
     public async Task AcquireImmediate_DuplicateIds_ReturnsTheRowOnce()
     {
