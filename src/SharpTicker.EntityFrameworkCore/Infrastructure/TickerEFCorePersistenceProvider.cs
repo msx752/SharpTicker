@@ -364,10 +364,11 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             if (affected == 0)
                 return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
 
-            // Return acquired occurrences with CronTicker populated
+            // Return the occurrences this call claimed, with CronTicker populated. The marker tells them apart from a row
+            // this node's fallback holds, which is InProgress for this node too and already running.
             return await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
                 .AsNoTracking()
-                .Where(x => idList.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
+                .Where(x => idList.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress && x.UpdatedAt == claimMarker)
                 .Include(x => x.CronTicker)
                 .ToArrayAsync(cancellationToken)
                 .ConfigureAwait(false);

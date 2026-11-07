@@ -128,6 +128,8 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             if(affected <= 0)
                 continue;
 
+            // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+            timeTicker.UpdatedAt = claimMarker;
             yield return timeTicker;
         }
     }
@@ -511,6 +513,8 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             if(affected <= 0)
                 continue;
 
+            // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+            cronTickerOccurrence.UpdatedAt = claimMarker;
             yield return cronTickerOccurrence;
         }
     }

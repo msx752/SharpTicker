@@ -360,6 +360,80 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(TickerStatus.InProgress, (await Occurrence(nodeA, id)).Status);
     }
 
+    // The fallback and run-now hand back each row they claimed with the marker their write gave it, so a job that never
+    // starts can be put back with that marker.
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await SeedTimeTicker();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await nodeB.GetTimeTickerById(id, CancellationToken.None)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await nodeB.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueOccurrenceOn(CreateProvider("node-A"));
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await Occurrence(nodeB, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await Occurrence(nodeB, id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await SeedTimeTicker();
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([id], CancellationToken.None));
+
+        Assert.Equal((await nodeA.GetTimeTickerById(id, CancellationToken.None)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None));
+
+        Assert.Equal((await Occurrence(nodeA, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await Occurrence(nodeA, id)).Status);
+    }
+
+    // Run-now returns only the rows its own call claimed. A row this node's fallback holds is already running; handing it
+    // out again would run it twice, and its put-back would undo the fallback's claim.
+    [Fact]
+    public async Task RunNowClaim_DoesNotReturnARowThisNodesFallbackHolds_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var heldByFallback = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == heldByFallback);
+        var idle = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([idle], CancellationToken.None);
+
+        var taken = await nodeA.AcquireImmediateCronOccurrencesAsync([heldByFallback, idle], CancellationToken.None);
+
+        Assert.Equal([idle], taken.Select(x => x.Id));
+    }
+
     [Fact]
     public async Task ReleaseClaim_WithAnotherMarkerOrNode_LeavesTheRow()
     {

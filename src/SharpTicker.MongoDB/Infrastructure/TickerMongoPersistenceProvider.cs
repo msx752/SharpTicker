@@ -103,16 +103,19 @@ namespace SharpTicker.MongoDB.Infrastructure
                     fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 // Every InProgress write of this node carries its own claim marker (see ClaimMarkers).
+                var claimMarker = _clock.NextClaimMarker();
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, _clock.NextClaimMarker())
+                    .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
                 var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
                 if (result.ModifiedCount <= 0)
                     continue;
 
+                // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+                candidate.UpdatedAt = claimMarker;
                 yield return BuildQueuedEntity(candidate, byParent);
             }
         }
@@ -561,14 +564,18 @@ namespace SharpTicker.MongoDB.Infrastructure
                     fb.Eq(x => x.UpdatedAt, occ.UpdatedAt),
                     fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
+                var claimMarker = _clock.NextClaimMarker();
                 var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, _clock.NextClaimMarker())
+                    .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
                 var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
                 if (result.ModifiedCount <= 0) continue;
+
+                // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+                occ.UpdatedAt = claimMarker;
 
                 if (cronById.TryGetValue(occ.CronTickerId, out var cron))
                 {
@@ -960,19 +967,23 @@ namespace SharpTicker.MongoDB.Infrastructure
                 fb.In(x => x.Id, occurrenceIds),
                 MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder));
 
+            var claimMarker = _clock.NextClaimMarker();
             var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, _clock.NextClaimMarker());
+                .Set(x => x.UpdatedAt, claimMarker);
 
             var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
             if (result.ModifiedCount == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
 
+            // Only the rows this call claimed. The marker tells them apart from a row this node's fallback holds, which is
+            // InProgress for this node too and already running.
             var acquiredFilter = fb.And(
                 fb.In(x => x.Id, occurrenceIds),
                 fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress));
+                fb.Eq(x => x.Status, TickerStatus.InProgress),
+                fb.Eq(x => x.UpdatedAt, claimMarker));
 
             var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
             return rows.ToArray();

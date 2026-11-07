@@ -119,8 +119,9 @@ namespace SharpTicker.Provider
 
                         if (TimeTickers.TryUpdate(ticker.Id, updatedTicker, existingTicker))
                         {
-                            // Only build the full hierarchy for successfully acquired tickers
-                            yield return ForQueueTimeTickers(ticker);
+                            // Only build the full hierarchy for successfully acquired tickers. The row as written is
+                            // returned, so it carries this claim's marker for a put-back.
+                            yield return ForQueueTimeTickers(updatedTicker);
                         }
                     }
                 }
