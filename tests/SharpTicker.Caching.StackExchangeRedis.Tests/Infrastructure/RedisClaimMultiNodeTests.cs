@@ -1279,6 +1279,37 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(id, Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(requeue, CancellationToken.None))).Id);
     }
 
+    // The holder's index batch landed only in part: the id sets were written, the pending entry was not. Being in the
+    // id set must not count as fully indexed, or the fallback, which reads only the pending set, never finds the row.
+    [Fact]
+    public async Task PartlyIndexedSlotRow_HolderRetries_BecomesReachable()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await fixture.Database.SortedSetRemoveAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString());
+
+        Assert.Empty(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+        Assert.Equal(id, (await nodeA.GetEarliestAvailableCronOccurrence([cronId], CancellationToken.None)).Id);
+    }
+
+    // Same partial index, the per-cron set missing too: the heal restores it, so deleting the cron still finds the row.
+    [Fact]
+    public async Task PartlyIndexedSlotRow_HolderRetries_RestoresThePerCronEntry()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await fixture.Database.SortedSetRemoveAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString());
+        await fixture.Database.SetRemoveAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString());
+
+        Assert.Empty(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.True(await fixture.Database.SetContainsAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString()));
+    }
+
     [Fact]
     public async Task SlotLoser_DoesNotRemoveHoldersPendingEntry()
     {

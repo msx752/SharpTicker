@@ -77,22 +77,24 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
     }
 
     // For a node that lost the slot's SET NX. Add-only on purpose: AddCronOccurrenceIndexesAsync decides "pending"
-    // relative to the caller and would ZREM the holder's healthy entry. SADD returning false means the row is
-    // already indexed (the normal case) and nothing else is touched. True means the winner never finished
-    // indexing, so the row is added to every set a normal update writes. Returns true when it healed.
+    // relative to the caller and would ZREM the holder's healthy entry. The winner's index batch is not atomic, so it
+    // can land in part: being in the id set does not mean the row is pending. In the normal case the row is in the id
+    // set and pending, and nothing else is touched. Otherwise the row is added to every set a normal update by this
+    // node would write. Returns true when it healed.
     internal async Task<bool> HealOrphanCronOccurrenceIndexesAsync(Guid id, Func<Task<CronTickerOccurrenceEntity<TCronTicker>>> loadRow)
     {
         var idStr = (RedisValue)id.ToString();
-        if (!await _db.SetAddAsync(CronOccurrenceIdsKey, idStr).ConfigureAwait(false))
+        var addedToIds = await _db.SetAddAsync(CronOccurrenceIdsKey, idStr).ConfigureAwait(false);
+        if (!addedToIds && await _db.SortedSetScoreAsync(CronOccurrencePendingKey, idStr).ConfigureAwait(false) != null)
             return false;
 
         var row = await loadRow().ConfigureAwait(false);
-        if (row == null) return true;
+        if (row == null) return addedToIds;
 
-        await _db.SetAddAsync(CronOccurrencesByCronKey(row.CronTickerId), idStr).ConfigureAwait(false);
-        if (CanAcquire(row.Status, row.LockHolder, _lockHolder))
-            await _db.SortedSetAddAsync(CronOccurrencePendingKey, idStr, ToScore(row.ExecutionTime)).ConfigureAwait(false);
-        return true;
+        var addedToCron = await _db.SetAddAsync(CronOccurrencesByCronKey(row.CronTickerId), idStr).ConfigureAwait(false);
+        var addedToPending = CanAcquire(row.Status, row.LockHolder, _lockHolder)
+            && await _db.SortedSetAddAsync(CronOccurrencePendingKey, idStr, ToScore(row.ExecutionTime)).ConfigureAwait(false);
+        return addedToIds || addedToCron || addedToPending;
     }
 
     internal Task RemoveCronOccurrenceIndexesAsync(Guid id, Guid cronTickerId)
