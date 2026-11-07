@@ -963,29 +963,39 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.CronTickerOccurrences;
             var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
 
-            var filter = fb.And(
-                fb.In(x => x.Id, occurrenceIds),
-                MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder));
+            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a read
+            // of "InProgress for this node" also returned a row this node's fallback was already running.
+            var won = new Dictionary<Guid, DateTime>(occurrenceIds.Length);
+            foreach (var id in occurrenceIds)
+            {
+                // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
+                // returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested) break;
 
-            var claimMarker = _clock.NextClaimMarker();
-            var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
-                .Set(x => x.LockHolder, _lockHolder)
-                .Set(x => x.LockedAt, now)
-                .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, claimMarker);
+                var claimMarker = _clock.NextClaimMarker();
+                var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                    .Set(x => x.LockHolder, _lockHolder)
+                    .Set(x => x.LockedAt, now)
+                    .Set(x => x.Status, TickerStatus.InProgress)
+                    .Set(x => x.UpdatedAt, claimMarker);
 
-            var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (result.ModifiedCount == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+                var result = await coll.UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
+                    update,
+                    cancellationToken: CancellationToken.None).ConfigureAwait(false);
 
-            // Only the rows this call claimed. The marker tells them apart from a row this node's fallback holds, which is
-            // InProgress for this node too and already running.
-            var acquiredFilter = fb.And(
-                fb.In(x => x.Id, occurrenceIds),
-                fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress),
-                fb.Eq(x => x.UpdatedAt, claimMarker));
+                if (result.ModifiedCount > 0) won[id] = claimMarker;
+            }
 
-            var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (won.Count == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+
+            var rows = await coll
+                .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+
+            // Each row is handed back with the marker its claim wrote, for a put-back.
+            foreach (var row in rows)
+                row.UpdatedAt = won[row.Id];
             return rows.ToArray();
         }
 

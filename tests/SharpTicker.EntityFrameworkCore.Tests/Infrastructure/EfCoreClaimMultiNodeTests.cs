@@ -373,6 +373,27 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle_CronOccurrence()
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var node = CreateProvider("node-A", Clock, new CancelAfterFirstUpdate(cts));
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
     private sealed class CancelAfterFirstUpdate(CancellationTokenSource cts) : DbCommandInterceptor
     {
         public override ValueTask<int> NonQueryExecutedAsync(

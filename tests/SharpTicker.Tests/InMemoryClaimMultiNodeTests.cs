@@ -129,6 +129,26 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AcquireImmediate_CancelledBeforeTheCall_ReturnsNothingAndLeavesTheRowsIdle_CronOccurrence()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(node), await QueueOccurrenceOn(node) };
+        await node.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Empty(acquired);
+        foreach (var id in ids)
+        {
+            var row = await Occurrence(node, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
     public async Task TryMark_OwnQueuedRow_ReturnsTrueAndWritesInProgress_TimeTicker()
     {
         var nodeA = CreateProvider("node-A");

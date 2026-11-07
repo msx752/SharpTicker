@@ -344,6 +344,37 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     // The caller's token fires between two row writes. The rows won so far are InProgress and must come back to be
     // dispatched; the rest must stay Idle. A command event subscriber cancels right after the first update.
     [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle_CronOccurrence()
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(e =>
+        {
+            if (e.CommandName == "update")
+                cts.Cancel();
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        var node = new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
     public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
     {
         using var cts = new CancellationTokenSource();

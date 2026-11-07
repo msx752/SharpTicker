@@ -1063,7 +1063,10 @@ namespace SharpTicker.Provider
 
             foreach (var id in occurrenceIds)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
                 if (!CronOccurrences.TryGetValue(id, out var occurrence))
                     continue;

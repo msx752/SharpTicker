@@ -900,6 +900,35 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
     // The caller's token fires between two row acquires. The rows won so far are InProgress and must come back to be
     // dispatched; the rest must stay Idle. The hooked database cancels right after the first acquire script returns.
     [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle_CronOccurrence()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder) };
+        await seeder.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var hooked = DispatchProxy.Create<IDatabase, HookedDatabase>();
+        var hook = (HookedDatabase)hooked;
+        hook.Inner = fixture.Database;
+        hook.AfterNextCall = () =>
+        {
+            cts.Cancel();
+            return Task.CompletedTask;
+        };
+        var node = fixture.CreateProvider("node-A", _clock, hooked);
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(seeder, ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
     public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
     {
         var seeder = CreateProvider("seed");
