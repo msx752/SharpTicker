@@ -32,6 +32,14 @@ namespace SharpTicker.Utilities.Interfaces
             await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
+
+        // Puts back a claim this node made whose job never started: the row goes back to Idle with its lock cleared, only
+        // while it is still InProgress, held by this node and carries claimMarker as its UpdatedAt. Anything else (the
+        // fallback or another node took the row, the job ran, the row is gone) is left alone and the call returns false.
+        // The default body writes nothing and returns false, so a custom provider keeps today's behaviour: such a row stays
+        // InProgress and the scheduler logs it.
+        Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
         #endregion
         
         #region Cron_Ticker_Core_Methods
@@ -67,6 +75,10 @@ namespace SharpTicker.Utilities.Interfaces
             await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
+
+        // Same contract as TryReleaseTimeTickerClaim, for a cron occurrence row.
+        Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
         #endregion
         
         #region Queryable

@@ -594,6 +594,144 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     #endregion
 
+    #region Putting back a claim whose job never started
+
+    // A claim the node won but never handed to a worker (stop, freeze, a refused queue, a claim call that failed after its
+    // write landed) is put back so the job still runs, once, through the fallback.
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = Clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        Clock.Advance(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+        Assert.Equal(Clock.UtcNow, row.UpdatedAt);
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var marker = Clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, marker));
+
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, marker));
+
+        var row = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+    }
+
+    // The loop lost the row to this node's own fallback, which runs it now. The loop's put-back carries the loop's marker,
+    // which the fallback's write does not have, so the running job is left alone even within the same millisecond.
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = Clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, loopMarker));
+        var before = await ReadTimeTicker(id);
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, loopMarker));
+
+        var after = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, after.Status);
+        Assert.Equal("node-A", after.LockHolder);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = Clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(id, loopMarker));
+
+        var after = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.InProgress, after.Status);
+        Assert.Equal("node-A", after.LockHolder);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_WithAnotherMarker_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = Clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker.AddMilliseconds(1)));
+
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OfAnotherNode_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = Clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await CreateProvider("node-B").TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    // A job that started and finished (or was cancelled) is past InProgress; putting it back would run it again.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    [InlineData(TickerStatus.Skipped)]
+    public async Task ReleaseClaim_RowNoLongerInProgress_LeavesTheRow(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = Clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        await using (var context = CreateContext())
+            await context.Set<TimeTickerEntity>().Where(x => x.Id == id)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, status));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        Assert.Equal(status, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(Guid.NewGuid(), Clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), Clock.NextClaimMarker()));
+    }
+
+    #endregion
+
     #region Startup release of an earlier run
 
     // The startup release frees what an earlier run of this node left locked. It runs after the fallback and the loop have

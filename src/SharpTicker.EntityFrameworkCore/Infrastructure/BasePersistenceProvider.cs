@@ -151,6 +151,24 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         return affected > 0;
     }
 
+    public async Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        // The marker is unique per node, so a row this node's fallback took and runs (its own marker) is never matched.
+        var affected = await dbContext.Set<TTimeTicker>()
+            .Where(x => x.Id == id && x.Status == TickerStatus.InProgress && x.LockHolder == _lockHolder && x.UpdatedAt == claimMarker)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
     public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContexts, CancellationToken cancellationToken)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -491,6 +509,23 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.InProgress)
                 .SetProperty(x => x.UpdatedAt, claimMarker), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
+    public async Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        var affected = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.Id == id && x.Status == TickerStatus.InProgress && x.LockHolder == _lockHolder && x.UpdatedAt == claimMarker)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
 
         return affected > 0;
     }

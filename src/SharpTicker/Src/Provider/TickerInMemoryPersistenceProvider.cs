@@ -253,6 +253,27 @@ namespace SharpTicker.Provider
             return Task.FromResult(TimeTickers.TryUpdate(id, updatedTicker, ticker));
         }
 
+        public Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            // Compare-and-swap against the row just read; a concurrent write sends the loop back to read and check again.
+            while (TimeTickers.TryGetValue(id, out var ticker))
+            {
+                if (ticker.Status != TickerStatus.InProgress || ticker.LockHolder != _lockHolder || ticker.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneTicker(ticker);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (TimeTickers.TryUpdate(id, released, ticker))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
+        }
+
         public Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default)
         {
             if (ids == null || ids.Length == 0)
@@ -878,6 +899,26 @@ namespace SharpTicker.Provider
             updatedOccurrence.UpdatedAt = claimMarker;
 
             return Task.FromResult(CronOccurrences.TryUpdate(id, updatedOccurrence, occurrence));
+        }
+
+        public Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            while (CronOccurrences.TryGetValue(id, out var occurrence))
+            {
+                if (occurrence.Status != TickerStatus.InProgress || occurrence.LockHolder != _lockHolder || occurrence.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneCronOccurrence(occurrence);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (CronOccurrences.TryUpdate(id, released, occurrence))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
         }
 
         public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)

@@ -577,6 +577,123 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
     #endregion
 
+    #region Putting back a claim whose job never started
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        _clock.Advance(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, marker));
+
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, marker));
+
+        var row = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
+    // MongoDB keeps milliseconds, so this is where two writes of one node in the same millisecond would look alike without
+    // the per-node marker: the loop's put-back must leave the row this node's fallback runs.
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, loopMarker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(id, loopMarker));
+
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_WithAnotherMarkerOrNode_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker.AddMilliseconds(1)));
+        Assert.False(await CreateProvider("node-B").TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    // The status write leaves UpdatedAt equal to the marker, so only the status tells the row moved on.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    [InlineData(TickerStatus.Skipped)]
+    public async Task ReleaseClaim_RowNoLongerInProgress_LeavesTheRow(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        await _f.TimeTickers.UpdateOneAsync(Builders<TimeTickerEntity>.Filter.Eq(x => x.Id, id), Builders<TimeTickerEntity>.Update.Set(x => x.Status, status));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        Assert.Equal(status, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+    }
+
+    #endregion
+
     #region Children
 
     // Mongo stores each child as a document of its own, linked by ParentId.

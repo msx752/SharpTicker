@@ -229,6 +229,27 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .ConfigureAwait(false);
         }
 
+        public async Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<TTimeTicker>.Filter;
+            // The marker is unique per node and kept to the millisecond, so a row this node's fallback runs is never matched.
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    fb.And(
+                        fb.Eq(x => x.Id, id),
+                        fb.Eq(x => x.Status, TickerStatus.InProgress),
+                        fb.Eq(x => x.LockHolder, _lockHolder),
+                        fb.Eq(x => x.UpdatedAt, claimMarker)),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.Idle)
+                        .Set(x => x.LockHolder, (string)null)
+                        .Set(x => x.LockedAt, (DateTime?)null)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
+        }
+
         public async Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default)
         {
             if (ids == null || ids.Length == 0) return Array.Empty<TimeTickerEntity>();
@@ -570,6 +591,26 @@ namespace SharpTicker.MongoDB.Infrastructure
                     Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                         .Set(x => x.Status, TickerStatus.InProgress)
                         .Set(x => x.UpdatedAt, claimMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
+        }
+
+        public async Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    fb.And(
+                        fb.Eq(x => x.Id, id),
+                        fb.Eq(x => x.Status, TickerStatus.InProgress),
+                        fb.Eq(x => x.LockHolder, _lockHolder),
+                        fb.Eq(x => x.UpdatedAt, claimMarker)),
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.Status, TickerStatus.Idle)
+                        .Set(x => x.LockHolder, (string)null)
+                        .Set(x => x.LockedAt, (DateTime?)null)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             return result.ModifiedCount > 0;

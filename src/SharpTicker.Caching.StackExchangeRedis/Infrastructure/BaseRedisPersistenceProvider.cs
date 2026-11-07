@@ -35,6 +35,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
     private static readonly string ReleaseScript = LuaScriptLoader.Load("Release");
     private static readonly string RecoverDeadNodeScript = LuaScriptLoader.Load("RecoverDeadNode");
     private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
+    private static readonly string ReleaseClaimScript = LuaScriptLoader.Load("ReleaseClaim");
 
     protected BaseRedisPersistenceProvider(
         IDatabase db,
@@ -130,6 +131,34 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
 
         if (result.IsNull) return (false, null);
         return (true, Serializer.DeserializeOrNull<T>((string)result));
+    }
+
+    // Puts back a claim whose job never started. The fallback and the loop find rows through the pending index, so the
+    // index entries of the put-back row are written first: while the row is still InProgress they are harmless, Acquire.lua
+    // rejects it. Written after the put-back, a failed index write would leave an Idle row that nothing looks at; this way a
+    // failure leaves the row InProgress and the caller tries again, and a put-back whose reply was lost is already indexed.
+    // The row key and the index keys live in different hash slots, so they cannot share one script.
+    protected async Task<bool> TryReleaseClaimAsync<T>(string key, DateTime claimMarker, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle)
+        where T : class
+    {
+        // A row that is not this claim is left alone without any write; the script below checks again atomically.
+        var row = await Serializer.GetAsync<T>(key).ConfigureAwait(false);
+        if (row == null || !isThisClaim(row))
+            return false;
+
+        asIdle(row);
+        await indexAsIdle(row).ConfigureAwait(false);
+
+        var result = await Db.ScriptEvaluateAsync(
+            ReleaseClaimScript,
+            [(RedisKey)key],
+            [(RedisValue)LockHolder, (RedisValue)claimMarker.ToString("O"), (RedisValue)Clock.UtcNow.ToString("O"),
+             LuaStatusInProgress, LuaStatusIdle]
+        ).ConfigureAwait(false);
+
+        // A row that moved on keeps the extra pending entry until its next write updates its index; Acquire.lua rejects
+        // it meanwhile.
+        return !result.IsNull;
     }
     #endregion
 
@@ -327,6 +356,14 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             await TryUpdateIndexAfterClaim(id, () => IndexManager.AddTimeTickerIndexesAsync(row)).ConfigureAwait(false);
         return true;
     }
+
+    public Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        => TryReleaseClaimAsync<TTimeTicker>(
+            TimeTickerKey(id),
+            claimMarker,
+            row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
+            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; },
+            row => IndexManager.AddTimeTickerIndexesAsync(row));
 
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken = default)
     {
@@ -634,6 +671,14 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
             await TryUpdateIndexAfterClaim(id, () => IndexManager.AddCronOccurrenceIndexesAsync(row)).ConfigureAwait(false);
         return true;
     }
+
+    public Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        => TryReleaseClaimAsync<CronTickerOccurrenceEntity<TCronTicker>>(
+            CronOccurrenceKey(id),
+            claimMarker,
+            row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
+            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; },
+            row => IndexManager.AddCronOccurrenceIndexesAsync(row));
 
     public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
     {
