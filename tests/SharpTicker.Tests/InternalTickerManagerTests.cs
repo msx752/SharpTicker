@@ -1131,4 +1131,37 @@ public class InternalTickerManagerTests
         Assert.Equal("the store refused", failure.Message);
         await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
     }
+
+    /// <summary>
+    /// The release of what an earlier run of this node left locked goes to the fenced overloads with the moment this run
+    /// started, never to the unfenced ones, which would also release the rows this run has claimed since.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseEarlierRunResources_UsesTheFencedReleasesWithTheStartOfThisRun()
+    {
+        var start = _now.AddMinutes(-3);
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        await _manager.ReleaseEarlierRunResources("node-a", start);
+
+        await _persistence.Received(1).ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>());
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().ReleaseDeadNodeOccurrenceResources(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().ReleaseDeadNodeTimeTickerResources(Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ReleaseEarlierRunResources_StillReleasesTheTimeTickers_WhenReleasingTheOccurrencesFails()
+    {
+        var start = _now.AddMinutes(-3);
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromException(new InvalidOperationException("the store refused")));
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.ReleaseEarlierRunResources("node-a", start));
+
+        Assert.Equal("the store refused", failure.Message);
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>());
+    }
 }

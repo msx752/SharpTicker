@@ -36,6 +36,12 @@ namespace SharpTicker.Utilities.Interfaces
         Task MigrateDefinedCronTickers((string Function, string Expression)[] cronTickers, CancellationToken cancellationToken = default);
         Task<CronTickerEntity[]> GetAllCronTickerExpressions(CancellationToken cancellationToken);
         Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default);
+
+        // Releases only what the node locked before lockedBefore. A node that releases what an earlier run of itself left
+        // behind passes the moment this run started, so rows it has claimed since are kept and not run a second time.
+        // The default body keeps the unfenced release for custom providers.
+        Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+            => ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken);
         #endregion
         
         #region Cron_TickerOccurrence_Core_Methods
@@ -47,6 +53,10 @@ namespace SharpTicker.Utilities.Interfaces
         Task<byte[]> GetCronTickerOccurrenceRequest(Guid tickerId, CancellationToken cancellationToken = default);
         Task UpdateCronTickerOccurrencesWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default);
         Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default);
+
+        // Same contract as the time ticker overload with lockedBefore.
+        Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+            => ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken);
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => Task.FromResult(0);
 
         // Same contract as TryMarkTimeTickerInProgress, for a cron occurrence row.

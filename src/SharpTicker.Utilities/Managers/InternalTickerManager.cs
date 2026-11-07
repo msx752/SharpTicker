@@ -472,7 +472,17 @@ namespace SharpTicker.Utilities.Managers
         public async Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default)
             => await _persistenceProvider.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken).ConfigureAwait(false);
 
-        public async Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+        public Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+            => ReleaseBothAsync(
+                () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken),
+                () => _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken));
+
+        public Task ReleaseEarlierRunResources(string nodeIdentifier, DateTime runStartedAt, CancellationToken cancellationToken = default)
+            => ReleaseBothAsync(
+                () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(nodeIdentifier, runStartedAt, cancellationToken),
+                () => _persistenceProvider.ReleaseDeadNodeTimeTickerResources(nodeIdentifier, runStartedAt, cancellationToken));
+
+        private static async Task ReleaseBothAsync(Func<Task> releaseOccurrences, Func<Task> releaseTimeTickers)
         {
             // One after the other: a store behind a single connection, such as an in-memory SQLite database, cannot run two
             // operations at once, and these are two short statements. They do not depend on each other, so the second runs
@@ -481,7 +491,7 @@ namespace SharpTicker.Utilities.Managers
 
             try
             {
-                await _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+                await releaseOccurrences().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -490,7 +500,7 @@ namespace SharpTicker.Utilities.Managers
 
             try
             {
-                await _persistenceProvider.ReleaseDeadNodeTimeTickerResources(instanceIdentifier, cancellationToken).ConfigureAwait(false);
+                await releaseTimeTickers().ConfigureAwait(false);
             }
             catch (Exception ex)
             {

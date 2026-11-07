@@ -25,17 +25,33 @@ public class StartupReleaseTests
             => Entries.Add((logLevel, formatter(state, exception), exception));
     }
 
+    private static readonly DateTime RunStartedAt = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+    // The startup release frees what an earlier run of this node left behind; it must not free what this run has claimed
+    // since it started, so it goes through the fenced release with the start of this run, never the unfenced one.
+    [Fact]
+    public async Task TheRelease_IsFencedByTheStartOfThisRun()
+    {
+        var manager = Substitute.For<IInternalTickerManager>();
+        manager.ReleaseEarlierRunResources("node-a", RunStartedAt, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", RunStartedAt, null, new CapturedLogger());
+
+        await manager.Received(1).ReleaseEarlierRunResources("node-a", RunStartedAt, Arg.Any<CancellationToken>());
+        await manager.DidNotReceive().ReleaseDeadNodeResources(Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
     [Fact]
     public async Task AFailureOfTheRelease_IsLoggedWithItsException_AndDoesNotFaultTheTask()
     {
         var manager = Substitute.For<IInternalTickerManager>();
-        manager.ReleaseDeadNodeResources("node-a", Arg.Any<CancellationToken>())
+        manager.ReleaseEarlierRunResources("node-a", RunStartedAt, Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromException(new InvalidOperationException("the store refused")));
         var scheduler = Substitute.For<ISharpTickerHostScheduler>();
         scheduler.IsRunning.Returns(true);
         var logger = new CapturedLogger();
 
-        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", scheduler, logger);
+        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", RunStartedAt, scheduler, logger);
 
         var entry = Assert.Single(logger.Entries);
         Assert.Equal(LogLevel.Error, entry.Level);
@@ -48,12 +64,12 @@ public class StartupReleaseTests
     public async Task AReleaseThatSucceeds_RestartsTheHostScheduler_WhenItIsRunning()
     {
         var manager = Substitute.For<IInternalTickerManager>();
-        manager.ReleaseDeadNodeResources("node-a", Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        manager.ReleaseEarlierRunResources("node-a", RunStartedAt, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
         var scheduler = Substitute.For<ISharpTickerHostScheduler>();
         scheduler.IsRunning.Returns(true);
         var logger = new CapturedLogger();
 
-        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", scheduler, logger);
+        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", RunStartedAt, scheduler, logger);
 
         scheduler.Received(1).Restart();
         Assert.Empty(logger.Entries);
@@ -63,11 +79,11 @@ public class StartupReleaseTests
     public async Task AReleaseThatSucceeds_LeavesAHostSchedulerThatIsNotRunning_Alone()
     {
         var manager = Substitute.For<IInternalTickerManager>();
-        manager.ReleaseDeadNodeResources("node-a", Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        manager.ReleaseEarlierRunResources("node-a", RunStartedAt, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
         var scheduler = Substitute.For<ISharpTickerHostScheduler>();
         scheduler.IsRunning.Returns(false);
 
-        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", scheduler, new CapturedLogger());
+        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(manager, "node-a", RunStartedAt, scheduler, new CapturedLogger());
 
         scheduler.DidNotReceive().Restart();
     }

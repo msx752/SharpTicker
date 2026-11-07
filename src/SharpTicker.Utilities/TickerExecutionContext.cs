@@ -23,6 +23,11 @@ internal class TickerExecutionContext
    internal Action<object> DashboardApplicationAction { get; set; }
    /// <summary>The work an external provider starts when the application has started, so it can be waited for.</summary>
    internal Task ExternalProviderStartup { get; set; }
+   /// <summary>
+   /// When this run of the node began to take work: set before the functions are registered, so no job of this run was
+   /// claimed earlier. A release of what an earlier run left locked takes only rows locked before this moment.
+   /// </summary>
+   internal DateTime? RunStartedAt { get; set; }
    public Action<object, CoreNotifyActionType> NotifyCoreAction { get; set; }
    public string LastHostExceptionMessage { get; set; }
    internal ITickerOptionsSeeding OptionsSeeding { get; set; }

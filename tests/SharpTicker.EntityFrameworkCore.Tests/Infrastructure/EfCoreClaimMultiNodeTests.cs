@@ -594,6 +594,79 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     #endregion
 
+    #region Startup release of an earlier run
+
+    // The startup release frees what an earlier run of this node left locked. It runs after the fallback and the loop have
+    // started, so a row this run has claimed since must be left alone, or the fallback claims it again and runs it twice.
+    [Fact]
+    public async Task ReleaseEarlierRun_ReleasesRowsLockedBeforeStart_KeepsRowsClaimedSince_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var leftByEarlierRun = await SeedTimeTicker(TickerStatus.InProgress, "node-A");
+        var queuedByEarlierRun = await SeedTimeTicker(TickerStatus.Queued, "node-A", executionTime: T0.AddHours(1));
+        var unlockedOfAnyNode = await SeedTimeTicker(executionTime: T0.AddHours(1));
+        var start = Clock.UtcNow;
+        var claimedByFallback = await SeedTimeTicker();
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == claimedByFallback);
+        var unlockedBefore = await ReadTimeTicker(unlockedOfAnyNode);
+
+        await nodeA.ReleaseDeadNodeTimeTickerResources("node-A", start, CancellationToken.None);
+
+        foreach (var released in new[] { leftByEarlierRun, queuedByEarlierRun })
+        {
+            var row = await ReadTimeTicker(released);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+            Assert.Null(row.LockedAt);
+        }
+        var kept = await ReadTimeTicker(claimedByFallback);
+        Assert.Equal(TickerStatus.InProgress, kept.Status);
+        Assert.Equal("node-A", kept.LockHolder);
+        Assert.DoesNotContain(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == claimedByFallback);
+        Assert.Equal(unlockedBefore.UpdatedAt, (await ReadTimeTicker(unlockedOfAnyNode)).UpdatedAt);
+    }
+
+    [Fact]
+    public async Task ReleaseEarlierRun_ReleasesRowsLockedBeforeStart_KeepsRowsClaimedSince_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var leftByEarlierRun = await QueueOccurrenceOn(nodeA);
+        await nodeA.TryMarkCronOccurrenceInProgress(leftByEarlierRun);
+        Clock.Advance(TimeSpan.FromMinutes(1));
+        var start = Clock.UtcNow;
+        Clock.Advance(TimeSpan.FromMilliseconds(5));
+        var queuedSince = await QueueOccurrenceOn(nodeA);
+        var claimedSince = await QueueOccurrenceOn(nodeA);
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(claimedSince));
+
+        await nodeA.ReleaseDeadNodeOccurrenceResources("node-A", start, CancellationToken.None);
+
+        var released = await ReadOccurrence(leftByEarlierRun);
+        Assert.Equal(TickerStatus.Idle, released.Status);
+        Assert.Null(released.LockHolder);
+        Assert.Equal(TickerStatus.Queued, (await ReadOccurrence(queuedSince)).Status);
+        var kept = await ReadOccurrence(claimedSince);
+        Assert.Equal(TickerStatus.InProgress, kept.Status);
+        Assert.Equal("node-A", kept.LockHolder);
+    }
+
+    // The overload without a start keeps today's behaviour: every row of that node is released. The Redis heartbeat uses it
+    // for nodes that are dead, where nothing of theirs can be running here.
+    [Fact]
+    public async Task ReleaseDeadNode_WithoutStart_StillReleasesEveryRowOfThatNode()
+    {
+        var nodeB = CreateProvider("node-B");
+        var held = await SeedTimeTicker(TickerStatus.InProgress, "node-A", executionTime: T0);
+        Clock.Advance(TimeSpan.FromHours(2));
+
+        await nodeB.ReleaseDeadNodeTimeTickerResources("node-A", CancellationToken.None);
+
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(held)).Status);
+    }
+
+    #endregion
+
     #region Children
 
     protected async Task<(Guid ParentId, Guid ChildId)> SeedParentWithChild()

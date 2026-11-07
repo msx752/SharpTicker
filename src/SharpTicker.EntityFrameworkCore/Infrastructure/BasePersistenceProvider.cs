@@ -220,23 +220,38 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
     }
     
-    public async Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+    public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+        => ReleaseDeadNodeTimeTickerResourcesCore(instanceIdentifier, null, cancellationToken);
+
+    public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+        => ReleaseDeadNodeTimeTickerResourcesCore(instanceIdentifier, lockedBefore, cancellationToken);
+
+    // With lockedBefore only the rows that node locked before that moment are released; every claim sets LockedAt, so a row
+    // this run claimed since keeps its lock. Without it, the release takes every row of that node, as before.
+    private async Task ReleaseDeadNodeTimeTickerResourcesCore(string instanceIdentifier, DateTime? lockedBefore, CancellationToken cancellationToken)
     {
         var now = _clock.UtcNow;
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
 
-        await dbContext.Set<TTimeTicker>()
-            .WhereCanAcquire(instanceIdentifier)
+        var waiting = dbContext.Set<TTimeTicker>().WhereCanAcquire(instanceIdentifier);
+        if (lockedBefore is { } waitingBefore)
+            waiting = waiting.Where(x => x.LockHolder == instanceIdentifier && x.LockedAt < waitingBefore);
+
+        await waiting
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
                 .SetProperty(x => x.Status, TickerStatus.Idle)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
-        
-        await dbContext.Set<TTimeTicker>()
-            .Where(x => x.LockHolder == instanceIdentifier && x.Status == TickerStatus.InProgress)
+
+        var running = dbContext.Set<TTimeTicker>()
+            .Where(x => x.LockHolder == instanceIdentifier && x.Status == TickerStatus.InProgress);
+        if (lockedBefore is { } runningBefore)
+            running = running.Where(x => x.LockedAt < runningBefore);
+
+        await running
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
@@ -477,23 +492,37 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         return affected > 0;
     }
 
-    public async Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+    public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
+        => ReleaseDeadNodeOccurrenceResourcesCore(instanceIdentifier, null, cancellationToken);
+
+    public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+        => ReleaseDeadNodeOccurrenceResourcesCore(instanceIdentifier, lockedBefore, cancellationToken);
+
+    // Same rule as ReleaseDeadNodeTimeTickerResourcesCore.
+    private async Task ReleaseDeadNodeOccurrenceResourcesCore(string instanceIdentifier, DateTime? lockedBefore, CancellationToken cancellationToken)
     {
         var now = _clock.UtcNow;
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
 
-        await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
-            .WhereCanAcquire(instanceIdentifier)
+        var waiting = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>().WhereCanAcquire(instanceIdentifier);
+        if (lockedBefore is { } waitingBefore)
+            waiting = waiting.Where(x => x.LockHolder == instanceIdentifier && x.LockedAt < waitingBefore);
+
+        await waiting
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
                 .SetProperty(x => x.Status, TickerStatus.Idle)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
-        
-        await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
-            .Where(x => x.LockHolder == instanceIdentifier && x.Status == TickerStatus.InProgress)
+
+        var running = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.LockHolder == instanceIdentifier && x.Status == TickerStatus.InProgress);
+        if (lockedBefore is { } runningBefore)
+            running = running.Where(x => x.LockedAt < runningBefore);
+
+        await running
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)

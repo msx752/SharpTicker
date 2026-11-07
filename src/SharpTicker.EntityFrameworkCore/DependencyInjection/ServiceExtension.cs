@@ -52,10 +52,16 @@ public static class ServiceExtension
             var logger = serviceProvider.GetService<ILoggerFactory>()?.CreateLogger(StartupReleaseCategory) ?? NullLogger.Instance;
             var executionContext = serviceProvider.GetService<TickerExecutionContext>();
 
+            // The initializer records when this run began, before any job could be claimed. Without it (a host that skipped
+            // the initializer) this moment is the latest one still before the scheduler and the fallback start.
+            var runStartedAt = executionContext?.RunStartedAt
+                               ?? serviceProvider.GetService<ITickerClock>()?.UtcNow
+                               ?? DateTime.UtcNow;
+
             hostLifetime.ApplicationStarted.Register(() =>
             {
                 // The context keeps the task so that whoever needs to know the release is over, a test for one, can wait for it.
-                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, hostScheduler, logger));
+                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, runStartedAt, hostScheduler, logger));
                 if (executionContext != null)
                     executionContext.ExternalProviderStartup = release;
             });
@@ -65,19 +71,20 @@ public static class ServiceExtension
     private const string StartupReleaseCategory = "SharpTicker.EntityFrameworkCore.StartupRelease";
 
     /// <summary>
-    /// Releases the jobs a dead node or an earlier run of this node left locked, then restarts the host scheduler so it picks
-    /// up what was seeded in the meantime.
+    /// Releases the jobs an earlier run of this node left locked, then restarts the host scheduler so it picks up what was
+    /// seeded in the meantime. It runs once the application has started, when the scheduler and the fallback may already
+    /// have claimed jobs of this run, so only rows locked before <paramref name="runStartedAt"/> are released.
     /// </summary>
     internal static async Task ReleaseDeadNodeResourcesOnStartAsync(
         IInternalTickerManager internalTickerManager,
         string nodeIdentifier,
+        DateTime runStartedAt,
         ISharpTickerHostScheduler hostScheduler,
         ILogger logger)
     {
         try
         {
-            // Release resources held by dead nodes before the scheduler starts processing.
-            await internalTickerManager.ReleaseDeadNodeResources(nodeIdentifier);
+            await internalTickerManager.ReleaseEarlierRunResources(nodeIdentifier, runStartedAt);
 
             // After cleanup, restart the host scheduler so it immediately
             // picks up newly seeded cron tickers and jobs configured via the core pipeline.

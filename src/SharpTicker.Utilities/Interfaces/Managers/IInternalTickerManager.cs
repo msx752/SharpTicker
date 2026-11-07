@@ -20,6 +20,10 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         Task MigrateDefinedCronTickers((string, string)[] cronExpressions, CancellationToken cancellationToken = default);
         Task DeleteTicker(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default);
+
+        // What an earlier run of this node left locked: only rows locked before runStartedAt, so the rows this run has
+        // claimed since keep their lock.
+        Task ReleaseEarlierRunResources(string nodeIdentifier, DateTime runStartedAt, CancellationToken cancellationToken = default);
         Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] context, CancellationToken cancellationToken = default);
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default);
     }

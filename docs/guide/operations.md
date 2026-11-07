@@ -16,7 +16,7 @@ builder.Services.AddSharpTicker(options =>
 });
 ```
 
-When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`), and with Redis when its heartbeat stops (a node counts as stopped when its heartbeat entry has expired, which takes `NodeHeartbeatInterval` plus 20 seconds, so a restart inside that time under the same name is not seen as a stop and its `InProgress` rows stay as they are). MongoDB has no release step, so a job left `InProgress` stays so until you change it.
+When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`, that was locked before this run started; jobs the new run has claimed in the meantime are kept), and with Redis when its heartbeat stops (a node counts as stopped when its heartbeat entry has expired, which takes `NodeHeartbeatInterval` plus 20 seconds, so a restart inside that time under the same name is not seen as a stop and its `InProgress` rows stay as they are). MongoDB has no release step, so a job left `InProgress` stays so until you change it.
 
 ### What is guaranteed
 
