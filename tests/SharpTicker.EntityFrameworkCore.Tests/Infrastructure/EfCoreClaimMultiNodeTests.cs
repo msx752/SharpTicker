@@ -594,6 +594,22 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     #endregion
 
+    #region Claim fan-out
+
+    protected abstract int ExpectedClaimFanOut { get; }
+
+    // SQLite allows one writer and a single-connection setup runs one command at a time, so its rows are claimed one by
+    // one; server databases take the scheduler's concurrent claims.
+    [Fact]
+    public async Task ClaimFanOut_FollowsTheDatabase()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(ExpectedClaimFanOut, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
+    #endregion
+
     #region Putting back a claim whose job never started
 
     // A claim the node won but never handed to a worker (stop, freeze, a refused queue, a claim call that failed after its
@@ -853,6 +869,8 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
 public class EfCoreClaimMultiNodeSqliteTests : EfCoreClaimMultiNodeTests
 {
+    protected override int ExpectedClaimFanOut => 1;
+
     private SqliteConnection _connection = null!;
     private DbContextOptions<TestSharpTickerDbContext> _options = null!;
 
@@ -891,6 +909,8 @@ public class EfCoreClaimMultiNodeSqliteTests : EfCoreClaimMultiNodeTests
 [Collection(PostgresTestFixture.CollectionName)]
 public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITestOutputHelper output) : EfCoreClaimMultiNodeTests
 {
+    protected override int ExpectedClaimFanOut => 16;
+
     protected override Task InitializeStoreAsync() => fixture.ResetAsync();
 
     protected override Task DisposeStoreAsync() => Task.CompletedTask;

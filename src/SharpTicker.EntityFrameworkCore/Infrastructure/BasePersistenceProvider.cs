@@ -17,11 +17,28 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
-internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker>
+internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
+    private int _maxConcurrentClaims;
+
+    // SQLite allows a single writer, and a single-connection setup (an in-memory database) cannot run two commands at once,
+    // so SQLite rows are claimed one at a time. The EF Core provider of a context does not change, so it is read once.
+    public async ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default)
+    {
+        var known = Volatile.Read(ref _maxConcurrentClaims);
+        if (known > 0)
+            return known;
+
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var providerName = session.Context.Database.ProviderName ?? string.Empty;
+        var fanOut = providerName.IndexOf("Sqlite", StringComparison.OrdinalIgnoreCase) >= 0 ? ClaimFanOut.Sequential : ClaimFanOut.Default;
+        Volatile.Write(ref _maxConcurrentClaims, fanOut);
+        return fanOut;
+    }
+
     public BasePersistenceProvider(IServiceProvider serviceProvider, ITickerClock clock, SchedulerOptionsBuilder optionsBuilder, ISharpTickerRedisContext redisContext)
     {
         _clock = clock;

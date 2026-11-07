@@ -18,7 +18,7 @@ namespace SharpTicker.Provider
 {
     internal class
         TickerInMemoryPersistenceProvider<TTimeTicker, TCronTicker> : ITickerPersistenceProvider<TTimeTicker,
-        TCronTicker>
+        TCronTicker>, IClaimFanOut
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -239,6 +239,9 @@ namespace SharpTicker.Provider
             
             return Task.CompletedTask;
         }
+
+        // Each claim is a compare-and-swap on one row.
+        public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
 
         public Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {

@@ -389,6 +389,14 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
     #endregion
 
+    [Fact]
+    public async Task ClaimFanOut_TakesConcurrentClaims()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(16, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
     #region Putting back a claim whose job never started
 
     [Fact]

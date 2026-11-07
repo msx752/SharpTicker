@@ -282,6 +282,14 @@ public class InMemoryClaimMultiNodeTests : IAsyncLifetime
         Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
+    [Fact]
+    public async Task ClaimFanOut_TakesConcurrentClaims()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(16, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
     // A claim the node won but never handed to a worker is put back so the job still runs, once, through the fallback.
     [Fact]
     public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()

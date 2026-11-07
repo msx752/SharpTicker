@@ -14,10 +14,13 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 
-internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker>
+internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> : IClaimFanOut
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
+    // Each claim is one script on one key; the connection multiplexes concurrent calls.
+    public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
+
     protected readonly IDatabase Db;
     protected readonly ITickerClock Clock;
     protected readonly string LockHolder;

@@ -16,7 +16,7 @@ using SharpTicker.Utilities.Models;
 namespace SharpTicker.MongoDB.Infrastructure
 {
     internal sealed class TickerMongoPersistenceProvider<TTimeTicker, TCronTicker> :
-        ITickerPersistenceProvider<TTimeTicker, TCronTicker>
+        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -177,6 +177,9 @@ namespace SharpTicker.MongoDB.Infrastructure
             var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
         }
+
+        // Each claim is a single-document conditional update.
+        public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
 
         public async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
