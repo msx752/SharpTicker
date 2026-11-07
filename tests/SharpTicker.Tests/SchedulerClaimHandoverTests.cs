@@ -993,6 +993,8 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(1, runs[id]);
         // The loop did try, and lost.
         Assert.Equal([false], manager.ClaimResults);
+        // A lost claim leaves the ledger: nothing to start, nothing to put back, and nothing for every later pass to scan.
+        Assert.Equal(0, loop.Claims.Count);
     }
 
     [Fact]

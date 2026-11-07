@@ -993,6 +993,28 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         }
     }
 
+    // An occurrence stored without its cron: after the claim is won, the cron is read separately, and that read fails. The
+    // won row must be put back, not left InProgress.
+    [Fact]
+    public async Task AcquireImmediate_CronReadFailsAfterTheWin_PutsTheRowBackAndThrows()
+    {
+        var seeder = CreateProvider("seed");
+        var cron = new CronTickerEntity { Id = Guid.NewGuid(), Function = "claim-cron-fn", Expression = "* * * * *", CreatedAt = T0, UpdatedAt = T0, Request = [] };
+        await seeder.InsertCronTickers([cron], CancellationToken.None);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = cron.Id, Status = TickerStatus.Idle, ExecutionTime = T0, CreatedAt = T0, UpdatedAt = T0
+        };
+        await seeder.InsertCronTickerOccurrences([occurrence], CancellationToken.None);
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.StringGetAsync), 1));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateCronOccurrencesAsync([occurrence.Id], CancellationToken.None));
+
+        var row = await ReadOccurrence(seeder, occurrence.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
     // A claim's script runs and lands, then its reply is lost (the call throws). The row is InProgress for this node with
     // nothing to run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron
     // occurrences.

@@ -19,6 +19,33 @@ public class SharpTickerDispatcherTests
         _dispatcher = new SharpTickerDispatcher(_taskScheduler, _taskHandler, new TickerFunctionConcurrencyGate());
     }
 
+    // A claimed run-now job goes through the claimed-work queue and only there: it runs exactly once, not also on the path
+    // for jobs without a claim marker.
+    [Fact]
+    public async Task DispatchAsync_ClaimedJob_RunsExactlyOnce()
+    {
+        var running = new List<Task>();
+        _taskScheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                running.Add(call.ArgAt<Func<CancellationToken, Task>>(0)(CancellationToken.None));
+                return ValueTask.CompletedTask;
+            });
+        var runs = 0;
+        _taskHandler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(_ => { Interlocked.Increment(ref runs); return Task.CompletedTask; });
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new SharpTicker.BackgroundServices.ClaimedWorkQueue(
+            Substitute.For<SharpTicker.Utilities.Interfaces.Managers.IInternalTickerManager>(), _taskScheduler, _taskHandler, gate);
+        var dispatcher = new SharpTickerDispatcher(_taskScheduler, _taskHandler, gate, null, null, work);
+
+        await dispatcher.DispatchAsync([new InternalFunctionContext { TickerId = Guid.NewGuid(), FunctionName = "fn", ClaimMarker = DateTime.UtcNow }]);
+        await Task.WhenAll(running);
+
+        Assert.Equal(1, runs);
+        Assert.Equal(0, work.Claims.Count);
+    }
+
     // A claimed run-now job returns to its caller only once the task scheduler has accepted it, as an unclaimed one does,
     // so a full scheduler slows the callers down instead of piling up claimed rows.
     [Fact]
