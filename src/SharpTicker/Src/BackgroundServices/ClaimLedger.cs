@@ -38,6 +38,9 @@ internal sealed class ClaimLedger
         private const int StartedState = 1;
         private const int RevertingState = 2;
         private const int GoneState = 3;
+        // A put-back was tried and failed. It may still have landed, so the job must not start any more; only another
+        // put-back can end the claim.
+        private const int PutBackFailedState = 4;
 
         private readonly ClaimLedger _ledger;
         private int _state = PendingState;
@@ -53,32 +56,35 @@ internal sealed class ClaimLedger
 
         internal DateTime ClaimMarker { get; }
 
-        internal bool IsPending => Volatile.Read(ref _state) == PendingState;
+        /// <summary>Neither started nor gone, and no put-back is under way right now.</summary>
+        internal bool IsPending => Volatile.Read(ref _state) is PendingState or PutBackFailedState;
 
         /// <summary>A put-back of this claim was tried and failed; the loop tries it again.</summary>
-        internal bool NeedsPutBack => Volatile.Read(ref _needsPutBack);
+        internal bool NeedsPutBack => Volatile.Read(ref _state) == PutBackFailedState;
 
-        private bool _needsPutBack;
-
-        /// <summary>The worker is about to run the job. False: the claim is being put back, the job must not run.</summary>
+        /// <summary>The worker is about to run the job. False: the claim is being put back, or a put-back was tried; the job must not run.</summary>
         internal bool TryStart() => Leave(PendingState, StartedState);
 
         /// <summary>The caller may put the claim back. False: the job started (or the claim is already handled).</summary>
-        internal bool TryBeginRevert() => Interlocked.CompareExchange(ref _state, RevertingState, PendingState) == PendingState;
+        internal bool TryBeginRevert()
+            => Interlocked.CompareExchange(ref _state, RevertingState, PendingState) == PendingState
+               || Interlocked.CompareExchange(ref _state, RevertingState, PutBackFailedState) == PutBackFailedState;
 
         internal void RevertSucceeded() => Leave(RevertingState, GoneState);
 
-        /// <summary>The put-back did not reach the store; the row is still this node's, so the claim is pending again.</summary>
         /// <summary>How many put-backs of this claim failed so far.</summary>
         internal int FailedPutBacks => Volatile.Read(ref _failedPutBacks);
 
         private int _failedPutBacks;
 
+        /// <summary>
+        /// The put-back did not reach the store, or its reply was lost. The claim stays in the ledger to be tried again, and
+        /// it can no longer start: the write may have landed, and the fallback may then be running the job.
+        /// </summary>
         internal void RevertFailed()
         {
             Interlocked.Increment(ref _failedPutBacks);
-            Volatile.Write(ref _needsPutBack, true);
-            Interlocked.CompareExchange(ref _state, PendingState, RevertingState);
+            Interlocked.CompareExchange(ref _state, PutBackFailedState, RevertingState);
         }
 
         /// <summary>The claim was lost (another claim took the row first): nothing to start, nothing to put back.</summary>

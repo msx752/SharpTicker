@@ -56,10 +56,10 @@ public class ClaimLedgerTests
         Assert.Equal(0, ledger.Count);
     }
 
-    // The store could not be reached: the row is still this node's and InProgress, so running it is still right, and the
-    // put-back is tried again later.
+    // A put-back whose call failed may still have landed (only its reply was lost): the row can be Idle and the fallback may
+    // run the job. The claim is therefore never started afterwards; it stays pending until a put-back reaches the store.
     [Fact]
-    public void APutBackThatFailed_GoesBackToPending_AndMayStillStart()
+    public void APutBackThatFailed_StaysPending_ButNeverStarts()
     {
         var ledger = new ClaimLedger();
         var entry = ledger.Record(Function(), Marker);
@@ -68,7 +68,10 @@ public class ClaimLedgerTests
         entry.RevertFailed();
 
         Assert.Same(entry, Assert.Single(ledger.Pending()));
-        Assert.True(entry.TryStart());
+        Assert.False(entry.TryStart());
+        Assert.Same(entry, Assert.Single(ledger.PendingPutBacks()));
+        Assert.True(entry.TryBeginRevert());
+        entry.RevertSucceeded();
         Assert.Empty(ledger.Pending());
     }
 
