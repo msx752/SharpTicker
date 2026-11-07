@@ -294,9 +294,8 @@ namespace SharpTicker.Utilities.Managers
 
         // The row is handed to a worker only when this call moved it from Queued (held by this node) to InProgress.
         // A node whose loop woke late finds the row taken by the fallback, or cancelled, and gets false.
-        public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default)
+        public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
-            var claimMarker = _clock.NextClaimMarker();
             var won = function.Type == TickerType.TimeTicker
                 ? await _persistenceProvider.TryMarkTimeTickerInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false)
                 : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
@@ -306,6 +305,27 @@ namespace SharpTicker.Utilities.Managers
 
             return won;
         }
+
+        public async Task<bool> TryReleaseClaim(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var released = function.Type == TickerType.TimeTicker
+                ? await _persistenceProvider.TryReleaseTimeTickerClaim(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false)
+                : await _persistenceProvider.TryReleaseCronOccurrenceClaim(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
+
+            if (released)
+                function.Status = TickerStatus.Idle;
+
+            return released;
+        }
+
+        public DateTime NextClaimMarker() => _clock.NextClaimMarker();
+
+        public async Task<int> GetMaxConcurrentClaims(CancellationToken cancellationToken = default)
+            => _persistenceProvider is IClaimFanOut fanOut
+                ? Math.Max(1, await fanOut.GetMaxConcurrentClaimsAsync(cancellationToken).ConfigureAwait(false))
+                : ClaimFanOut.Sequential;
+
+        public Task NotifyStatusChanged(InternalFunctionContext function) => NotifyInProgress(function);
 
         public async Task NotifyInProgress(InternalFunctionContext function)
         {

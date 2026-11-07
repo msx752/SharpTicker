@@ -10,6 +10,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.BackgroundServices;
+using SharpTicker.SharpTickerThreadPool;
 using SharpTicker.Provider;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
@@ -159,12 +160,12 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         var scheduler = Substitute.For<ISharpTickerTaskScheduler>();
         var handler = Substitute.For<ITickerExecutionTaskHandler>();
         var logger = new RecordingLogger();
-        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(false);
+        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
         var job = Function("Handover.Lost");
 
         await RunOneBatchAsync(new TickerExecutionContext(), manager, scheduler, handler, [job], logger);
 
-        await manager.Received(1).TryClaimDueTicker(job, Arg.Any<CancellationToken>());
+        await manager.Received(1).TryClaimDueTicker(job, Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
         await scheduler.DidNotReceiveWithAnyArgs().QueueAsync(default!, default, default);
         await manager.DidNotReceiveWithAnyArgs().NotifyInProgress(default!);
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Information && e.Message.Contains(job.TickerId.ToString()) && e.Message.Contains("Handover.Lost"));
@@ -177,7 +178,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         var scheduler = new RecordingTaskScheduler();
         var handler = Substitute.For<ITickerExecutionTaskHandler>();
         handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
-        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(false);
+        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
         var child = Function("Handover.Child");
         var parent = Function("Handover.Parent", TickerTaskPriority.Normal, child);
 
@@ -198,7 +199,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         var handler = Substitute.For<ITickerExecutionTaskHandler>();
         var logger = new RecordingLogger();
         handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
-        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
         manager.NotifyInProgress(Arg.Any<InternalFunctionContext>()).Returns<Task>(_ => throw new InvalidOperationException("hub is down"));
         var job = Function("Handover.Notify");
 
@@ -217,7 +218,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         var handler = Substitute.For<ITickerExecutionTaskHandler>();
         handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
         var claimed = new ConcurrentQueue<Guid>();
-        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(call =>
+        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(call =>
         {
             claimed.Enqueue(call.Arg<InternalFunctionContext>().TickerId);
             return true;
@@ -301,24 +302,74 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             return result;
         }
 
-        public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default)
+        /// <summary>The claim of this row throws before it reaches the store.</summary>
+        public Guid? ThrowBeforeClaimOf { get; set; }
+        /// <summary>The claim of this row reaches the store and its write lands, then the call throws (a lost reply).</summary>
+        public Guid? ThrowAfterClaimOf { get; set; }
+        /// <summary>The first this-many put-backs throw, as when the store cannot be reached.</summary>
+        public int FailPutBacks { get; set; }
+        /// <summary>When set, replaces what the store says about concurrent claims.</summary>
+        public int? FanOut { get; set; }
+        /// <summary>How long each claim takes, so concurrent claims overlap.</summary>
+        public TimeSpan ClaimDelay { get; set; }
+        private int _inFlight;
+        private int _mostInFlight;
+        public int MostClaimsAtOnce => Volatile.Read(ref _mostInFlight);
+        public ConcurrentQueue<Guid> PutBacks { get; } = new();
+
+        public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
-            var claim = Interlocked.Increment(ref _claims);
-            if (claim == ThrowOnClaim)
+            var now = Interlocked.Increment(ref _inFlight);
+            int seen;
+            while (now > (seen = Volatile.Read(ref _mostInFlight)) && Interlocked.CompareExchange(ref _mostInFlight, now, seen) != seen) { }
+            try
             {
-                if (OnClaim != null)
-                    await OnClaim(cancellationToken);
+                var claim = Interlocked.Increment(ref _claims);
+                if (claim == ThrowOnClaim || function.TickerId == ThrowBeforeClaimOf)
+                {
+                    if (OnClaim != null)
+                        await OnClaim(cancellationToken);
+                    throw new InvalidOperationException("the store is unreachable");
+                }
+                if (claim == BeforeClaimNumber && BeforeClaim != null)
+                    await BeforeClaim();
+                if (claim == BeforeClaimNumber && BeforeClaimWithToken != null)
+                    await BeforeClaimWithToken(cancellationToken);
+                if (ClaimDelay > TimeSpan.Zero)
+                    await Task.Delay(ClaimDelay, CancellationToken.None);
+
+                var won = await inner.TryClaimDueTicker(function, claimMarker, cancellationToken);
+                ClaimResults.Enqueue(won);
+                if (function.TickerId == ThrowAfterClaimOf)
+                    throw new TimeoutException("the reply of the claim was lost");
+                return won;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
+
+        public async Task<bool> TryReleaseClaim(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            if (FailPutBacks > 0)
+            {
+                FailPutBacks--;
                 throw new InvalidOperationException("the store is unreachable");
             }
-            if (claim == BeforeClaimNumber && BeforeClaim != null)
-                await BeforeClaim();
-            if (claim == BeforeClaimNumber && BeforeClaimWithToken != null)
-                await BeforeClaimWithToken(cancellationToken);
 
-            var won = await inner.TryClaimDueTicker(function, cancellationToken);
-            ClaimResults.Enqueue(won);
-            return won;
+            var putBack = await inner.TryReleaseClaim(function, claimMarker, cancellationToken);
+            if (putBack)
+                PutBacks.Enqueue(function.TickerId);
+            return putBack;
         }
+
+        public async Task<int> GetMaxConcurrentClaims(CancellationToken cancellationToken = default)
+            => FanOut ?? await inner.GetMaxConcurrentClaims(cancellationToken);
+
+        public DateTime NextClaimMarker() => inner.NextClaimMarker();
+
+        public Task NotifyStatusChanged(InternalFunctionContext function) => inner.NotifyStatusChanged(function);
 
         public Task NotifyInProgress(InternalFunctionContext function) => inner.NotifyInProgress(function);
 
@@ -388,13 +439,15 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
     private async Task<TickerStatus> StatusOf(TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> node, Guid id)
         => (await node.GetTimeTickerById(id, CancellationToken.None)).Status;
 
+    // The rows of a batch are claimed independently: one claim that fails does not keep the others from running. The row whose
+    // claim failed before reaching the store is still Queued and goes back to Idle with the loop's error handling.
     [Fact]
-    public async Task Handover_ClaimThrowsOnThirdRow_FirstTwoRun_RestReleased()
+    public async Task Handover_ClaimOfOneRowThrows_TheOthersRun_ThatRowIsReleased()
     {
         var node = CreateProvider("node-A");
         var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
         var batch = await QueueBatch(node, ids);
-        var manager = new HookedManager(CreateRealManager(node)) { ThrowOnClaim = 3 };
+        var manager = new HookedManager(CreateRealManager(node)) { ThrowBeforeClaimOf = ids[2] };
         var scheduler = new RecordingTaskScheduler();
         var handler = Substitute.For<ITickerExecutionTaskHandler>();
         handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
@@ -412,15 +465,179 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         }
         await scheduler.WhenAllIdleAsync();
 
-        // The two rows that were handed over are running work and stay InProgress; the one whose claim failed and the one not
-        // reached go back to Idle for the next poll.
-        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, ids[0]));
-        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, ids[1]));
+        foreach (var id in new[] { ids[0], ids[1], ids[3] })
+        {
+            Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+            await handler.Received(1).ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == id), false, Arg.Any<CancellationToken>());
+        }
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, ids[2]));
-        Assert.Equal(TickerStatus.Idle, await StatusOf(node, ids[3]));
-        Assert.Equal(2, scheduler.QueuedCount);
-        await handler.Received(1).ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == ids[0]), false, Arg.Any<CancellationToken>());
-        await handler.Received(1).ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == ids[1]), false, Arg.Any<CancellationToken>());
+        Assert.Equal(3, scheduler.QueuedCount);
+        Assert.Equal(0, service.Claims.Count);
+    }
+
+    // The claim's write landed but its reply was lost: the row is InProgress for this node with no worker. Its marker was
+    // recorded before the call, so it is put back and the fallback runs the job once.
+    [Fact]
+    public async Task Handover_ClaimReplyLost_RowIsPutBack()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
+        var batch = await QueueBatch(node, ids);
+        var manager = new HookedManager(CreateRealManager(node)) { ThrowAfterClaimOf = ids[1] };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var logger = new RecordingLogger();
+        var (service, context) = CreateService(manager, scheduler, handler, logger);
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Contains(ids[1])), "the claim whose reply was lost was not put back");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+        await scheduler.WhenAllIdleAsync();
+
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, ids[0]));
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, ids[1]));
+        await handler.DidNotReceive().ExecuteTaskAsync(Arg.Is<InternalFunctionContext>(f => f.TickerId == ids[1]), Arg.Any<bool>(), Arg.Any<CancellationToken>());
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(ids[1].ToString()) && e.Message.Contains("put back"));
+    }
+
+    // The application stops while a claimed job waits for its function's concurrency slot, on the real task scheduler. The job
+    // never started, so its row is put back for the fallback instead of staying InProgress with nothing to run it.
+    [Fact]
+    public async Task Stop_WhileAClaimedJobWaitsForItsConcurrencySlot_PutsTheRowBack()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker("Handover.Gate");
+        var batch = await QueueBatch(node, id);
+        batch[0].CachedMaxConcurrency = 1;
+        var manager = new HookedManager(CreateRealManager(node));
+        var gate = new TickerFunctionConcurrencyGate();
+        var slot = gate.GetSemaphoreOrNull("Handover.Gate", 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        await using var scheduler = new SharpTickerTaskScheduler(4);
+        var logger = new RecordingLogger();
+        var context = new TickerExecutionContext();
+        var service = new SharpTickerSchedulerBackgroundService(context, handler, scheduler, manager,
+            new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(10) }, gate, logger, _clock)
+        { ShutdownWaitLimit = TimeSpan.FromMilliseconds(200) };
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        Assert.True(await WaitUntilAsync(() => manager.ClaimResults.Contains(true)), "the job was never claimed");
+        await Task.Delay(100);
+        await service.StopAsync(CancellationToken.None);
+        slot.Release();
+        await Task.Delay(100);
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.Contains(id, manager.PutBacks);
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains(id.ToString()) && e.Message.Contains("put back"));
+        Assert.Equal(0, service.Claims.Count);
+    }
+
+    // The store cannot be reached when the claim is put back: the row stays InProgress, the failure is an error, and the loop
+    // tries again on its next pass until it works.
+    [Fact]
+    public async Task Handover_PutBackFails_IsTriedAgainUntilItWorks()
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker("Handover.Batch");
+        var batch = await QueueBatch(node, id);
+        var manager = new HookedManager(CreateRealManager(node)) { ThrowAfterClaimOf = id, FailPutBacks = 2 };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        var logger = new RecordingLogger();
+        var (service, context) = CreateService(manager, scheduler, handler, logger);
+        // The loop has nothing else to do and would sleep a day; a pending put-back keeps its sleep short.
+        service.PutBackRetryInterval = TimeSpan.FromMilliseconds(50);
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Contains(id)), "the put-back was not tried again");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        // One error for the claim, not one per attempt; the later attempts are at Debug and the put-back that works is a warning.
+        Assert.Single(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("could not be put back"));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Debug && e.Message.Contains("could not be put back"));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("put back"));
+        Assert.Equal(0, service.Claims.Count);
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+    }
+
+    // The batch is claimed as many rows at once as the store takes, and the won rows are still handed over in priority order.
+    [Fact]
+    public async Task Handover_ClaimsConcurrently_UpToTheStoresFanOut_AndKeepsPriorityOrder()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new List<Guid>();
+        for (var i = 0; i < 12; i++)
+            ids.Add(await SeedTimeTicker("Handover.Batch"));
+        var batch = await QueueBatch(node, ids.ToArray());
+        for (var i = 0; i < batch.Length; i++)
+            batch[i].CachedPriority = (TickerTaskPriority)(i % 3);
+        var manager = new HookedManager(CreateRealManager(node)) { FanOut = 4, ClaimDelay = TimeSpan.FromMilliseconds(50) };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var (service, context) = CreateService(manager, scheduler, handler);
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => scheduler.QueuedCount == 12), "not every row was handed over");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.InRange(manager.MostClaimsAtOnce, 2, 4);
+        Assert.Equal(batch.Select(x => x.CachedPriority).OrderBy(x => x), scheduler.Priorities);
+    }
+
+    // A store that takes one claim at a time (SQLite, a custom provider) is never sent two at once.
+    [Fact]
+    public async Task Handover_FanOutOfOne_ClaimsOneRowAtATime()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
+        var batch = await QueueBatch(node, ids);
+        var manager = new HookedManager(CreateRealManager(node)) { FanOut = 1, ClaimDelay = TimeSpan.FromMilliseconds(30) };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var (service, context) = CreateService(manager, scheduler, handler);
+        context.SetFunctions(batch);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => scheduler.QueuedCount == 3), "not every row was handed over");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(1, manager.MostClaimsAtOnce);
     }
 
     [Fact]
@@ -505,8 +722,10 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(3, scheduler.QueuedCount);
     }
 
+    // The whole batch is claimed before the hand-over; the stop arrives after the first job was accepted, so the rows not
+    // handed over are claimed with no worker and are put back.
     [Fact]
-    public async Task Handover_StopMidBatch_UnreachedRowsAreReleased()
+    public async Task Handover_StopMidBatch_RowsNotHandedOverArePutBack()
     {
         var node = CreateProvider("node-A");
         var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
@@ -524,20 +743,21 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         context.SetFunctions(batch);
 
         await service.StartAsync(CancellationToken.None);
-        await manager.Released.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(await WaitUntilAsync(() => manager.PutBacks.Count == 3), "the rows not handed over were not put back");
         await stop!.WaitAsync(TimeSpan.FromSeconds(10));
         await scheduler.WhenAllIdleAsync();
 
         Assert.Equal(TickerStatus.InProgress, await StatusOf(node, ids[0]));
         foreach (var id in ids.Skip(1))
             Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
-        Assert.Single(manager.ClaimResults);
+        Assert.Equal(ids.Skip(1).OrderBy(x => x), manager.PutBacks.OrderBy(x => x));
         Assert.Equal(1, scheduler.QueuedCount);
+        Assert.Equal(0, service.Claims.Count);
         Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Error);
     }
 
     [Fact]
-    public async Task Handover_SchedulerFrozenMidBatch_RowsAreNotClaimed()
+    public async Task Handover_SchedulerFrozenMidBatch_RowsNotHandedOverArePutBack()
     {
         var node = CreateProvider("node-A");
         var ids = new[] { await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch"), await SeedTimeTicker("Handover.Batch") };
@@ -555,7 +775,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         await service.StartAsync(CancellationToken.None);
         try
         {
-            await manager.Released.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Count == 2), "the rows not handed over were not put back");
         }
         finally
         {
@@ -566,15 +786,19 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(TickerStatus.InProgress, await StatusOf(node, ids[0]));
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, ids[1]));
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, ids[2]));
-        Assert.Single(manager.ClaimResults);
+        Assert.Equal(0, service.Claims.Count);
         Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Error);
     }
 
+    // The scheduler refused a job it had claimed and the put-back cannot reach the store either: the row stays InProgress,
+    // which is an error naming the job.
     [Fact]
-    public async Task Handover_QueueFaults_IsLogged()
+    public async Task Handover_QueueFaults_AndPutBackFails_IsLoggedAsAnError()
     {
         var manager = Substitute.For<IInternalTickerManager>();
-        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
+        manager.TryReleaseClaim(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>())
+            .Returns<Task<bool>>(_ => throw new InvalidOperationException("the store is unreachable"));
         var scheduler = Substitute.For<ISharpTickerTaskScheduler>();
         scheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
             .Returns(_ => new ValueTask(Task.FromException(new InvalidOperationException("Scheduler is frozen"))));

@@ -29,6 +29,9 @@ internal sealed class ClaimLedger
     /// <summary>The claims that are neither started nor being put back right now.</summary>
     internal IReadOnlyList<Entry> Pending() => _entries.Keys.Where(x => x.IsPending).ToArray();
 
+    /// <summary>The pending claims whose put-back failed and has to be tried again; a claim waiting for its worker is not one.</summary>
+    internal IReadOnlyList<Entry> PendingPutBacks() => _entries.Keys.Where(x => x.IsPending && x.NeedsPutBack).ToArray();
+
     internal sealed class Entry
     {
         private const int PendingState = 0;
@@ -52,6 +55,11 @@ internal sealed class ClaimLedger
 
         internal bool IsPending => Volatile.Read(ref _state) == PendingState;
 
+        /// <summary>A put-back of this claim was tried and failed; the loop tries it again.</summary>
+        internal bool NeedsPutBack => Volatile.Read(ref _needsPutBack);
+
+        private bool _needsPutBack;
+
         /// <summary>The worker is about to run the job. False: the claim is being put back, the job must not run.</summary>
         internal bool TryStart() => Leave(PendingState, StartedState);
 
@@ -61,7 +69,17 @@ internal sealed class ClaimLedger
         internal void RevertSucceeded() => Leave(RevertingState, GoneState);
 
         /// <summary>The put-back did not reach the store; the row is still this node's, so the claim is pending again.</summary>
-        internal void RevertFailed() => Interlocked.CompareExchange(ref _state, PendingState, RevertingState);
+        /// <summary>How many put-backs of this claim failed so far.</summary>
+        internal int FailedPutBacks => Volatile.Read(ref _failedPutBacks);
+
+        private int _failedPutBacks;
+
+        internal void RevertFailed()
+        {
+            Interlocked.Increment(ref _failedPutBacks);
+            Volatile.Write(ref _needsPutBack, true);
+            Interlocked.CompareExchange(ref _state, PendingState, RevertingState);
+        }
 
         /// <summary>The claim was lost (another claim took the row first): nothing to start, nothing to put back.</summary>
         internal void Forget() => Leave(PendingState, GoneState);

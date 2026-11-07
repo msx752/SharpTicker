@@ -83,7 +83,7 @@ public class SharpTickerSchedulerBackgroundServiceTests
         var taskHandler = Substitute.For<ITickerExecutionTaskHandler>();
         var taskScheduler = Substitute.For<ISharpTickerTaskScheduler>();
         var gate = new TickerFunctionConcurrencyGate();
-        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         var function = new InternalFunctionContext
         {
@@ -160,7 +160,7 @@ public class SharpTickerSchedulerBackgroundServiceTests
         var taskHandler = Substitute.For<ITickerExecutionTaskHandler>();
         var taskScheduler = Substitute.For<ISharpTickerTaskScheduler>();
         var gate = new TickerFunctionConcurrencyGate();
-        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         taskHandler.ExecuteTaskAsync(
             Arg.Any<InternalFunctionContext>(),
@@ -224,7 +224,7 @@ public class SharpTickerSchedulerBackgroundServiceTests
         var taskHandler = Substitute.For<ITickerExecutionTaskHandler>();
         var taskScheduler = Substitute.For<ISharpTickerTaskScheduler>();
         var gate = new TickerFunctionConcurrencyGate();
-        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        internalManager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
         var function = new InternalFunctionContext
         {

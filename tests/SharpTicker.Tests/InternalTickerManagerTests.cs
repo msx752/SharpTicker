@@ -751,7 +751,7 @@ public class InternalTickerManagerTests
         var function = new InternalFunctionContext { TickerId = timeTickerId, Type = TickerType.TimeTicker, FunctionName = "Func1" };
         _persistence.TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
-        var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
 
         Assert.True(won);
         Assert.Equal(TickerStatus.InProgress, function.Status);
@@ -766,7 +766,7 @@ public class InternalTickerManagerTests
         var function = new InternalFunctionContext { TickerId = cronId, Type = TickerType.CronTickerOccurrence, FunctionName = "CronFunc" };
         _persistence.TryMarkCronOccurrenceInProgress(cronId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
-        var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
 
         Assert.True(won);
         Assert.Equal(TickerStatus.InProgress, function.Status);
@@ -783,7 +783,7 @@ public class InternalTickerManagerTests
         _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
         _persistence.TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
 
-        var won = await _manager.TryClaimDueTicker(function, CancellationToken.None);
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
 
         Assert.False(won);
         Assert.Equal(TickerStatus.Queued, function.Status);
@@ -796,25 +796,70 @@ public class InternalTickerManagerTests
         var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" };
         _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
-        await _manager.TryClaimDueTicker(function, cts.Token);
+        await _manager.TryClaimDueTicker(function, _now, cts.Token);
 
         await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, Arg.Any<DateTime>(), cts.Token);
     }
 
-    // Each claim hands the provider a marker of its own, taken from the node's clock, so a claim can be found again by
-    // it; two claims at the same clock reading still get different markers.
+    // The caller chooses the marker before the call, so a claim whose call failed after its write landed can still be
+    // found and put back; the manager hands that very marker to the store.
     [Fact]
-    public async Task TryClaimDueTicker_PassesAFreshClaimMarkerFromTheNodeClock()
+    public async Task TryClaimDueTicker_HandsTheCallersMarkerToTheStore()
     {
-        var markers = new List<DateTime>();
-        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Do<DateTime>(markers.Add), Arg.Any<CancellationToken>()).Returns(true);
+        var marker = _now.AddMilliseconds(7);
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" };
+        _persistence.TryMarkTimeTickerInProgress(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(true);
 
-        await _manager.TryClaimDueTicker(new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" });
-        await _manager.TryClaimDueTicker(new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" });
+        Assert.True(await _manager.TryClaimDueTicker(function, marker));
 
-        Assert.Equal(2, markers.Count);
-        Assert.Equal(_now, markers[0]);
-        Assert.True(markers[1] > markers[0]);
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, marker, Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(TickerType.TimeTicker)]
+    [InlineData(TickerType.CronTickerOccurrence)]
+    public async Task TryReleaseClaim_PutBack_MarksTheFunctionIdle(TickerType type)
+    {
+        var marker = _now;
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = type, FunctionName = "Func1", Status = TickerStatus.InProgress };
+        _persistence.TryReleaseTimeTickerClaim(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(type == TickerType.TimeTicker);
+        _persistence.TryReleaseCronOccurrenceClaim(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(type == TickerType.CronTickerOccurrence);
+
+        Assert.True(await _manager.TryReleaseClaim(function, marker));
+
+        Assert.Equal(TickerStatus.Idle, function.Status);
+    }
+
+    [Fact]
+    public async Task TryReleaseClaim_RowMovedOn_LeavesTheFunctionAlone()
+    {
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1", Status = TickerStatus.InProgress };
+        _persistence.TryReleaseTimeTickerClaim(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        Assert.False(await _manager.TryReleaseClaim(function, _now));
+
+        Assert.Equal(TickerStatus.InProgress, function.Status);
+    }
+
+    // A store that says nothing about concurrent claims (a custom provider) is claimed one row at a time.
+    [Fact]
+    public async Task GetMaxConcurrentClaims_IsOne_ForAStoreThatDoesNotSay()
+    {
+        Assert.Equal(1, await _manager.GetMaxConcurrentClaims());
+    }
+
+    [Fact]
+    public async Task GetMaxConcurrentClaims_IsWhatTheStoreSays()
+    {
+        var persistence = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IClaimFanOut>();
+        ((IClaimFanOut)persistence).GetMaxConcurrentClaimsAsync(Arg.Any<CancellationToken>()).Returns(new ValueTask<int>(16));
+        var managerType = typeof(IInternalTickerManager).Assembly
+            .GetType("SharpTicker.Utilities.Managers.InternalTickerManager`2")!
+            .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker));
+        var manager = (IInternalTickerManager)Activator.CreateInstance(managerType,
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, [persistence, _clock, _notificationHub], null)!;
+
+        Assert.Equal(16, await manager.GetMaxConcurrentClaims());
     }
 
     [Fact]

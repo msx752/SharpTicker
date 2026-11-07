@@ -11,8 +11,18 @@ namespace SharpTicker.Utilities.Interfaces.Managers
     {
         Task<(TimeSpan TimeRemaining, InternalFunctionContext[] Functions)> GetNextTickers(CancellationToken cancellationToken = default);
         Task ReleaseAcquiredResources(InternalFunctionContext[] context, CancellationToken cancellationToken = default);
-        Task<bool> TryClaimDueTicker(InternalFunctionContext function, CancellationToken cancellationToken = default); // sets Status on a win
+        // Fenced Queued -> InProgress claim writing claimMarker; sets Status on a win. The caller chose the marker, so a claim
+        // whose call failed after its write landed can still be put back with TryReleaseClaim.
+        Task<bool> TryClaimDueTicker(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default);
+        // Puts back a claim whose job never started; sets Status to Idle when this call did it.
+        Task<bool> TryReleaseClaim(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default);
+        // The next claim marker of this node, from the clock the store shares, so it never equals another claim's marker.
+        DateTime NextClaimMarker();
+        // How many due rows may be claimed at once on this store (1 when the store does not say).
+        Task<int> GetMaxConcurrentClaims(CancellationToken cancellationToken = default);
         Task NotifyInProgress(InternalFunctionContext function);
+        // Sends the function's current status to the dashboard.
+        Task NotifyStatusChanged(InternalFunctionContext function);
         Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);

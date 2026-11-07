@@ -72,6 +72,21 @@ public class ClaimLedgerTests
         Assert.Empty(ledger.Pending());
     }
 
+    // Only a claim whose put-back failed is tried again by the loop; one that waits in the queue for its worker is not.
+    [Fact]
+    public void PendingPutBacks_HoldsOnlyClaimsWhosePutBackFailed()
+    {
+        var ledger = new ClaimLedger();
+        var waiting = ledger.Record(Function(), Marker);
+        var failed = ledger.Record(Function(), Marker);
+        Assert.True(failed.TryBeginRevert());
+        failed.RevertFailed();
+
+        Assert.Same(failed, Assert.Single(ledger.PendingPutBacks()));
+        Assert.Equal(2, ledger.Pending().Count);
+        Assert.False(waiting.NeedsPutBack);
+    }
+
     [Fact]
     public void ALostClaim_IsForgotten()
     {
