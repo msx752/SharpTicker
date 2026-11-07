@@ -593,6 +593,51 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     }
 
     #endregion
+
+    #region Children
+
+    protected async Task<(Guid ParentId, Guid ChildId)> SeedParentWithChild()
+    {
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "claim-child-fn";
+        child.RunCondition = RunCondition.OnSuccess;
+        var parent = NewTimeTicker();
+        parent.Children = [child];
+        await using var context = CreateContext();
+        context.Set<TimeTickerEntity>().Add(parent);
+        await context.SaveChangesAsync();
+        return (parent.Id, child.Id);
+    }
+
+    // A child without an execution time of its own runs only inside its parent. No claim path hands it out as a row
+    // of its own, and only the claim that won the parent carries it, so a late loop cannot run it a second time.
+    [Fact]
+    public async Task Child_IsCarriedOnlyByTheClaimThatWonItsParent()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var (parentId, childId) = await SeedParentWithChild();
+
+        var window = await nodeA.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.DoesNotContain(window, x => x.Id == childId);
+        var parent = Assert.Single(window, x => x.Id == parentId);
+        Assert.Equal([childId], parent.Children.Select(x => x.Id));
+        Assert.Single(await Drain(nodeA.QueueTimeTickers([parent], CancellationToken.None)));
+
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        var fallback = await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.DoesNotContain(fallback, x => x.Id == childId);
+        var taken = Assert.Single(fallback, x => x.Id == parentId);
+        Assert.Equal([childId], taken.Children.Select(x => x.Id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.Empty(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
+    }
+
+    #endregion
 }
 
 public class EfCoreClaimMultiNodeSqliteTests : EfCoreClaimMultiNodeTests
