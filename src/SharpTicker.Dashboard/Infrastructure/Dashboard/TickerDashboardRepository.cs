@@ -474,16 +474,30 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             if (acquired.Length > 0)
             {
                 var occurrence = acquired[0];
+
+                // The row is InProgress for this node now, so nothing below may throw before the dispatch, which runs the
+                // job or puts the claim back. A provider that does not fill CronTicker still has the cron stored.
+                var cron = occurrence.CronTicker
+                    ?? await _persistenceProvider.GetCronTickerById(occurrence.CronTickerId, CancellationToken.None).ConfigureAwait(false);
+                if (cron is null)
+                {
+                    // The cron was deleted after the endpoint checked it. The occurrence this call stored points at nothing,
+                    // and a fallback that took it back would have no function to run, so it is removed instead.
+                    await _persistenceProvider.RemoveCronTickerOccurrences([occurrence.Id], CancellationToken.None).ConfigureAwait(false);
+                    return;
+                }
+
                 acquiredOccurrence = occurrence;
                 var context = new InternalFunctionContext
                 {
                     ParentId = occurrence.CronTickerId,
-                    FunctionName = occurrence.CronTicker.Function,
+                    FunctionName = cron.Function,
                     TickerId = occurrence.Id,
                     Type = TickerType.CronTickerOccurrence,
-                    Retries = occurrence.CronTicker.Retries,
-                    RetryIntervals = occurrence.CronTicker.RetryIntervals,
-                    ExecutionTime = occurrence.ExecutionTime
+                    Retries = cron.Retries,
+                    RetryIntervals = cron.RetryIntervals,
+                    ExecutionTime = occurrence.ExecutionTime,
+                    ClaimMarker = occurrence.UpdatedAt
                 };
 
                 // Populate cached delegate and priority so the dispatcher can execute the job

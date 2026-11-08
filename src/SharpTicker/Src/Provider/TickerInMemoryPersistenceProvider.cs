@@ -18,7 +18,7 @@ namespace SharpTicker.Provider
 {
     internal class
         TickerInMemoryPersistenceProvider<TTimeTicker, TCronTicker> : ITickerPersistenceProvider<TTimeTicker,
-        TCronTicker>
+        TCronTicker>, IClaimFanOut, IChildSkipWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -104,22 +104,30 @@ namespace SharpTicker.Provider
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // A delayed child whose parent ended with an outcome it does not run on never will; the parent's run
+                // skips it, and this covers a node that stopped before doing so. A child whose parent has not ended
+                // waits.
+                if (SkipIfParentOutcomeDoesNotMatch(ticker, now) || !ChainGateOpen(ticker))
+                    continue;
+
                 // Now update the actual ticker in storage
                 if (TimeTickers.TryGetValue(ticker.Id, out var existingTicker))
                 {
                     // Check if we can update (matching EF's Where condition)
-                    if (existingTicker.UpdatedAt <= ticker.UpdatedAt)
+                    // The scan above is a snapshot: a row another node moved on meanwhile must not be taken again.
+                    if ((existingTicker.Status == TickerStatus.Idle || existingTicker.Status == TickerStatus.Queued) && existingTicker.UpdatedAt <= ticker.UpdatedAt)
                     {
                         var updatedTicker = CloneTicker(existingTicker);
                         updatedTicker.LockHolder = _lockHolder;
                         updatedTicker.LockedAt = now;
-                        updatedTicker.UpdatedAt = now;
+                        updatedTicker.UpdatedAt = _clock.NextClaimMarker();
                         updatedTicker.Status = TickerStatus.InProgress;
 
                         if (TimeTickers.TryUpdate(ticker.Id, updatedTicker, existingTicker))
                         {
-                            // Only build the full hierarchy for successfully acquired tickers
-                            yield return ForQueueTimeTickers(ticker);
+                            // Only build the full hierarchy for successfully acquired tickers. The row as written is
+                            // returned, so it carries this claim's marker for a put-back.
+                            yield return ForQueueTimeTickers(updatedTicker);
                         }
                     }
                 }
@@ -162,10 +170,13 @@ namespace SharpTicker.Provider
             var oneSecondAgo = now.AddSeconds(-1);
 
             // Base query: same filter as EF provider, but over the snapshot
+            // The chain gate is part of the base query: a delayed child that still waits for its parent must not hide the
+            // rows due after it.
             var baseQuery = TimeTickers.Values
                 .Where(x => x.ExecutionTime != null)
                 .Where(CanAcquire)
                 .Where(x => x.ExecutionTime >= oneSecondAgo)
+                .Where(ChainGateOpen)
                 .ToArray();
 
             // Get minimum execution time
@@ -235,8 +246,63 @@ namespace SharpTicker.Provider
                     TimeTickers.TryUpdate(id, updatedTicker, ticker);
                 }
             }
-            
+
             return Task.CompletedTask;
+        }
+
+        // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
+        // keeps the status of its run. A row that changes meanwhile is read again.
+        public Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        {
+            foreach (var id in timeTickerIds)
+            {
+                while (TimeTickers.TryGetValue(id, out var ticker) && (ticker.Status == TickerStatus.Idle || ticker.Status == TickerStatus.Queued))
+                {
+                    var skipped = CloneTicker(ticker);
+                    ApplyFunctionContextToTicker(skipped, skip);
+                    if (TimeTickers.TryUpdate(id, skipped, ticker))
+                        break;
+                }
+            }
+
+            return Task.CompletedTask;
+        }
+
+        // Each claim is a compare-and-swap on one row.
+        public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
+
+        public Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            // Queued plus our own lock is the claim token: a fallback that took the row, a cancel or a finished run all fail it.
+            if (!TimeTickers.TryGetValue(id, out var ticker) || ticker.Status != TickerStatus.Queued || ticker.LockHolder != _lockHolder)
+                return Task.FromResult(false);
+
+            var updatedTicker = CloneTicker(ticker);
+            updatedTicker.Status = TickerStatus.InProgress;
+            updatedTicker.UpdatedAt = claimMarker;
+
+            return Task.FromResult(TimeTickers.TryUpdate(id, updatedTicker, ticker));
+        }
+
+        public Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            // Compare-and-swap against the row just read; a concurrent write sends the loop back to read and check again.
+            while (TimeTickers.TryGetValue(id, out var ticker))
+            {
+                if (ticker.Status != TickerStatus.InProgress || ticker.LockHolder != _lockHolder || ticker.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneTicker(ticker);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (TimeTickers.TryUpdate(id, released, ticker))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
         }
 
         public Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default)
@@ -249,19 +315,22 @@ namespace SharpTicker.Provider
 
             foreach (var id in ids)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
                 if (!TimeTickers.TryGetValue(id, out var ticker))
                     continue;
 
-                if (!CanAcquire(ticker))
+                if (!CanAcquire(ticker) || !ChainGateOpen(ticker))
                     continue;
 
                 var updatedTicker = CloneTicker(ticker);
                 updatedTicker.LockHolder = _lockHolder;
                 updatedTicker.LockedAt = now;
                 updatedTicker.Status = TickerStatus.InProgress;
-                updatedTicker.UpdatedAt = now;
+                updatedTicker.UpdatedAt = _clock.NextClaimMarker();
 
                 if (TimeTickers.TryUpdate(id, updatedTicker, ticker))
                 {
@@ -451,23 +520,30 @@ namespace SharpTicker.Provider
                     // Clean children index
                     if (removed.ParentId.HasValue)
                         RemoveChildIndex(removed.ParentId.Value, removed.Id);
-                    
-                    // Remove children
-                    var childrenIds = GetChildrenIds(id);
-                        
-                    foreach (var childId in childrenIds)
-                    {
-                        if (TimeTickers.TryRemove(childId, out var child))
-                        {
-                            count++;
-                            if (child.ParentId.HasValue)
-                                RemoveChildIndex(child.ParentId.Value, child.Id);
-                        }
-                    }
+
+                    // Remove every descendant, as the other stores do: a grandchild left without its parent row would
+                    // never run, and a delayed one would wait for that parent forever.
+                    count += RemoveDescendants(id);
                 }
             }
-            
+
             return Task.FromResult(count);
+        }
+
+        private static int RemoveDescendants(Guid parentId)
+        {
+            var count = 0;
+            foreach (var childId in GetChildrenIds(parentId))
+            {
+                if (TimeTickers.TryRemove(childId, out var child))
+                {
+                    count++;
+                    if (child.ParentId.HasValue)
+                        RemoveChildIndex(child.ParentId.Value, child.Id);
+                    count += RemoveDescendants(childId);
+                }
+            }
+            return count;
         }
 
         public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
@@ -764,12 +840,12 @@ namespace SharpTicker.Provider
 
                 if (CronOccurrences.TryGetValue(occurrence.Id, out var existingOccurrence))
                 {
-                    if (existingOccurrence.UpdatedAt <= occurrence.UpdatedAt)
+                    if ((existingOccurrence.Status == TickerStatus.Idle || existingOccurrence.Status == TickerStatus.Queued) && existingOccurrence.UpdatedAt <= occurrence.UpdatedAt)
                     {
                         var updatedOccurrence = CloneCronOccurrence(existingOccurrence);
                         updatedOccurrence.LockHolder = _lockHolder;
                         updatedOccurrence.LockedAt = now;
-                        updatedOccurrence.UpdatedAt = now;
+                        updatedOccurrence.UpdatedAt = _clock.NextClaimMarker();
                         updatedOccurrence.Status = TickerStatus.InProgress;
 
                         if (CronOccurrences.TryUpdate(occurrence.Id, updatedOccurrence, existingOccurrence))
@@ -849,6 +925,38 @@ namespace SharpTicker.Provider
             }
             
             return Task.CompletedTask;
+        }
+
+        public Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            if (!CronOccurrences.TryGetValue(id, out var occurrence) || occurrence.Status != TickerStatus.Queued || occurrence.LockHolder != _lockHolder)
+                return Task.FromResult(false);
+
+            var updatedOccurrence = CloneCronOccurrence(occurrence);
+            updatedOccurrence.Status = TickerStatus.InProgress;
+            updatedOccurrence.UpdatedAt = claimMarker;
+
+            return Task.FromResult(CronOccurrences.TryUpdate(id, updatedOccurrence, occurrence));
+        }
+
+        public Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            while (CronOccurrences.TryGetValue(id, out var occurrence))
+            {
+                if (occurrence.Status != TickerStatus.InProgress || occurrence.LockHolder != _lockHolder || occurrence.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneCronOccurrence(occurrence);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (CronOccurrences.TryUpdate(id, released, occurrence))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
         }
 
         public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
@@ -989,7 +1097,10 @@ namespace SharpTicker.Provider
 
             foreach (var id in occurrenceIds)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
                 if (!CronOccurrences.TryGetValue(id, out var occurrence))
                     continue;
@@ -1001,7 +1112,7 @@ namespace SharpTicker.Provider
                 updated.LockHolder = _lockHolder;
                 updated.LockedAt = now;
                 updated.Status = TickerStatus.InProgress;
-                updated.UpdatedAt = now;
+                updated.UpdatedAt = _clock.NextClaimMarker();
 
                 if (CronOccurrences.TryUpdate(id, updated, occurrence))
                 {
@@ -1101,10 +1212,8 @@ namespace SharpTicker.Provider
                     if (!TimeTickers.TryGetValue(childId, out var ch))
                         continue;
 
-                    // Only children with null ExecutionTime, matching EF mapping
-                    if (ch.ExecutionTime != null)
-                        continue;
-
+                    // A delayed child (one with a time of its own) is carried with its time: the handler never runs
+                    // it inline, it skips it when the parent's outcome does not match.
                     var childEntity = new TimeTickerEntity
                     {
                         Id = ch.Id,
@@ -1112,6 +1221,7 @@ namespace SharpTicker.Provider
                         Retries = ch.Retries,
                         RetryIntervals = ch.RetryIntervals,
                         RunCondition = ch.RunCondition,
+                        ExecutionTime = ch.ExecutionTime,
                         Children = new List<TimeTickerEntity>()
                     };
 
@@ -1131,7 +1241,8 @@ namespace SharpTicker.Provider
                                 Function = gch.Function,
                                 Retries = gch.Retries,
                                 RetryIntervals = gch.RetryIntervals,
-                                RunCondition = gch.RunCondition
+                                RunCondition = gch.RunCondition,
+                                ExecutionTime = gch.ExecutionTime
                             });
                         }
 
@@ -1173,6 +1284,35 @@ namespace SharpTicker.Provider
                 return Array.Empty<Guid>();
 
             return children.Keys.ToArray();
+        }
+
+        // A row of a chain (a delayed child) may be handed out only once its parent's status lets it run (ChainRunGate).
+        private static bool ChainGateOpen(TTimeTicker ticker)
+            => ticker.ParentId == null
+               || (TimeTickers.TryGetValue(ticker.ParentId.Value, out var parent) && ChainRunGate.Allows(ticker.RunCondition, parent.Status));
+
+        // Skips a delayed child whose parent has ended with an outcome it does not run on; true when it did.
+        private bool SkipIfParentOutcomeDoesNotMatch(TTimeTicker snapshot, DateTime now)
+        {
+            if (snapshot.ParentId == null
+                || !TimeTickers.TryGetValue(snapshot.ParentId.Value, out var parent)
+                || !ChainRunGate.IsFinal(parent.Status)
+                || ChainRunGate.Allows(snapshot.RunCondition, parent.Status))
+                return false;
+
+            if (!TimeTickers.TryGetValue(snapshot.Id, out var current)
+                || (current.Status != TickerStatus.Idle && current.Status != TickerStatus.Queued)
+                || current.UpdatedAt > snapshot.UpdatedAt)
+                return false;
+
+            var skipped = CloneTicker(current);
+            skipped.Status = TickerStatus.Skipped;
+            skipped.ExecutedAt = now;
+            skipped.SkippedReason = ChainRunGate.NotMatchedReason;
+            skipped.LockHolder = null;
+            skipped.LockedAt = null;
+            skipped.UpdatedAt = now;
+            return TimeTickers.TryUpdate(snapshot.Id, skipped, current);
         }
 
         private bool CanAcquire(TTimeTicker ticker)

@@ -2,9 +2,9 @@
 
 ## Several instances
 
-Instances that use the same shared store ([EF Core, MongoDB or Redis](storage.md)) work as one scheduler. When a job becomes due, an instance claims it with a conditional update on the stored record and marks itself as the lock holder, so each run happens once.
+Instances that use the same shared store ([EF Core, MongoDB or Redis](storage.md)) work as one scheduler. When a job becomes due, an instance claims it with a conditional update on the stored record and marks itself as the lock holder, so one instance wins each claim. [What is guaranteed](#what-is-guaranteed) lists where a job can still run more than once.
 
-Give every instance a stable, unique name. The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine:
+Give every running instance a stable name that no other running instance uses. The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine. The name is the lock holder on a job, and a starting instance treats every job held under its own name as left behind (see the next paragraph), so two running instances with one name release each other's running jobs:
 
 ```csharp
 builder.Services.AddSharpTicker(options =>
@@ -16,7 +16,42 @@ builder.Services.AddSharpTicker(options =>
 });
 ```
 
-When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again, and with Redis when its heartbeat stops.
+When an instance stops while holding jobs, they are released for the others: with EF Core when that node starts again (every job held under the name of the starting instance, `Queued` or `InProgress`, that was locked before this run started; jobs the new run has claimed in the meantime are kept), and with Redis when its heartbeat stops (a node counts as stopped when its heartbeat entry has expired, which takes `NodeHeartbeatInterval` plus 20 seconds, so a restart inside that time under the same name is not seen as a stop and its `InProgress` rows stay as they are). MongoDB has no release step for an instance that stopped, so a job left `InProgress` by a process that ended stays so until you change it. A running instance puts back its own claims whose job never started, with every store; see [What is guaranteed](#what-is-guaranteed).
+
+### What is guaranteed
+
+Of all instances that try to start a due job, one wins: the job goes to a worker only after a conditional write moved its row to `InProgress` and that write was the winner. The regular claim needs the row to be `Queued` and held by this node. The fallback for missed jobs takes a row that is `Idle` or `Queued` (held by any node with EF Core and MongoDB, unlocked or held by this node with Redis), and "run now" takes an `Idle` or `Queued` row that is unlocked or held by this node. A node that loses a claim logs it at `Information` level and does not run the job. With Redis, a cron expression also produces one occurrence per time slot, however many instances create it, provided the cron itself exists once (see below).
+
+Each claim starts its job at most once. A claim that was won but whose job never starts is put back: its row returns to `Idle` without a lock holder, and the fallback runs the job once. This holds for the regular claim, the fallback and "run now", when the application stops while the job waits for its concurrency slot, when the scheduler is stopped or refuses the job, and when a claim call fails after it had claimed some rows, or after its own write landed and its reply was lost. The put-back is a conditional write that matches only this claim (the row is still `InProgress`, held by this instance, and its `UpdatedAt` is the marker the claim wrote), so it never changes a row that another claim took or a job that ran, and it changes nothing when the failed write did not land. When the store cannot be reached, the instance tries again while it runs (each attempt waits at most 5 seconds, and a pass stops at the first one that fails), and the job does not start in the meantime. At a stop, the put-backs use the time the host gives the stop (`HostOptions.ShutdownTimeout`); what has not been put back by then is logged as an error.
+
+"Run now" (adding jobs that are due within a second) returns success once the jobs are stored, even when they cannot run now: on an instance whose scheduler is stopped, while the application stops, or when the store fails while they are claimed. The jobs that were claimed are put back, and all of them run when the fallback of a running instance picks them up. A failure of the claim is logged (see [Scheduler log entries](#scheduler-log-entries)); do not retry the add, or the jobs are added twice.
+
+The put-back has these limits:
+
+- A job whose put-back had not succeeded when the process ended stays `InProgress` until its store releases it: EF Core when the instance starts again, Redis when its heartbeat stops, MongoDB not at all.
+- The marker is the instance's clock in whole milliseconds. An `UpdatedAt` column that keeps less than that, such as SQL Server `datetime` or MySQL `datetime` without fractional seconds, cannot hold it exactly, so a put-back may not find its claim. The default mappings (`datetime2`, `datetime(6)`) keep enough.
+- A cron occurrence that was put back keeps its time slot, so it counts as missed: with `SkipStaleCronOccurrencesOnStartup` it is skipped when an instance starts later than the threshold.
+- With a [custom persistence provider](storage.md#custom-persistence-providers) that keeps the default put-back methods, nothing is put back.
+
+While instances of the previous version still run against the store (see [Migrating](https://github.com/msx752/SharpTicker/blob/main/MIGRATING.md#rolling-deployment)), none of this holds: a job can run twice until the last of them is gone.
+
+A job can still run more than once, or twice at about the same time, in these cases:
+
+- A process dies while a job runs, or the job finishes and its final write to the store fails. After a restart (EF Core) or the heartbeat release (Redis) the job runs again, and a repeated parent repeats its children.
+- A Redis node that stopped sending heartbeats (a long pause, a network split) has its `InProgress` jobs released while they may still be running.
+- An instance starts with the name of another running instance, with EF Core: its startup release frees the jobs that instance is running.
+- A write the store acknowledged is lost, for example MongoDB with a write concern of `w:1` after a primary change, or Redis after a failover to a replica that had not received it.
+- A job record is updated with the whole object (`UpdateTimeTickers`, which the manager's update methods call, and the edit dialog of the dashboard) while the job runs, or a dialog opened before the job started is saved after it ran. EF Core, MongoDB and Redis write every field, so a copy loaded before the claim puts the old `Status` and lock back and the job can be claimed again.
+
+- Two instances start a new cron function at the same time. Seeding reads the existing crons and then inserts a new one with a new id, and none of the stores has a unique constraint on the function, so both can insert it and each cron then creates its own occurrences. Start new cron functions on one instance first, or check for duplicate crons afterwards.
+
+Write jobs so that a second run does no harm: key side effects on the ticker id or on your own business key, and skip work that is already done.
+
+### Clocks
+
+Due times are compared against each instance's own clock. The scheduler picks a job up when it is due and treats it as missed one second later. Keep the clocks of all instances in sync with NTP. With a difference of one second or more, an instance with a fast clock starts a job earlier than the others expect, and an instance with a slow clock finds the job already taken and does not run it. The claim still has one winner either way.
+
+The marker a claim writes into `UpdatedAt` grows with every claim of an instance. When its clock is set back, the markers keep growing from the last one, so the `UpdatedAt` of a claimed job can be ahead of the clock until it catches up.
 
 ## Scheduler options
 
@@ -32,6 +67,8 @@ Set through `options.ConfigureScheduler(scheduler => ...)`:
 | `SchedulerTimeZone` | `TimeZoneInfo.Local` | Time zone for cron expressions; see [Scheduling](scheduling.md#time-zone). |
 
 The default `NodeIdentifier` is the machine name, which in a container is the container id and changes with every new container. Jobs keep the identifier of the node that locked them, so the Machines panel of the dashboard lists every identifier that ever locked a job, with its job count since the beginning, not only the nodes that are running now (the one marked Current is this node). Set a stable name, such as the pod name of a StatefulSet or a fixed name per service, to keep that list short, and so that jobs left running by a node that stopped can be released.
+
+A worker thread runs a job up to its first `await` of a task that has not completed yet; what the job does after that runs on the .NET thread pool. So `MaxConcurrency` limits how many jobs start at once and how many synchronous (blocking) parts run at once, not how many asynchronous jobs are in progress. Because jobs start on the scheduler's own threads, they start on time even when the application has used up the .NET thread pool, but under such starvation a job still waits at its first `await` until the pool has a free thread. A job that a worker runs does not inherit ambient state (`AsyncLocal` values, culture, `Activity.Current`) from the code that queued it or from earlier jobs on the same worker; set what it needs inside the job. A `LongRunning` job does not go through a worker and starts with the ambient state of the code that queued it.
 
 To limit how many runs of one function execute at the same time on an instance, use `maxConcurrency` on `[TickerFunction]` or `WithMaxConcurrency` on code-first registrations.
 
@@ -80,9 +117,19 @@ A job reports its own failure through the exception handler above. These entries
 |---|---|---|
 | `SharpTicker.TaskScheduler` | Error | A job threw an exception that nothing handled, or the scheduler could not start a worker thread. The scheduler keeps running. |
 | `SharpTicker.TaskScheduler` | Warning | The scheduler was disposed with queued jobs that had not started. The number is in the entry. |
-| `SharpTicker.Dispatcher.SharpTickerDispatcher` | Warning | Jobs were dispatched while the application was stopping, so they will not start. The entry names each function and ticker id. Their tickers stay `InProgress`. |
+| `SharpTicker.Dispatcher.SharpTickerDispatcher` | Warning | Jobs without a claim marker were dispatched while the application was stopping, so they will not start. The entry names each function and ticker id. Their tickers stay `InProgress`. Jobs that SharpTicker claimed itself always carry a marker and are put back instead. |
+| `SharpTicker.BackgroundServices.ClaimedWorkQueue` | Warning | A claimed job did not start (the reason is in the entry) and was put back; the fallback runs it. A second entry at the same level says when the dashboard could not be told. |
+| `SharpTicker.BackgroundServices.ClaimedWorkQueue` | Error | A claimed job did not start and could not be put back, so its row stays `InProgress` for now. The scheduler tries again; the attempts after the first are written at `Debug`. The entry written while the application stops says that nothing tries again, and the row stays `InProgress` until its store releases this instance's rows. |
+| `SharpTicker.Utilities.Managers.TickerManager` | Warning | Jobs added for "run now" were stored, but claiming them failed. The add returned success, and the jobs run when the fallback picks them up. At `Error`: some of the rows that had been claimed could not be put back, and they stay `InProgress` until their store releases this instance's rows. |
+| `SharpTicker.BackgroundServices.ClaimedWorkQueue` | Information | A claimed job did not start and its row was no longer this claim (another claim took it, or it was removed), so nothing was put back. A custom provider that keeps the default put-back writes this entry for every such job. |
+| `SharpTicker.BackgroundServices.SharpTickerFallbackBackgroundService` | Error | The fallback failed, so overdue jobs are not picked up until it recovers. It tries again every `FallbackIntervalChecker`; the failures after the first are written at `Debug`, and the recovery at `Information`. |
+| `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Error | The scheduler loop failed, so no job is picked up until it recovers. It tries again every second; the failures after the first are written at `Debug`, and the recovery at `Information`. |
+| `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | The fallback took a job but the dashboard could not be told. The job runs. |
 | `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Warning | The application is stopping with jobs running. The first entry says that the scheduler waits for them and names them (the first ten); the second says that some were still running when the wait ended (a little before the host's shutdown timeout) and were recorded as `Cancelled`. |
 | `SharpTicker.EntityFrameworkCore.StartupRelease` | Error | Releasing the jobs that a dead node or an earlier run of this node left locked failed when the application started. |
+| `SharpTicker.TickerExecutionTaskHandler` | Warning | Starting the delayed chain children of a parent that ended (or, for `InProgress` children, started) failed, or waking the scheduler for one due later failed. The fallback runs them. At `Error`: the children were claimed but could not be dispatched, and they stay `InProgress` until their store releases the rows of this node. |
+| `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | Claiming delayed chain children after their parent ended failed. The fallback runs them. A second entry at the same level says that they were claimed but the dashboard could not be told; they run. At `Error`: some rows the claim had taken could not be put back, and they stay `InProgress` until their store releases the rows of this node. |
+| `SharpTicker.EntityFrameworkCore`, `SharpTicker.MongoDB` | Warning | The fallback could not mark the delayed chain children whose parent ended with an outcome they do not run on as `Skipped`. The fallback still takes the other overdue jobs, and the next pass tries again. |
 
 ## Tracing
 

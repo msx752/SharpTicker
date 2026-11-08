@@ -5,6 +5,11 @@ using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using MongoDB.Bson;
+using MongoDB.Bson.IO;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
@@ -16,13 +21,15 @@ using SharpTicker.Utilities.Models;
 namespace SharpTicker.MongoDB.Infrastructure
 {
     internal sealed class TickerMongoPersistenceProvider<TTimeTicker, TCronTicker> :
-        ITickerPersistenceProvider<TTimeTicker, TCronTicker>
+        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut, IChildSkipWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
         private readonly ITickerMongoContext<TTimeTicker, TCronTicker> _context;
         private readonly ITickerClock _clock;
         private readonly string _lockHolder;
+        private readonly ILogger _logger;
+        private readonly Lazy<ChainGateStages> _chainGate;
 
         private static readonly Func<TTimeTicker, TimeTickerEntity> ProjectTimeTicker
             = MappingExtensions.ForQueueTimeTickers<TTimeTicker>().Compile();
@@ -30,11 +37,15 @@ namespace SharpTicker.MongoDB.Infrastructure
         public TickerMongoPersistenceProvider(
             ITickerMongoContext<TTimeTicker, TCronTicker> context,
             ITickerClock clock,
-            SchedulerOptionsBuilder optionsBuilder)
+            SchedulerOptionsBuilder optionsBuilder,
+            ILogger logger = null)
         {
             _context = context;
             _clock = clock;
             _lockHolder = optionsBuilder.NodeIdentifier;
+            _logger = logger ?? NullLogger.Instance;
+            // Built on first use: the element names come from the class map, registered before the first query.
+            _chainGate = new Lazy<ChainGateStages>(() => ChainGateStages.For(context.TimeTickers.CollectionNamespace.CollectionName));
         }
 
         // ===================================================================
@@ -53,7 +64,10 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var filter = fb.And(fb.Eq(x => x.Id, ticker.Id), fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt));
+                var filter = fb.And(
+                    fb.Eq(x => x.Id, ticker.Id),
+                    fb.Eq(x => x.UpdatedAt, ticker.UpdatedAt),
+                    MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
@@ -85,27 +99,67 @@ namespace SharpTicker.MongoDB.Infrastructure
                 fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }),
                 fb.Lte(x => x.ExecutionTime, fallbackThreshold));
 
-            var candidates = await coll.Find(candidatesFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
+            var overdue = await coll.Find(candidatesFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
+
+            // A delayed child (a chain child with an execution time of its own) is claimed only once its parent's status
+            // lets it run; one whose parent ended without a match is skipped; one whose parent has not ended waits.
+            var parentStatuses = await LoadParentStatuses(overdue.Select(c => c.ParentId), cancellationToken).ConfigureAwait(false);
+            var outcomeDoesNotMatch = overdue
+                .Where(c => ParentEndedWithoutMatch(c.ParentId, c.RunCondition, parentStatuses))
+                .Select(c => c.Id)
+                .ToArray();
+            if (outcomeDoesNotMatch.Length > 0)
+            {
+                // A failure here must not stop this pass from taking the overdue jobs: the rows it would skip can never be
+                // claimed, and the next pass tries again.
+                try
+                {
+                    await SkipDelayedChildrenAsync(outcomeDoesNotMatch, now, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(ex, "Skipping delayed chain children whose parent's outcome does not match failed; the next fallback pass tries again.");
+                }
+            }
+
+            var candidates = overdue.Where(c => ChainGateOpen(c.ParentId, c.RunCondition, parentStatuses)).ToList();
             var byParent = await LoadChildrenLookup(candidates.Select(c => c.Id).ToArray(), cancellationToken).ConfigureAwait(false);
 
             foreach (var candidate in candidates)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // The status check keeps a row another node already moved to InProgress out of reach, even when
+                // that node's clock is behind and wrote an earlier UpdatedAt.
                 var filter = fb.And(
                     fb.Eq(x => x.Id, candidate.Id),
-                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt));
+                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
+                // Every InProgress write of this node carries its own claim marker (see ClaimMarkers).
+                var claimMarker = _clock.NextClaimMarker();
                 var update = Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, now)
+                    .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
-                var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                UpdateResult result;
+                try
+                {
+                    result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(candidate.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                    throw;
+                }
+
                 if (result.ModifiedCount <= 0)
                     continue;
 
+                // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+                candidate.UpdatedAt = claimMarker;
                 yield return BuildQueuedEntity(candidate, byParent);
             }
         }
@@ -142,17 +196,26 @@ namespace SharpTicker.MongoDB.Infrastructure
                 fb.Gte(x => x.ExecutionTime, oneSecondAgo),
                 MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
 
+            var gate = _chainGate.Value;
+            var byTime = Builders<TTimeTicker>.Sort.Ascending(x => x.ExecutionTime);
+
+            // The gate is part of the earliest-time query: a delayed child that still waits must not hide the rows due
+            // after it.
             var earliest = await coll
-                .Find(baseFilter)
-                .Sort(Builders<TTimeTicker>.Sort.Ascending(x => x.ExecutionTime))
+                .Aggregate()
+                .Match(baseFilter)
+                .Sort(byTime)
+                .AppendStage<BsonDocument>(gate.LookupParent)
+                .Match(gate.Open)
                 .Limit(1)
+                .Project(gate.ExecutionTimeOnly)
                 .FirstOrDefaultAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            if (earliest?.ExecutionTime == null)
+            if (earliest == null || !earliest.TryGetValue(gate.ExecutionTimeElement, out var earliestTime) || earliestTime.IsBsonNull)
                 return Array.Empty<TimeTickerEntity>();
 
-            var min = earliest.ExecutionTime.Value;
+            var min = earliestTime.ToUniversalTime();
             var minSecond = new DateTime(min.Year, min.Month, min.Day, min.Hour, min.Minute, min.Second, DateTimeKind.Utc);
             var maxExecutionTime = minSecond.AddSeconds(1);
 
@@ -162,13 +225,37 @@ namespace SharpTicker.MongoDB.Infrastructure
                 fb.Lt(x => x.ExecutionTime, maxExecutionTime));
 
             var rows = await coll
-                .Find(windowFilter)
-                .Sort(Builders<TTimeTicker>.Sort.Ascending(x => x.ExecutionTime))
+                .Aggregate()
+                .Match(windowFilter)
+                .Sort(byTime)
+                .AppendStage<BsonDocument>(gate.LookupParent)
+                .Match(gate.Open)
+                .AppendStage<TTimeTicker>(gate.DropParent)
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
 
             var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
             return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
+        }
+
+        // Each claim is a single-document conditional update.
+        public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
+
+        public async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
+            // The status changes on every match, so ModifiedCount equals the matched count.
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    Builders<TTimeTicker>.Filter.And(
+                        Builders<TTimeTicker>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByTimeTicker<TTimeTicker>(_lockHolder)),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, claimMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
         }
 
         public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
@@ -205,6 +292,41 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .ConfigureAwait(false);
         }
 
+        // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
+        // keeps the status of its run.
+        public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        {
+            if (timeTickerIds.Length == 0) return;
+            var fb = Builders<TTimeTicker>.Filter;
+            await _context.TimeTickers
+                .UpdateManyAsync(
+                    fb.And(fb.In(x => x.Id, timeTickerIds), fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued })),
+                    MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(skip, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        public async Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<TTimeTicker>.Filter;
+            // The marker is unique per node and kept to the millisecond, so a row this node's fallback runs is never matched.
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    fb.And(
+                        fb.Eq(x => x.Id, id),
+                        fb.Eq(x => x.Status, TickerStatus.InProgress),
+                        fb.Eq(x => x.LockHolder, _lockHolder),
+                        fb.Eq(x => x.UpdatedAt, claimMarker)),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.Idle)
+                        .Set(x => x.LockHolder, (string)null)
+                        .Set(x => x.LockedAt, (DateTime?)null)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
+        }
+
         public async Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default)
         {
             if (ids == null || ids.Length == 0) return Array.Empty<TimeTickerEntity>();
@@ -213,27 +335,73 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
 
-            var filter = fb.And(
-                fb.In(x => x.Id, ids),
-                MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder));
-
+            // One marker for this call: markers must differ between claims of one row, not between rows.
+            var claimMarker = _clock.NextClaimMarker();
             var update = Builders<TTimeTicker>.Update
                 .Set(x => x.LockHolder, _lockHolder)
                 .Set(x => x.LockedAt, now)
                 .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, now);
+                .Set(x => x.UpdatedAt, claimMarker);
 
-            var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (result.ModifiedCount == 0) return Array.Empty<TimeTickerEntity>();
+            // A delayed child is claimable only once its parent's status lets it run. Read first, then claim by id: the gate
+            // does not close again once open, as a finished parent status does not change. A cancelled caller is answered
+            // by the loop below (it stops before claiming), not by a throw here.
+            var requested = await coll
+                .Find(fb.In(x => x.Id, ids))
+                .Project(x => new { x.Id, x.ParentId, x.RunCondition })
+                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            var parentStatuses = await LoadParentStatuses(requested.Select(r => r.ParentId), CancellationToken.None).ConfigureAwait(false);
+            var gateOpen = requested
+                .Where(r => ChainGateOpen(r.ParentId, r.RunCondition, parentStatuses))
+                .Select(r => r.Id)
+                .ToHashSet();
+            if (gateOpen.Count == 0) return Array.Empty<TimeTickerEntity>();
 
-            var acquiredFilter = fb.And(
-                fb.In(x => x.Id, ids),
-                fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress));
+            var won = new Dictionary<Guid, DateTime>(ids.Length);
+            try
+            {
+                // One conditional write per row, so the rows this call won are known exactly. A batch update followed by
+                // a read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+                foreach (var id in ids)
+                {
+                    // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must
+                    // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                    if (cancellationToken.IsCancellationRequested) break;
 
-            var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
-            var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), cancellationToken).ConfigureAwait(false);
-            return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
+                    if (!gateOpen.Contains(id)) continue;
+
+                    UpdateResult result;
+                    try
+                    {
+                        result = await coll.UpdateOneAsync(
+                            fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(_lockHolder)),
+                            update,
+                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
+
+                    if (result.ModifiedCount > 0) won[id] = claimMarker;
+                }
+
+                if (won.Count == 0) return Array.Empty<TimeTickerEntity>();
+
+                var rows = await coll
+                    .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                    .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+                var byParent = await LoadChildrenLookup(rows.Select(r => r.Id).ToArray(), CancellationToken.None).ConfigureAwait(false);
+                return rows.Select(r => BuildQueuedEntity(r, byParent)).ToArray();
+            }
+            catch (Exception failure) when (won.Count > 0)
+            {
+                // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                throw;
+            }
         }
 
         public async Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
@@ -500,16 +668,31 @@ namespace SharpTicker.MongoDB.Infrastructure
 
                 var filter = fb.And(
                     fb.Eq(x => x.Id, occ.Id),
-                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt));
+                    fb.Eq(x => x.UpdatedAt, occ.UpdatedAt),
+                    fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
+                var claimMarker = _clock.NextClaimMarker();
                 var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, _lockHolder)
                     .Set(x => x.LockedAt, now)
-                    .Set(x => x.UpdatedAt, now)
+                    .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
-                var result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                UpdateResult result;
+                try
+                {
+                    result = await coll.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(occ.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                    throw;
+                }
+
                 if (result.ModifiedCount <= 0) continue;
+
+                // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+                occ.UpdatedAt = claimMarker;
 
                 if (cronById.TryGetValue(occ.CronTickerId, out var cron))
                 {
@@ -523,6 +706,41 @@ namespace SharpTicker.MongoDB.Infrastructure
                 }
                 yield return occ;
             }
+        }
+
+        public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.And(
+                        Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.Eq(x => x.Id, id),
+                        MongoUpdateBuilders.QueuedByCronOccurrence<TCronTicker>(_lockHolder)),
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, claimMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
+        }
+
+        public async Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    fb.And(
+                        fb.Eq(x => x.Id, id),
+                        fb.Eq(x => x.Status, TickerStatus.InProgress),
+                        fb.Eq(x => x.LockHolder, _lockHolder),
+                        fb.Eq(x => x.UpdatedAt, claimMarker)),
+                    Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.Status, TickerStatus.Idle)
+                        .Set(x => x.LockHolder, (string)null)
+                        .Set(x => x.LockedAt, (DateTime?)null)
+                        .Set(x => x.UpdatedAt, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return result.ModifiedCount > 0;
         }
 
         public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
@@ -862,26 +1080,75 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.CronTickerOccurrences;
             var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
 
-            var filter = fb.And(
-                fb.In(x => x.Id, occurrenceIds),
-                MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder));
+            var won = new Dictionary<Guid, DateTime>(occurrenceIds.Length);
+            try
+            {
+                // One conditional write per row, so the rows this call won are known exactly. A batch update followed by
+                // a read of "InProgress for this node" also returned a row this node's fallback was already running.
+                foreach (var id in occurrenceIds)
+                {
+                    // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must
+                    // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                    if (cancellationToken.IsCancellationRequested) break;
 
-            var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
-                .Set(x => x.LockHolder, _lockHolder)
-                .Set(x => x.LockedAt, now)
-                .Set(x => x.Status, TickerStatus.InProgress)
-                .Set(x => x.UpdatedAt, now);
+                    var claimMarker = _clock.NextClaimMarker();
+                    var update = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
+                        .Set(x => x.LockHolder, _lockHolder)
+                        .Set(x => x.LockedAt, now)
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.UpdatedAt, claimMarker);
 
-            var result = await coll.UpdateManyAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (result.ModifiedCount == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+                    UpdateResult result;
+                    try
+                    {
+                        result = await coll.UpdateOneAsync(
+                            fb.And(fb.Eq(x => x.Id, id), MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(_lockHolder)),
+                            update,
+                            cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
 
-            var acquiredFilter = fb.And(
-                fb.In(x => x.Id, occurrenceIds),
-                fb.Eq(x => x.LockHolder, _lockHolder),
-                fb.Eq(x => x.Status, TickerStatus.InProgress));
+                    if (result.ModifiedCount > 0) won[id] = claimMarker;
+                }
 
-            var rows = await coll.Find(acquiredFilter).ToListAsync(cancellationToken).ConfigureAwait(false);
-            return rows.ToArray();
+                if (won.Count == 0) return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+
+                var rows = await coll
+                    .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
+                    .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+
+                // The caller runs each row from its cron (function, retries, intervals), which an occurrence document
+                // does not hold; it is loaded as the fallback does. A failure here puts the won rows back below.
+                var cronById = await LoadCronTickers(rows.Select(r => r.CronTickerId).Distinct().ToArray(), CancellationToken.None).ConfigureAwait(false);
+
+                // Each row is handed back with the marker its claim wrote, for a put-back.
+                foreach (var row in rows)
+                {
+                    row.UpdatedAt = won[row.Id];
+                    if (cronById.TryGetValue(row.CronTickerId, out var cron))
+                    {
+                        row.CronTicker = new TCronTicker
+                        {
+                            Id = cron.Id,
+                            Function = cron.Function,
+                            RetryIntervals = cron.RetryIntervals,
+                            Retries = cron.Retries
+                        };
+                    }
+                }
+                return rows.ToArray();
+            }
+            catch (Exception failure) when (won.Count > 0)
+            {
+                // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                throw;
+            }
         }
 
         // ===================================================================
@@ -918,42 +1185,173 @@ namespace SharpTicker.MongoDB.Infrastructure
         // Private helpers
         // ===================================================================
 
+        // The dispatched payload holds the two levels below each row that the execution handler runs (children and
+        // grandchildren), as on the other stores. Mongo keeps each descendant as a document of its own, so this is one
+        // query per level. A delayed child (one with an execution time of its own) is carried with its time: the handler
+        // never runs it inline, and skips it only while it has not started (IChildSkipWriter).
         private async Task<Dictionary<Guid, List<TTimeTicker>>> LoadChildrenLookup(Guid[] parentIds, CancellationToken ct)
         {
-            if (parentIds.Length == 0) return new Dictionary<Guid, List<TTimeTicker>>();
-            var fb = Builders<TTimeTicker>.Filter;
-            var rows = await _context.TimeTickers
-                .Find(fb.And(
-                    fb.In(x => x.ParentId, parentIds.Select(p => (Guid?)p)),
-                    fb.Eq(x => x.ExecutionTime, null)))
+            var byParent = new Dictionary<Guid, List<TTimeTicker>>();
+            if (parentIds.Length == 0) return byParent;
+
+            var children = await LoadChildren(parentIds, ct).ConfigureAwait(false);
+            var grandchildren = children.Count == 0
+                ? children
+                : await LoadChildren(children.Select(c => c.Id).ToArray(), ct).ConfigureAwait(false);
+
+            foreach (var row in children.Concat(grandchildren))
+            {
+                if (!byParent.TryGetValue(row.ParentId!.Value, out var list))
+                    byParent[row.ParentId.Value] = list = new List<TTimeTicker>();
+                list.Add(row);
+            }
+            return byParent;
+        }
+
+        // The payload never carries a descendant's request (the handler reads it when the descendant runs), so it is not
+        // read here.
+        private Task<List<TTimeTicker>> LoadChildren(Guid[] parentIds, CancellationToken ct)
+            => _context.TimeTickers
+                .Find(Builders<TTimeTicker>.Filter.In(x => x.ParentId, parentIds.Select(p => (Guid?)p)))
+                .Project<TTimeTicker>(Builders<TTimeTicker>.Projection.Exclude(x => x.Request))
+                .ToListAsync(ct);
+
+        // The status of each parent of the given rows, for the chain gate. A parent that is not found is left out, so its
+        // children wait.
+        private async Task<Dictionary<Guid, TickerStatus>> LoadParentStatuses(IEnumerable<Guid?> parentIds, CancellationToken ct)
+        {
+            var ids = parentIds.Where(p => p.HasValue).Select(p => p.Value).Distinct().ToArray();
+            if (ids.Length == 0) return new Dictionary<Guid, TickerStatus>();
+            var parents = await _context.TimeTickers
+                .Find(Builders<TTimeTicker>.Filter.In(x => x.Id, ids))
+                .Project(x => new { x.Id, x.Status })
                 .ToListAsync(ct)
                 .ConfigureAwait(false);
-            return rows
-                .Where(r => r.ParentId.HasValue)
-                .GroupBy(r => r.ParentId.Value)
-                .ToDictionary(g => g.Key, g => g.ToList());
+            return parents.ToDictionary(p => p.Id, p => p.Status);
+        }
+
+        // A row may be handed out when it has no parent, or when its parent's status lets it run (ChainRunGate).
+        private static bool ChainGateOpen(Guid? parentId, RunCondition? condition, Dictionary<Guid, TickerStatus> parentStatuses)
+            => parentId == null
+               || (parentStatuses.TryGetValue(parentId.Value, out var status) && ChainRunGate.Allows(condition, status));
+
+        // A delayed child whose parent ended with an outcome it does not run on never will, as a finished status does not
+        // change.
+        private static bool ParentEndedWithoutMatch(Guid? parentId, RunCondition? condition, Dictionary<Guid, TickerStatus> parentStatuses)
+            => parentId != null
+               && parentStatuses.TryGetValue(parentId.Value, out var status)
+               && ChainRunGate.IsFinal(status)
+               && !ChainRunGate.Allows(condition, status);
+
+        // The parent's run skips a child its outcome does not let run; this covers a node that stopped before doing so. Its
+        // own delayed children follow on a later pass. Only a row that has not started is written.
+        private Task SkipDelayedChildrenAsync(Guid[] ids, DateTime now, CancellationToken ct)
+        {
+            var fb = Builders<TTimeTicker>.Filter;
+            return _context.TimeTickers.UpdateManyAsync(
+                fb.And(fb.In(x => x.Id, ids), fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued })),
+                Builders<TTimeTicker>.Update
+                    .Set(x => x.Status, TickerStatus.Skipped)
+                    .Set(x => x.ExecutedAt, now)
+                    .Set(x => x.SkippedReason, ChainRunGate.NotMatchedReason)
+                    .Set(x => x.LockHolder, (string)null)
+                    .Set(x => x.LockedAt, (DateTime?)null)
+                    .Set(x => x.UpdatedAt, now),
+                cancellationToken: ct);
+        }
+
+        /// <summary>
+        /// The aggregation stages of the chain gate in the window query: each row is joined to its parent, and only a row
+        /// without a parent, or one whose parent's status lets it run, goes on. The condition is built from
+        /// <see cref="ChainRunGate"/>, so it holds the same table; element names come from the class map.
+        /// </summary>
+        private sealed class ChainGateStages
+        {
+            private const string ParentField = "__chainParent";
+
+            public BsonDocument LookupParent { get; private set; }
+            public BsonDocument Open { get; private set; }
+            public BsonDocument DropParent { get; private set; }
+            public BsonDocument ExecutionTimeOnly { get; private set; }
+            public string ExecutionTimeElement { get; private set; }
+
+            public static ChainGateStages For(string collectionName)
+            {
+                var classMap = BsonClassMap.LookupClassMap(typeof(TTimeTicker));
+                BsonMemberMap MemberOf(string member)
+                    => classMap.AllMemberMaps.FirstOrDefault(m => m.MemberName == member)
+                       ?? throw new InvalidOperationException(
+                           $"The MongoDB class map of {typeof(TTimeTicker).FullName} does not map {member}, which SharpTicker needs to run chains.");
+
+                var parentIdMember = MemberOf(nameof(TimeTickerEntity.ParentId));
+                var runConditionMember = MemberOf(nameof(TimeTickerEntity.RunCondition));
+                var statusMember = MemberOf(nameof(TimeTickerEntity.Status));
+                var parentId = parentIdMember.ElementName;
+                var runCondition = runConditionMember.ElementName;
+                var status = statusMember.ElementName;
+                var executionTime = MemberOf(nameof(TimeTickerEntity.ExecutionTime)).ElementName;
+
+                // Values are written by the members' own serializers, so a class map that stores the enums differently
+                // (as strings, say) is matched as the typed filters match it.
+                var open = new BsonArray { new BsonDocument(parentId, BsonNull.Value) };
+                foreach (var condition in Enum.GetValues(typeof(RunCondition)).Cast<RunCondition?>().Append(null))
+                {
+                    var statuses = ChainRunGate.ParentStatusesFor(condition);
+                    if (statuses.Length == 0) continue;
+                    open.Add(new BsonDocument
+                    {
+                        { runCondition, Serialize(runConditionMember, condition) },
+                        { ParentField + "." + status, new BsonDocument("$in", new BsonArray(statuses.Select(s => Serialize(statusMember, s)))) }
+                    });
+                }
+
+                return new ChainGateStages
+                {
+                    // Only the parent's status is read: the parent is matched on _id (indexed) and nothing else is copied.
+                    LookupParent = new BsonDocument("$lookup", new BsonDocument
+                    {
+                        { "from", collectionName },
+                        { "let", new BsonDocument("parentId", "$" + parentId) },
+                        { "pipeline", new BsonArray
+                            {
+                                new BsonDocument("$match", new BsonDocument("$expr", new BsonDocument("$eq", new BsonArray { "$_id", "$$parentId" }))),
+                                new BsonDocument("$project", new BsonDocument { { "_id", 0 }, { status, 1 } })
+                            }
+                        },
+                        { "as", ParentField }
+                    }),
+                    Open = new BsonDocument("$or", open),
+                    DropParent = new BsonDocument("$project", new BsonDocument(ParentField, 0)),
+                    ExecutionTimeOnly = new BsonDocument { { "_id", 0 }, { executionTime, 1 } },
+                    ExecutionTimeElement = executionTime
+                };
+            }
+
+            private static BsonValue Serialize(BsonMemberMap member, object value)
+            {
+                var document = new BsonDocument();
+                using (var writer = new BsonDocumentWriter(document))
+                {
+                    writer.WriteStartDocument();
+                    writer.WriteName("v");
+                    member.GetSerializer().Serialize(BsonSerializationContext.CreateRoot(writer), value);
+                    writer.WriteEndDocument();
+                }
+                return document["v"];
+            }
         }
 
         private TimeTickerEntity BuildQueuedEntity(TTimeTicker ticker, Dictionary<Guid, List<TTimeTicker>> byParent)
         {
-            // The ForQueueTimeTickers projection expects nested .Children with grandchildren.
-            // Since we already filter children to ExecutionTime == null, attach them in-memory
-            // then invoke the compiled projection to produce the shape the scheduler expects.
-            if (byParent.TryGetValue(ticker.Id, out var directChildren))
-            {
-                ticker.Children = directChildren;
-                // Mongo-side we don't fetch grandchildren in LoadChildrenLookup (they'd cascade widely).
-                // Grandchildren are rare in practice and only needed for deeply-nested time tickers;
-                // when needed the dashboard goes through ITickerQueryable.WithRelated(ChildrenDeep).
-                foreach (var ch in directChildren)
-                    ch.Children = new List<TTimeTicker>();
-            }
-            else
-            {
-                ticker.Children = new List<TTimeTicker>();
-            }
+            // Attach the loaded children and grandchildren, then run the shared projection, which keeps two levels.
+            ticker.Children = ChildrenOf(ticker.Id, byParent);
+            foreach (var child in ticker.Children)
+                child.Children = ChildrenOf(child.Id, byParent);
             return ProjectTimeTicker(ticker);
         }
+
+        private static List<TTimeTicker> ChildrenOf(Guid id, Dictionary<Guid, List<TTimeTicker>> byParent)
+            => byParent.TryGetValue(id, out var children) ? children : new List<TTimeTicker>();
 
         private async Task<Dictionary<Guid, TCronTicker>> LoadCronTickers(Guid[] ids, CancellationToken ct)
         {

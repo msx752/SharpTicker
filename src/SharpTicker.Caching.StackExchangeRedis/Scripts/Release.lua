@@ -18,6 +18,10 @@ obj['Status'] = tonumber(ARGV[3])
 obj['status'] = nil
 obj['UpdatedAt'] = ARGV[2]
 obj['updatedAt'] = nil
+-- cjson writes an empty array as {}, which System.Text.Json cannot read back into a collection property;
+-- turn those back into [] by key (a string value holds its quotes escaped, so it never matches).
 local updated = cjson.encode(obj)
+updated = (string.gsub(updated, '"Children":{}', '"Children":[]'))
+updated = (string.gsub(updated, '"RetryIntervals":{}', '"RetryIntervals":[]'))
 redis.call('SET', KEYS[1], updated)
 return updated

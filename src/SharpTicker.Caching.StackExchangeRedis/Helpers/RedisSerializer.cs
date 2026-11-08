@@ -40,6 +40,13 @@ internal sealed class RedisSerializer
         return _db.StringSetAsync(key, payload);
     }
 
+    // SET NX: false means the key already exists and nothing was written.
+    internal Task<bool> TryCreateAsync<T>(string key, T value) where T : class
+    {
+        var payload = JsonSerializer.Serialize(value, GetTypeInfo<T>());
+        return _db.StringSetAsync(key, payload, when: When.NotExists);
+    }
+
     internal T DeserializeOrNull<T>(string json) where T : class
     {
         if (string.IsNullOrEmpty(json)) return null;

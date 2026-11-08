@@ -146,5 +146,5 @@ builder.Services.MapTickerGroup("Reports", group => group
 
 `TickerTaskPriority` has four values:
 
-- **`LongRunning`** runs the job on its own thread instead of the scheduler's worker pool. Use it for jobs that block a thread for a long time.
+- **`LongRunning`** starts the job at once on a thread of its own instead of a worker of the scheduler: it does not wait in the queue, does not count against `MaxConcurrency` and ignores priority order. Like any job, it keeps that thread only up to its first `await` of a task that has not completed yet. Use it for jobs that block a thread for a long time, so they do not hold a worker.
 - **`High`, `Normal` and `Low`** decide which waiting job a free worker takes. When more jobs are ready than there are workers (see `MaxConcurrency`), `High` jobs start before `Normal` ones and `Normal` before `Low` ones; jobs of one priority start in the order they became ready. A `Low` job is not held back for ever: after ten higher priority jobs have started in a row while it waits, one `Low` job goes next. Priority does not pause or preempt jobs that are already running, and it does not change when a job becomes due. It applies to every job that goes through the worker pool, however it was started: by the scheduler, from the dashboard, or picked up again after a timeout.

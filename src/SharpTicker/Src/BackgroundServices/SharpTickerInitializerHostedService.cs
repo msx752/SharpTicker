@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using SharpTicker.Provider;
 using SharpTicker.Utilities;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 
 namespace SharpTicker.BackgroundServices;
@@ -48,6 +49,10 @@ internal sealed class SharpTickerInitializerHostedService : IHostedService
     {
         if (!InitializationRequested)
             return;
+
+        // No job of this run can be claimed before the functions are registered below, so this moment comes before every
+        // claim of this run. The startup release of what an earlier run left locked is fenced by it.
+        _executionContext.RunStartedAt ??= _serviceProvider.GetService<ITickerClock>()?.UtcNow ?? DateTime.UtcNow;
 
         TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(_configuration);
         TickerFunctionProvider.Build();

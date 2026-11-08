@@ -10,6 +10,7 @@ using SharpTicker.BackgroundServices;
 using SharpTicker.DependencyInjection;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 
 namespace SharpTicker.Tests;
@@ -109,6 +110,36 @@ public class DesignTimeToolDetectionTests
         var optionsSeeding = context.OptionsSeeding;
         Assert.NotNull(optionsSeeding);
         Assert.False(optionsSeeding.SeedDefinedCronTickers);
+    }
+
+    // A seeder can add a job that is dispatched at once, so the start of this run must be on record before seeding: the
+    // startup release frees only rows locked earlier, and a job seeded and claimed now must not count as earlier.
+    [Fact]
+    public async Task Initializer_RecordsTheRunStart_BeforeItSeeds()
+    {
+        var start = new System.DateTime(2025, 6, 15, 12, 0, 0, System.DateTimeKind.Utc);
+        var context = new TickerExecutionContext();
+        System.DateTime? seenWhileSeeding = null;
+        var internalManager = Substitute.For<IInternalTickerManager>();
+        internalManager.MigrateDefinedCronTickers(Arg.Any<(string, string)[]>())
+            .Returns(_ => { seenWhileSeeding = context.RunStartedAt; return Task.CompletedTask; });
+        var clock = Substitute.For<ITickerClock>();
+        clock.UtcNow.Returns(start);
+        var configuration = Substitute.For<IConfiguration>();
+
+        var services = new ServiceCollection();
+        services.AddSingleton(context);
+        services.AddSingleton(configuration);
+        services.AddSingleton(internalManager);
+        services.AddSingleton(clock);
+        services.AddSingleton(new SchedulerOptionsBuilder());
+        var initializer = new SharpTickerInitializerHostedService(context, services.BuildServiceProvider(), configuration);
+        initializer.InitializationRequested = true;
+
+        await initializer.StartAsync(CancellationToken.None);
+
+        Assert.Equal(start, seenWhileSeeding);
+        Assert.Equal(start, context.RunStartedAt);
     }
 
     [Fact]

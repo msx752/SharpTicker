@@ -37,6 +37,19 @@ namespace SharpTicker.Utilities.Models
         public RunCondition RunCondition { get; set; }
         public List<InternalFunctionContext> TimeTickerChildren { get; set; } = [];
 
+        /// <summary>
+        /// The marker the claim that handed this job out wrote to its row (the fallback, run-now), or null when the job was
+        /// not handed out by such a claim (a child, which runs inside its parent). A job that never starts is put back with it.
+        /// </summary>
+        internal DateTime? ClaimMarker { get; set; }
+
+        /// <summary>
+        /// True for a chain child (or grandchild) that has an execution time of its own. Such a child is a row of its own: its
+        /// parent's run never runs it, the store hands it out once the parent has ended with a status its
+        /// <see cref="RunCondition"/> accepts and its time has come (see <see cref="ChainRunGate"/>).
+        /// </summary>
+        internal bool IsDelayed { get; set; }
+
         [DynamicDependency(DynamicallyAccessedMemberTypes.PublicProperties, typeof(InternalFunctionContext))]
         public InternalFunctionContext SetProperty<T>(Expression<Func<InternalFunctionContext, T>> property, T value)
         {

@@ -991,6 +991,67 @@ public class TickerManagerTests : IDisposable
             .AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>());
     }
 
+    private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<TickerManager<TimeTickerEntity, CronTickerEntity>>
+    {
+        public List<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Entries { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, formatter(state, exception)));
+    }
+
+    private ITimeTickerManager<TimeTickerEntity> ManagerWith(RecordingLogger logger)
+        => new TickerManager<TimeTickerEntity, CronTickerEntity>(
+            _persistenceProvider, _hostScheduler, _clock, _notificationHubSender, _executionContext, _dispatcher, logger);
+
+    // The ticker is stored; the claim for the immediate run then fails. The store has put back what it claimed, so the
+    // fallback runs the job: adding it succeeded, and a caller that retried on a failure would add it twice. The failure
+    // of the claim is logged here instead.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AddTimeTickerAsync_StoredButTheImmediateClaimFails_SucceedsAndLogs(bool putBackFailedToo)
+    {
+        _dispatcher.IsEnabled.Returns(true);
+        var logger = new RecordingLogger();
+        var manager = ManagerWith(logger);
+        var entity = new TimeTickerEntity { Function = ValidFunctionName, ExecutionTime = FixedUtcNow };
+        _persistenceProvider.AddTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>()).Returns(1);
+        Exception failure = putBackFailedToo
+            ? new ClaimPutBackFailedException(1, [new InvalidOperationException("store failed"), new TimeoutException("release failed")])
+            : new InvalidOperationException("store failed");
+        _persistenceProvider.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw failure);
+
+        var result = await manager.AddAsync(entity, CancellationToken.None);
+
+        Assert.True(result.IsSucceeded);
+        var expected = putBackFailedToo ? Microsoft.Extensions.Logging.LogLevel.Error : Microsoft.Extensions.Logging.LogLevel.Warning;
+        Assert.Contains(logger.Entries, e => e.Level == expected && e.Message.Contains(entity.Id.ToString()));
+    }
+
+    [Fact]
+    public async Task AddTimeTickersBatchAsync_StoredButTheImmediateClaimFails_SucceedsAndLogs()
+    {
+        _dispatcher.IsEnabled.Returns(true);
+        var logger = new RecordingLogger();
+        var manager = ManagerWith(logger);
+        var entities = new List<TimeTickerEntity>
+        {
+            new() { Function = ValidFunctionName, ExecutionTime = FixedUtcNow },
+            new() { Function = ValidFunctionName, ExecutionTime = FixedUtcNow }
+        };
+        _persistenceProvider.AddTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>()).Returns(2);
+        _persistenceProvider.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw new InvalidOperationException("store failed"));
+
+        var result = await manager.AddBatchAsync(entities, CancellationToken.None);
+
+        Assert.True(result.IsSucceeded);
+        Assert.Contains(logger.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning);
+    }
+
     [Fact]
     public async Task AddTimeTickerAsync_DispatcherDisabledAndImmediateExecution_DoesNotDispatch()
     {

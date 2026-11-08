@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
@@ -42,7 +43,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ITickerFunctionConcurrencyGate concurrencyGate,
         ILogger<SharpTickerSchedulerBackgroundService> logger = null,
         ITickerClock clock = null,
-        IOptions<HostOptions> hostOptions = null)
+        IOptions<HostOptions> hostOptions = null,
+        ClaimedWorkQueue claimedWork = null)
     {
         _logger = logger;
         _clock = clock;
@@ -53,6 +55,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _internalTickerManager = internalTickerManager ?? throw new ArgumentNullException(nameof(internalTickerManager));
         _concurrencyGate = concurrencyGate;
         _minPollingInterval = ResolveMinPollingInterval(schedulerOptions);
+        _work = claimedWork ?? new ClaimedWorkQueue(_internalTickerManager, taskScheduler, taskHandler, concurrencyGate, logger);
         _restartThrottle = new RestartThrottleManager(() => _schedulerLoopCancellationTokenSource?.Cancel());
     }
     
@@ -117,30 +120,15 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     {
         while (!stoppingToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
+            // The put-backs of every claim of this node (loop, fallback, run-now) are tried again here.
+            await _work.RetryFailedPutBacksAsync();
+
             if (_executionContext.Functions.Length != 0)
             {
-                await _internalTickerManager.SetTickersInProgress(_executionContext.Functions, cancellationToken);
 
-                foreach (var function in _executionContext.Functions.OrderBy(x => x.CachedPriority))
-                {
-                    var semaphore = _concurrencyGate.GetSemaphoreOrNull(function.FunctionName, function.CachedMaxConcurrency);
+                var batch = _executionContext.Functions.OrderBy(x => x.CachedPriority).ToArray();
+                await HandOverBatchAsync(batch, stoppingToken);
 
-                    _ = _taskScheduler.QueueAsync(async ct =>
-                    {
-                        if (semaphore != null)
-                            await semaphore.WaitAsync(ct).ConfigureAwait(false);
-
-                        try
-                        {
-                            await _taskHandler.ExecuteTaskAsync(function, false, ct).ConfigureAwait(false);
-                        }
-                        finally
-                        {
-                            semaphore?.Release();
-                        }
-                    }, function.CachedPriority, stoppingToken);
-                }
-                
                 _executionContext.SetFunctions(null);
             }
             
@@ -170,6 +158,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 _executionContext.SetNextPlannedOccurrence(DateTime.UtcNow.Add(sleepDuration));
             }
 
+            // A put-back that failed is tried again on the loop's next pass, and an idle loop could sleep up to a day.
+            if (sleepDuration > PutBackRetryInterval && _work.Claims.PendingPutBacks().Count > 0)
+                sleepDuration = PutBackRetryInterval;
+
             var notify = _executionContext.NotifyCoreAction;
             if (notify != null)
             {
@@ -177,6 +169,117 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
 
             await Task.Delay(sleepDuration, cancellationToken);
+        }
+    }
+
+    private enum ClaimOutcome
+    {
+        Lost,
+        Won,
+        Failed
+    }
+
+    // Hands won claims to the workers and puts back those whose job does not start; shared with the fallback and run-now.
+    private readonly ClaimedWorkQueue _work;
+
+    internal ClaimLedger Claims => _work.Claims;
+
+    /// <summary>How long the loop sleeps at most while a put-back is waiting to be tried again. Tests shorten it.</summary>
+    internal TimeSpan PutBackRetryInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    private bool CanHandOver(CancellationToken stoppingToken)
+        => !stoppingToken.IsCancellationRequested && !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
+
+    // The batch is claimed first, as many rows at once as the store takes, and the won rows are then handed to the workers in
+    // priority order. A job goes to a worker only when this node won the claim on its row: the fallback or a cancel may have
+    // taken the row while the loop slept, and then the job is not ours to run. A won row that is not handed over, because the
+    // scheduler stopped or froze meanwhile, is put back, and so is a row whose claim call failed, because its write may have
+    // landed. A failed claim then ends the batch the way any store failure ends a pass of the loop.
+    private async Task HandOverBatchAsync(InternalFunctionContext[] batch, CancellationToken stoppingToken)
+    {
+        // A row claimed after the scheduler stopped taking work would be InProgress with no worker to run it. Nothing is
+        // claimed yet, the rows are still Queued and are released.
+        if (!CanHandOver(stoppingToken))
+        {
+            await TryReleaseAcquiredResourcesAsync(batch, CancellationToken.None, stopping: stoppingToken.IsCancellationRequested);
+            return;
+        }
+
+        var fanOut = Math.Max(1, await _internalTickerManager.GetMaxConcurrentClaims(stoppingToken).ConfigureAwait(false));
+        var entries = new ClaimLedger.Entry[batch.Length];
+        var outcomes = new ClaimOutcome[batch.Length];
+        var failures = new Exception[batch.Length];
+
+        // The claim follows the application's token, not the loop's: a restart request must not cut a hand-over short, it
+        // takes effect at the next wait on the loop's token. The marker is chosen and recorded before the call, so a claim
+        // whose call fails after its write landed is still found and put back. Until the call returns, a sweep by another
+        // stopping service leaves the claim alone; the outcomes below decide it.
+        await Parallel.ForEachAsync(Enumerable.Range(0, batch.Length), new ParallelOptions { MaxDegreeOfParallelism = fanOut }, async (i, _) =>
+        {
+            var entry = _work.Record(batch[i], _internalTickerManager.NextClaimMarker(), claimInFlight: true);
+            entries[i] = entry;
+            try
+            {
+                outcomes[i] = await _internalTickerManager.TryClaimDueTicker(batch[i], entry.ClaimMarker, stoppingToken).ConfigureAwait(false)
+                    ? ClaimOutcome.Won
+                    : ClaimOutcome.Lost;
+            }
+            catch (Exception ex)
+            {
+                outcomes[i] = ClaimOutcome.Failed;
+                failures[i] = ex;
+            }
+        }).ConfigureAwait(false);
+
+        Exception firstFailure = null;
+        for (var i = 0; i < batch.Length; i++)
+        {
+            var function = batch[i];
+            switch (outcomes[i])
+            {
+                case ClaimOutcome.Lost:
+                    entries[i].Forget();
+                    _logger?.LogInformation("Job {FunctionName} ({TickerId}) is no longer this node's to run (taken by another claim, cancelled or removed) and is not run by this loop.",
+                        function.FunctionName, function.TickerId);
+                    break;
+
+                case ClaimOutcome.Failed:
+                    firstFailure ??= failures[i];
+                    entries[i].ClaimSettled();
+                    await _work.PutBackAsync(entries[i], "its claim call failed", failures[i], quietWhenNothingToPutBack: true);
+                    break;
+
+                default:
+                    entries[i].ClaimSettled();
+                    if (!CanHandOver(stoppingToken))
+                    {
+                        await _work.PutBackAsync(entries[i], "the scheduler stopped taking work before its worker got it");
+                        break;
+                    }
+
+                    await NotifyInProgressAsync(function);
+                    // Not awaited, as before: the loop hands the whole batch over in priority order and is not held by a
+                    // full scheduler. A refusal is still put back.
+                    _ = _work.QueueWork(entries[i], isDue: false, stoppingToken);
+                    break;
+            }
+        }
+
+        if (firstFailure != null)
+            ExceptionDispatchInfo.Capture(firstFailure).Throw();
+    }
+
+    private async Task NotifyInProgressAsync(InternalFunctionContext function)
+    {
+        // The notification is for the dashboard and does not decide the job.
+        try
+        {
+            await _internalTickerManager.NotifyInProgress(function);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) is running but the dashboard could not be notified.",
+                function.FunctionName, function.TickerId);
         }
     }
 
@@ -338,6 +441,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
         await WaitForRunningJobsAsync(cancellationToken);
+        // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
+        // the host gives the stop.
+        await _work.PutBackUnstartedAsync(cancellationToken: cancellationToken);
     }
 
     // The jobs run on the scheduler's workers, not inside this service, so stopping the service did not wait for them. The

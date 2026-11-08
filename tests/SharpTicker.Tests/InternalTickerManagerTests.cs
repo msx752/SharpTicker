@@ -9,6 +9,7 @@ using NSubstitute;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Managers;
@@ -741,108 +742,139 @@ public class InternalTickerManagerTests
     }
 
     // ====================================================================
-    // 3. SetTickersInProgress
+    // 3. TryClaimDueTicker / NotifyInProgress
     // ====================================================================
 
     [Fact]
-    public async Task SetTickersInProgress_SetsStatusToInProgress_OnPersistenceProvider()
+    public async Task TryClaimDueTicker_TimeTicker_WonClaim_SetsStatusToInProgress()
     {
         var timeTickerId = Guid.NewGuid();
-        var resources = new[]
-        {
-            new InternalFunctionContext
-            {
-                TickerId = timeTickerId,
-                Type = TickerType.TimeTicker,
-                FunctionName = "Func1"
-            }
-        };
+        var function = new InternalFunctionContext { TickerId = timeTickerId, Type = TickerType.TimeTicker, FunctionName = "Func1" };
+        _persistence.TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
-        _persistence.UpdateTimeTickersWithUnifiedContext(
-                Arg.Any<Guid[]>(),
-                Arg.Any<InternalFunctionContext>(),
-                Arg.Any<CancellationToken>())
-            .Returns(Task.CompletedTask);
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
 
-        await _manager.SetTickersInProgress(resources, CancellationToken.None);
-
-        await _persistence.Received(1).UpdateTimeTickersWithUnifiedContext(
-            Arg.Is<Guid[]>(ids => ids.Length == 1 && ids[0] == timeTickerId),
-            Arg.Is<InternalFunctionContext>(ctx => ctx.Status == TickerStatus.InProgress),
-            Arg.Any<CancellationToken>());
-
-        Assert.Equal(TickerStatus.InProgress, resources[0].Status);
+        Assert.True(won);
+        Assert.Equal(TickerStatus.InProgress, function.Status);
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(timeTickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public async Task SetTickersInProgress_HandlesMixOfTimeTickersAndCronOccurrences()
-    {
-        var timeTickerId = Guid.NewGuid();
-        var cronOccurrenceId = Guid.NewGuid();
-        var resources = new[]
-        {
-            new InternalFunctionContext
-            {
-                TickerId = timeTickerId,
-                Type = TickerType.TimeTicker,
-                FunctionName = "TimeFunc"
-            },
-            new InternalFunctionContext
-            {
-                TickerId = cronOccurrenceId,
-                Type = TickerType.CronTickerOccurrence,
-                FunctionName = "CronFunc"
-            }
-        };
-
-        _persistence.UpdateTimeTickersWithUnifiedContext(
-                Arg.Any<Guid[]>(), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(Task.CompletedTask);
-        _persistence.UpdateCronTickerOccurrencesWithUnifiedContext(
-                Arg.Any<Guid[]>(), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(Task.CompletedTask);
-
-        await _manager.SetTickersInProgress(resources, CancellationToken.None);
-
-        // Both persistence calls should have been made (the WhenAll branch)
-        await _persistence.Received(1).UpdateTimeTickersWithUnifiedContext(
-            Arg.Is<Guid[]>(ids => ids.Length == 1 && ids[0] == timeTickerId),
-            Arg.Any<InternalFunctionContext>(),
-            Arg.Any<CancellationToken>());
-        await _persistence.Received(1).UpdateCronTickerOccurrencesWithUnifiedContext(
-            Arg.Is<Guid[]>(ids => ids.Length == 1 && ids[0] == cronOccurrenceId),
-            Arg.Any<InternalFunctionContext>(),
-            Arg.Any<CancellationToken>());
-
-        Assert.All(resources, r => Assert.Equal(TickerStatus.InProgress, r.Status));
-    }
-
-    [Fact]
-    public async Task SetTickersInProgress_OnlyCronOccurrences_CallsCronUpdateOnly()
+    public async Task TryClaimDueTicker_CronOccurrence_WonClaim_UsesTheOccurrenceMethod()
     {
         var cronId = Guid.NewGuid();
-        var resources = new[]
-        {
-            new InternalFunctionContext
-            {
-                TickerId = cronId,
-                Type = TickerType.CronTickerOccurrence,
-                FunctionName = "CronFunc"
-            }
-        };
+        var function = new InternalFunctionContext { TickerId = cronId, Type = TickerType.CronTickerOccurrence, FunctionName = "CronFunc" };
+        _persistence.TryMarkCronOccurrenceInProgress(cronId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
 
-        _persistence.UpdateCronTickerOccurrencesWithUnifiedContext(
-                Arg.Any<Guid[]>(), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(Task.CompletedTask);
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
 
-        await _manager.SetTickersInProgress(resources, CancellationToken.None);
+        Assert.True(won);
+        Assert.Equal(TickerStatus.InProgress, function.Status);
+        await _persistence.Received(1).TryMarkCronOccurrenceInProgress(cronId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>());
+    }
 
-        await _persistence.Received(1).UpdateCronTickerOccurrencesWithUnifiedContext(
-            Arg.Is<Guid[]>(ids => ids.Length == 1 && ids[0] == cronId),
-            Arg.Any<InternalFunctionContext>(),
-            Arg.Any<CancellationToken>());
-        await _persistence.DidNotReceive().UpdateTimeTickersWithUnifiedContext(
-            Arg.Any<Guid[]>(), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
+    [Theory]
+    [InlineData(TickerType.TimeTicker)]
+    [InlineData(TickerType.CronTickerOccurrence)]
+    public async Task TryClaimDueTicker_LostClaim_ReturnsFalseAndLeavesStatusAlone(TickerType type)
+    {
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = type, FunctionName = "Func1", Status = TickerStatus.Queued };
+        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
+        _persistence.TryMarkCronOccurrenceInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        var won = await _manager.TryClaimDueTicker(function, _now, CancellationToken.None);
+
+        Assert.False(won);
+        Assert.Equal(TickerStatus.Queued, function.Status);
+    }
+
+    [Fact]
+    public async Task TryClaimDueTicker_PassesTheCancellationTokenToTheProvider()
+    {
+        using var cts = new CancellationTokenSource();
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" };
+        _persistence.TryMarkTimeTickerInProgress(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
+
+        await _manager.TryClaimDueTicker(function, _now, cts.Token);
+
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, Arg.Any<DateTime>(), cts.Token);
+    }
+
+    // The caller chooses the marker before the call, so a claim whose call failed after its write landed can still be
+    // found and put back; the manager hands that very marker to the store.
+    [Fact]
+    public async Task TryClaimDueTicker_HandsTheCallersMarkerToTheStore()
+    {
+        var marker = _now.AddMilliseconds(7);
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1" };
+        _persistence.TryMarkTimeTickerInProgress(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(true);
+
+        Assert.True(await _manager.TryClaimDueTicker(function, marker));
+
+        await _persistence.Received(1).TryMarkTimeTickerInProgress(function.TickerId, marker, Arg.Any<CancellationToken>());
+    }
+
+    [Theory]
+    [InlineData(TickerType.TimeTicker)]
+    [InlineData(TickerType.CronTickerOccurrence)]
+    public async Task TryReleaseClaim_PutBack_MarksTheFunctionIdle(TickerType type)
+    {
+        var marker = _now;
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = type, FunctionName = "Func1", Status = TickerStatus.InProgress };
+        _persistence.TryReleaseTimeTickerClaim(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(type == TickerType.TimeTicker);
+        _persistence.TryReleaseCronOccurrenceClaim(function.TickerId, marker, Arg.Any<CancellationToken>()).Returns(type == TickerType.CronTickerOccurrence);
+
+        Assert.True(await _manager.TryReleaseClaim(function, marker));
+
+        Assert.Equal(TickerStatus.Idle, function.Status);
+    }
+
+    [Fact]
+    public async Task TryReleaseClaim_RowMovedOn_LeavesTheFunctionAlone()
+    {
+        var function = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "Func1", Status = TickerStatus.InProgress };
+        _persistence.TryReleaseTimeTickerClaim(Arg.Any<Guid>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        Assert.False(await _manager.TryReleaseClaim(function, _now));
+
+        Assert.Equal(TickerStatus.InProgress, function.Status);
+    }
+
+    // A store that says nothing about concurrent claims (a custom provider) is claimed one row at a time.
+    [Fact]
+    public async Task GetMaxConcurrentClaims_IsOne_ForAStoreThatDoesNotSay()
+    {
+        Assert.Equal(1, await _manager.GetMaxConcurrentClaims());
+    }
+
+    [Fact]
+    public async Task GetMaxConcurrentClaims_IsWhatTheStoreSays()
+    {
+        var persistence = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IClaimFanOut>();
+        ((IClaimFanOut)persistence).GetMaxConcurrentClaimsAsync(Arg.Any<CancellationToken>()).Returns(new ValueTask<int>(16));
+        var managerType = typeof(IInternalTickerManager).Assembly
+            .GetType("SharpTicker.Utilities.Managers.InternalTickerManager`2")!
+            .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker));
+        var manager = (IInternalTickerManager)Activator.CreateInstance(managerType,
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, [persistence, _clock, _notificationHub], null)!;
+
+        Assert.Equal(16, await manager.GetMaxConcurrentClaims());
+    }
+
+    [Fact]
+    public async Task NotifyInProgress_PicksTheNotificationByType()
+    {
+        var timeFunction = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, FunctionName = "TimeFunc" };
+        var cronFunction = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.CronTickerOccurrence, FunctionName = "CronFunc" };
+
+        await _manager.NotifyInProgress(timeFunction);
+        await _manager.NotifyInProgress(cronFunction);
+
+        await _notificationHub.Received(1).UpdateTimeTickerFromInternalFunctionContext<FakeTimeTicker>(timeFunction);
+        await _notificationHub.Received(1).UpdateCronOccurrenceFromInternalFunctionContext<FakeCronTicker>(cronFunction);
+        await _notificationHub.DidNotReceive().UpdateTimeTickerFromInternalFunctionContext<FakeTimeTicker>(cronFunction);
     }
 
     // ====================================================================
@@ -1066,6 +1098,175 @@ public class InternalTickerManagerTests
         Assert.Equal(childId, grandchildResult.ParentId);
     }
 
+    // A parent with a child that has no time of its own (which carries a delayed grandchild) and a delayed child.
+    private TimeTickerEntity ParentWithDelayedDescendants()
+        => new()
+        {
+            Id = Guid.NewGuid(),
+            Function = "ParentFunc",
+            ExecutionTime = _now.AddMinutes(-5),
+            RetryIntervals = [],
+            Children = new List<TimeTickerEntity>
+            {
+                new()
+                {
+                    Id = Guid.NewGuid(), Function = "ChildFunc", RetryIntervals = [],
+                    Children = new List<TimeTickerEntity>
+                    {
+                        new() { Id = Guid.NewGuid(), Function = "DelayedGrandchild", ExecutionTime = _now.AddHours(3), RetryIntervals = [] },
+                        new() { Id = Guid.NewGuid(), Function = "Grandchild", RetryIntervals = [] }
+                    }
+                },
+                new() { Id = Guid.NewGuid(), Function = "DelayedChild", ExecutionTime = _now.AddHours(2), RetryIntervals = [] }
+            }
+        };
+
+    // The handler leaves a delayed child to the store only when its context says so; a context that missed it would run
+    // the child inline as well as at its own time.
+    private static void AssertMarksTheDelayedOnes(InternalFunctionContext root, DateTime now)
+    {
+        Assert.False(root.IsDelayed);
+        var child = Assert.Single(root.TimeTickerChildren, x => x.FunctionName == "ChildFunc");
+        Assert.False(child.IsDelayed);
+        var delayedChild = Assert.Single(root.TimeTickerChildren, x => x.FunctionName == "DelayedChild");
+        Assert.True(delayedChild.IsDelayed);
+        Assert.Equal(now.AddHours(2), delayedChild.ExecutionTime);
+        Assert.True(Assert.Single(child.TimeTickerChildren, x => x.FunctionName == "DelayedGrandchild").IsDelayed);
+        Assert.False(Assert.Single(child.TimeTickerChildren, x => x.FunctionName == "Grandchild").IsDelayed);
+    }
+
+    [Fact]
+    public async Task RunTimedOutTickers_MarksDelayedChildrenAndGrandchildren()
+    {
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>())
+            .Returns(ToAsyncEnumerable(new[] { ParentWithDelayedDescendants() }));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+
+        var results = await _manager.RunTimedOutTickers(CancellationToken.None);
+
+        AssertMarksTheDelayedOnes(Assert.Single(results), _now);
+    }
+
+    [Fact]
+    public async Task GetNextTickers_MarksDelayedChildrenAndGrandchildren()
+    {
+        var parent = ParentWithDelayedDescendants();
+        parent.ExecutionTime = _now.AddMinutes(5);
+        _persistence.GetEarliestTimeTickers(Arg.Any<CancellationToken>()).Returns(Task.FromResult(new[] { parent }));
+        _persistence.QueueTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(new[] { parent }));
+
+        var (_, functions) = await _manager.GetNextTickers(CancellationToken.None);
+
+        AssertMarksTheDelayedOnes(Assert.Single(functions), _now);
+    }
+
+    private IInternalTickerManager ManagerOver(ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker> persistence)
+        => (IInternalTickerManager)Activator.CreateInstance(
+            typeof(IInternalTickerManager).Assembly
+                .GetType("SharpTicker.Utilities.Managers.InternalTickerManager`2")!
+                .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker)),
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+            binder: null,
+            args: new object[] { persistence, _clock, _notificationHub },
+            culture: null)!;
+
+    private static InternalFunctionContext[] ChildrenToSkip(params Guid[] ids)
+        => ids.Select(id => new InternalFunctionContext { TickerId = id, Type = TickerType.TimeTicker }).ToArray();
+
+    // A store that can skip only the rows that have not started gets that write, so a delayed child it already ran keeps
+    // the status of its run.
+    [Fact]
+    public async Task SkippingChildren_UsesTheStoresNotStartedWrite_WhenItHasOne()
+    {
+        var persistence = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IChildSkipWriter>();
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid() };
+
+        await ManagerOver(persistence).UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+
+        await ((IChildSkipWriter)persistence).Received(1).SkipNotStartedTimeTickersAsync(
+            Arg.Is<Guid[]>(x => x.SequenceEqual(ids)),
+            Arg.Is<InternalFunctionContext>(c => c.Status == TickerStatus.Skipped && c.ExceptionDetails == ChainRunGate.NotMatchedReason),
+            Arg.Any<CancellationToken>());
+        await persistence.DidNotReceiveWithAnyArgs().UpdateTimeTickersWithUnifiedContext(default!, default!, default);
+    }
+
+    // A custom store keeps the write it had.
+    [Fact]
+    public async Task SkippingChildren_UsesTheUnifiedWrite_OnAStoreWithoutTheNotStartedOne()
+    {
+        var ids = new[] { Guid.NewGuid() };
+
+        await _manager.UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+
+        await _persistence.Received(1).UpdateTimeTickersWithUnifiedContext(
+            Arg.Is<Guid[]>(x => x.SequenceEqual(ids)), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
+    }
+
+    // Run-now and the hand-off after a parent build their contexts with one builder.
+    [Fact]
+    public void RunNowContexts_MarkDelayedChildrenAndGrandchildren()
+    {
+        var build = typeof(IInternalTickerManager).Assembly
+            .GetType("SharpTicker.Utilities.Managers.ClaimedTimeTickerContexts")!
+            .GetMethod("Build", BindingFlags.NonPublic | BindingFlags.Static, [typeof(IEnumerable<TimeTickerEntity>)])!;
+
+        var contexts = (InternalFunctionContext[])build.Invoke(null, [new TimeTickerEntity[] { ParentWithDelayedDescendants() }])!;
+
+        AssertMarksTheDelayedOnes(Assert.Single(contexts), _now);
+    }
+
+    // The hand-off claims through run-now's store call; each row comes back with the marker its claim wrote, and the
+    // dashboard is told.
+    [Fact]
+    public async Task AcquireDelayedChildren_ReturnsTheClaimedRows_WithTheirMarkers()
+    {
+        var row = ParentWithDelayedDescendants();
+        row.UpdatedAt = _now.AddMilliseconds(7);
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns(new TimeTickerEntity[] { row });
+
+        var contexts = await _manager.AcquireDelayedChildrenAsync([row.Id], CancellationToken.None);
+
+        var context = Assert.Single(contexts);
+        Assert.Equal(row.Id, context.TickerId);
+        Assert.Equal(_now.AddMilliseconds(7), context.ClaimMarker);
+        AssertMarksTheDelayedOnes(context, _now);
+        await _persistence.Received(1).AcquireImmediateTimeTickersAsync(Arg.Is<Guid[]>(x => x.SequenceEqual(new[] { row.Id })), Arg.Any<CancellationToken>());
+        await _notificationHub.Received(1).UpdateTimeTickerNotifyAsync(row);
+    }
+
+    // A failed claim is logged and returns nothing to run; the fallback runs the rows.
+    [Fact]
+    public async Task AcquireDelayedChildren_ReturnsNothing_WhenTheClaimFails()
+    {
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw new InvalidOperationException("store failed"));
+
+        Assert.Empty(await _manager.AcquireDelayedChildrenAsync([Guid.NewGuid()], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcquireDelayedChildren_IsCancelledWithItsToken()
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(call => throw new OperationCanceledException((CancellationToken)call[1]));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _manager.AcquireDelayedChildrenAsync([Guid.NewGuid()], cancelled.Token));
+    }
+
+    // A dashboard that cannot be told must not drop a row the claim already took.
+    [Fact]
+    public async Task AcquireDelayedChildren_KeepsTheClaimedRows_WhenTheDashboardCannotBeTold()
+    {
+        var row = ParentWithDelayedDescendants();
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns(new TimeTickerEntity[] { row });
+        _notificationHub.UpdateTimeTickerNotifyAsync(Arg.Any<object>()).Returns<Task>(_ => throw new InvalidOperationException("hub down"));
+
+        Assert.Equal(row.Id, Assert.Single(await _manager.AcquireDelayedChildrenAsync([row.Id], CancellationToken.None)).TickerId);
+    }
+
     [Fact]
     public async Task RunTimedOutTickers_NotifiesHub_ForTimeTickers()
     {
@@ -1087,6 +1288,85 @@ public class InternalTickerManagerTests
         await _manager.RunTimedOutTickers(CancellationToken.None);
 
         await _notificationHub.Received(1).UpdateTimeTickerNotifyAsync(timedOutTimeTicker);
+    }
+
+    private static TimeTickerEntity TimedOut(string function = "Func") => new()
+    {
+        Id = Guid.NewGuid(), Function = function, ExecutionTime = new DateTime(2025, 6, 15, 11, 59, 0, DateTimeKind.Utc),
+        RetryIntervals = Array.Empty<int>(), Children = new List<TimeTickerEntity>()
+    };
+
+    private static async IAsyncEnumerable<T> YieldThenThrow<T>(IEnumerable<T> items, Exception failure)
+    {
+        foreach (var item in items)
+        {
+            await Task.Yield();
+            yield return item;
+        }
+        throw failure;
+    }
+
+    // The fallback's store call fails after it claimed some rows (the connection drops in the middle). Those rows are
+    // InProgress for this node; they come back with the failure so the fallback can run them, instead of staying InProgress.
+    [Fact]
+    public async Task RunTimedOutTickers_StoreFailsAfterSomeRowsWereClaimed_HandsBackTheClaimedRowsWithTheFailure()
+    {
+        var claimed = TimedOut();
+        var failure = new InvalidOperationException("the connection dropped");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(YieldThenThrow(new[] { claimed }, failure));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+
+        var interrupted = await Assert.ThrowsAsync<ClaimsInterruptedException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, interrupted.InnerException);
+        var context = Assert.Single(interrupted.Claimed);
+        Assert.Equal(claimed.Id, context.TickerId);
+        Assert.Equal(claimed.UpdatedAt, context.ClaimMarker);
+    }
+
+    [Fact]
+    public async Task RunTimedOutTickers_CronStoreFailsAfterTimeTickersWereClaimed_HandsBackTheTimeTickers()
+    {
+        var claimed = TimedOut();
+        var failure = new InvalidOperationException("the connection dropped");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(new[] { claimed }));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(YieldThenThrow(Array.Empty<CronTickerOccurrenceEntity<FakeCronTicker>>(), failure));
+
+        var interrupted = await Assert.ThrowsAsync<ClaimsInterruptedException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, interrupted.InnerException);
+        Assert.Equal(claimed.Id, Assert.Single(interrupted.Claimed).TickerId);
+    }
+
+    // Nothing was claimed yet: the failure is the store's own, as before.
+    [Fact]
+    public async Task RunTimedOutTickers_StoreFailsBeforeAnyClaim_ThrowsTheStoresException()
+    {
+        var failure = new InvalidOperationException("the store is down");
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(YieldThenThrow(Array.Empty<TimeTickerEntity>(), failure));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Same(failure, thrown);
+    }
+
+    // The dashboard notification does not decide the job: a hub that fails must not lose the rows that were claimed, nor
+    // end the pass after one row.
+    [Fact]
+    public async Task RunTimedOutTickers_DashboardNotificationFails_EveryClaimedRowIsStillReturned()
+    {
+        var rows = new[] { TimedOut(), TimedOut() };
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(rows));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+        _notificationHub.UpdateTimeTickerNotifyAsync(Arg.Any<object>())
+            .Returns(Task.FromException(new InvalidOperationException("the hub is down")));
+
+        var results = await _manager.RunTimedOutTickers(CancellationToken.None);
+
+        Assert.Equal(rows.Select(x => x.Id), results.Select(x => x.TickerId));
     }
 
     [Fact]
@@ -1160,5 +1440,38 @@ public class InternalTickerManagerTests
 
         Assert.Equal("the store refused", failure.Message);
         await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// The release of what an earlier run of this node left locked goes to the fenced overloads with the moment this run
+    /// started, never to the unfenced ones, which would also release the rows this run has claimed since.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseEarlierRunResources_UsesTheFencedReleasesWithTheStartOfThisRun()
+    {
+        var start = _now.AddMinutes(-3);
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        await _manager.ReleaseEarlierRunResources("node-a", start);
+
+        await _persistence.Received(1).ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>());
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().ReleaseDeadNodeOccurrenceResources(Arg.Any<string>(), Arg.Any<CancellationToken>());
+        await _persistence.DidNotReceive().ReleaseDeadNodeTimeTickerResources(Arg.Any<string>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ReleaseEarlierRunResources_StillReleasesTheTimeTickers_WhenReleasingTheOccurrencesFails()
+    {
+        var start = _now.AddMinutes(-3);
+        _persistence.ReleaseDeadNodeOccurrenceResources("node-a", start, Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromException(new InvalidOperationException("the store refused")));
+        _persistence.ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => _manager.ReleaseEarlierRunResources("node-a", start));
+
+        Assert.Equal("the store refused", failure.Message);
+        await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>());
     }
 }

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Exceptions;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Exceptions;
@@ -37,13 +38,22 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         _internalTickerManager = internalTickerManager;
     }
 
-    public async Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
+    public Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
+        => ExecuteTaskAsync(context, isDue, isChild: false, cancellationToken);
+
+    private async Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, bool isChild, CancellationToken cancellationToken)
     {
         if (context.Type == TickerType.CronTickerOccurrence)
         {
             await RunContextFunctionAsync(context, isDue, cancellationToken);
             return;
         }
+
+        // A chain child without a time of its own runs inside its parent's run and was never claimed: its row is recorded
+        // InProgress here, before it starts and before its InProgress delayed children are handed off (the store lets them
+        // run once this row is InProgress).
+        if (isChild)
+            await RecordChildInProgressAsync(context, cancellationToken);
 
         var childCount = context.TimeTickerChildren.Count;
         var childrenToRunAfter = new InternalFunctionContext[childCount];
@@ -53,9 +63,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         var tasksToRunNowCount = 0;
 
         var hasChildren = context.TimeTickerChildren.Count > 0;
+        List<InternalFunctionContext> delayedChildren = null;
 
         // Add parent task
-        tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken);
+        tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken, isChild);
 
         if (hasChildren)
         {
@@ -63,7 +74,15 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             for (var i = 0; i < context.TimeTickerChildren.Count; i++)
             {
                 var child = context.TimeTickerChildren[i];
-                
+
+                // A delayed child is a row of its own: the store hands it out once this parent has ended and its time
+                // has come. Running it here as well would run it twice.
+                if (child.IsDelayed)
+                {
+                    (delayedChildren ??= []).Add(child);
+                    continue;
+                }
+
                 if (child.CachedDelegate != null)
                 {
                     if (child.RunCondition == RunCondition.InProgress)
@@ -76,21 +95,33 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             }
         }
         
+        // An InProgress delayed child may run once its parent has started, which it has: its row was claimed InProgress
+        // before it was handed here.
+        if (delayedChildren != null)
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => c.RunCondition == RunCondition.InProgress), cancellationToken);
+
         // Wait for concurrent tasks (parent + InProgress children)
         await Task.WhenAll(tasksToRunNow.AsSpan(0, tasksToRunNowCount).ToArray());
 
+        // The parent's outcome is written, so the store now hands out the delayed children it lets run. The InProgress ones
+        // again too: the claim at the start finds a closed gate when the parent was not recorded InProgress, and a row
+        // already claimed is simply not claimed twice. Handed off before anything below that can take long or throw, so a
+        // child that is due is not held back by its siblings.
+        if (delayedChildren != null && ChainRunGate.IsFinal(context.Status))
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, context.Status)), cancellationToken);
+
         // Process deferred children after parent completion
-        if (childrenToRunAfterCount > 0)
+        if (childrenToRunAfterCount > 0 || delayedChildren != null)
         {
             var childrenToSkip = new List<InternalFunctionContext>(30); // Pre-sized for performance
             var childrenToRunAfterTask = new Task[childrenToRunAfterCount];
-            
+
             var taskCount = 0;
-            
+
             for (var i = 0; i < childrenToRunAfterCount; i++)
             {
                 var child = childrenToRunAfter[i];
-                
+
                 if (child.CachedDelegate != null)
                 {
                     if (ShouldRunChild(child, context.Status))
@@ -99,17 +130,19 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                     }
                     else
                     {
-                        _sharpTickerInstrumentation.LogJobSkipped(
-                            child.TickerId,
-                            child.FunctionName,
-                            $"Condition {child.RunCondition} not met (Parent status: {context.Status})"
-                        );
-                        child.ParentId = context.TickerId;
-                        childrenToSkip.Add(child);
-
-                        // Recursively gather all descendants to skip
-                        GatherDescendantsToSkip(child, childrenToSkip);
+                        SkipWithDescendants(child, context, childrenToSkip);
                     }
+                }
+            }
+
+            // A delayed child the parent's outcome lets run is left to the store; one it does not let run never will, as
+            // a finished status does not change, so it is skipped now with what it carries.
+            if (delayedChildren != null)
+            {
+                foreach (var child in delayedChildren)
+                {
+                    if (!ShouldRunChild(child, context.Status))
+                        SkipWithDescendants(child, context, childrenToSkip);
                 }
             }
 
@@ -117,11 +150,98 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             if (childrenToSkip.Count > 0)
                 await _internalTickerManager.UpdateSkipTimeTickersWithUnifiedContextAsync(
                     childrenToSkip.ToArray(), cancellationToken);
-            
+
             // Wait for deferred tasks
             if (taskCount > 0)
                 await Task.WhenAll(childrenToRunAfterTask.AsSpan(0, taskCount).ToArray());
         }
+    }
+
+    // A delayed child whose time has come is claimed and started now, instead of waiting for the next fallback pass; one due
+    // later wakes the scheduler loop, which did not plan it while it waited for its parent. Never before its own time: the
+    // claim does not look at the time. Best effort: the fallback still runs what this misses, so nothing here fails the run.
+    private async Task HandOffDelayedChildrenAsync(IEnumerable<InternalFunctionContext> children, CancellationToken cancellationToken)
+    {
+        var now = _clock.UtcNow;
+        List<Guid> due = null;
+        DateTime? nextTime = null;
+        foreach (var child in children)
+        {
+            if (child.ExecutionTime <= now)
+                (due ??= []).Add(child.TickerId);
+            else if (nextTime == null || child.ExecutionTime < nextTime)
+                nextTime = child.ExecutionTime;
+        }
+
+        if (nextTime != null)
+        {
+            try
+            {
+                HostScheduler?.RestartIfNeeded(nextTime);
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Waking the scheduler for a delayed chain child due at {ExecutionTime} failed; the fallback runs it.", nextTime);
+            }
+        }
+
+        // Without a running dispatcher (background services off) a claimed row would never start.
+        var dispatcher = due == null ? null : Dispatcher;
+        if (dispatcher is not { IsEnabled: true })
+            return;
+
+        InternalFunctionContext[] claimed;
+        try
+        {
+            claimed = await _internalTickerManager.AcquireDelayedChildrenAsync(due.ToArray(), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Claiming delayed chain children was cancelled; the fallback runs them.");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} failed; the fallback runs them.", string.Join(", ", due));
+            return;
+        }
+
+        if (claimed.Length == 0)
+            return;
+
+        try
+        {
+            await dispatcher.DispatchAsync(claimed, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The claimed-work queue does not fail a dispatch, so this is not expected; but the rows are InProgress for this
+            // node now, and the fallback does not take them.
+            Logger?.LogError(ex, "Delayed chain children {TickerIds} were claimed but could not be dispatched. They stay InProgress until the store releases the rows of this node.",
+                string.Join(", ", claimed.Select(c => c.TickerId)));
+        }
+    }
+
+    // Resolved on first use: the dispatcher and the scheduler service depend on this handler.
+    private ISharpTickerDispatcher Dispatcher => _dispatcher ??= _serviceProvider.GetService<ISharpTickerDispatcher>();
+    private ISharpTickerHostScheduler HostScheduler => _hostScheduler ??= _serviceProvider.GetService<ISharpTickerHostScheduler>();
+    private ILogger Logger => _logger ??= _serviceProvider.GetService<ILoggerFactory>()?.CreateLogger<TickerExecutionTaskHandler>();
+    private ISharpTickerDispatcher _dispatcher;
+    private ISharpTickerHostScheduler _hostScheduler;
+    private ILogger _logger;
+
+    private void SkipWithDescendants(InternalFunctionContext child, InternalFunctionContext parent, List<InternalFunctionContext> childrenToSkip)
+    {
+        _sharpTickerInstrumentation.LogJobSkipped(
+            child.TickerId,
+            child.FunctionName,
+            $"Condition {child.RunCondition} not met (Parent status: {parent.Status})"
+        );
+        child.ParentId = parent.TickerId;
+        childrenToSkip.Add(child);
+
+        // Recursively gather all descendants to skip
+        GatherDescendantsToSkip(child, childrenToSkip);
     }
 
     /// <summary>
@@ -150,9 +270,6 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         _sharpTickerInstrumentation.LogJobEnqueued(typeName, context.FunctionName, context.TickerId, "ExecutionTaskHandler");
         
         context.SetProperty(x => x.Status, TickerStatus.InProgress);
-
-        if (isChild)
-            await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
 
         var stopWatch = new Stopwatch();
         // Total wall-clock from first attempt start through the final outcome,
@@ -406,20 +523,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }, SharpTickerInternalJsonContext.Default.ExceptionDetailClassForSerialization);
     }
 
+    // The same rule the stores apply to a delayed child, so a child runs on the same parent outcomes either way. A child
+    // that is not delayed and runs while its parent is InProgress was started with the parent and never comes here.
     private static bool ShouldRunChild(InternalFunctionContext childContext, TickerStatus parentStatus)
-    {
-        return childContext.RunCondition switch
-        {
-            RunCondition.InProgress => parentStatus == TickerStatus.InProgress,
-            RunCondition.OnSuccess => parentStatus is TickerStatus.Done or TickerStatus.DueDone,
-            RunCondition.OnFailure => parentStatus == TickerStatus.Failed,
-            RunCondition.OnCancelled => parentStatus == TickerStatus.Cancelled,
-            RunCondition.OnFailureOrCancelled => parentStatus is TickerStatus.Failed or TickerStatus.Cancelled,
-            RunCondition.OnAnyCompletedStatus => parentStatus is TickerStatus.Done or TickerStatus.DueDone
-                or TickerStatus.Failed or TickerStatus.Cancelled,
-            _ => false
-        };
-    }
+        => ChainRunGate.Allows(childContext.RunCondition, parentStatus);
 
     private static void GatherDescendantsToSkip(InternalFunctionContext parent, List<InternalFunctionContext> skipList)
     {
@@ -435,11 +542,35 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
     }
 
+    // The status is for the dashboard and the chain gate; a failed write must not stop the child, which nothing else would
+    // ever run, nor the rest of the chain. Its final status is written as usual.
+    private async Task RecordChildInProgressAsync(InternalFunctionContext child, CancellationToken cancellationToken)
+    {
+        child.SetProperty(x => x.Status, TickerStatus.InProgress);
+        try
+        {
+            await _internalTickerManager.UpdateTickerAsync(child, cancellationToken);
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Recording chain child {FunctionName} ({TickerId}) as InProgress was cancelled.", child.FunctionName, child.TickerId);
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway.",
+                child.FunctionName, child.TickerId);
+        }
+        finally
+        {
+            child.ResetUpdateProps();
+        }
+    }
+
     private Task SafeRecursiveExecution(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
     {
         try
         {
-            return ExecuteTaskAsync(context, isDue, cancellationToken);
+            return ExecuteTaskAsync(context, isDue, isChild: true, cancellationToken);
         }
         catch
         {

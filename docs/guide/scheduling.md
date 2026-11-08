@@ -141,6 +141,30 @@ A chain has up to five children per parent and up to five grandchildren per chil
 | `OnAnyCompletedStatus` | finished in any way except being skipped |
 | `InProgress` | starts; the child runs in parallel with it |
 
+A child stored without a condition runs as `OnAnyCompletedStatus`. A skipped parent runs none of its children, and a child that does not run is recorded as `Skipped` together with everything below it.
+
+When the application stops while a parent runs, the parent is recorded as `Cancelled`. Its `OnCancelled`, `OnFailureOrCancelled` and `OnAnyCompletedStatus` children then run, and its `OnSuccess` children are skipped. A deploy can therefore start the chains you set up for cancellations.
+
+### Delayed children
+
+A child or grandchild can have an execution time of its own (`SetExecutionTime` on the child or grandchild builder). Such a **delayed child** follows the same rules as any other child, and in addition does not start before its own time:
+
+- It runs only when its parent has ended with a status its `RunCondition` accepts, and never before its own execution time. If that time has already passed when the parent ends, it runs right after the parent.
+- When the parent ends with a status its condition does not accept, it is skipped with everything below it.
+- An `InProgress` delayed child runs at its time once its parent has started, whatever the parent's outcome. It is skipped only when the parent was skipped.
+- A delayed grandchild depends on its own parent (the child), not on the root of the chain.
+- It runs once, on one node, also with several nodes and across restarts. A child that has already started keeps the status of its own run.
+
+Pass the child's time in UTC.
+
+When a parent ends, the node that ran it at once starts the delayed children that may run and whose time has come, and wakes its scheduler for the next one due later. An `InProgress` delayed child is handled the same way when its parent starts. If that node stops before this, for example when the application stops while the parent runs, the fallback starts them after the restart, up to `FallbackIntervalChecker` later. A delayed child started right after its parent ends as `Done`, one started by the fallback as `DueDone`; a `RunCondition` treats both as success.
+
+A child without a time of its own runs inside its parent's run and is recorded as `InProgress` while it runs, so an `InProgress` delayed grandchild below it can start as soon as that child starts. Known limit: if the node stops while such a child runs after its parent has ended, the child stays `InProgress` and is not run again. In the dashboard, cancel it; when the cancel is refused because no node runs it, use Force delete.
+
+Store support: EF Core, MongoDB, Redis and the in-memory store behave as described. On Redis, each child is a record of its own. A chain that Redis stored with an older version keeps its children inside the parent's record and runs as before: a delayed child of such a chain runs right after its parent, by its `RunCondition`, and its own time is ignored. The dashboard does not show the results of such children, and such a child cannot be deleted on its own (delete the chain). On Redis, the scheduler looks past at most 1024 delayed children that wait for their parent and are due before other jobs; with more of them, those other jobs are started by the fallback, up to `FallbackIntervalChecker` late.
+
+Upgrade all nodes together, and do not roll back once chains have been added. A node on an older version hands out delayed children without waiting for their parent; on Redis it does not read the new child records and runs only the parent of a newer chain, never its children. On EF Core and MongoDB, delayed children stored before the upgrade follow these rules from then on: one whose parent has not ended waits for it, and one whose parent has already ended with a status its condition does not accept is recorded as `Skipped` once its time has passed.
+
 ## Seeding
 
 A seeder is code that creates tickers when the application starts. Register it on the options builder:

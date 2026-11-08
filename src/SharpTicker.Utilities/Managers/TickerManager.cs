@@ -1,4 +1,5 @@
-﻿using NCrontab;
+﻿using Microsoft.Extensions.Logging;
+using NCrontab;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -26,6 +27,8 @@ namespace SharpTicker.Utilities.Managers
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
         private readonly ISharpTickerDispatcher _dispatcher;
         private readonly TickerExecutionContext _executionContext;
+        private readonly ILogger _logger;
+
         public TickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
             ISharpTickerHostScheduler sharpTickerHostScheduler,
@@ -34,13 +37,50 @@ namespace SharpTicker.Utilities.Managers
             TickerExecutionContext executionContext,
             ISharpTickerDispatcher dispatcher
             )
+            : this(persistenceProvider, sharpTickerHostScheduler, clock, notificationHubSender, executionContext, dispatcher, null)
         {
+        }
+
+        public TickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ISharpTickerHostScheduler sharpTickerHostScheduler,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            TickerExecutionContext executionContext,
+            ISharpTickerDispatcher dispatcher,
+            ILogger<TickerManager<TTimeTicker, TCronTicker>> logger
+            )
+        {
+            _logger = logger;
             _persistenceProvider = persistenceProvider;
             _sharpTickerHostScheduler = sharpTickerHostScheduler ?? throw new ArgumentNullException(nameof(sharpTickerHostScheduler));
             _clock = clock;
             _notificationHubSender = notificationHubSender;
             _executionContext = executionContext ?? throw new ArgumentNullException(nameof(executionContext));
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        }
+
+        // Claims stored tickers to run them now. The tickers are stored whatever happens here: what the store claimed before
+        // it failed it has put back, and the fallback runs them. So a failure of the claim does not fail the add (a caller
+        // that retried would add the tickers twice); it is logged, and nothing is run now.
+        private async Task<TimeTickerEntity[]> AcquireForRunNowAsync(Guid[] ids, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await _persistenceProvider.AcquireImmediateTimeTickersAsync(ids, cancellationToken).ConfigureAwait(false);
+            }
+            catch (ClaimPutBackFailedException ex)
+            {
+                _logger?.LogError(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed and some of the rows it claimed could not be put back. " +
+                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                return [];
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed. They run when the fallback picks them up.",
+                    string.Join(", ", ids));
+                return [];
+            }
         }
 
         Task<TickerResult<TCronTicker>> ICronTickerManager<TCronTicker>.AddAsync(TCronTicker entity, CancellationToken cancellationToken)
@@ -140,14 +180,11 @@ namespace SharpTicker.Utilities.Managers
                 if (_dispatcher.IsEnabled && executionTime <= now.AddSeconds(1))
                 {
                     // Acquire and mark InProgress in one provider call
-                    var acquired = await _persistenceProvider
-                        .AcquireImmediateTimeTickersAsync([entity.Id], cancellationToken)
-                        .ConfigureAwait(false);
+                    var acquired = await AcquireForRunNowAsync([entity.Id], cancellationToken).ConfigureAwait(false);
 
                     if (acquired.Length > 0)
                     {
-                        var contexts = BuildImmediateContextsFromNonGeneric(acquired);
-                        CacheFunctionReferences(contexts.AsSpan());
+                        var contexts = ClaimedTimeTickerContexts.Build(acquired);
                         await _dispatcher.DispatchAsync(contexts, cancellationToken).ConfigureAwait(false);
                     }
                 }
@@ -320,47 +357,6 @@ namespace SharpTicker.Utilities.Managers
             };
         }
 
-        // Batch operations implementation
-        private static void CacheFunctionReferences(Span<InternalFunctionContext> functions)
-        {
-            for (var i = 0; i < functions.Length; i++)
-            {
-                ref var context = ref functions[i];
-                if (TickerFunctionProvider.TickerFunctions.TryGetValue(context.FunctionName, out var tickerItem))
-                {
-                    context.CachedDelegate = tickerItem.Delegate;
-                    context.CachedPriority = tickerItem.Priority;
-                    context.CachedMaxConcurrency = tickerItem.MaxConcurrency;
-                }
-
-                if (context.TimeTickerChildren is { Count: > 0 })
-                {
-                    var childrenSpan = CollectionsMarshal.AsSpan(context.TimeTickerChildren);
-                    CacheFunctionReferences(childrenSpan);
-                }
-            }
-        }
-
-        private static InternalFunctionContext[] BuildImmediateContextsFromNonGeneric(IEnumerable<TimeTickerEntity> tickers)
-        {
-            return tickers.Select(BuildContextFromNonGeneric).ToArray();
-        }
-
-        private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker)
-        {
-            return new InternalFunctionContext
-            {
-                FunctionName = ticker.Function,
-                TickerId = ticker.Id,
-                Type = Enums.TickerType.TimeTicker,
-                Retries = ticker.Retries,
-                RetryIntervals = ticker.RetryIntervals,
-                ParentId = ticker.ParentId,
-                ExecutionTime = ticker.ExecutionTime ?? DateTime.UtcNow,
-                RunCondition = ticker.RunCondition ?? Enums.RunCondition.OnAnyCompletedStatus,
-                TimeTickerChildren = ticker.Children.Select(BuildContextFromNonGeneric).ToList()
-            };
-        }
 
         private async Task<TickerResult<List<TTimeTicker>>> AddTimeTickersBatchAsync(List<TTimeTicker> entities, CancellationToken cancellationToken = default)
         {
@@ -405,14 +401,11 @@ namespace SharpTicker.Utilities.Managers
                 // Only try to dispatch immediately if dispatcher is enabled (background services running)
                 if (_dispatcher.IsEnabled && immediateTickers.Count > 0)
                 {
-                    var acquired = await _persistenceProvider
-                        .AcquireImmediateTimeTickersAsync(immediateTickers.ToArray(), cancellationToken)
-                        .ConfigureAwait(false);
+                    var acquired = await AcquireForRunNowAsync(immediateTickers.ToArray(), cancellationToken).ConfigureAwait(false);
 
                     if (acquired.Length > 0)
                     {
-                        var contexts = BuildImmediateContextsFromNonGeneric(acquired);
-                        CacheFunctionReferences(contexts.AsSpan());
+                        var contexts = ClaimedTimeTickerContexts.Build(acquired);
                         await _dispatcher.DispatchAsync(contexts, cancellationToken).ConfigureAwait(false);
                     }
                 }

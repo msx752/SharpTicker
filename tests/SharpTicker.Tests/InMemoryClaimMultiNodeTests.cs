@@ -1,0 +1,702 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using SharpTicker.Provider;
+using SharpTicker.Utilities;
+using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Interfaces;
+using SharpTicker.Utilities.Models;
+using Xunit;
+
+namespace SharpTicker.Tests;
+
+/// <summary>
+/// Two provider instances (separate NodeIdentifier) over the one process-wide in-memory store and a fake clock,
+/// driving the fenced Queued to InProgress claim and the fallback claim the way two nodes would.
+/// </summary>
+[Collection(SharedStaticStateCollection.Name)]
+public class InMemoryClaimMultiNodeTests : IAsyncLifetime
+{
+    private static readonly DateTime T0 = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+    private sealed class FakeClock(DateTime start) : ITickerClock
+    {
+        public DateTime UtcNow { get; set; } = start;
+
+        public void Advance(TimeSpan by) => UtcNow += by;
+    }
+
+    private readonly FakeClock _clock = new(T0);
+    private readonly List<Guid> _timeTickerIds = [];
+    private readonly List<Guid> _occurrenceIds = [];
+
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // The in-memory store is process-wide, so every row a test made is removed again.
+    public async Task DisposeAsync()
+    {
+        var node = CreateProvider("cleanup");
+        await node.RemoveTimeTickers(_timeTickerIds.ToArray(), CancellationToken.None);
+        await node.RemoveCronTickerOccurrences(_occurrenceIds.ToArray(), CancellationToken.None);
+    }
+
+    private TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, FakeClock? clock = null)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ITickerClock>(clock ?? _clock);
+        services.AddSingleton(new SchedulerOptionsBuilder { NodeIdentifier = nodeIdentifier });
+        return new TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity>(services.BuildServiceProvider());
+    }
+
+    private static InternalFunctionContext StatusContext(TickerStatus status)
+        => new InternalFunctionContext().SetProperty(x => x.Status, status);
+
+    private static async Task<List<T>> Drain<T>(IAsyncEnumerable<T> source)
+    {
+        var list = new List<T>();
+        await foreach (var item in source)
+            list.Add(item);
+        return list;
+    }
+
+    private async Task<Guid> SeedTimeTicker()
+    {
+        var ticker = new TimeTickerEntity
+        {
+            Id = Guid.NewGuid(),
+            Function = "claim-fn",
+            ExecutionTime = T0,
+            Status = TickerStatus.Idle,
+            CreatedAt = T0.AddHours(-2),
+            UpdatedAt = T0.AddHours(-1),
+            Request = []
+        };
+        _timeTickerIds.Add(ticker.Id);
+        await CreateProvider("seed").AddTimeTickers([ticker], CancellationToken.None);
+        return ticker.Id;
+    }
+
+    private async Task<Guid> QueueTimeTickerOn(TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+    {
+        var id = await SeedTimeTicker();
+        var window = await node.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(await Drain(node.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
+        return id;
+    }
+
+    private async Task<Guid> QueueOccurrenceOn(TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+    {
+        var slot = (T0, new[] { new InternalManagerContext(Guid.NewGuid()) { FunctionName = "claim-cron-fn", Expression = "* * * * *" } });
+        var id = Assert.Single(await Drain(node.QueueCronTickerOccurrences(slot, CancellationToken.None))).Id;
+        _occurrenceIds.Add(id);
+        return id;
+    }
+
+    private static async Task<CronTickerOccurrenceEntity<CronTickerEntity>> Occurrence(
+        TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> provider, Guid id)
+        => (await provider.GetAllCronTickerOccurrences(x => x.Id == id, CancellationToken.None)).Single();
+
+    public static TheoryData<TickerStatus> NonQueuedStatuses => new()
+    {
+        TickerStatus.Idle, TickerStatus.InProgress, TickerStatus.Done, TickerStatus.DueDone,
+        TickerStatus.Failed, TickerStatus.Cancelled, TickerStatus.Skipped
+    };
+
+    // The in-memory provider has no hook between two row writes, so the token is cancelled before the call: the loop
+    // must end without writing and the rows must stay Idle. The mid-batch case is covered on the other providers.
+    [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker() };
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var acquired = await node.AcquireImmediateTimeTickersAsync(ids, cts.Token);
+
+        Assert.Empty(acquired);
+        foreach (var id in ids)
+        {
+            var row = await node.GetTimeTickerById(id, CancellationToken.None);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_CancelledBeforeTheCall_ReturnsNothingAndLeavesTheRowsIdle_CronOccurrence()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(node), await QueueOccurrenceOn(node) };
+        await node.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Empty(acquired);
+        foreach (var id in ids)
+        {
+            var row = await Occurrence(node, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
+    public async Task TryMark_OwnQueuedRow_ReturnsTrueAndWritesInProgress_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromMilliseconds(300));
+
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
+
+        var row = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task TryMark_OwnQueuedRow_ReturnsTrueAndWritesInProgress_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromMilliseconds(300));
+
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
+
+        var row = await Occurrence(nodeA, id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
+
+        var after = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal("node-B", after.LockHolder);
+        Assert.Equal(before.Status, after.Status);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task TryMark_RowClaimedByFallbackOfAnotherNode_ReturnsFalseAndLeavesRow_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var before = await Occurrence(nodeA, id);
+
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
+
+        var after = await Occurrence(nodeA, id);
+        Assert.Equal("node-B", after.LockHolder);
+        Assert.Equal(before.Status, after.Status);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    // The status clause alone cannot tell these apart: the row is Queued again, but for another node.
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueTimeTickerOn(nodeA);
+        await nodeA.ReleaseAcquiredTimeTickers([id], CancellationToken.None);
+        var window = await nodeB.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
+        var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
+
+        var untouched = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
+        Assert.Equal(TickerStatus.InProgress, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task TryMark_RowRequeuedByAnotherNode_ReturnsFalseUntilItsHolderMarks_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var cronId = Guid.NewGuid();
+        var slot = (T0, new[] { new InternalManagerContext(cronId) { FunctionName = "claim-cron-fn", Expression = "* * * * *" } });
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(slot, CancellationToken.None))).Id;
+        _occurrenceIds.Add(id);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        slot.Item2[0].NextCronOccurrence = new NextCronOccurrence(id, T0);
+        Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(slot, CancellationToken.None)));
+        var before = await Occurrence(nodeA, id);
+
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
+
+        var untouched = await Occurrence(nodeA, id);
+        Assert.Equal(TickerStatus.Queued, untouched.Status);
+        Assert.Equal("node-B", untouched.LockHolder);
+        Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
+        Assert.Equal(TickerStatus.InProgress, (await Occurrence(nodeA, id)).Status);
+    }
+
+    // Finished rows keep the lock holder, so even the owning node must not move them back to InProgress.
+    [Theory]
+    [MemberData(nameof(NonQueuedStatuses))]
+    public async Task TryMark_RowInStatus_ReturnsFalse_TimeTicker(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        await nodeA.UpdateTimeTickersWithUnifiedContext([id], StatusContext(status), CancellationToken.None);
+        var before = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
+
+        var after = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(status, after.Status);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    [Theory]
+    [MemberData(nameof(NonQueuedStatuses))]
+    public async Task TryMark_RowInStatus_ReturnsFalse_CronOccurrence(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        await nodeA.UpdateCronTickerOccurrencesWithUnifiedContext([id], StatusContext(status), CancellationToken.None);
+        var before = await Occurrence(nodeA, id);
+
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
+
+        var after = await Occurrence(nodeA, id);
+        Assert.Equal(status, after.Status);
+        Assert.Equal(before.UpdatedAt, after.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task TryMark_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+    }
+
+    [Fact]
+    public async Task ClaimFanOut_TakesConcurrentClaims()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(16, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
+    // A claim the node won but never handed to a worker is put back so the job still runs, once, through the fallback.
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        _clock.Advance(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, marker));
+
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, marker));
+
+        var row = await Occurrence(nodeA, id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
+    // The loop lost the row to this node's own fallback, which runs it. The loop's put-back carries the loop's marker, which
+    // the fallback's write does not have, so the running job is left alone.
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, loopMarker));
+
+        var row = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(id, loopMarker));
+
+        Assert.Equal(TickerStatus.InProgress, (await Occurrence(nodeA, id)).Status);
+    }
+
+    // The fallback and run-now hand back each row they claimed with the marker their write gave it, so a job that never
+    // starts can be put back with that marker.
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await SeedTimeTicker();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await nodeB.GetTimeTickerById(id, CancellationToken.None)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await nodeB.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueOccurrenceOn(CreateProvider("node-A"));
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await Occurrence(nodeB, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await Occurrence(nodeB, id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await SeedTimeTicker();
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([id], CancellationToken.None));
+
+        Assert.Equal((await nodeA.GetTimeTickerById(id, CancellationToken.None)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None));
+
+        Assert.Equal((await Occurrence(nodeA, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await Occurrence(nodeA, id)).Status);
+    }
+
+    // Run-now returns only the rows its own call claimed. A row this node's fallback holds is already running; handing it
+    // out again would run it twice, and its put-back would undo the fallback's claim.
+    [Fact]
+    public async Task RunNowClaim_DoesNotReturnARowThisNodesFallbackHolds_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var heldByFallback = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == heldByFallback);
+        var idle = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([idle], CancellationToken.None);
+
+        var taken = await nodeA.AcquireImmediateCronOccurrencesAsync([heldByFallback, idle], CancellationToken.None);
+
+        Assert.Equal([idle], taken.Select(x => x.Id));
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_WithAnotherMarkerOrNode_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker.AddMilliseconds(1)));
+        Assert.False(await CreateProvider("node-B").TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await nodeA.GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    [InlineData(TickerStatus.Skipped)]
+    public async Task ReleaseClaim_RowNoLongerInProgress_LeavesTheRow(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        // The clock has not moved, so the terminal write leaves UpdatedAt equal to the marker, the worst case for the fence:
+        // only the status tells the row moved on.
+        await nodeA.UpdateTimeTickersWithUnifiedContext([id], StatusContext(status), CancellationToken.None);
+        Assert.Equal(marker, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).UpdatedAt);
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        Assert.Equal(status, (await nodeA.GetTimeTickerById(id, CancellationToken.None)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+    }
+
+    // The fallback scans a snapshot, then re-reads each row. A row that another node moved to InProgress between the
+    // two, on a clock that is behind, still passes the UpdatedAt comparison and would be claimed a second time.
+    [Fact]
+    public async Task Fallback_DoesNotClaimInProgressRow_WhenItsUpdatedAtIsEarlier_TimeTicker()
+    {
+        var nodeFallback = CreateProvider("node-fallback");
+        var nodeBehind = CreateProvider("node-behind", new FakeClock(T0.AddHours(-2)));
+        var first = await SeedTimeTicker();
+        var second = await SeedTimeTicker();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var claimed = new List<Guid>();
+        await foreach (var row in nodeFallback.QueueTimedOutTimeTickers(CancellationToken.None))
+        {
+            claimed.Add(row.Id);
+            if (claimed.Count != 1)
+                continue;
+
+            var other = claimed[0] == first ? second : first;
+            await nodeBehind.UpdateTimeTickersWithUnifiedContext([other], StatusContext(TickerStatus.InProgress), CancellationToken.None);
+        }
+
+        var untouched = await nodeFallback.GetTimeTickerById(claimed[0] == first ? second : first, CancellationToken.None);
+        Assert.Single(claimed);
+        Assert.Equal(TickerStatus.InProgress, untouched.Status);
+        Assert.NotEqual("node-fallback", untouched.LockHolder);
+    }
+
+    [Fact]
+    public async Task Fallback_DoesNotClaimInProgressRow_WhenItsUpdatedAtIsEarlier_CronOccurrence()
+    {
+        var nodeFallback = CreateProvider("node-fallback");
+        var nodeBehind = CreateProvider("node-behind", new FakeClock(T0.AddHours(-2)));
+        var first = await QueueOccurrenceOn(nodeBehind);
+        var second = await QueueOccurrenceOn(nodeBehind);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var claimed = new List<Guid>();
+        await foreach (var row in nodeFallback.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        {
+            claimed.Add(row.Id);
+            if (claimed.Count != 1)
+                continue;
+
+            var other = claimed[0] == first ? second : first;
+            await nodeBehind.UpdateCronTickerOccurrencesWithUnifiedContext([other], StatusContext(TickerStatus.InProgress), CancellationToken.None);
+        }
+
+        var untouched = await Occurrence(nodeFallback, claimed[0] == first ? second : first);
+        Assert.Single(claimed);
+        Assert.Equal(TickerStatus.InProgress, untouched.Status);
+        Assert.NotEqual("node-fallback", untouched.LockHolder);
+    }
+
+    private async Task<(Guid ParentId, Guid ChildId)> SeedParentWithChild()
+    {
+        var child = new TimeTickerEntity
+        {
+            Id = Guid.NewGuid(),
+            Function = "claim-child-fn",
+            RunCondition = RunCondition.OnSuccess,
+            Status = TickerStatus.Idle,
+            CreatedAt = T0.AddHours(-2),
+            UpdatedAt = T0.AddHours(-1),
+            Request = []
+        };
+        var parent = new TimeTickerEntity
+        {
+            Id = Guid.NewGuid(),
+            Function = "claim-fn",
+            ExecutionTime = T0,
+            Status = TickerStatus.Idle,
+            CreatedAt = T0.AddHours(-2),
+            UpdatedAt = T0.AddHours(-1),
+            Request = [],
+            Children = [child]
+        };
+        _timeTickerIds.Add(child.Id);
+        _timeTickerIds.Add(parent.Id);
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+        return (parent.Id, child.Id);
+    }
+
+    // A child without an execution time of its own runs only inside its parent. No claim path hands it out as a row
+    // of its own, and only the claim that won the parent carries it, so a late loop cannot run it a second time.
+    [Fact]
+    public async Task Child_IsCarriedOnlyByTheClaimThatWonItsParent()
+    {
+        var nodeA = CreateProvider("node-A");
+        var nodeB = CreateProvider("node-B");
+        var (parentId, childId) = await SeedParentWithChild();
+
+        var window = await nodeA.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.DoesNotContain(window, x => x.Id == childId);
+        var parent = Assert.Single(window, x => x.Id == parentId);
+        Assert.Equal([childId], parent.Children.Select(x => x.Id));
+        Assert.Single(await Drain(nodeA.QueueTimeTickers([parent], CancellationToken.None)));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var fallback = await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.DoesNotContain(fallback, x => x.Id == childId);
+        var taken = Assert.Single(fallback, x => x.Id == parentId);
+        Assert.Equal([childId], taken.Children.Select(x => x.Id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, _clock.NextClaimMarker()));
+        Assert.DoesNotContain(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parentId || x.Id == childId);
+        Assert.DoesNotContain(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parentId || x.Id == childId);
+    }
+
+    // A provider written before the fenced claim exists still compiles and keeps the unfenced write.
+    [Fact]
+    public async Task CustomProvider_DefaultBody_WritesAndReturnsTrue()
+    {
+        var provider = new LegacyProvider();
+        ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> contract = provider;
+        var timeId = Guid.NewGuid();
+        var occurrenceId = Guid.NewGuid();
+
+        Assert.True(await contract.TryMarkTimeTickerInProgress(timeId, _clock.NextClaimMarker()));
+        Assert.True(await contract.TryMarkCronOccurrenceInProgress(occurrenceId, _clock.NextClaimMarker()));
+
+        var timeWrite = Assert.Single(provider.TimeTickerWrites);
+        Assert.Equal([timeId], timeWrite.Ids);
+        Assert.Equal(TickerStatus.InProgress, timeWrite.Status);
+        var occurrenceWrite = Assert.Single(provider.OccurrenceWrites);
+        Assert.Equal([occurrenceId], occurrenceWrite.Ids);
+        Assert.Equal(TickerStatus.InProgress, occurrenceWrite.Status);
+    }
+
+    // Such a provider cannot put a claim back: the default writes nothing and says so, and the scheduler logs the row.
+    [Fact]
+    public async Task CustomProvider_DefaultReleaseClaim_WritesNothingAndReturnsFalse()
+    {
+        var provider = new LegacyProvider();
+        ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> contract = provider;
+
+        Assert.False(await contract.TryReleaseTimeTickerClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await contract.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+
+        Assert.Empty(provider.TimeTickerWrites);
+        Assert.Empty(provider.OccurrenceWrites);
+    }
+
+    // Implements only the members that existed before the fenced claim, so the two new ones use their default bodies.
+    private sealed class LegacyProvider : ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>
+    {
+        public List<(Guid[] Ids, TickerStatus Status)> TimeTickerWrites { get; } = [];
+
+        public List<(Guid[] Ids, TickerStatus Status)> OccurrenceWrites { get; } = [];
+
+        public IAsyncEnumerable<TimeTickerEntity> QueueTimeTickers(TimeTickerEntity[] timeTickers, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<TimeTickerEntity> QueueTimedOutTimeTickers(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task ReleaseAcquiredTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> UpdateTimeTicker(InternalFunctionContext functionContext, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<byte[]> GetTimeTickerRequest(Guid id, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task UpdateTimeTickersWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
+        {
+            TimeTickerWrites.Add((timeTickerIds, functionContext.Status));
+            return Task.CompletedTask;
+        }
+        public Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task MigrateDefinedCronTickers((string Function, string Expression)[] cronTickers, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<CronTickerEntity[]> GetAllCronTickerExpressions(CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<CronTickerOccurrenceEntity<CronTickerEntity>> GetEarliestAvailableCronOccurrence(Guid[] ids, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<CronTickerOccurrenceEntity<CronTickerEntity>> QueueCronTickerOccurrences((DateTime Key, InternalManagerContext[] Items) cronTickerOccurrences, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public IAsyncEnumerable<CronTickerOccurrenceEntity<CronTickerEntity>> QueueTimedOutCronTickerOccurrences(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task ReleaseAcquiredCronTickerOccurrences(Guid[] occurrenceIds, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<byte[]> GetCronTickerOccurrenceRequest(Guid tickerId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task UpdateCronTickerOccurrencesWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
+        {
+            OccurrenceWrites.Add((timeTickerIds, functionContext.Status));
+            return Task.CompletedTask;
+        }
+        public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public ITickerQueryable<TimeTickerEntity> TimeTickersQuery() => throw new NotSupportedException();
+        public ITickerQueryable<CronTickerEntity> CronTickersQuery() => throw new NotSupportedException();
+        public ITickerQueryable<CronTickerOccurrenceEntity<CronTickerEntity>> CronTickerOccurrencesQuery() => throw new NotSupportedException();
+        public Task<TimeTickerEntity> GetTimeTickerById(Guid id, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<TimeTickerEntity[]> GetTimeTickers(Expression<Func<TimeTickerEntity, bool>> predicate, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<PaginationResult<TimeTickerEntity>> GetTimeTickersPaginated(Expression<Func<TimeTickerEntity, bool>> predicate, int pageNumber, int pageSize, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> AddTimeTickers(TimeTickerEntity[] tickers, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> UpdateTimeTickers(TimeTickerEntity[] tickers, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<CronTickerEntity> GetCronTickerById(Guid id, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<CronTickerEntity[]> GetCronTickers(Expression<Func<CronTickerEntity, bool>> predicate, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<PaginationResult<CronTickerEntity>> GetCronTickersPaginated(Expression<Func<CronTickerEntity, bool>> predicate, int pageNumber, int pageSize, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> InsertCronTickers(CronTickerEntity[] tickers, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<int> UpdateCronTickers(CronTickerEntity[] cronTicker, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<int> RemoveCronTickers(Guid[] cronTickerIds, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<CronTickerOccurrenceEntity<CronTickerEntity>[]> GetAllCronTickerOccurrences(Expression<Func<CronTickerOccurrenceEntity<CronTickerEntity>, bool>> predicate, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<PaginationResult<CronTickerOccurrenceEntity<CronTickerEntity>>> GetAllCronTickerOccurrencesPaginated(Expression<Func<CronTickerOccurrenceEntity<CronTickerEntity>, bool>> predicate, int pageNumber, int pageSize, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<int> InsertCronTickerOccurrences(CronTickerOccurrenceEntity<CronTickerEntity>[] cronTickerOccurrences, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<int> RemoveCronTickerOccurrences(Guid[] cronTickerOccurrences, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<CronTickerOccurrenceEntity<CronTickerEntity>[]> AcquireImmediateCronOccurrencesAsync(Guid[] occurrenceIds, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+}
