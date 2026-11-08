@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.BackgroundServices;
 using SharpTicker.Utilities;
@@ -93,6 +94,31 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
         return condition();
     }
 
+    // The task scheduler is full and has not accepted the job yet. The fallback waits for it before it claims more, so it
+    // does not take every overdue row of the cluster onto this node while it cannot run them.
+    [Fact]
+    public async Task WhileTheSchedulerHasNotAcceptedTheJob_TheFallbackClaimsNoMore()
+    {
+        var accepted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _scheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
+            .Returns(_ => new ValueTask(accepted.Task));
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>())
+            .Returns(_ => [new InternalFunctionContext { TickerId = Guid.NewGuid(), FunctionName = "Fallback.Parent", ClaimMarker = DateTime.UtcNow }]);
+
+        await _service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => Polls() >= 1));
+            await Task.Delay(300);
+
+            Assert.Equal(1, Polls());
+        }
+        finally
+        {
+            accepted.TrySetResult();
+        }
+    }
+
     [Fact]
     public async Task AJobAndItsChildren_GetTheirDelegateAndPriorityFromTheRegistry()
     {
@@ -154,19 +180,19 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
     [Fact]
     public async Task TheConcurrencyLimit_IsReleased_EvenWhenTheJobFails()
     {
-        var parent = Job("Fallback.Parent");          // limit of 2
-        ReturnOnce(parent);
+        // Three jobs of a function with a limit of 2. Each claim starts its job once, so each job is its own queued work.
+        ReturnOnce(Job("Fallback.Parent"), Job("Fallback.Parent"), Job("Fallback.Parent"));
         _handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromException(new InvalidOperationException("the job failed")));
 
         await _service.StartAsync(CancellationToken.None);
-        Assert.True(await WaitUntilAsync(() => !_queued.IsEmpty));
-        _queued.TryPeek(out var queued);
+        Assert.True(await WaitUntilAsync(() => _queued.Count == 3));
 
-        // More failing runs than the limit allows: if a slot leaked, the third would wait forever.
-        for (var i = 0; i < 3; i++)
+        // More failing runs than the limit allows, one after the other: if a slot leaked, the third would wait forever.
+        foreach (var queued in _queued)
             await Assert.ThrowsAsync<InvalidOperationException>(() => queued.Work(CancellationToken.None))
                 .WaitAsync(TimeSpan.FromSeconds(5));
+        await _handler.Received(3).ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), true, Arg.Any<CancellationToken>());
     }
 
     [Fact]
@@ -211,6 +237,105 @@ public class FallbackServiceRecoveryTests : IAsyncLifetime
         await _service.StartAsync(CancellationToken.None);
 
         Assert.True(await WaitUntilAsync(() => Polls() >= 3), "the loop gave up after the store failed");
+    }
+
+    // An outage of the safety net must not be silent: the first failure is an error, the attempts while it goes on are at
+    // Debug, and the recovery is written once.
+    [Fact]
+    public async Task AFailureOfTheStore_IsLoggedOnceAsAnError_AndTheRecoveryIsLogged()
+    {
+        var logs = new CapturedLogs();
+        using var loggerFactory = new LoggerFactory(new[] { logs });
+        var failures = 3;
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(_ => failures-- > 0
+            ? Task.FromException<InternalFunctionContext[]>(new InvalidOperationException("the store is down"))
+            : Task.FromResult(Array.Empty<InternalFunctionContext>()));
+        using var service = new SharpTickerFallbackBackgroundService(
+            _manager, new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) },
+            _handler, _scheduler, new TickerFunctionConcurrencyGate(), loggerFactory.CreateLogger<SharpTickerFallbackBackgroundService>());
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => logs.Entries.Any(e => e.Level == LogLevel.Information)), "the recovery was not logged");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        var error = Assert.Single(logs.Entries, e => e.Level >= LogLevel.Error);
+        Assert.Equal("the store is down", error.Exception?.Message);
+        Assert.Equal(2, logs.Entries.Count(e => e.Level == LogLevel.Debug));
+        Assert.Contains("recovered", Assert.Single(logs.Entries, e => e.Level == LogLevel.Information).Message);
+    }
+
+    // The store failed after the fallback had claimed a row: the row comes back with the failure. It is run, not left
+    // InProgress, and the failure is still reported.
+    [Fact]
+    public async Task TheStoreFailsAfterARowWasClaimed_TheRowIsStillRun_AndTheFailureIsLogged()
+    {
+        var logs = new CapturedLogs();
+        using var loggerFactory = new LoggerFactory(new[] { logs });
+        var claimed = Job("Fallback.Parent");
+        claimed.ClaimMarker = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var failure = new InvalidOperationException("the connection dropped");
+        var first = true;
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            if (!first) return Task.FromResult(Array.Empty<InternalFunctionContext>());
+            first = false;
+            return Task.FromException<InternalFunctionContext[]>(new SharpTicker.Utilities.Exceptions.ClaimsInterruptedException([claimed], failure));
+        });
+        using var service = new SharpTickerFallbackBackgroundService(
+            _manager, new SchedulerOptionsBuilder { FallbackIntervalChecker = TimeSpan.FromMilliseconds(20) },
+            _handler, _scheduler, new TickerFunctionConcurrencyGate(), loggerFactory.CreateLogger<SharpTickerFallbackBackgroundService>());
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => _queued.Count == 1), "the claimed row was not handed over");
+            await _queued.Single().Work(CancellationToken.None);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        await _handler.Received(1).ExecuteTaskAsync(claimed, true, Arg.Any<CancellationToken>());
+        Assert.Same(failure, Assert.Single(logs.Entries, e => e.Level >= LogLevel.Error).Exception);
+    }
+
+    // The stop cancels the claim call after it claimed a row: the row is put back, not handed to a scheduler that stops.
+    [Fact]
+    public async Task TheStopInterruptsTheClaimCall_TheClaimedRowIsPutBack()
+    {
+        var claimed = Job("Fallback.Parent");
+        claimed.ClaimMarker = new DateTime(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+        var calling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager.RunTimedOutTickers(Arg.Any<CancellationToken>()).Returns(async call =>
+        {
+            var token = call.Arg<CancellationToken>();
+            calling.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.Infinite, token);
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw new SharpTicker.Utilities.Exceptions.ClaimsInterruptedException([claimed], ex);
+            }
+            return Array.Empty<InternalFunctionContext>();
+        });
+        _manager.TryReleaseClaim(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(true);
+
+        await _service.StartAsync(CancellationToken.None);
+        await calling.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await _service.StopAsync(CancellationToken.None);
+
+        await _manager.Received(1).TryReleaseClaim(claimed, claimed.ClaimMarker.Value, Arg.Any<CancellationToken>());
+        Assert.True(_queued.IsEmpty);
+        await _handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
     }
 
     [Fact]

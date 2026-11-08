@@ -23,13 +23,23 @@ namespace SharpTicker.Utilities.Interfaces
         Task UpdateTimeTickersWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default);
         Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default);
 
-        // true: this call moved the row from Queued (held by this node) to InProgress; the caller may run the job.
-        // Default bodies keep the unfenced behaviour for custom providers.
-        async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        // true: this call moved the row from Queued (held by this node) to InProgress and wrote claimMarker as its UpdatedAt;
+        // the caller may run the job. The marker comes from the node's clock (ClaimMarkers) and is unique per node, so the
+        // claim can be found again and put back if the job never starts, even when this call failed after the write landed.
+        // Default bodies keep the unfenced behaviour for custom providers and do not write the marker.
+        async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
+
+        // Puts back a claim this node made whose job never started: the row goes back to Idle with its lock cleared, only
+        // while it is still InProgress, held by this node and carries claimMarker as its UpdatedAt. Anything else (the
+        // fallback or another node took the row, the job ran, the row is gone) is left alone and the call returns false.
+        // The default body writes nothing and returns false, so a custom provider keeps today's behaviour: such a row stays
+        // InProgress and the scheduler logs it.
+        Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
         #endregion
         
         #region Cron_Ticker_Core_Methods
@@ -60,11 +70,15 @@ namespace SharpTicker.Utilities.Interfaces
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => Task.FromResult(0);
 
         // Same contract as TryMarkTimeTickerInProgress, for a cron occurrence row.
-        async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
+
+        // Same contract as TryReleaseTimeTickerClaim, for a cron occurrence row.
+        Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
         #endregion
         
         #region Queryable

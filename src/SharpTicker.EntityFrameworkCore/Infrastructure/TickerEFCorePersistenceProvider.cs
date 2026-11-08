@@ -344,32 +344,69 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
             var dbContext = session.Context;
             var now = _clock.UtcNow;
-            var idList = occurrenceIds.ToList();
+            var set = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>();
+            var won = new Dictionary<Guid, DateTime>(occurrenceIds.Length);
 
-            // Only acquire occurrences that are acquirable (Idle/Queued and not locked by another node)
-            var query = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
-                .Where(x => idList.Contains(x.Id))
-                .WhereCanAcquire(_lockHolder);
+            try
+            {
+                // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
+                // read of "InProgress for this node" also returned a row this node's fallback was already running, and a
+                // read by the marker would miss rows on a column that keeps less than milliseconds.
+                foreach (var id in occurrenceIds)
+                {
+                    // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must
+                    // be returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
 
-            // Lock and mark InProgress
-            var affected = await query
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress)
-                    .SetProperty(x => x.UpdatedAt, now), cancellationToken)
-                .ConfigureAwait(false);
+                    var claimMarker = _clock.NextClaimMarker();
+                    int affected;
+                    try
+                    {
+                        affected = await set
+                            .Where(x => x.Id == id)
+                            .WhereCanAcquire(_lockHolder)
+                            .ExecuteUpdateAsync(setter => setter
+                                .SetProperty(x => x.LockHolder, _lockHolder)
+                                .SetProperty(x => x.LockedAt, now)
+                                .SetProperty(x => x.Status, TickerStatus.InProgress)
+                                .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // The write may have landed before its reply was lost: put it back with the rows already won.
+                        won[id] = claimMarker;
+                        throw;
+                    }
 
-            if (affected == 0)
-                return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+                    if (affected > 0)
+                        won[id] = claimMarker;
+                }
 
-            // Return acquired occurrences with CronTicker populated
-            return await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
-                .AsNoTracking()
-                .Where(x => idList.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
-                .Include(x => x.CronTicker)
-                .ToArrayAsync(cancellationToken)
-                .ConfigureAwait(false);
+                if (won.Count == 0)
+                    return Array.Empty<CronTickerOccurrenceEntity<TCronTicker>>();
+
+                // Return the occurrences this call claimed, with CronTicker populated, each with the marker its claim wrote.
+                var wonIds = won.Keys.ToList();
+                var acquired = await set
+                    .AsNoTracking()
+                    .Where(x => wonIds.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
+                    .Include(x => x.CronTicker)
+                    .ToArrayAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+
+                foreach (var occurrence in acquired)
+                    occurrence.UpdatedAt = won[occurrence.Id];
+
+                return acquired;
+            }
+            catch (Exception failure) when (won.Count > 0)
+            {
+                // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                throw;
+            }
         }
 
         #endregion

@@ -18,7 +18,7 @@ namespace SharpTicker.Provider
 {
     internal class
         TickerInMemoryPersistenceProvider<TTimeTicker, TCronTicker> : ITickerPersistenceProvider<TTimeTicker,
-        TCronTicker>
+        TCronTicker>, IClaimFanOut
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -114,13 +114,14 @@ namespace SharpTicker.Provider
                         var updatedTicker = CloneTicker(existingTicker);
                         updatedTicker.LockHolder = _lockHolder;
                         updatedTicker.LockedAt = now;
-                        updatedTicker.UpdatedAt = now;
+                        updatedTicker.UpdatedAt = _clock.NextClaimMarker();
                         updatedTicker.Status = TickerStatus.InProgress;
 
                         if (TimeTickers.TryUpdate(ticker.Id, updatedTicker, existingTicker))
                         {
-                            // Only build the full hierarchy for successfully acquired tickers
-                            yield return ForQueueTimeTickers(ticker);
+                            // Only build the full hierarchy for successfully acquired tickers. The row as written is
+                            // returned, so it carries this claim's marker for a put-back.
+                            yield return ForQueueTimeTickers(updatedTicker);
                         }
                     }
                 }
@@ -240,7 +241,10 @@ namespace SharpTicker.Provider
             return Task.CompletedTask;
         }
 
-        public Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+        // Each claim is a compare-and-swap on one row.
+        public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
+
+        public Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             // Queued plus our own lock is the claim token: a fallback that took the row, a cancel or a finished run all fail it.
             if (!TimeTickers.TryGetValue(id, out var ticker) || ticker.Status != TickerStatus.Queued || ticker.LockHolder != _lockHolder)
@@ -248,9 +252,30 @@ namespace SharpTicker.Provider
 
             var updatedTicker = CloneTicker(ticker);
             updatedTicker.Status = TickerStatus.InProgress;
-            updatedTicker.UpdatedAt = _clock.UtcNow;
+            updatedTicker.UpdatedAt = claimMarker;
 
             return Task.FromResult(TimeTickers.TryUpdate(id, updatedTicker, ticker));
+        }
+
+        public Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            // Compare-and-swap against the row just read; a concurrent write sends the loop back to read and check again.
+            while (TimeTickers.TryGetValue(id, out var ticker))
+            {
+                if (ticker.Status != TickerStatus.InProgress || ticker.LockHolder != _lockHolder || ticker.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneTicker(ticker);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (TimeTickers.TryUpdate(id, released, ticker))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
         }
 
         public Task<TimeTickerEntity[]> AcquireImmediateTimeTickersAsync(Guid[] ids, CancellationToken cancellationToken = default)
@@ -278,7 +303,7 @@ namespace SharpTicker.Provider
                 updatedTicker.LockHolder = _lockHolder;
                 updatedTicker.LockedAt = now;
                 updatedTicker.Status = TickerStatus.InProgress;
-                updatedTicker.UpdatedAt = now;
+                updatedTicker.UpdatedAt = _clock.NextClaimMarker();
 
                 if (TimeTickers.TryUpdate(id, updatedTicker, ticker))
                 {
@@ -786,7 +811,7 @@ namespace SharpTicker.Provider
                         var updatedOccurrence = CloneCronOccurrence(existingOccurrence);
                         updatedOccurrence.LockHolder = _lockHolder;
                         updatedOccurrence.LockedAt = now;
-                        updatedOccurrence.UpdatedAt = now;
+                        updatedOccurrence.UpdatedAt = _clock.NextClaimMarker();
                         updatedOccurrence.Status = TickerStatus.InProgress;
 
                         if (CronOccurrences.TryUpdate(occurrence.Id, updatedOccurrence, existingOccurrence))
@@ -868,16 +893,36 @@ namespace SharpTicker.Provider
             return Task.CompletedTask;
         }
 
-        public Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+        public Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
             if (!CronOccurrences.TryGetValue(id, out var occurrence) || occurrence.Status != TickerStatus.Queued || occurrence.LockHolder != _lockHolder)
                 return Task.FromResult(false);
 
             var updatedOccurrence = CloneCronOccurrence(occurrence);
             updatedOccurrence.Status = TickerStatus.InProgress;
-            updatedOccurrence.UpdatedAt = _clock.UtcNow;
+            updatedOccurrence.UpdatedAt = claimMarker;
 
             return Task.FromResult(CronOccurrences.TryUpdate(id, updatedOccurrence, occurrence));
+        }
+
+        public Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+        {
+            while (CronOccurrences.TryGetValue(id, out var occurrence))
+            {
+                if (occurrence.Status != TickerStatus.InProgress || occurrence.LockHolder != _lockHolder || occurrence.UpdatedAt != claimMarker)
+                    return Task.FromResult(false);
+
+                var released = CloneCronOccurrence(occurrence);
+                released.Status = TickerStatus.Idle;
+                released.LockHolder = null;
+                released.LockedAt = null;
+                released.UpdatedAt = _clock.UtcNow;
+
+                if (CronOccurrences.TryUpdate(id, released, occurrence))
+                    return Task.FromResult(true);
+            }
+
+            return Task.FromResult(false);
         }
 
         public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
@@ -1018,7 +1063,10 @@ namespace SharpTicker.Provider
 
             foreach (var id in occurrenceIds)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
                 if (!CronOccurrences.TryGetValue(id, out var occurrence))
                     continue;
@@ -1030,7 +1078,7 @@ namespace SharpTicker.Provider
                 updated.LockHolder = _lockHolder;
                 updated.LockedAt = now;
                 updated.Status = TickerStatus.InProgress;
-                updated.UpdatedAt = now;
+                updated.UpdatedAt = _clock.NextClaimMarker();
 
                 if (CronOccurrences.TryUpdate(id, updated, occurrence))
                 {

@@ -17,11 +17,28 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
-internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker>
+internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
+    private int _maxConcurrentClaims;
+
+    // SQLite allows a single writer, and a single-connection setup (an in-memory database) cannot run two commands at once,
+    // so SQLite rows are claimed one at a time. The EF Core provider of a context does not change, so it is read once.
+    public async ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default)
+    {
+        var known = Volatile.Read(ref _maxConcurrentClaims);
+        if (known > 0)
+            return known;
+
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var providerName = session.Context.Database.ProviderName ?? string.Empty;
+        var fanOut = providerName.IndexOf("Sqlite", StringComparison.OrdinalIgnoreCase) >= 0 ? ClaimFanOut.Sequential : ClaimFanOut.Default;
+        Volatile.Write(ref _maxConcurrentClaims, fanOut);
+        return fanOut;
+    }
+
     public BasePersistenceProvider(IServiceProvider serviceProvider, ITickerClock clock, SchedulerOptionsBuilder optionsBuilder, ISharpTickerRedisContext redisContext)
     {
         _clock = clock;
@@ -96,18 +113,32 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var affected = await context
-                .Where(x => x.Id == timeTicker.Id && x.UpdatedAt <= timeTicker.UpdatedAt)
-                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.UpdatedAt, now)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
-                
+            // Every InProgress write of this node carries its own claim marker, so a claim of the loop is never mistaken
+            // for this one when it is put back.
+            var claimMarker = _clock.NextClaimMarker();
+            int affected;
+            try
+            {
+                affected = await context
+                    .Where(x => x.Id == timeTicker.Id && x.UpdatedAt <= timeTicker.UpdatedAt)
+                    .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                    .ExecuteUpdateAsync(setter => setter
+                        .SetProperty(x => x.LockHolder, _lockHolder)
+                        .SetProperty(x => x.LockedAt, now)
+                        .SetProperty(x => x.UpdatedAt, claimMarker)
+                        .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                throw;
+            }
+
             if(affected <= 0)
                 continue;
 
+            // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+            timeTicker.UpdatedAt = claimMarker;
             yield return timeTicker;
         }
     }
@@ -132,11 +163,10 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .SetProperty(x => x.UpdatedAt, _ => now), cancellationToken).ConfigureAwait(false);;
     }
         
-    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, CancellationToken cancellationToken = default)
+    public async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
-        var now = _clock.UtcNow;
 
         // Fenced claim: only a row still Queued by this node moves on, so a fallback that took it first wins.
         var affected = await dbContext.Set<TTimeTicker>()
@@ -144,6 +174,24 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .WhereQueuedBy(_lockHolder)
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.InProgress)
+                .SetProperty(x => x.UpdatedAt, claimMarker), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
+    public async Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        // The marker is unique per node, so a row this node's fallback took and runs (its own marker) is never matched.
+        var affected = await dbContext.Set<TTimeTicker>()
+            .Where(x => x.Id == id && x.Status == TickerStatus.InProgress && x.LockHolder == _lockHolder && x.UpdatedAt == claimMarker)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
 
         return affected > 0;
@@ -270,42 +318,68 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var dbContext = session.Context;
         var now = _clock.UtcNow;
         var set = dbContext.Set<TTimeTicker>();
-        var won = new List<Guid>(ids.Length);
+        var won = new Dictionary<Guid, DateTime>(ids.Length);
 
-        // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
-        // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
-        foreach (var id in ids)
+        try
         {
-            // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
-            // returned to be dispatched, the rows not written yet stay Idle for the fallback.
-            if (cancellationToken.IsCancellationRequested)
-                break;
+            // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
+            // read of "InProgress for this node" would also return a row this node's fallback had taken earlier.
+            foreach (var id in ids)
+            {
+                // A cancelled caller stops the loop but not the writes: a row won here is already InProgress and must be
+                // returned to be dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested)
+                    break;
 
-            var affected = await set
-                .Where(x => x.Id == id)
-                .WhereCanAcquire(_lockHolder)
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress)
-                    .SetProperty(x => x.UpdatedAt, now), CancellationToken.None)
+                var claimMarker = _clock.NextClaimMarker();
+                int affected;
+                try
+                {
+                    affected = await set
+                        .Where(x => x.Id == id)
+                        .WhereCanAcquire(_lockHolder)
+                        .ExecuteUpdateAsync(setter => setter
+                            .SetProperty(x => x.LockHolder, _lockHolder)
+                            .SetProperty(x => x.LockedAt, now)
+                            .SetProperty(x => x.Status, TickerStatus.InProgress)
+                            .SetProperty(x => x.UpdatedAt, claimMarker), CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The write may have landed before its reply was lost: put it back with the rows already won.
+                    won[id] = claimMarker;
+                    throw;
+                }
+
+                if (affected > 0)
+                    won[id] = claimMarker;
+            }
+
+            if (won.Count == 0)
+                return [];
+
+            // Return the acquired tickers for immediate execution, with children, each with the marker its claim wrote.
+            var wonIds = won.Keys.ToList();
+            var acquired = await set
+                .AsNoTracking()
+                .Where(x => wonIds.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
+                .Include(x => x.Children.Where(y => y.ExecutionTime == null))
+                .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+                .ToArrayAsync(CancellationToken.None)
                 .ConfigureAwait(false);
 
-            if (affected > 0)
-                won.Add(id);
+            foreach (var ticker in acquired)
+                ticker.UpdatedAt = won[ticker.Id];
+
+            return acquired;
         }
-
-        if (won.Count == 0)
-            return [];
-
-        // Return the acquired tickers for immediate execution, with children
-        return await set
-            .AsNoTracking()
-            .Where(x => won.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
-            .Include(x => x.Children.Where(y => y.ExecutionTime == null))
-            .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
-            .ToArrayAsync(CancellationToken.None)
-            .ConfigureAwait(false);
+        catch (Exception failure) when (won.Count > 0)
+        {
+            // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            throw;
+        }
     }
         
     #region Core_Cron_Ticker_Methods
@@ -459,34 +533,62 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var affected = await context
-                .Where(x => x.Id == cronTickerOccurrence.Id && x.UpdatedAt == cronTickerOccurrence.UpdatedAt)
-                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-                .ExecuteUpdateAsync(setter => setter
-                    .SetProperty(x => x.LockHolder, _lockHolder)
-                    .SetProperty(x => x.LockedAt, now)
-                    .SetProperty(x => x.UpdatedAt,  now)
-                    .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken)
-                .ConfigureAwait(false);
-                
+            var claimMarker = _clock.NextClaimMarker();
+            int affected;
+            try
+            {
+                affected = await context
+                    .Where(x => x.Id == cronTickerOccurrence.Id && x.UpdatedAt == cronTickerOccurrence.UpdatedAt)
+                    .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                    .ExecuteUpdateAsync(setter => setter
+                        .SetProperty(x => x.LockHolder, _lockHolder)
+                        .SetProperty(x => x.LockedAt, now)
+                        .SetProperty(x => x.UpdatedAt, claimMarker)
+                        .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                throw;
+            }
+
             if(affected <= 0)
                 continue;
 
+            // The row was read before the claim; it is handed back with the marker the claim wrote, for a put-back.
+            cronTickerOccurrence.UpdatedAt = claimMarker;
             yield return cronTickerOccurrence;
         }
     }
     
-    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, CancellationToken cancellationToken = default)
+    public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
-        var now = _clock.UtcNow;
 
         var affected = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
             .Where(x => x.Id == id)
             .WhereQueuedBy(_lockHolder)
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.InProgress)
+                .SetProperty(x => x.UpdatedAt, claimMarker), cancellationToken).ConfigureAwait(false);
+
+        return affected > 0;
+    }
+
+    public async Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var now = _clock.UtcNow;
+
+        var affected = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.Id == id && x.Status == TickerStatus.InProgress && x.LockHolder == _lockHolder && x.UpdatedAt == claimMarker)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
 
         return affected > 0;

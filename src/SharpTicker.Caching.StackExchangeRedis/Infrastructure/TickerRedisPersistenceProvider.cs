@@ -239,24 +239,36 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             return [];
 
         var acquired = new List<CronTickerOccurrenceEntity<TCronTicker>>();
-        foreach (var id in occurrenceIds)
+        var won = new Dictionary<Guid, DateTime>(occurrenceIds.Length);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var id in occurrenceIds)
+            {
+                // A cancelled caller stops the loop: a row won here is already InProgress and must be returned to be
+                // dispatched, the rows not written yet stay Idle for the fallback.
+                if (cancellationToken.IsCancellationRequested) break;
 
-            var occurrence = await TryAcquireAsync<CronTickerOccurrenceEntity<TCronTicker>>(
-                CronOccurrenceKey(id),
-                TickerStatus.InProgress).ConfigureAwait(false);
+                var occurrence = await TryClaimInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(
+                    CronOccurrenceKey(id), id, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
 
-            if (occurrence == null) continue;
+                if (occurrence == null) continue;
 
-            if (occurrence.CronTicker == null && occurrence.CronTickerId != Guid.Empty)
-                occurrence.CronTicker = await Serializer.GetAsync<TCronTicker>(CronKey(occurrence.CronTickerId)).ConfigureAwait(false);
+                won[occurrence.Id] = occurrence.UpdatedAt;
+                if (occurrence.CronTicker == null && occurrence.CronTickerId != Guid.Empty)
+                    occurrence.CronTicker = await Serializer.GetAsync<TCronTicker>(CronKey(occurrence.CronTickerId)).ConfigureAwait(false);
 
-            await TryUpdateIndexAfterClaim(occurrence.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(occurrence)).ConfigureAwait(false);
-            acquired.Add(occurrence);
+                await TryUpdateIndexAfterClaim(occurrence.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(occurrence)).ConfigureAwait(false);
+                acquired.Add(occurrence);
+            }
+
+            return acquired.ToArray();
         }
-
-        return acquired.ToArray();
+        catch (Exception failure) when (won.Count > 0)
+        {
+            // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
+            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+            throw;
+        }
     }
     #endregion
 }

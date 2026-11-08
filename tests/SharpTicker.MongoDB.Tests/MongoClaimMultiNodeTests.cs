@@ -137,7 +137,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await QueueTimeTickerOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -153,7 +153,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await QueueOccurrenceOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -172,7 +172,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Contains(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -190,7 +190,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Contains(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal("node-B", after.LockHolder);
@@ -211,13 +211,13 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadTimeTicker(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
     }
 
@@ -234,13 +234,13 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(requeue, CancellationToken.None)));
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadOccurrence(id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
     }
 
@@ -253,7 +253,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var id = await SeedTimeTicker(status, lockHolder: "node-A");
         var before = await ReadTimeTicker(id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(id);
         Assert.Equal(status, after.Status);
@@ -271,7 +271,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
             Builders<CronTickerOccurrenceEntity<CronTickerEntity>>.Update.Set(x => x.Status, status));
         var before = await ReadOccurrence(id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(id);
         Assert.Equal(status, after.Status);
@@ -283,8 +283,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     {
         var nodeA = CreateProvider("node-A");
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid()));
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     #endregion
@@ -344,6 +344,37 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     // The caller's token fires between two row writes. The rows won so far are InProgress and must come back to be
     // dispatched; the rest must stay Idle. A command event subscriber cancels right after the first update.
     [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle_CronOccurrence()
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(e =>
+        {
+            if (e.CommandName == "update")
+                cts.Cancel();
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        var node = new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
     public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
     {
         using var cts = new CancellationTokenSource();
@@ -370,6 +401,123 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
             Assert.Equal(TickerStatus.Idle, row.Status);
             Assert.Null(row.LockHolder);
         }
+    }
+
+    // The store fails once after the call has won rows: either the write of a later row or the read of the won rows.
+    // Nobody gets the won rows to run, so they must be put back (Idle, no holder) for the fallback, and the call must throw.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows(bool readFails)
+    {
+        var node = CreateFailingNode(readFails ? "find" : "update", readFails ? 1 : 2);
+        var ids = new[] { await SeedTimeTicker(), await SeedTimeTicker(), await SeedTimeTicker() };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateTimeTickersAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence(bool readFails)
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = CreateFailingNode(readFails ? "find" : "update", readFails ? 1 : 2);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // A claim's write lands, then its reply is lost (the call throws). The row is InProgress for this node with nothing to
+    // run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron occurrences.
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_IsPutBack(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seed = CreateProvider("node-A");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seed);
+            if (path.StartsWith("immediate"))
+                await seed.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker();
+        }
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var failed = 0;
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandSucceededEvent>(e =>
+        {
+            if (e.CommandName == "update" && Interlocked.Exchange(ref failed, 1) == 0)
+                throw new TimeoutException("the reply of the claim was lost");
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        var node = new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        if (cron)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+        else
+        {
+            var row = await ReadTimeTicker(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // A node whose n-th command of the given name throws before it is sent, once; every later command runs normally.
+    private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateFailingNode(string commandName, int n)
+    {
+        var seen = 0;
+        var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
+        settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(e =>
+        {
+            if (e.CommandName == commandName && ++seen == n)
+                throw new InvalidOperationException("store failed");
+        });
+        var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
+        return new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
+            _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
     }
 
     [Fact]
@@ -400,7 +548,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(fallbackNode.QueueTimedOutTimeTickers(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -420,7 +568,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -520,7 +668,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
         var claimedByFaster = await Drain(faster.QueueTimedOutTimeTickers(CancellationToken.None));
         slowClock.Advance(TimeSpan.FromMilliseconds(300));
-        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id);
+        var lateOwnerWon = await owner.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFaster).Id);
         Assert.False(lateOwnerWon);
@@ -541,11 +689,11 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         _clock.Advance(TimeSpan.FromSeconds(2));
 
         // Row 1: one TryMark wins, the twin's fallback then finds nothing to claim for it.
-        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst);
-        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst);
+        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
+        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
         // Row 2: the twin's fallback wins, the other's TryMark then loses.
         var claimedByTwin = await Drain(twin.QueueTimedOutTimeTickers(CancellationToken.None));
-        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst);
+        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst, _clock.NextClaimMarker());
 
         Assert.True(tryMarkWon);
         Assert.False(twinTryMarkWon);
@@ -573,6 +721,205 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         var row = Assert.Single(rows);
         Assert.Equal("node-A", row.LockHolder);
         Assert.Equal(TickerStatus.Queued, row.Status);
+    }
+
+    #endregion
+
+    [Fact]
+    public async Task ClaimFanOut_TakesConcurrentClaims()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(16, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
+    #region Putting back a claim whose job never started
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        _clock.Advance(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, marker));
+
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, marker));
+
+        var row = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
+    // MongoDB keeps milliseconds, so this is where two writes of one node in the same millisecond would look alike without
+    // the per-node marker: the loop's put-back must leave the row this node's fallback runs.
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, loopMarker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(id, loopMarker));
+
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
+    }
+
+    // The fallback and run-now hand back each row they claimed with the marker their write gave it, so a job that never
+    // starts can be put back with that marker.
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await SeedTimeTicker();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await ReadTimeTicker(id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueOccurrenceOn(CreateProvider("node-A"));
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await ReadOccurrence(id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await SeedTimeTicker();
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([id], CancellationToken.None));
+
+        Assert.Equal((await ReadTimeTicker(id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None));
+
+        Assert.Equal((await ReadOccurrence(id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(id)).Status);
+    }
+
+    // Run-now returns only the rows its own call claimed. A row this node's fallback holds is already running; handing it
+    // out again would run it twice, and its put-back would undo the fallback's claim.
+    [Fact]
+    public async Task RunNowClaim_DoesNotReturnARowThisNodesFallbackHolds_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var heldByFallback = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == heldByFallback);
+        var idle = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([idle], CancellationToken.None);
+
+        var taken = await nodeA.AcquireImmediateCronOccurrencesAsync([heldByFallback, idle], CancellationToken.None);
+
+        Assert.Equal([idle], taken.Select(x => x.Id));
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_WithAnotherMarkerOrNode_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker.AddMilliseconds(1)));
+        Assert.False(await CreateProvider("node-B").TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    // The status write leaves UpdatedAt equal to the marker, so only the status tells the row moved on.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    [InlineData(TickerStatus.Skipped)]
+    public async Task ReleaseClaim_RowNoLongerInProgress_LeavesTheRow(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        await _f.TimeTickers.UpdateOneAsync(Builders<TimeTickerEntity>.Filter.Eq(x => x.Id, id), Builders<TimeTickerEntity>.Update.Set(x => x.Status, status));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        Assert.Equal(status, (await ReadTimeTicker(id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     #endregion
@@ -613,8 +960,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.DoesNotContain(fallback, x => x.Id == childId);
         var taken = Assert.Single(fallback, x => x.Id == parentId);
         Assert.Equal([childId], taken.Children.Select(x => x.Id));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, _clock.NextClaimMarker()));
         Assert.Empty(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)));
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
@@ -654,7 +1001,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         {
             start.Wait();
             foreach (var id in ids)
-                if (await node.TryMarkTimeTickerInProgress(id))
+                if (await node.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()))
                     winners.Add(id);
         }
 

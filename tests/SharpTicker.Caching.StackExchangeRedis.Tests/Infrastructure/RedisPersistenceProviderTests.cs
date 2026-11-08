@@ -712,7 +712,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         SeedTimeTicker(ticker);
         _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
 
-        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkTimeTickerInProgress(ticker.Id);
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkTimeTickerInProgress(ticker.Id, _clock.NextClaimMarker());
 
         Assert.True(marked);
         Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:tt:{ticker.Id}"]).RootElement.GetProperty("Status").GetInt32());
@@ -729,10 +729,28 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         SeedCronOccurrence(occ);
         _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
 
-        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkCronOccurrenceInProgress(occ.Id);
+        var marked = await ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryMarkCronOccurrenceInProgress(occ.Id, _clock.NextClaimMarker());
 
         Assert.True(marked);
         Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:co:{occ.Id}"]).RootElement.GetProperty("Status").GetInt32());
+    }
+
+    // Putting a claim back writes the index entries first. When they cannot be written the row must stay InProgress and the
+    // call fail, so the caller tries again; an Idle row without its pending entry is one neither the loop nor the fallback
+    // would ever look at again.
+    [Fact]
+    public async Task TryReleaseTimeTickerClaim_IndexWriteFails_FailsAndLeavesTheRowInProgress()
+    {
+        var marker = _clock.NextClaimMarker();
+        var ticker = CreateTimeTicker(status: TickerStatus.InProgress, lockHolder: NodeId, lockedAt: _fixedNow);
+        ticker.UpdatedAt = marker;
+        SeedTimeTicker(ticker);
+        _db.CreateBatch(Arg.Any<object>()).Returns(_ => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "index down"));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() =>
+            ((ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>)_provider).TryReleaseTimeTickerClaim(ticker.Id, marker));
+
+        Assert.Equal((int)TickerStatus.InProgress, JsonDocument.Parse(_store[$"{Prefix}:tt:{ticker.Id}"]).RootElement.GetProperty("Status").GetInt32());
     }
 
     // A claim the Lua script committed must reach the caller even when the pending index cannot be updated: the row is

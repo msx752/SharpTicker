@@ -111,7 +111,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var id = await QueueTimeTickerOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadTimeTicker(nodeA, id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -127,7 +127,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var id = await QueueOccurrenceOn(nodeA);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var row = await ReadOccurrence(nodeA, id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -147,8 +147,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.TimeTickerPendingKey, timeId.ToString()));
         Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, occurrenceId.ToString()));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(timeId));
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(occurrenceId));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(timeId, _clock.NextClaimMarker()));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(occurrenceId, _clock.NextClaimMarker()));
 
         Assert.Null(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.TimeTickerPendingKey, timeId.ToString()));
         Assert.Null(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, occurrenceId.ToString()));
@@ -169,13 +169,13 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Single(await Drain(nodeB.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
         var before = await ReadTimeTicker(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadTimeTicker(nodeA, id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id));
+        Assert.True(await nodeB.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(nodeA, id)).Status);
     }
 
@@ -192,13 +192,13 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Single(await Drain(nodeB.QueueCronTickerOccurrences(requeue, CancellationToken.None)));
         var before = await ReadOccurrence(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var untouched = await ReadOccurrence(nodeA, id);
         Assert.Equal(TickerStatus.Queued, untouched.Status);
         Assert.Equal("node-B", untouched.LockHolder);
         Assert.Equal(before.UpdatedAt, untouched.UpdatedAt);
-        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id));
+        Assert.True(await nodeB.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(nodeA, id)).Status);
     }
 
@@ -211,7 +211,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var id = await SeedTimeTicker(nodeA, status, lockHolder: "node-A");
         var before = await ReadTimeTicker(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadTimeTicker(nodeA, id);
         Assert.Equal(status, after.Status);
@@ -227,7 +227,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         await nodeA.UpdateCronTickerOccurrence(StatusContext(id, status), CancellationToken.None);
         var before = await ReadOccurrence(nodeA, id);
 
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
 
         var after = await ReadOccurrence(nodeA, id);
         Assert.Equal(status, after.Status);
@@ -239,8 +239,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
     {
         var nodeA = CreateProvider("node-A");
 
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid()));
-        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     // The script re-encodes the row with cjson: whatever the row carries must come back unchanged except Status and
@@ -274,7 +274,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var before = await RawTimeTicker(ticker.Id);
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkTimeTickerInProgress(ticker.Id));
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(ticker.Id, _clock.NextClaimMarker()));
 
         var after = await RawTimeTicker(ticker.Id);
         Assert.Equal((int)TickerStatus.InProgress, (int)after["Status"]!);
@@ -317,7 +317,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var before = JsonNode.Parse((string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.CronOccurrenceKey(occurrence.Id)))!)!.AsObject();
         _clock.Advance(TimeSpan.FromMilliseconds(300));
 
-        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(occurrence.Id));
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(occurrence.Id, _clock.NextClaimMarker()));
 
         var after = JsonNode.Parse((string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.CronOccurrenceKey(occurrence.Id)))!)!.AsObject();
         Assert.Equal((int)TickerStatus.InProgress, (int)after["Status"]!);
@@ -381,10 +381,212 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.DoesNotContain(fallback, x => x.Id == childId);
         var taken = Assert.Single(fallback, x => x.Id == parentId);
         Assert.Equal([childId], taken.Children.Select(x => x.Id));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId));
-        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(parentId, _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(childId, _clock.NextClaimMarker()));
         Assert.Empty(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)));
         Assert.Empty(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)));
+    }
+
+    #endregion
+
+    [Fact]
+    public async Task ClaimFanOut_TakesConcurrentClaims()
+    {
+        var fanOut = (IClaimFanOut)CreateProvider("node-A");
+
+        Assert.Equal(16, await fanOut.GetMaxConcurrentClaimsAsync());
+    }
+
+    #region Putting back a claim whose job never started
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        _clock.Advance(TimeSpan.FromMilliseconds(40));
+
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(nodeA, id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.LockedAt);
+        Assert.Equal(_clock.UtcNow, row.UpdatedAt);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_OwnClaim_PutsTheRowBackForTheFallback_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, marker));
+
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, marker));
+
+        var row = await ReadOccurrence(nodeA, id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(CreateProvider("node-B").QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkTimeTickerInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, loopMarker));
+
+        var row = await ReadTimeTicker(nodeA, id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_RowTakenByTheSameNodesFallback_IsLeftRunning_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+        var loopMarker = _clock.NextClaimMarker();
+        Assert.False(await nodeA.TryMarkCronOccurrenceInProgress(id, loopMarker));
+
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(id, loopMarker));
+
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(nodeA, id)).Status);
+    }
+
+    // The fallback and run-now hand back each row they claimed with the marker their write gave it, so a job that never
+    // starts can be put back with that marker.
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeB = CreateProvider("node-B");
+        var id = await SeedTimeTicker(nodeB);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await ReadTimeTicker(nodeB, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(nodeB, id)).Status);
+    }
+
+    [Fact]
+    public async Task FallbackClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        // Here the fallback does not take another holder's Queued row, so it takes a row of its own node.
+        var nodeB = CreateProvider("node-B");
+        var id = await QueueOccurrenceOn(nodeB);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var taken = Assert.Single(await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == id);
+
+        Assert.Equal((await ReadOccurrence(nodeB, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeB.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(nodeB, id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_TimeTicker()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await SeedTimeTicker(nodeA);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([id], CancellationToken.None));
+
+        Assert.Equal((await ReadTimeTicker(nodeA, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseTimeTickerClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(nodeA, id)).Status);
+    }
+
+    [Fact]
+    public async Task RunNowClaim_ReturnsItsMarker_SoItCanBePutBack_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None));
+
+        Assert.Equal((await ReadOccurrence(nodeA, id)).UpdatedAt, taken.UpdatedAt);
+        Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
+        Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(nodeA, id)).Status);
+    }
+
+    // Run-now returns only the rows its own call claimed. A row this node's fallback holds is already running; handing it
+    // out again would run it twice, and its put-back would undo the fallback's claim.
+    [Fact]
+    public async Task RunNowClaim_DoesNotReturnARowThisNodesFallbackHolds_CronOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var heldByFallback = await QueueOccurrenceOn(nodeA);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Contains(await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None)), x => x.Id == heldByFallback);
+        var idle = await QueueOccurrenceOn(nodeA);
+        await nodeA.ReleaseAcquiredCronTickerOccurrences([idle], CancellationToken.None);
+
+        var taken = await nodeA.AcquireImmediateCronOccurrencesAsync([heldByFallback, idle], CancellationToken.None);
+
+        Assert.Equal([idle], taken.Select(x => x.Id));
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_WithAnotherMarkerOrNode_LeavesTheRow()
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker.AddMilliseconds(1)));
+        Assert.False(await CreateProvider("node-B").TryReleaseTimeTickerClaim(id, marker));
+
+        var row = await ReadTimeTicker(nodeA, id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+    }
+
+    // Only the status is changed in the stored JSON, so UpdatedAt keeps the marker text: the status alone must stop it.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    [InlineData(TickerStatus.Skipped)]
+    public async Task ReleaseClaim_RowNoLongerInProgress_LeavesTheRow(TickerStatus status)
+    {
+        var nodeA = CreateProvider("node-A");
+        var id = await QueueTimeTickerOn(nodeA);
+        var marker = _clock.NextClaimMarker();
+        Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, marker));
+        var json = JsonNode.Parse((string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.TimeTickerKey(id)))!)!;
+        json["Status"] = (int)status;
+        await fixture.Database.StringSetAsync(RedisKeyBuilder.TimeTickerKey(id), json.ToJsonString());
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(id, marker));
+
+        Assert.Equal(status, (await ReadTimeTicker(nodeA, id)).Status);
+    }
+
+    [Fact]
+    public async Task ReleaseClaim_MissingRow_ReturnsFalse()
+    {
+        var nodeA = CreateProvider("node-A");
+
+        Assert.False(await nodeA.TryReleaseTimeTickerClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
+        Assert.False(await nodeA.TryReleaseCronOccurrenceClaim(Guid.NewGuid(), _clock.NextClaimMarker()));
     }
 
     #endregion
@@ -401,7 +603,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -420,7 +622,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByFallback = await Drain(nodeA.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id);
+        var lateLoopWon = await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker());
 
         Assert.Equal(id, Assert.Single(claimedByFallback).Id);
         Assert.False(lateLoopWon);
@@ -441,7 +643,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByB = await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var ownerWon = await nodeA.TryMarkTimeTickerInProgress(id);
+        var ownerWon = await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Empty(claimedByB);
         Assert.True(ownerWon);
@@ -460,7 +662,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
         var claimedByB = await Drain(nodeB.QueueTimedOutCronTickerOccurrences(CancellationToken.None));
         _clock.Advance(TimeSpan.FromMilliseconds(500));
-        var ownerWon = await nodeA.TryMarkCronOccurrenceInProgress(id);
+        var ownerWon = await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker());
 
         Assert.Empty(claimedByB);
         Assert.True(ownerWon);
@@ -479,7 +681,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
         var claimedByFaster = await Drain(faster.QueueTimedOutTimeTickers(CancellationToken.None));
         slowClock.Advance(TimeSpan.FromMilliseconds(300));
-        var ownerWon = await owner.TryMarkTimeTickerInProgress(id);
+        var ownerWon = await owner.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker());
 
         Assert.Empty(claimedByFaster);
         Assert.True(ownerWon);
@@ -497,11 +699,11 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
 
         // Row 1: one TryMark wins, the twin's fallback then finds nothing to claim for it.
-        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst);
-        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst);
+        var tryMarkWon = await first.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
+        var twinTryMarkWon = await twin.TryMarkTimeTickerInProgress(markedFirst, _clock.NextClaimMarker());
         // Row 2: the twin's fallback wins, the other's TryMark then loses.
         var claimedByTwin = await Drain(twin.QueueTimedOutTimeTickers(CancellationToken.None));
-        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst);
+        var lateTryMarkWon = await first.TryMarkTimeTickerInProgress(fallbackFirst, _clock.NextClaimMarker());
 
         Assert.True(tryMarkWon);
         Assert.False(twinTryMarkWon);
@@ -649,7 +851,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         string? claimedJson = null;
         hook.AfterNextCall = async () =>
         {
-            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
             claimedJson = await RawOccurrence(id);
         };
 
@@ -657,7 +859,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
             new InternalFunctionContext { TickerId = id }.SetProperty(x => x.ExecutionTime, T0.AddMinutes(5)), CancellationToken.None);
         if (claimedJson is null)
         {
-            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id));
+            Assert.True(await nodeA.TryMarkCronOccurrenceInProgress(id, _clock.NextClaimMarker()));
             claimedJson = await RawOccurrence(id);
         }
 
@@ -679,7 +881,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         string? claimedJson = null;
         hook.AfterNextCall = async () =>
         {
-            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
             claimedJson = await RawTimeTickerJson(id);
         };
 
@@ -687,7 +889,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
             new InternalFunctionContext { TickerId = id }.SetProperty(x => x.ExecutionTime, T0.AddMinutes(5)), CancellationToken.None);
         if (claimedJson is null)
         {
-            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id));
+            Assert.True(await nodeA.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()));
             claimedJson = await RawTimeTickerJson(id);
         }
 
@@ -697,6 +899,35 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
     // The caller's token fires between two row acquires. The rows won so far are InProgress and must come back to be
     // dispatched; the rest must stay Idle. The hooked database cancels right after the first acquire script returns.
+    [Fact]
+    public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle_CronOccurrence()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder) };
+        await seeder.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var hooked = DispatchProxy.Create<IDatabase, HookedDatabase>();
+        var hook = (HookedDatabase)hooked;
+        hook.Inner = fixture.Database;
+        hook.AfterNextCall = () =>
+        {
+            cts.Cancel();
+            return Task.CompletedTask;
+        };
+        var node = fixture.CreateProvider("node-A", _clock, hooked);
+
+        var acquired = await node.AcquireImmediateCronOccurrencesAsync(ids, cts.Token);
+
+        Assert.Equal(ids[0], Assert.Single(acquired).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(seeder, ids[0])).Status);
+        foreach (var id in ids.Skip(1))
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
     [Fact]
     public async Task AcquireImmediate_CancelledMidBatch_ReturnsWonRowsAndLeavesTheRestIdle()
     {
@@ -722,6 +953,160 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
             var row = await ReadTimeTicker(seeder, id);
             Assert.Equal(TickerStatus.Idle, row.Status);
             Assert.Null(row.LockHolder);
+        }
+    }
+
+    // The store fails once after the call has won a row: the acquire script of the next row throws. Nobody gets the
+    // won row to run, so it must be put back (Idle, no holder) for the fallback, and the call must throw.
+    [Fact]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await SeedTimeTicker(seeder), await SeedTimeTicker(seeder), await SeedTimeTicker(seeder) };
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 2));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateTimeTickersAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadTimeTicker(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    [Fact]
+    public async Task AcquireImmediate_StoreFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence()
+    {
+        var seeder = CreateProvider("seed");
+        var ids = new[] { await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder), await QueueOccurrenceOn(seeder) };
+        await seeder.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 2));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // An occurrence stored without its cron: after the claim is won, the cron is read separately, and that read fails. The
+    // won row must be put back, not left InProgress.
+    [Fact]
+    public async Task AcquireImmediate_CronReadFailsAfterTheWin_PutsTheRowBackAndThrows()
+    {
+        var seeder = CreateProvider("seed");
+        var cron = new CronTickerEntity { Id = Guid.NewGuid(), Function = "claim-cron-fn", Expression = "* * * * *", CreatedAt = T0, UpdatedAt = T0, Request = [] };
+        await seeder.InsertCronTickers([cron], CancellationToken.None);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = cron.Id, Status = TickerStatus.Idle, ExecutionTime = T0, CreatedAt = T0, UpdatedAt = T0
+        };
+        await seeder.InsertCronTickerOccurrences([occurrence], CancellationToken.None);
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.StringGetAsync), 1));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => node.AcquireImmediateCronOccurrencesAsync([occurrence.Id], CancellationToken.None));
+
+        var row = await ReadOccurrence(seeder, occurrence.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
+    // A claim's script runs and lands, then its reply is lost (the call throws). The row is InProgress for this node with
+    // nothing to run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron
+    // occurrences.
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_IsPutBack(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seeder = CreateProvider("seed");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seeder);
+            await seeder.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker(seeder);
+        }
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var node = fixture.CreateProvider("node-A", _clock, FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 1, landFirst: true));
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        await Assert.ThrowsAsync<RedisConnectionException>(claim);
+
+        if (cron)
+        {
+            var row = await ReadOccurrence(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+        else
+        {
+            var row = await ReadTimeTicker(seeder, id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
+    // Throws on the n-th call of one method, once; every other call goes through. By default the call fails before it
+    // reaches Redis; with landFirst (ScriptEvaluateAsync only) it runs and lands, then its reply is lost.
+    public class FailingDatabase : DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _method = "";
+        private int _failAt;
+        private int _seen;
+        private bool _landFirst;
+
+        public static IDatabase Create(IDatabase inner, string method, int failAt, bool landFirst = false)
+        {
+            var proxy = DispatchProxy.Create<IDatabase, FailingDatabase>();
+            var failing = (FailingDatabase)(object)proxy;
+            failing._inner = inner;
+            failing._method = method;
+            failing._failAt = failAt;
+            failing._landFirst = landFirst;
+            return proxy;
+        }
+
+        private static async Task<RedisResult> LandThenFail(Task<RedisResult> call)
+        {
+            await call.ConfigureAwait(false);
+            throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "the reply was lost");
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            if (targetMethod!.Name == _method && ++_seen == _failAt)
+            {
+                if (_landFirst)
+                    return LandThenFail((Task<RedisResult>)targetMethod.Invoke(_inner, args)!);
+                throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
+            }
+
+            try
+            {
+                return targetMethod.Invoke(_inner, args);
+            }
+            catch (TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
         }
     }
 
@@ -798,7 +1183,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         {
             start.Wait();
             foreach (var id in ids)
-                if (await node.TryMarkTimeTickerInProgress(id))
+                if (await node.TryMarkTimeTickerInProgress(id, _clock.NextClaimMarker()))
                     winners.Add(id);
         }
 
@@ -975,6 +1360,37 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var requeue = Slot(cronId);
         requeue.Items[0].NextCronOccurrence = new NextCronOccurrence(found.Id, found.CreatedAt);
         Assert.Equal(id, Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(requeue, CancellationToken.None))).Id);
+    }
+
+    // The holder's index batch landed only in part: the id sets were written, the pending entry was not. Being in the
+    // id set must not count as fully indexed, or the fallback, which reads only the pending set, never finds the row.
+    [Fact]
+    public async Task PartlyIndexedSlotRow_HolderRetries_BecomesReachable()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await fixture.Database.SortedSetRemoveAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString());
+
+        Assert.Empty(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString()));
+        Assert.Equal(id, (await nodeA.GetEarliestAvailableCronOccurrence([cronId], CancellationToken.None)).Id);
+    }
+
+    // Same partial index, the per-cron set missing too: the heal restores it, so deleting the cron still finds the row.
+    [Fact]
+    public async Task PartlyIndexedSlotRow_HolderRetries_RestoresThePerCronEntry()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cronId = Guid.NewGuid();
+        var id = Assert.Single(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None))).Id;
+        await fixture.Database.SortedSetRemoveAsync(RedisKeyBuilder.CronOccurrencePendingKey, id.ToString());
+        await fixture.Database.SetRemoveAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString());
+
+        Assert.Empty(await Drain(nodeA.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        Assert.True(await fixture.Database.SetContainsAsync(RedisKeyBuilder.CronOccurrencesByCronKey(cronId), id.ToString()));
     }
 
     [Fact]

@@ -109,7 +109,7 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
                 await node.ReleaseAcquiredTimeTickers([ticker.Id], CancellationToken.None);
                 break;
             case "MarkInProgress":
-                Assert.True(await node.TryMarkTimeTickerInProgress(ticker.Id, CancellationToken.None));
+                Assert.True(await node.TryMarkTimeTickerInProgress(ticker.Id, T0));
                 break;
             default:
                 await node.ReleaseDeadNodeTimeTickerResources("node-dead", CancellationToken.None);
