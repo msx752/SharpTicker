@@ -18,7 +18,7 @@ namespace SharpTicker.Provider
 {
     internal class
         TickerInMemoryPersistenceProvider<TTimeTicker, TCronTicker> : ITickerPersistenceProvider<TTimeTicker,
-        TCronTicker>, IClaimFanOut
+        TCronTicker>, IClaimFanOut, IChildSkipWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -246,7 +246,25 @@ namespace SharpTicker.Provider
                     TimeTickers.TryUpdate(id, updatedTicker, ticker);
                 }
             }
-            
+
+            return Task.CompletedTask;
+        }
+
+        // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
+        // keeps the status of its run. A row that changes meanwhile is read again.
+        public Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        {
+            foreach (var id in timeTickerIds)
+            {
+                while (TimeTickers.TryGetValue(id, out var ticker) && (ticker.Status == TickerStatus.Idle || ticker.Status == TickerStatus.Queued))
+                {
+                    var skipped = CloneTicker(ticker);
+                    ApplyFunctionContextToTicker(skipped, skip);
+                    if (TimeTickers.TryUpdate(id, skipped, ticker))
+                        break;
+                }
+            }
+
             return Task.CompletedTask;
         }
 

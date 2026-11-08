@@ -1148,6 +1148,166 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
     }
 
     #endregion
+
+    #region Delayed children
+
+    // A parent row (not due, or already run) with a delayed child: a child with an execution time of its own.
+    private async Task<(Guid ParentId, Guid ChildId)> SeedDelayedChild(TickerStatus parentStatus, RunCondition? condition, DateTime childTime, TimeTickerEntity? grandchild = null)
+    {
+        var child = NewTimeTicker(executionTime: childTime);
+        child.Function = "delayed-child-fn";
+        child.RunCondition = condition;
+        if (grandchild != null) child.Children = [grandchild];
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(-1));
+        parent.Children = [child];
+        await using var context = CreateContext();
+        context.Set<TimeTickerEntity>().Add(parent);
+        await context.SaveChangesAsync();
+        return (parent.Id, child.Id);
+    }
+
+    private async Task<TimeTickerEntity> ReadRow(Guid id)
+    {
+        await using var context = CreateContext();
+        return await context.Set<TimeTickerEntity>().AsNoTracking().SingleAsync(x => x.Id == id);
+    }
+
+    public static IEnumerable<object?[]> EveryConditionAndParentStatus()
+        => from condition in Enum.GetValues<RunCondition>().Select(c => (RunCondition?)c).Append(null)
+           from status in Enum.GetValues<TickerStatus>()
+           select new object?[] { condition, status };
+
+    // The gate is written out for EF Core to translate; it must agree with ChainRunGate everywhere.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task DelayedChild_IsHandedOutExactlyWhenItsParentsStatusLetsItRun(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(30));
+
+        var claimed = await CreateProvider("node-A").AcquireImmediateTimeTickersAsync([childId], CancellationToken.None);
+
+        Assert.Equal(ChainRunGate.Allows(condition, parentStatus), claimed.Any(x => x.Id == childId));
+    }
+
+    // The fallback's skip query is the negation of the gate; both must agree with ChainRunGate everywhere: an overdue
+    // delayed child is claimed when its parent's status lets it run, skipped when its parent ended without a match, and
+    // left waiting otherwise.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task OverdueDelayedChild_IsClaimedSkippedOrLeftByTheFallback_ExactlyAsChainRunGateSays(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(-30));
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        var claimed = fallback.Any(x => x.Id == childId);
+        var status = (await ReadRow(childId)).Status;
+        if (ChainRunGate.Allows(condition, parentStatus))
+            Assert.True(claimed, "a child its parent's status lets run was not claimed");
+        else if (ChainRunGate.IsFinal(parentStatus))
+            Assert.True(!claimed && status == TickerStatus.Skipped, $"claimed={claimed}, status={status}; expected Skipped");
+        else
+            Assert.True(!claimed && status == TickerStatus.Idle, $"claimed={claimed}, status={status}; expected it to wait");
+    }
+
+    // A delayed child is a row of its own; removing its parent removes it, and its children, with it.
+    [Fact]
+    public async Task RemovingAParent_RemovesItsDelayedDescendants()
+    {
+        var grandchild = NewTimeTicker(executionTime: T0.AddHours(3));
+        var (parentId, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddHours(2), grandchild);
+
+        await CreateProvider("node-A").RemoveTimeTickers([parentId], CancellationToken.None);
+
+        await using var context = CreateContext();
+        Assert.False(await context.Set<TimeTickerEntity>().AnyAsync(x => x.Id == parentId || x.Id == childId || x.Id == grandchild.Id));
+    }
+
+    [Theory]
+    [InlineData(TickerStatus.Idle, 30)]
+    [InlineData(TickerStatus.Queued, 30)]
+    [InlineData(TickerStatus.InProgress, 30)]
+    [InlineData(TickerStatus.InProgress, -30)]
+    public async Task DelayedChild_IsNotHandedOutByTheWindowOrTheFallback_WhileItsParentHasNotEnded(TickerStatus parentStatus, int childDueInSeconds)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, RunCondition.OnSuccess, T0.AddSeconds(childDueInSeconds));
+        var node = CreateProvider("node-A");
+
+        Assert.DoesNotContain(await node.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == childId);
+        Assert.DoesNotContain(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == childId);
+        Assert.Equal(TickerStatus.Idle, (await ReadRow(childId)).Status);
+    }
+
+    [Fact]
+    public async Task DelayedChild_IsHandedOutByTheWindowAtItsTime_OnceItsParentSucceeded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddSeconds(30));
+
+        var window = await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal([childId], window.Select(x => x.Id));
+    }
+
+    [Fact]
+    public async Task DelayedChild_IsHandedOutByTheFallback_WhenItsTimePassedBeforeItsParentSucceeded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddSeconds(-30));
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Contains(fallback, x => x.Id == childId);
+    }
+
+    [Fact]
+    public async Task AWaitingDelayedChildDueFirst_DoesNotHideTheJobsDueAfterIt()
+    {
+        await SeedDelayedChild(TickerStatus.InProgress, RunCondition.OnSuccess, T0.AddSeconds(10));
+        var laterId = await SeedTimeTicker(executionTime: T0.AddSeconds(20));
+
+        var window = await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal([laterId], window.Select(x => x.Id));
+    }
+
+    // The parent's run skips a child its outcome does not let run; the fallback does it for a node that stopped first,
+    // and the skip reaches a delayed grandchild on a later pass.
+    [Fact]
+    public async Task TheFallback_SkipsADelayedChildWhoseParentsOutcomeDoesNotMatch_AndThenItsDelayedGrandchild()
+    {
+        var grandchild = NewTimeTicker(executionTime: T0.AddSeconds(-20));
+        grandchild.Function = "delayed-grandchild-fn";
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Failed, RunCondition.OnSuccess, T0.AddSeconds(-30), grandchild);
+        var node = CreateProvider("node-A");
+
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        var skipped = await ReadRow(childId);
+        Assert.Equal(TickerStatus.Skipped, skipped.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, skipped.SkippedReason);
+        Assert.Equal(TickerStatus.Skipped, (await ReadRow(grandchild.Id)).Status);
+    }
+
+    // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
+    [Theory]
+    [InlineData(TickerStatus.InProgress)]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status)
+    {
+        var started = await SeedTimeTicker(status, executionTime: T0.AddSeconds(-30));
+        var waiting = await SeedTimeTicker(executionTime: T0.AddSeconds(-30));
+        var skip = new InternalFunctionContext()
+            .SetProperty(x => x.Status, TickerStatus.Skipped)
+            .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
+
+        await ((IChildSkipWriter)CreateProvider("node-A")).SkipNotStartedTimeTickersAsync([started, waiting], skip, CancellationToken.None);
+
+        Assert.Equal(status, (await ReadRow(started)).Status);
+        Assert.Equal(TickerStatus.Skipped, (await ReadRow(waiting)).Status);
+    }
+
+    #endregion
 }
 
 public class EfCoreClaimMultiNodeSqliteTests : EfCoreClaimMultiNodeTests
