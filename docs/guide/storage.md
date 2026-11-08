@@ -84,6 +84,7 @@ options.AddStackExchangeRedis(redis =>
 - Set one of `Configuration`, `ConfigurationOptions`, `ConnectionMultiplexer` or `ConnectionMultiplexerFactory`; startup fails otherwise.
 - `InstanceName` (default `sharpticker:`) is the prefix under which nodes report that they are alive. Job data uses its own `tq:*` keys.
 - Each node sends a heartbeat every `NodeHeartbeatInterval` (default one minute). Jobs held by a node that stopped sending heartbeats are released for others.
+- Each child and grandchild of a chain is a record of its own, linked to its parent. Upgrade all nodes together: an older version reads only chains that hold their children inside the parent's record (see [Delayed children](scheduling.md#delayed-children)).
 - For trimmed or AOT applications, set `JsonSerializerContext`.
 - A custom entity can add properties, but Redis rewrites the stored record when a job is claimed, and an empty collection comes back readable only for `Children` and `RetryIntervals`, and only under those exact (PascalCase) names. A custom entity with another collection property, or a camelCase JSON context, can leave a record that cannot be read after a claim, so avoid both with Redis.
 

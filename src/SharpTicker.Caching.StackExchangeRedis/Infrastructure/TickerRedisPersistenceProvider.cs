@@ -35,7 +35,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             var list = await Serializer.LoadAllFromSetAsync<TTimeTicker>(
                 TimeTickerIdsKey, TimeTickerKey, ct).ConfigureAwait(false);
-            LinkLoadedChildren(list);
+            await LinkLoadedChildrenAsync(list).ConfigureAwait(false);
             return list;
         });
     }
@@ -77,7 +77,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         // Children are rows too: every row is linked first, so the predicate sees a root with its children.
         var list = await Serializer.LoadAllFromSetAsync<TTimeTicker>(
             TimeTickerIdsKey, TimeTickerKey, cancellationToken).ConfigureAwait(false);
-        LinkLoadedChildren(list);
+        await LinkLoadedChildrenAsync(list).ConfigureAwait(false);
 
         return list
             .Where(t => t.ParentId == null && (compiled == null || compiled(t)))
@@ -101,8 +101,9 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return tickers.Length;
     }
 
-    // An update also writes the chain nodes it carries, as rows of their own; a row stored by an older version with its
-    // children nested is split this way. Children it does not carry are kept.
+    // An update also writes the chain nodes it carries, as rows of their own. Children it does not carry are kept; a row
+    // stored by an older version with its children nested is split into rows, with the nested children when the update
+    // carries none.
     public async Task<int> UpdateTimeTickers(TTimeTicker[] tickers, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
@@ -113,16 +114,30 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     // Every chain node is a row of its own. Children are written before their parent, so a parent is never stored
     // without them, and a child is linked to its parent before its row exists: a link without a row is skipped on read.
+    // Cancellation is checked only before a chain starts, so a cancel does not leave half a chain behind.
     private async Task WriteChainAsync(TTimeTicker ticker, DateTime now, bool adding, int depth, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        if (depth == 0)
+            cancellationToken.ThrowIfCancellationRequested();
 
         var children = depth < MaxChainDepth ? ticker.Children?.Where(c => c != null).ToList() ?? [] : [];
 
-        foreach (var child in children)
+        if (!adding)
         {
+            var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(ticker.Id)).ConfigureAwait(false);
+            if (stored != null)
+            {
+                KeepStoredChainState(ticker, stored);
+                if (children.Count == 0 && stored.Children is { Count: > 0 } nested)
+                    children = nested.Where(c => c != null).ToList();
+            }
+        }
+
+        for (var position = 0; position < children.Count; position++)
+        {
+            var child = children[position];
             child.ParentId = ticker.Id;
-            await IndexManager.AddTimeTickerChildAsync(ticker.Id, child.Id).ConfigureAwait(false);
+            await IndexManager.AddTimeTickerChildAsync(ticker.Id, child.Id, position).ConfigureAwait(false);
             await WriteChainAsync(child, now, adding, depth + 1, cancellationToken).ConfigureAwait(false);
         }
 
@@ -141,6 +156,25 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             ticker.Children = carried;
         }
         await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
+    }
+
+    // A chain child's link and run belong to the store: an update carries a copy read earlier, whose run state may be
+    // stale, and the dashboard's edit form carries no ParentId or RunCondition. The update's definition is applied. A
+    // root keeps the update's run state, as before.
+    private static void KeepStoredChainState(TTimeTicker ticker, TTimeTicker stored)
+    {
+        if (stored.ParentId == null) return;
+
+        ticker.ParentId = stored.ParentId;
+        ticker.RunCondition ??= stored.RunCondition;
+        ticker.Status = stored.Status;
+        ticker.LockHolder = stored.LockHolder;
+        ticker.LockedAt = stored.LockedAt;
+        ticker.ExecutedAt = stored.ExecutedAt;
+        ticker.ExceptionMessage = stored.ExceptionMessage;
+        ticker.SkippedReason = stored.SkippedReason;
+        ticker.ElapsedTime = stored.ElapsedTime;
+        ticker.RetryCount = stored.RetryCount;
     }
 
     // Removes the rows with every descendant, as the other stores do: a child left without its parent would never run.

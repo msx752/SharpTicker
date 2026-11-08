@@ -280,9 +280,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         for (var depth = 0; level.Count > 0 && depth < MaxChainDepth; depth++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            // Sent together; the connection pipelines them.
-            var reads = level.Select(r => Db.SetMembersAsync(TimeTickerChildrenKey(r.Id))).ToArray();
-            var childIds = (await Task.WhenAll(reads).ConfigureAwait(false)).SelectMany(ParseGuidSet).Distinct().ToArray();
+            var order = await ReadChildOrderAsync(level.Select(r => r.Id)).ConfigureAwait(false);
+            var childIds = order.Keys.ToArray();
             if (childIds.Length == 0) return;
 
             var byParent = (await Serializer.LoadByIdsAsync<TTimeTicker>(childIds, TimeTickerKey, cancellationToken).ConfigureAwait(false))
@@ -292,11 +291,25 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             var next = new List<TTimeTicker>();
             foreach (var row in level.Where(r => byParent.Contains(r.Id)))
             {
-                row.Children = InChildOrder(byParent[row.Id]);
+                row.Children = InChildOrder(byParent[row.Id], order);
                 next.AddRange(row.Children);
             }
             level = next;
         }
+    }
+
+    // Each child's position under its parent, read from the parents' children sets in one pipelined round trip.
+    private async Task<Dictionary<Guid, int>> ReadChildOrderAsync(IEnumerable<Guid> parentIds)
+    {
+        var reads = parentIds.Select(id => Db.SortedSetRangeByRankAsync(TimeTickerChildrenKey(id))).ToArray();
+        var order = new Dictionary<Guid, int>();
+        foreach (var members in await Task.WhenAll(reads).ConfigureAwait(false))
+        {
+            var ids = ParseGuidSet(members);
+            for (var i = 0; i < ids.Length; i++)
+                order.TryAdd(ids[i], i);
+        }
+        return order;
     }
 
     // The children of the row with this id, read before the row is claimed: a failed read then leaves nothing claimed.
@@ -307,12 +320,16 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return holder.Children;
     }
 
-    // For reads that load every row anyway: links them by ParentId without another round trip.
-    protected static void LinkLoadedChildren(IReadOnlyCollection<TTimeTicker> rows)
+    // For reads that load every row anyway: links them by ParentId, reading only the order of the children.
+    protected async Task LinkLoadedChildrenAsync(IReadOnlyCollection<TTimeTicker> rows)
     {
         var byParent = rows.Where(r => r.ParentId.HasValue).ToLookup(r => r.ParentId.Value);
-        foreach (var row in rows.Where(r => byParent.Contains(r.Id)))
-            row.Children = InChildOrder(byParent[row.Id]);
+        var parents = rows.Where(r => byParent.Contains(r.Id)).ToList();
+        if (parents.Count == 0) return;
+
+        var order = await ReadChildOrderAsync(parents.Select(p => p.Id)).ConfigureAwait(false);
+        foreach (var row in parents)
+            row.Children = InChildOrder(byParent[row.Id], order);
     }
 
     // A claimed root carries the children read before its claim, unless it holds them nested (older format).
@@ -323,8 +340,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return row;
     }
 
-    private static List<TTimeTicker> InChildOrder(IEnumerable<TTimeTicker> children)
-        => children.OrderBy(c => c.CreatedAt).ThenBy(c => c.Id).ToList();
+    // A child missing from the order (its link was dropped) goes last.
+    private static List<TTimeTicker> InChildOrder(IEnumerable<TTimeTicker> children, Dictionary<Guid, int> order)
+        => children.OrderBy(c => order.TryGetValue(c.Id, out var position) ? position : int.MaxValue)
+            .ThenBy(c => c.CreatedAt).ThenBy(c => c.Id).ToList();
     #endregion
 
     // A delayed child is carried without its time on purpose: the handler then runs it right after its parent, by its

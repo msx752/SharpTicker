@@ -38,11 +38,14 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return Task.WhenAll(t1, t2);
     }
 
-    internal Task AddTimeTickerChildAsync(Guid parentId, Guid childId)
-        => _db.SetAddAsync(TimeTickerChildrenKey(parentId), childId.ToString());
+    // Scored by the child's position in its chain, so children read back in the order the chain was built. A child
+    // already linked keeps its place.
+    internal Task AddTimeTickerChildAsync(Guid parentId, Guid childId, int position)
+        => _db.SortedSetAddAsync(TimeTickerChildrenKey(parentId), childId.ToString(), position, When.NotExists);
 
+    // In chain order.
     internal async Task<Guid[]> GetTimeTickerChildIdsAsync(Guid parentId)
-        => ParseGuidSet(await _db.SetMembersAsync(TimeTickerChildrenKey(parentId)).ConfigureAwait(false));
+        => ParseGuidSet(await _db.SortedSetRangeByRankAsync(TimeTickerChildrenKey(parentId)).ConfigureAwait(false));
 
     // Also drops the row's own children set and its entry in its parent's children set.
     internal Task RemoveTimeTickerIndexesAsync(Guid id, Guid? parentId = null)
@@ -53,7 +56,7 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         var t1 = batch.SetRemoveAsync(TimeTickerIdsKey, idStr);
         var t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
         var t3 = batch.KeyDeleteAsync(TimeTickerChildrenKey(id));
-        var t4 = parentId.HasValue ? batch.SetRemoveAsync(TimeTickerChildrenKey(parentId.Value), idStr) : Task.CompletedTask;
+        var t4 = parentId.HasValue ? batch.SortedSetRemoveAsync(TimeTickerChildrenKey(parentId.Value), idStr) : Task.CompletedTask;
 
         batch.Execute();
         return Task.WhenAll(t1, t2, t3, t4);

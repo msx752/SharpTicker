@@ -347,7 +347,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
     #region Children
 
-    // Redis keeps the children inside the parent's record; they are never rows of their own.
+    // Each chain node is a row of its own, linked to its parent.
     private async Task<(Guid ParentId, Guid ChildId)> SeedParentWithChild(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> via)
     {
         var child = NewTimeTicker();
@@ -549,6 +549,99 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal([parent.Id.ToString()], (await fixture.Database.SetMembersAsync(RedisKeyBuilder.TimeTickerIdsKey)).Select(x => x.ToString()));
     }
 
+    // An update carries a copy of the chain read earlier. A child's run (written by id) since then must survive it, while
+    // the definition the update carries is applied.
+    [Fact]
+    public async Task UpdatingAChain_KeepsTheRunStateOfItsChildren_AndAppliesTheirDefinition()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+        var stale = await ReadTimeTicker(nodeA, parent.Id);
+
+        var done = StatusContext(child.Id, TickerStatus.Done).SetProperty(x => x.ExecutedAt, T0).SetProperty(x => x.ElapsedTime, 42L);
+        Assert.Equal(1, await nodeA.UpdateTimeTicker(done, CancellationToken.None));
+
+        stale.Children.Single().Description = "edited";
+        Assert.Equal(1, await nodeA.UpdateTimeTickers([stale], CancellationToken.None));
+
+        var row = await ReadTimeTicker(nodeA, child.Id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal(T0, row.ExecutedAt);
+        Assert.Equal(42L, row.ElapsedTime);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(grandchild.Id, Assert.Single(row.Children).Id);
+    }
+
+    // The dashboard's edit form sends a child without its ParentId and RunCondition, and with an execution time. The
+    // child must stay in its chain: linked, with its condition, and not handed out on its own.
+    [Fact]
+    public async Task EditingAChildAsAStandaloneTicker_KeepsItInItsChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        var edit = NewTimeTicker();
+        edit.Id = child.Id;
+        edit.Function = "edited-child";
+        Assert.Null(edit.ParentId);
+        Assert.Null(edit.RunCondition);
+        Assert.Equal(1, await nodeA.UpdateTimeTickers([edit], CancellationToken.None));
+
+        var read = await ReadTimeTicker(nodeA, parent.Id);
+        var edited = Assert.Single(read.Children);
+        Assert.Equal("edited-child", edited.Function);
+        Assert.Equal(RunCondition.OnSuccess, edited.RunCondition);
+        Assert.Equal(grandchild.Id, Assert.Single(edited.Children).Id);
+        Assert.Single(await nodeA.GetTimeTickers(null!, CancellationToken.None));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Equal([parent.Id], (await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
+    }
+
+    // The dashboard's edit form sends a root without its children. An older chain keeps its children nested in the
+    // root's row, so such an edit must not drop them.
+    [Fact]
+    public async Task EditingAnOldFormatRootWithoutItsChildren_KeepsTheChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = await SeedOldFormatChain();
+
+        var edit = NewTimeTicker();
+        edit.Id = parent.Id;
+        edit.Description = "edited";
+        Assert.Equal(1, await nodeA.UpdateTimeTickers([edit], CancellationToken.None));
+
+        var read = await ReadTimeTicker(nodeA, parent.Id);
+        Assert.Equal("edited", read.Description);
+        AssertCarriesTheChain(read, child.Id, grandchild.Id);
+        Assert.Equal(parent.Id, (await ReadTimeTicker(nodeA, child.Id)).ParentId);
+        Assert.Contains("\"Children\":[]", (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.TimeTickerKey(parent.Id)))!);
+    }
+
+    // Children come back in the order the chain was built, also when they share their CreatedAt.
+    [Fact]
+    public async Task Children_ComeBackInTheOrderTheChainWasBuilt()
+    {
+        var nodeA = CreateProvider("node-A");
+        var parent = NewTimeTicker();
+        var children = Enumerable.Range(0, 5).Select(i =>
+        {
+            var c = NewTimeTicker();
+            c.ExecutionTime = null;
+            c.Function = $"child-{i}";
+            return c;
+        }).ToList();
+        parent.Children = children;
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        var expected = children.Select(c => c.Id).ToArray();
+        Assert.Equal(expected, (await ReadTimeTicker(nodeA, parent.Id)).Children.Select(c => c.Id));
+        Assert.Equal(expected, Assert.Single(await nodeA.GetTimeTickers(null!, CancellationToken.None)).Children.Select(c => c.Id));
+        Assert.Equal(expected, Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None)).Children.Select(c => c.Id));
+    }
+
     // A write that stopped after linking a child but before storing its row leaves a link without a row.
     [Fact]
     public async Task AChildLinkWithoutItsRow_IsSkippedOnRead()
@@ -556,7 +649,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         var nodeA = CreateProvider("node-A");
         var (parent, child, _) = NewChain();
         await nodeA.AddTimeTickers([parent], CancellationToken.None);
-        await fixture.Database.SetAddAsync(RedisKeyBuilder.TimeTickerChildrenKey(parent.Id), Guid.NewGuid().ToString());
+        await fixture.Database.SortedSetAddAsync(RedisKeyBuilder.TimeTickerChildrenKey(parent.Id), Guid.NewGuid().ToString(), -1);
 
         Assert.Equal(child.Id, Assert.Single((await ReadTimeTicker(nodeA, parent.Id)).Children).Id);
         Assert.Equal(child.Id, Assert.Single(Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None)).Children).Id);
