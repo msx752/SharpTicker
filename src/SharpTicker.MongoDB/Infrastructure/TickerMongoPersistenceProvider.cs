@@ -16,7 +16,7 @@ using SharpTicker.Utilities.Models;
 namespace SharpTicker.MongoDB.Infrastructure
 {
     internal sealed class TickerMongoPersistenceProvider<TTimeTicker, TCronTicker> :
-        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut
+        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut, IChildSkipWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -241,6 +241,20 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .UpdateManyAsync(
                     Builders<TTimeTicker>.Filter.In(x => x.Id, timeTickerIds),
                     update,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
+        // keeps the status of its run.
+        public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        {
+            if (timeTickerIds.Length == 0) return;
+            var fb = Builders<TTimeTicker>.Filter;
+            await _context.TimeTickers
+                .UpdateManyAsync(
+                    fb.And(fb.In(x => x.Id, timeTickerIds), fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued })),
+                    MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(skip, _clock.UtcNow),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
         }

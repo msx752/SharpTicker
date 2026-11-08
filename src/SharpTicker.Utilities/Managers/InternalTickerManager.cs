@@ -400,7 +400,13 @@ namespace SharpTicker.Utilities.Managers
                 .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
             
             if (resources.Length != 0)
-                await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(resources.Select(x => x.TickerId).ToArray(), unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+            {
+                var ids = resources.Select(x => x.TickerId).ToArray();
+                if (_persistenceProvider is IChildSkipWriter skipWriter)
+                    await skipWriter.SkipNotStartedTimeTickersAsync(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+                else
+                    await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+            }
             
             foreach (var resource in resources)
             {

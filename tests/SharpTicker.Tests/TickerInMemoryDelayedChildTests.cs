@@ -175,6 +175,26 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Idle, await StatusOf(child.Id));
     }
 
+    // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
+    [Theory]
+    [InlineData(TickerStatus.InProgress)]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status)
+    {
+        var started = Row(Now.AddSeconds(-30), status);
+        var waiting = Row(Now.AddSeconds(-30));
+        await _provider.AddTimeTickers([started, waiting], CancellationToken.None);
+        var skip = new SharpTicker.Utilities.Models.InternalFunctionContext()
+            .SetProperty(x => x.Status, TickerStatus.Skipped)
+            .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
+
+        await ((SharpTicker.Utilities.Interfaces.IChildSkipWriter)_provider).SkipNotStartedTimeTickersAsync([started.Id, waiting.Id], skip, CancellationToken.None);
+
+        Assert.Equal(status, await StatusOf(started.Id));
+        Assert.Equal(TickerStatus.Skipped, await StatusOf(waiting.Id));
+    }
+
     // A grandchild left without its parent row would wait for that parent forever.
     [Fact]
     public async Task RemovingARoot_RemovesItsGrandchildrenToo()

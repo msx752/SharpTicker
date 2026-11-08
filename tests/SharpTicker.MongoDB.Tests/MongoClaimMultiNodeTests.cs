@@ -1088,6 +1088,26 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         AssertCarriesTheChain(Assert.Single(acquired, x => x.Id == parentId), childId, grandchildId);
     }
 
+    // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
+    [Theory]
+    [InlineData(TickerStatus.InProgress)]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.Failed)]
+    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status)
+    {
+        var started = NewTimeTicker(status);
+        var waiting = NewTimeTicker();
+        await CreateProvider("seed").AddTimeTickers([started, waiting], CancellationToken.None);
+        var skip = new InternalFunctionContext()
+            .SetProperty(x => x.Status, TickerStatus.Skipped)
+            .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
+
+        await ((IChildSkipWriter)CreateProvider("node-A")).SkipNotStartedTimeTickersAsync([started.Id, waiting.Id], skip, CancellationToken.None);
+
+        Assert.Equal(status, (await ReadTimeTicker(started.Id)).Status);
+        Assert.Equal(TickerStatus.Skipped, (await ReadTimeTicker(waiting.Id)).Status);
+    }
+
     #endregion
 
     #region Racing

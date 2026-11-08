@@ -1161,6 +1161,48 @@ public class InternalTickerManagerTests
         AssertMarksTheDelayedOnes(Assert.Single(functions), _now);
     }
 
+    private IInternalTickerManager ManagerOver(ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker> persistence)
+        => (IInternalTickerManager)Activator.CreateInstance(
+            typeof(IInternalTickerManager).Assembly
+                .GetType("SharpTicker.Utilities.Managers.InternalTickerManager`2")!
+                .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker)),
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+            binder: null,
+            args: new object[] { persistence, _clock, _notificationHub },
+            culture: null)!;
+
+    private static InternalFunctionContext[] ChildrenToSkip(params Guid[] ids)
+        => ids.Select(id => new InternalFunctionContext { TickerId = id, Type = TickerType.TimeTicker }).ToArray();
+
+    // A store that can skip only the rows that have not started gets that write, so a delayed child it already ran keeps
+    // the status of its run.
+    [Fact]
+    public async Task SkippingChildren_UsesTheStoresNotStartedWrite_WhenItHasOne()
+    {
+        var persistence = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IChildSkipWriter>();
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid() };
+
+        await ManagerOver(persistence).UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+
+        await ((IChildSkipWriter)persistence).Received(1).SkipNotStartedTimeTickersAsync(
+            Arg.Is<Guid[]>(x => x.SequenceEqual(ids)),
+            Arg.Is<InternalFunctionContext>(c => c.Status == TickerStatus.Skipped && c.ExceptionDetails == ChainRunGate.NotMatchedReason),
+            Arg.Any<CancellationToken>());
+        await persistence.DidNotReceiveWithAnyArgs().UpdateTimeTickersWithUnifiedContext(default!, default!, default);
+    }
+
+    // A custom store keeps the write it had.
+    [Fact]
+    public async Task SkippingChildren_UsesTheUnifiedWrite_OnAStoreWithoutTheNotStartedOne()
+    {
+        var ids = new[] { Guid.NewGuid() };
+
+        await _manager.UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+
+        await _persistence.Received(1).UpdateTimeTickersWithUnifiedContext(
+            Arg.Is<Guid[]>(x => x.SequenceEqual(ids)), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
+    }
+
     // Run-now builds its contexts in TickerManager.
     [Fact]
     public void RunNowContexts_MarkDelayedChildrenAndGrandchildren()

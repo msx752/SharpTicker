@@ -17,7 +17,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
-internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut
+internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
@@ -99,12 +99,38 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var context = dbContext.Set<TTimeTicker>();
         var now = _clock.UtcNow;
         var fallbackThreshold = now.AddSeconds(-1);  // Fallback picks up tasks older than main 1-second window
-            
+
+        // A delayed child whose parent ended with an outcome it does not run on never will. The parent's run skips it;
+        // this covers a node that stopped before doing so. Its own delayed children follow on a later pass.
+        // Read first, then write by id: an UPDATE through the parent join does not translate on every provider (SQLite),
+        // and such a row can never become claimable meanwhile, as its parent's finished status does not change.
+        var outcomeDoesNotMatch = await context
+            .AsNoTracking()
+            .Where(x => x.ExecutionTime != null && x.ExecutionTime <= fallbackThreshold)
+            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+            .WhereParentEndedWithoutMatch()
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        if (outcomeDoesNotMatch.Count > 0)
+            await context
+                .Where(x => outcomeDoesNotMatch.Contains(x.Id))
+                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Skipped)
+                .SetProperty(x => x.ExecutedAt, now)
+                .SetProperty(x => x.SkippedReason, ChainRunGate.NotMatchedReason)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+
+        // A delayed child whose parent has not ended (with a status its condition accepts) waits.
         var timeTickersToUpdate =  await context
             .AsNoTracking()
             .Where(x => x.ExecutionTime != null)
             .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
             .Where(x => x.ExecutionTime <= fallbackThreshold)  // Only tasks older than 1 second
+            .WhereChainGateOpen()
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
@@ -214,6 +240,19 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => idList.Contains(x.Id))
             .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(functionContext, _clock.UtcNow), cancellationToken).ConfigureAwait(false);
     }
+
+    // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out keeps
+    // the status of its run.
+    public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+        var idList = timeTickerIds.ToList();
+        await dbContext.Set<TTimeTicker>()
+            .Where(x => idList.Contains(x.Id))
+            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+            .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(skip, _clock.UtcNow), cancellationToken).ConfigureAwait(false);
+    }
         
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken)
     {
@@ -228,7 +267,9 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .AsNoTracking()
             .Where(x => x.ExecutionTime != null)
             .Where(x => x.ExecutionTime >= oneSecondAgo)  // Ignore old tickers (fallback handles them)
-            .WhereCanAcquire(_lockHolder);
+            .WhereCanAcquire(_lockHolder)
+            // Part of the earliest-time query: a delayed child that still waits must not hide the rows due after it.
+            .WhereChainGateOpen();
     
         // Find the earliest ticker within our window
         var minExecutionTime = await baseQuery
@@ -318,6 +359,19 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var set = dbContext.Set<TTimeTicker>();
         var won = new Dictionary<Guid, DateTime>(ids.Length);
 
+        // A delayed child is claimable only once its parent's status lets it run. Read first, then claim by id: an UPDATE
+        // through the parent join does not translate on every provider (SQLite), and the gate does not close again once
+        // open, as a finished parent status does not change.
+        var gateOpen = await set
+            .AsNoTracking()
+            .Where(x => ids.Contains(x.Id))
+            .WhereChainGateOpen()
+            .Select(x => x.Id)
+            // A cancelled caller is answered by the loop below (it stops before claiming), not by a throw here.
+            .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+        if (gateOpen.Count == 0)
+            return [];
+
         try
         {
             // One conditional write per row, so the rows this call won are known exactly. A batch update followed by a
@@ -328,6 +382,9 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 // returned to be dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested)
                     break;
+
+                if (!gateOpen.Contains(id))
+                    continue;
 
                 var claimMarker = _clock.NextClaimMarker();
                 int affected;
