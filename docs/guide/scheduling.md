@@ -157,7 +157,7 @@ A child or grandchild can have an execution time of its own (`SetExecutionTime` 
 
 Pass the child's time in UTC.
 
-Store support: EF Core and the in-memory store behave as described. On MongoDB a delayed child currently runs at its own time without waiting for its parent. On Redis, children are stored inside the parent's record, so a delayed child runs right after its parent, by its `RunCondition`, and its own time is ignored. The remaining stores follow in the next releases. Upgrade all nodes together: a node on an older version hands out delayed children without waiting for their parent.
+Store support: EF Core, MongoDB and the in-memory store behave as described. On Redis, children are stored inside the parent's record, so a delayed child runs right after its parent, by its `RunCondition`, and its own time is ignored. Redis follows in a next release. Upgrade all nodes together: a node on an older version hands out delayed children without waiting for their parent.
 
 ## Seeding
 
