@@ -1110,17 +1110,17 @@ namespace SharpTicker.MongoDB.Infrastructure
 
         // The dispatched payload holds the two levels below each row that the execution handler runs (children and
         // grandchildren), as on the other stores. Mongo keeps each descendant as a document of its own, so this is one
-        // query per level. Only descendants without an execution time of their own run inside the chain; one that has
-        // a time is scheduled as a row of its own.
+        // query per level. A delayed child (one with an execution time of its own) is carried with its time: the handler
+        // never runs it inline, it skips it when the parent's outcome does not match, and the store hands it out otherwise.
         private async Task<Dictionary<Guid, List<TTimeTicker>>> LoadChildrenLookup(Guid[] parentIds, CancellationToken ct)
         {
             var byParent = new Dictionary<Guid, List<TTimeTicker>>();
             if (parentIds.Length == 0) return byParent;
 
-            var children = await LoadUnscheduledChildren(parentIds, ct).ConfigureAwait(false);
+            var children = await LoadChildren(parentIds, ct).ConfigureAwait(false);
             var grandchildren = children.Count == 0
                 ? children
-                : await LoadUnscheduledChildren(children.Select(c => c.Id).ToArray(), ct).ConfigureAwait(false);
+                : await LoadChildren(children.Select(c => c.Id).ToArray(), ct).ConfigureAwait(false);
 
             foreach (var row in children.Concat(grandchildren))
             {
@@ -1131,15 +1131,10 @@ namespace SharpTicker.MongoDB.Infrastructure
             return byParent;
         }
 
-        private Task<List<TTimeTicker>> LoadUnscheduledChildren(Guid[] parentIds, CancellationToken ct)
-        {
-            var fb = Builders<TTimeTicker>.Filter;
-            return _context.TimeTickers
-                .Find(fb.And(
-                    fb.In(x => x.ParentId, parentIds.Select(p => (Guid?)p)),
-                    fb.Eq(x => x.ExecutionTime, null)))
+        private Task<List<TTimeTicker>> LoadChildren(Guid[] parentIds, CancellationToken ct)
+            => _context.TimeTickers
+                .Find(Builders<TTimeTicker>.Filter.In(x => x.ParentId, parentIds.Select(p => (Guid?)p)))
                 .ToListAsync(ct);
-        }
 
         private TimeTickerEntity BuildQueuedEntity(TTimeTicker ticker, Dictionary<Guid, List<TTimeTicker>> byParent)
         {

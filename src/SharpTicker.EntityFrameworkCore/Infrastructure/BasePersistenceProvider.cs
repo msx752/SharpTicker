@@ -105,7 +105,6 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => x.ExecutionTime != null)
             .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
             .Where(x => x.ExecutionTime <= fallbackThreshold)  // Only tasks older than 1 second
-            .Include(x => x.Children.Where(y => y.ExecutionTime == null))
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
@@ -250,7 +249,6 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var maxExecutionTime = minSecond.AddSeconds(1);
     
         return await baseQuery
-            .Include(x => x.Children.Where(y => y.ExecutionTime == null))
             .Where(x => x.ExecutionTime >= minSecond && x.ExecutionTime < maxExecutionTime)
             .OrderBy(x => x.ExecutionTime)
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
@@ -364,7 +362,6 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             var acquired = await set
                 .AsNoTracking()
                 .Where(x => wonIds.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
-                .Include(x => x.Children.Where(y => y.ExecutionTime == null))
                 .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
                 .ToArrayAsync(CancellationToken.None)
                 .ConfigureAwait(false);

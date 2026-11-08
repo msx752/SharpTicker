@@ -53,6 +53,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         var tasksToRunNowCount = 0;
 
         var hasChildren = context.TimeTickerChildren.Count > 0;
+        List<InternalFunctionContext> delayedChildren = null;
 
         // Add parent task
         tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken);
@@ -63,7 +64,15 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             for (var i = 0; i < context.TimeTickerChildren.Count; i++)
             {
                 var child = context.TimeTickerChildren[i];
-                
+
+                // A delayed child is a row of its own: the store hands it out once this parent has ended and its time
+                // has come. Running it here as well would run it twice.
+                if (child.IsDelayed)
+                {
+                    (delayedChildren ??= []).Add(child);
+                    continue;
+                }
+
                 if (child.CachedDelegate != null)
                 {
                     if (child.RunCondition == RunCondition.InProgress)
@@ -80,17 +89,17 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         await Task.WhenAll(tasksToRunNow.AsSpan(0, tasksToRunNowCount).ToArray());
 
         // Process deferred children after parent completion
-        if (childrenToRunAfterCount > 0)
+        if (childrenToRunAfterCount > 0 || delayedChildren != null)
         {
             var childrenToSkip = new List<InternalFunctionContext>(30); // Pre-sized for performance
             var childrenToRunAfterTask = new Task[childrenToRunAfterCount];
-            
+
             var taskCount = 0;
-            
+
             for (var i = 0; i < childrenToRunAfterCount; i++)
             {
                 var child = childrenToRunAfter[i];
-                
+
                 if (child.CachedDelegate != null)
                 {
                     if (ShouldRunChild(child, context.Status))
@@ -99,17 +108,19 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                     }
                     else
                     {
-                        _sharpTickerInstrumentation.LogJobSkipped(
-                            child.TickerId,
-                            child.FunctionName,
-                            $"Condition {child.RunCondition} not met (Parent status: {context.Status})"
-                        );
-                        child.ParentId = context.TickerId;
-                        childrenToSkip.Add(child);
-
-                        // Recursively gather all descendants to skip
-                        GatherDescendantsToSkip(child, childrenToSkip);
+                        SkipWithDescendants(child, context, childrenToSkip);
                     }
+                }
+            }
+
+            // A delayed child the parent's outcome lets run is left to the store; one it does not let run never will, as
+            // a finished status does not change, so it is skipped now with what it carries.
+            if (delayedChildren != null)
+            {
+                foreach (var child in delayedChildren)
+                {
+                    if (!ShouldRunChild(child, context.Status))
+                        SkipWithDescendants(child, context, childrenToSkip);
                 }
             }
 
@@ -117,11 +128,25 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             if (childrenToSkip.Count > 0)
                 await _internalTickerManager.UpdateSkipTimeTickersWithUnifiedContextAsync(
                     childrenToSkip.ToArray(), cancellationToken);
-            
+
             // Wait for deferred tasks
             if (taskCount > 0)
                 await Task.WhenAll(childrenToRunAfterTask.AsSpan(0, taskCount).ToArray());
         }
+    }
+
+    private void SkipWithDescendants(InternalFunctionContext child, InternalFunctionContext parent, List<InternalFunctionContext> childrenToSkip)
+    {
+        _sharpTickerInstrumentation.LogJobSkipped(
+            child.TickerId,
+            child.FunctionName,
+            $"Condition {child.RunCondition} not met (Parent status: {parent.Status})"
+        );
+        child.ParentId = parent.TickerId;
+        childrenToSkip.Add(child);
+
+        // Recursively gather all descendants to skip
+        GatherDescendantsToSkip(child, childrenToSkip);
     }
 
     /// <summary>
@@ -406,20 +431,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }, SharpTickerInternalJsonContext.Default.ExceptionDetailClassForSerialization);
     }
 
+    // The same rule the stores apply to a delayed child, so a child runs on the same parent outcomes either way. A child
+    // that is not delayed and runs while its parent is InProgress was started with the parent and never comes here.
     private static bool ShouldRunChild(InternalFunctionContext childContext, TickerStatus parentStatus)
-    {
-        return childContext.RunCondition switch
-        {
-            RunCondition.InProgress => parentStatus == TickerStatus.InProgress,
-            RunCondition.OnSuccess => parentStatus is TickerStatus.Done or TickerStatus.DueDone,
-            RunCondition.OnFailure => parentStatus == TickerStatus.Failed,
-            RunCondition.OnCancelled => parentStatus == TickerStatus.Cancelled,
-            RunCondition.OnFailureOrCancelled => parentStatus is TickerStatus.Failed or TickerStatus.Cancelled,
-            RunCondition.OnAnyCompletedStatus => parentStatus is TickerStatus.Done or TickerStatus.DueDone
-                or TickerStatus.Failed or TickerStatus.Cancelled,
-            _ => false
-        };
-    }
+        => ChainRunGate.Allows(childContext.RunCondition, parentStatus);
 
     private static void GatherDescendantsToSkip(InternalFunctionContext parent, List<InternalFunctionContext> skipList)
     {

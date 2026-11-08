@@ -391,6 +391,9 @@ namespace SharpTicker.Utilities.Managers
         }
 
         private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker)
+            => BuildContextFromNonGeneric(ticker, isChild: false);
+
+        private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker, bool isChild)
         {
             return new InternalFunctionContext
             {
@@ -402,7 +405,8 @@ namespace SharpTicker.Utilities.Managers
                 ParentId = ticker.ParentId,
                 ExecutionTime = ticker.ExecutionTime ?? DateTime.UtcNow,
                 RunCondition = ticker.RunCondition ?? Enums.RunCondition.OnAnyCompletedStatus,
-                TimeTickerChildren = ticker.Children.Select(BuildContextFromNonGeneric).ToList()
+                IsDelayed = isChild && ticker.ExecutionTime.HasValue,
+                TimeTickerChildren = ticker.Children.Select(child => BuildContextFromNonGeneric(child, isChild: true)).ToList()
             };
         }
 

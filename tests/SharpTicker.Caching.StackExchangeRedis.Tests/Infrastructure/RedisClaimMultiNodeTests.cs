@@ -387,6 +387,32 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Empty(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
+    // Until delayed children are rows of their own on Redis, a child with an execution time of its own stays inside its
+    // parent's record and is carried without its time: it runs right after its parent, by its RunCondition, once, and
+    // never early. Carrying its time would make the handler leave it to the store, where it would never run.
+    [Fact]
+    public async Task ChildWithItsOwnTime_IsCarriedWithoutIt_SoItRunsWithItsParent()
+    {
+        var nodeA = CreateProvider("node-A");
+        var grandchild = NewTimeTicker();
+        grandchild.ExecutionTime = T0.AddHours(3);
+        var child = NewTimeTicker();
+        child.ExecutionTime = T0.AddHours(2);
+        child.RunCondition = RunCondition.OnSuccess;
+        child.Children = [grandchild];
+        var parent = NewTimeTicker();
+        parent.Children = [child];
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        var payload = Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None));
+
+        Assert.Equal(parent.Id, payload.Id);
+        var carried = Assert.Single(payload.Children);
+        Assert.Equal(child.Id, carried.Id);
+        Assert.Null(carried.ExecutionTime);
+        Assert.Null(Assert.Single(carried.Children).ExecutionTime);
+    }
+
     #endregion
 
     [Fact]
