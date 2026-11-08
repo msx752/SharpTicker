@@ -551,6 +551,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         {
             await _internalTickerManager.UpdateTickerAsync(child, cancellationToken);
         }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Recording chain child {FunctionName} ({TickerId}) as InProgress was cancelled.", child.FunctionName, child.TickerId);
+        }
         catch (Exception ex)
         {
             Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway.",
