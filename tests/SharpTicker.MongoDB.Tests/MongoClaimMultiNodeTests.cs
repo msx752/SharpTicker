@@ -1,4 +1,8 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Configuration;
 using MongoDB.Driver.Core.Events;
@@ -524,19 +528,34 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
     // A node whose n-th command of the given name throws before it is sent, once; every later command runs normally.
     private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateFailingNode(string commandName, int n)
+        => CreateNodeWithHook(commandName, n, () => throw new InvalidOperationException("store failed"));
+
+    // A node that runs the hook just before its n-th command of the given name is sent, once.
+    private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateNodeWithHook(string commandName, int n, Action hook, ILogger? logger = null)
     {
         var seen = 0;
         var settings = MongoClientSettings.FromConnectionString(_f.Container.GetConnectionString());
         settings.ClusterConfigurator = builder => builder.Subscribe<CommandStartedEvent>(e =>
         {
             if (e.CommandName == commandName && ++seen == n)
-                throw new InvalidOperationException("store failed");
+                hook();
         });
         var database = new MongoClient(settings).GetDatabase(_f.Database.DatabaseNamespace.DatabaseName);
         return new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
             new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(database, "ticker_"),
             _clock,
-            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+            new SchedulerOptionsBuilder { NodeIdentifier = "node-A" },
+            logger);
+    }
+
+    // Keeps the level and exception of each entry written.
+    private sealed class ListLogger : ILogger
+    {
+        public List<(LogLevel Level, Exception? Exception)> Entries { get; } = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, exception));
     }
 
     [Fact]
@@ -1023,8 +1042,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
-    // Parent -> child -> grandchild, where neither descendant has an execution time of its own; plus a grandchild that
-    // has one (it is scheduled on its own, so no claim path carries it inside the chain).
+    // Parent -> child -> grandchild, where neither descendant has an execution time of its own; plus a delayed grandchild
+    // (one with an execution time of its own), which the payload carries with its time so the handler never runs it inline.
     private async Task<(Guid ParentId, Guid ChildId, Guid GrandchildId, Guid ScheduledGrandchildId)> SeedThreeLevelChain()
     {
         var grandchild = NewTimeTicker();
@@ -1044,48 +1063,76 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         return (parent.Id, child.Id, grandchild.Id, scheduledGrandchild.Id);
     }
 
-    private static void AssertCarriesTheChain(TimeTickerEntity parent, Guid childId, Guid grandchildId)
+    private static void AssertCarriesTheChain(TimeTickerEntity parent, Guid childId, Guid grandchildId, Guid delayedGrandchildId)
     {
         var child = Assert.Single(parent.Children);
         Assert.Equal(childId, child.Id);
-        var grandchild = Assert.Single(child.Children);
-        Assert.Equal(grandchildId, grandchild.Id);
+        Assert.Null(child.ExecutionTime);
+        Assert.Equal(2, child.Children.Count);
+        var grandchild = Assert.Single(child.Children, x => x.Id == grandchildId);
         Assert.Equal("claim-grandchild-fn", grandchild.Function);
         Assert.Equal(RunCondition.OnSuccess, grandchild.RunCondition);
+        Assert.Null(grandchild.ExecutionTime);
+        var delayedGrandchild = Assert.Single(child.Children, x => x.Id == delayedGrandchildId);
+        Assert.Equal("claim-scheduled-grandchild-fn", delayedGrandchild.Function);
+        Assert.Equal(T0.AddHours(1), delayedGrandchild.ExecutionTime);
     }
 
     [Fact]
     public async Task Window_CarriesTheGrandchildrenOfAChain()
     {
         var nodeA = CreateProvider("node-A");
-        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+        var (parentId, childId, grandchildId, delayedGrandchildId) = await SeedThreeLevelChain();
 
         var window = await nodeA.GetEarliestTimeTickers(CancellationToken.None);
 
-        AssertCarriesTheChain(Assert.Single(window, x => x.Id == parentId), childId, grandchildId);
+        AssertCarriesTheChain(Assert.Single(window, x => x.Id == parentId), childId, grandchildId, delayedGrandchildId);
     }
 
     [Fact]
     public async Task Fallback_CarriesTheGrandchildrenOfAChain()
     {
         var nodeA = CreateProvider("node-A");
-        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+        var (parentId, childId, grandchildId, delayedGrandchildId) = await SeedThreeLevelChain();
         _clock.Advance(TimeSpan.FromSeconds(2));
 
         var fallback = await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None));
 
-        AssertCarriesTheChain(Assert.Single(fallback, x => x.Id == parentId), childId, grandchildId);
+        AssertCarriesTheChain(Assert.Single(fallback, x => x.Id == parentId), childId, grandchildId, delayedGrandchildId);
     }
 
     [Fact]
     public async Task RunNow_CarriesTheGrandchildrenOfAChain()
     {
         var nodeA = CreateProvider("node-A");
-        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+        var (parentId, childId, grandchildId, delayedGrandchildId) = await SeedThreeLevelChain();
 
         var acquired = await nodeA.AcquireImmediateTimeTickersAsync([parentId], CancellationToken.None);
 
-        AssertCarriesTheChain(Assert.Single(acquired, x => x.Id == parentId), childId, grandchildId);
+        AssertCarriesTheChain(Assert.Single(acquired, x => x.Id == parentId), childId, grandchildId, delayedGrandchildId);
+    }
+
+    // A delayed child (a child with an execution time of its own) is a row of its own. Every claim path carries it in its
+    // parent's payload with its time, so the handler knows of it and never runs it inline.
+    [Fact]
+    public async Task DelayedChild_IsCarriedWithItsTime_ByEveryClaimPath()
+    {
+        var delayedChild = NewTimeTicker(executionTime: T0.AddHours(2));
+        delayedChild.Function = "delayed-child-fn";
+        var parent = NewTimeTicker();
+        parent.Children = [delayedChild];
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+
+        void AssertCarried(TimeTickerEntity payload)
+            => Assert.Equal(T0.AddHours(2), Assert.Single(payload.Children, x => x.Id == delayedChild.Id).ExecutionTime);
+
+        AssertCarried(Assert.Single(await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None), x => x.Id == parent.Id));
+        AssertCarried(Assert.Single(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([parent.Id], CancellationToken.None)));
+
+        await _f.TimeTickers.UpdateOneAsync(x => x.Id == parent.Id, Builders<TimeTickerEntity>.Update
+            .Set(x => x.Status, TickerStatus.Idle).Set(x => x.LockHolder, (string?)null).Set(x => x.LockedAt, (DateTime?)null));
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        AssertCarried(Assert.Single(await Drain(CreateProvider("node-C").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parent.Id));
     }
 
     // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
@@ -1106,6 +1153,306 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
 
         Assert.Equal(status, (await ReadTimeTicker(started.Id)).Status);
         Assert.Equal(TickerStatus.Skipped, (await ReadTimeTicker(waiting.Id)).Status);
+    }
+
+    #endregion
+
+    #region Delayed children
+
+    // A parent row (not due, or already run) with a delayed child: a child with an execution time of its own.
+    private async Task<(Guid ParentId, Guid ChildId)> SeedDelayedChild(TickerStatus parentStatus, RunCondition? condition, DateTime childTime, TimeTickerEntity? grandchild = null)
+    {
+        var child = NewTimeTicker(executionTime: childTime);
+        child.Function = "delayed-child-fn";
+        child.RunCondition = condition;
+        if (grandchild != null) child.Children = [grandchild];
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(-1));
+        parent.Children = [child];
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+        return (parent.Id, child.Id);
+    }
+
+    public static IEnumerable<object?[]> EveryConditionAndParentStatus()
+        => from condition in Enum.GetValues<RunCondition>().Select(c => (RunCondition?)c).Append(null)
+           from status in Enum.GetValues<TickerStatus>()
+           select new object?[] { condition, status };
+
+    // The gate is built from ChainRunGate; run-now must agree with it everywhere.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task DelayedChild_IsHandedOutExactlyWhenItsParentsStatusLetsItRun(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(30));
+
+        var claimed = await CreateProvider("node-A").AcquireImmediateTimeTickersAsync([childId], CancellationToken.None);
+
+        Assert.Equal(ChainRunGate.Allows(condition, parentStatus), claimed.Any(x => x.Id == childId));
+        if (!claimed.Any(x => x.Id == childId))
+            Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
+    }
+
+    // Run-now with several rows claims each row whose gate is open and leaves the others waiting.
+    [Fact]
+    public async Task RunNow_ClaimsTheRowsWhoseGateIsOpen_AndLeavesAWaitingDelayedChild()
+    {
+        var (_, waitingChildId) = await SeedDelayedChild(TickerStatus.InProgress, RunCondition.OnSuccess, T0.AddSeconds(30));
+        var (_, readyChildId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddSeconds(30));
+        var plainId = await SeedTimeTicker(executionTime: T0.AddSeconds(30));
+
+        var claimed = await CreateProvider("node-A").AcquireImmediateTimeTickersAsync([waitingChildId, readyChildId, plainId], CancellationToken.None);
+
+        Assert.Equal(new[] { readyChildId, plainId }.OrderBy(x => x), claimed.Select(x => x.Id).OrderBy(x => x));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(waitingChildId)).Status);
+    }
+
+    // The window's gate is part of the earliest-time query (an aggregation); it must agree with ChainRunGate everywhere.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task DelayedChild_IsInTheWindowExactlyWhenItsParentsStatusLetsItRun(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(30));
+
+        var window = await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal(ChainRunGate.Allows(condition, parentStatus), window.Any(x => x.Id == childId));
+    }
+
+    // An overdue delayed child is claimed by the fallback when its parent's status lets it run, skipped when its parent
+    // ended without a match, and left waiting otherwise.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task OverdueDelayedChild_IsClaimedSkippedOrLeftByTheFallback_ExactlyAsChainRunGateSays(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(-30));
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        var claimed = fallback.Any(x => x.Id == childId);
+        var status = (await ReadTimeTicker(childId)).Status;
+        if (ChainRunGate.Allows(condition, parentStatus))
+            Assert.True(claimed, "a child its parent's status lets run was not claimed");
+        else if (ChainRunGate.IsFinal(parentStatus))
+            Assert.True(!claimed && status == TickerStatus.Skipped, $"claimed={claimed}, status={status}; expected Skipped");
+        else
+            Assert.True(!claimed && status == TickerStatus.Idle, $"claimed={claimed}, status={status}; expected it to wait");
+    }
+
+    [Theory]
+    [InlineData(TickerStatus.Idle, 30)]
+    [InlineData(TickerStatus.Queued, 30)]
+    [InlineData(TickerStatus.InProgress, 30)]
+    [InlineData(TickerStatus.InProgress, -30)]
+    public async Task DelayedChild_IsNotHandedOutByTheWindowOrTheFallback_WhileItsParentHasNotEnded(TickerStatus parentStatus, int childDueInSeconds)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, RunCondition.OnSuccess, T0.AddSeconds(childDueInSeconds));
+        var node = CreateProvider("node-A");
+
+        Assert.DoesNotContain(await node.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == childId);
+        Assert.DoesNotContain(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == childId);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
+    }
+
+    [Fact]
+    public async Task DelayedChild_IsHandedOutByTheWindowAtItsTime_OnceItsParentSucceeded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddSeconds(30));
+        var node = CreateProvider("node-A");
+
+        var window = await node.GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal([childId], window.Select(x => x.Id));
+        Assert.Single(await Drain(node.QueueTimeTickers(window, CancellationToken.None)));
+    }
+
+    [Fact]
+    public async Task DelayedChild_IsHandedOutByTheFallback_WhenItsTimePassedBeforeItsParentSucceeded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddSeconds(-30));
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Contains(fallback, x => x.Id == childId);
+    }
+
+    // The gate is part of the earliest-time query: a waiting delayed child due first must not hide the rows due after it.
+    [Fact]
+    public async Task AWaitingDelayedChildDueFirst_DoesNotHideTheJobsDueAfterIt()
+    {
+        await SeedDelayedChild(TickerStatus.InProgress, RunCondition.OnSuccess, T0.AddSeconds(10));
+        var laterId = await SeedTimeTicker(executionTime: T0.AddSeconds(20));
+
+        var window = await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal([laterId], window.Select(x => x.Id));
+    }
+
+    // A waiting delayed child in the same second as a row that is due must not go out with it.
+    [Fact]
+    public async Task AWaitingDelayedChild_IsLeftOutOfTheWindowItsSecondOpens()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.InProgress, RunCondition.OnSuccess, T0.AddSeconds(10).AddMilliseconds(100));
+        var dueId = await SeedTimeTicker(executionTime: T0.AddSeconds(10).AddMilliseconds(200));
+
+        var window = await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None);
+
+        Assert.Equal([dueId], window.Select(x => x.Id));
+    }
+
+    // The parent's run skips a child its outcome does not let run; the fallback does it for a node that stopped first,
+    // and the skip reaches a delayed grandchild on a later pass.
+    [Fact]
+    public async Task TheFallback_SkipsADelayedChildWhoseParentsOutcomeDoesNotMatch_AndThenItsDelayedGrandchild()
+    {
+        var grandchild = NewTimeTicker(executionTime: T0.AddSeconds(-20));
+        grandchild.Function = "delayed-grandchild-fn";
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Failed, RunCondition.OnSuccess, T0.AddSeconds(-30), grandchild);
+        var node = CreateProvider("node-A");
+
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(grandchild.Id)).Status);
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        var skipped = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.Skipped, skipped.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, skipped.SkippedReason);
+        Assert.Equal(T0, skipped.ExecutedAt);
+        Assert.Null(skipped.LockHolder);
+        Assert.Equal(TickerStatus.Skipped, (await ReadTimeTicker(grandchild.Id)).Status);
+    }
+
+    // A delayed child is a row of its own; removing its parent removes it, and its children, with it.
+    [Fact]
+    public async Task RemovingAParent_RemovesItsDelayedDescendants()
+    {
+        var grandchild = NewTimeTicker(executionTime: T0.AddHours(3));
+        var (parentId, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddHours(2), grandchild);
+
+        await CreateProvider("node-A").RemoveTimeTickers([parentId], CancellationToken.None);
+
+        Assert.Equal(0, await _f.TimeTickers.CountDocumentsAsync(x => x.Id == parentId || x.Id == childId || x.Id == grandchild.Id));
+    }
+
+    // A row whose parent is not found waits: it is not handed out, not skipped, and does not hide the rows due after it.
+    [Fact]
+    public async Task ADelayedChildWhoseParentIsMissing_Waits_AndDoesNotHideTheJobsDueAfterIt()
+    {
+        var overdueOrphan = NewTimeTicker(executionTime: T0.AddSeconds(-30));
+        overdueOrphan.ParentId = Guid.NewGuid();
+        var orphan = NewTimeTicker(executionTime: T0.AddSeconds(10));
+        orphan.ParentId = Guid.NewGuid();
+        await _f.TimeTickers.InsertManyAsync([overdueOrphan, orphan]);
+        var laterId = await SeedTimeTicker(executionTime: T0.AddSeconds(20));
+        var node = CreateProvider("node-A");
+
+        Assert.Equal([laterId], (await node.GetEarliestTimeTickers(CancellationToken.None)).Select(x => x.Id));
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Empty(await node.AcquireImmediateTimeTickersAsync([overdueOrphan.Id, orphan.Id], CancellationToken.None));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(overdueOrphan.Id)).Status);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(orphan.Id)).Status);
+    }
+
+    // The fallback reads the parents' statuses before it claims: a parent it takes in the same pass has not ended, so its
+    // overdue delayed child waits for the parent's run.
+    [Fact]
+    public async Task TheFallback_TakesAnOverdueParent_ButNotItsOverdueDelayedChild_InTheSamePass()
+    {
+        var child = NewTimeTicker(executionTime: T0.AddSeconds(-30));
+        child.Function = "delayed-child-fn";
+        child.RunCondition = RunCondition.OnSuccess;
+        var parent = NewTimeTicker(executionTime: T0.AddSeconds(-60));
+        parent.Children = [child];
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Equal([parent.Id], fallback.Select(x => x.Id));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(child.Id)).Status);
+    }
+
+    // A class map of the user's own that stores the statuses as strings: the gate writes its values with the members'
+    // serializers, so it matches the stored rows as the typed filters do.
+    public sealed class StringStatusTicker : TimeTickerEntity<StringStatusTicker>;
+
+    private static readonly Lazy<bool> StringStatusClassMaps = new(() =>
+    {
+        BsonClassMap.RegisterClassMap<TimeTickerEntity<StringStatusTicker>>(cm =>
+        {
+            cm.AutoMap();
+            cm.SetIgnoreExtraElements(true);
+            cm.UnmapMember(x => x.Parent);
+            cm.UnmapMember(x => x.Children);
+            cm.MapMember(x => x.Status).SetSerializer(new EnumSerializer<TickerStatus>(BsonType.String));
+            cm.MapMember(x => x.RunCondition).SetSerializer(new NullableSerializer<RunCondition>(new EnumSerializer<RunCondition>(BsonType.String)));
+        });
+        BsonClassMap.RegisterClassMap<StringStatusTicker>(cm => { cm.AutoMap(); cm.SetIgnoreExtraElements(true); });
+        return true;
+    });
+
+    [Fact]
+    public async Task TheGate_FollowsAClassMapThatStoresStatusesAsStrings()
+    {
+        _ = StringStatusClassMaps.Value;
+        var context = new TickerMongoContext<StringStatusTicker, CronTickerEntity>(_f.Database, $"strings_{Guid.NewGuid():N}_");
+        var node = new TickerMongoPersistenceProvider<StringStatusTicker, CronTickerEntity>(
+            context, _clock, new SchedulerOptionsBuilder { NodeIdentifier = "node-A" });
+
+        StringStatusTicker Row(TickerStatus status, DateTime time, RunCondition? condition = null) => new()
+        {
+            Id = Guid.NewGuid(), Function = "claim-fn", ExecutionTime = time, Status = status, RunCondition = condition,
+            CreatedAt = T0.AddHours(-2), UpdatedAt = T0.AddHours(-1), Request = []
+        };
+        var readyChild = Row(TickerStatus.Idle, T0.AddSeconds(10), RunCondition.OnSuccess);
+        var doneParent = Row(TickerStatus.Done, T0.AddHours(-1));
+        doneParent.Children = [readyChild];
+        var blockedChild = Row(TickerStatus.Idle, T0.AddSeconds(5), RunCondition.OnSuccess);
+        var failedParent = Row(TickerStatus.Failed, T0.AddHours(-1));
+        failedParent.Children = [blockedChild];
+        var overdueChild = Row(TickerStatus.Idle, T0.AddSeconds(-30));
+        var cancelledParent = Row(TickerStatus.Cancelled, T0.AddHours(-1));
+        cancelledParent.Children = [overdueChild];
+        await node.AddTimeTickers([doneParent, failedParent, cancelledParent], CancellationToken.None);
+
+        var stored = await context.TimeTickers.Database.GetCollection<BsonDocument>(context.TimeTickers.CollectionNamespace.CollectionName)
+            .Find(new BsonDocument("_id", new BsonBinaryData(doneParent.Id, GuidRepresentation.Standard))).SingleAsync();
+        Assert.Equal("Done", stored["Status"].AsString);
+
+        Assert.Equal([readyChild.Id], (await node.GetEarliestTimeTickers(CancellationToken.None)).Select(x => x.Id));
+        Assert.Empty(await node.AcquireImmediateTimeTickersAsync([blockedChild.Id], CancellationToken.None));
+        Assert.Equal([overdueChild.Id], (await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
+    }
+
+    // The fallback's skip is read first, then written by id: a row that started in between keeps its status.
+    [Fact]
+    public async Task TheFallbacksSkip_LeavesARowThatStartedAfterItWasRead()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Failed, RunCondition.OnSuccess, T0.AddSeconds(-30));
+        var node = CreateNodeWithHook("update", 1, () => _f.TimeTickers.UpdateOne(
+            x => x.Id == childId,
+            Builders<TimeTickerEntity>.Update.Set(x => x.Status, TickerStatus.InProgress).Set(x => x.LockHolder, "node-B")));
+
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(childId)).Status);
+    }
+
+    // A failed skip write must not stop the fallback from taking the other overdue jobs; the next pass tries again.
+    [Fact]
+    public async Task AFailedSkipWrite_DoesNotStopTheFallbackFromTakingTheOtherJobs()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Failed, RunCondition.OnSuccess, T0.AddSeconds(-30));
+        var dueId = await SeedTimeTicker(executionTime: T0.AddSeconds(-30));
+        var logger = new ListLogger();
+        var node = CreateNodeWithHook("update", 1, () => throw new InvalidOperationException("store failed"), logger);
+
+        var fallback = await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Contains(fallback, x => x.Id == dueId);
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("store failed", entry.Exception?.Message);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
+        Assert.Empty(await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Equal(TickerStatus.Skipped, (await ReadTimeTicker(childId)).Status);
     }
 
     #endregion

@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 using SharpTicker.MongoDB.Indexes;
 using SharpTicker.MongoDB.Infrastructure;
@@ -57,7 +58,8 @@ namespace SharpTicker.MongoDB.DependencyInjection
                 new TickerMongoPersistenceProvider<TTimeTicker, TCronTicker>(
                     sp.GetRequiredService<ITickerMongoContext<TTimeTicker, TCronTicker>>(),
                     sp.GetRequiredService<ITickerClock>(),
-                    sp.GetRequiredService<SchedulerOptionsBuilder>()));
+                    sp.GetRequiredService<SchedulerOptionsBuilder>(),
+                    sp.GetService<ILoggerFactory>()?.CreateLogger("SharpTicker.MongoDB")));
 
             services.AddHostedService(sp => new TickerIndexProvisioner<TTimeTicker, TCronTicker>(
                 sp.GetRequiredService<ITickerMongoContext<TTimeTicker, TCronTicker>>()));
