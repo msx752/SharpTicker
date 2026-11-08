@@ -35,6 +35,9 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         // claimed since keep their lock.
         Task ReleaseEarlierRunResources(string nodeIdentifier, DateTime runStartedAt, CancellationToken cancellationToken = default);
         Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] context, CancellationToken cancellationToken = default);
+        // Claims delayed chain children whose parent has ended (the store's gate decides) to run them now. Returns the rows
+        // this call won, ready to dispatch; a failed claim is logged and returns none, the fallback then runs them.
+        Task<InternalFunctionContext[]> AcquireDelayedChildrenAsync(Guid[] ids, CancellationToken cancellationToken = default);
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default);
     }
 }

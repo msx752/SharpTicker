@@ -127,6 +127,8 @@ A job reports its own failure through the exception handler above. These entries
 | `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | The fallback took a job but the dashboard could not be told. The job runs. |
 | `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Warning | The application is stopping with jobs running. The first entry says that the scheduler waits for them and names them (the first ten); the second says that some were still running when the wait ended (a little before the host's shutdown timeout) and were recorded as `Cancelled`. |
 | `SharpTicker.EntityFrameworkCore.StartupRelease` | Error | Releasing the jobs that a dead node or an earlier run of this node left locked failed when the application started. |
+| `SharpTicker.TickerExecutionTaskHandler` | Warning | Starting the delayed chain children whose parent just ended failed. They run when the scheduler or the fallback picks them up. |
+| `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | Claiming delayed chain children after their parent ended failed, and they run when the fallback picks them up; or they were claimed but the dashboard could not be told, and they run. At `Error`: some rows the claim had taken could not be put back, and they stay `InProgress` until their store releases this instance's rows. |
 | `SharpTicker.EntityFrameworkCore`, `SharpTicker.MongoDB` | Warning | The fallback could not mark the delayed chain children whose parent ended with an outcome they do not run on as `Skipped`. The fallback still takes the other overdue jobs, and the next pass tries again. |
 
 ## Tracing

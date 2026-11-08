@@ -420,6 +420,41 @@ namespace SharpTicker.Utilities.Managers
             }
         }
 
+        public async Task<InternalFunctionContext[]> AcquireDelayedChildrenAsync(Guid[] ids, CancellationToken cancellationToken = default)
+        {
+            if (ids == null || ids.Length == 0) return [];
+
+            TimeTickerEntity[] acquired;
+            try
+            {
+                acquired = await _persistenceProvider.AcquireImmediateTimeTickersAsync(ids, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (ClaimPutBackFailedException ex)
+            {
+                _logger?.LogError(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed, and some of the rows it claimed could not be put back. " +
+                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                return [];
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed. They run when the fallback picks them up.",
+                    string.Join(", ", ids));
+                return [];
+            }
+
+            var contexts = ClaimedTimeTickerContexts.Build(acquired);
+            for (var i = 0; i < contexts.Length; i++)
+            {
+                var row = acquired[i];
+                await NotifyClaimedAsync(() => _notificationHubSender.UpdateTimeTickerNotifyAsync(row), contexts[i], afterParent: true).ConfigureAwait(false);
+            }
+            return contexts;
+        }
+
         public async Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default)
         {
             var request = type == TickerType.CronTickerOccurrence
@@ -463,11 +498,16 @@ namespace SharpTicker.Utilities.Managers
 
         // The notification is for the dashboard and does not decide the job: a hub that fails must not drop a claimed row or
         // end the pass.
-        private async Task NotifyClaimedAsync(Func<Task> notify, InternalFunctionContext function)
+        private async Task NotifyClaimedAsync(Func<Task> notify, InternalFunctionContext function, bool afterParent = false)
         {
             try
             {
                 await notify().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (afterParent)
+            {
+                _logger?.LogWarning(ex, "Delayed chain child {FunctionName} ({TickerId}) was claimed to run after its parent but the dashboard could not be notified.",
+                    function.FunctionName, function.TickerId);
             }
             catch (Exception ex)
             {

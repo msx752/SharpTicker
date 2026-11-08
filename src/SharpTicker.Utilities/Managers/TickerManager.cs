@@ -184,8 +184,7 @@ namespace SharpTicker.Utilities.Managers
 
                     if (acquired.Length > 0)
                     {
-                        var contexts = BuildImmediateContextsFromNonGeneric(acquired);
-                        CacheFunctionReferences(contexts.AsSpan());
+                        var contexts = ClaimedTimeTickerContexts.Build(acquired);
                         await _dispatcher.DispatchAsync(contexts, cancellationToken).ConfigureAwait(false);
                     }
                 }
@@ -358,57 +357,6 @@ namespace SharpTicker.Utilities.Managers
             };
         }
 
-        // Batch operations implementation
-        private static void CacheFunctionReferences(Span<InternalFunctionContext> functions)
-        {
-            for (var i = 0; i < functions.Length; i++)
-            {
-                ref var context = ref functions[i];
-                if (TickerFunctionProvider.TickerFunctions.TryGetValue(context.FunctionName, out var tickerItem))
-                {
-                    context.CachedDelegate = tickerItem.Delegate;
-                    context.CachedPriority = tickerItem.Priority;
-                    context.CachedMaxConcurrency = tickerItem.MaxConcurrency;
-                }
-
-                if (context.TimeTickerChildren is { Count: > 0 })
-                {
-                    var childrenSpan = CollectionsMarshal.AsSpan(context.TimeTickerChildren);
-                    CacheFunctionReferences(childrenSpan);
-                }
-            }
-        }
-
-        // Each acquired row carries the marker its claim wrote; only the row itself was claimed, not its children.
-        private static InternalFunctionContext[] BuildImmediateContextsFromNonGeneric(IEnumerable<TimeTickerEntity> tickers)
-        {
-            return tickers.Select(ticker =>
-            {
-                var context = BuildContextFromNonGeneric(ticker);
-                context.ClaimMarker = ticker.UpdatedAt;
-                return context;
-            }).ToArray();
-        }
-
-        private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker)
-            => BuildContextFromNonGeneric(ticker, isChild: false);
-
-        private static InternalFunctionContext BuildContextFromNonGeneric(TimeTickerEntity ticker, bool isChild)
-        {
-            return new InternalFunctionContext
-            {
-                FunctionName = ticker.Function,
-                TickerId = ticker.Id,
-                Type = Enums.TickerType.TimeTicker,
-                Retries = ticker.Retries,
-                RetryIntervals = ticker.RetryIntervals,
-                ParentId = ticker.ParentId,
-                ExecutionTime = ticker.ExecutionTime ?? DateTime.UtcNow,
-                RunCondition = ticker.RunCondition ?? Enums.RunCondition.OnAnyCompletedStatus,
-                IsDelayed = isChild && ticker.ExecutionTime.HasValue,
-                TimeTickerChildren = ticker.Children.Select(child => BuildContextFromNonGeneric(child, isChild: true)).ToList()
-            };
-        }
 
         private async Task<TickerResult<List<TTimeTicker>>> AddTimeTickersBatchAsync(List<TTimeTicker> entities, CancellationToken cancellationToken = default)
         {
@@ -457,8 +405,7 @@ namespace SharpTicker.Utilities.Managers
 
                     if (acquired.Length > 0)
                     {
-                        var contexts = BuildImmediateContextsFromNonGeneric(acquired);
-                        CacheFunctionReferences(contexts.AsSpan());
+                        var contexts = ClaimedTimeTickerContexts.Build(acquired);
                         await _dispatcher.DispatchAsync(contexts, cancellationToken).ConfigureAwait(false);
                     }
                 }

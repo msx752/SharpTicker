@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Exceptions;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Exceptions;
@@ -85,8 +86,18 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
             }
         }
         
+        // An InProgress delayed child may run once its parent has started, which it has: its row was claimed InProgress
+        // before it was handed here.
+        if (delayedChildren != null)
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => c.RunCondition == RunCondition.InProgress), cancellationToken);
+
         // Wait for concurrent tasks (parent + InProgress children)
         await Task.WhenAll(tasksToRunNow.AsSpan(0, tasksToRunNowCount).ToArray());
+
+        // The parent's outcome is written, so the store now hands out the delayed children it lets run. Handed off before
+        // anything below that can take long or throw, so a child that is due is not held back by its siblings.
+        if (delayedChildren != null && ChainRunGate.IsFinal(context.Status))
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, context.Status)), cancellationToken);
 
         // Process deferred children after parent completion
         if (childrenToRunAfterCount > 0 || delayedChildren != null)
@@ -134,6 +145,58 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 await Task.WhenAll(childrenToRunAfterTask.AsSpan(0, taskCount).ToArray());
         }
     }
+
+    // A delayed child whose time has come is claimed and started now, instead of waiting for the next fallback pass; one due
+    // later wakes the scheduler loop, which did not plan it while it waited for its parent. Never before its own time: the
+    // claim does not look at the time. Best effort: the fallback still runs what this misses, so nothing here fails the run.
+    private async Task HandOffDelayedChildrenAsync(IEnumerable<InternalFunctionContext> children, CancellationToken cancellationToken)
+    {
+        var now = _clock.UtcNow;
+        List<Guid> due = null;
+        DateTime? nextTime = null;
+        foreach (var child in children)
+        {
+            if (child.ExecutionTime <= now)
+                (due ??= []).Add(child.TickerId);
+            else if (nextTime == null || child.ExecutionTime < nextTime)
+                nextTime = child.ExecutionTime;
+        }
+
+        if (due == null && nextTime == null)
+            return;
+
+        try
+        {
+            if (nextTime != null)
+                HostScheduler?.RestartIfNeeded(nextTime);
+
+            // Without a running dispatcher (background services off) a claimed row would never start.
+            var dispatcher = Dispatcher;
+            if (due == null || dispatcher is not { IsEnabled: true })
+                return;
+
+            var claimed = await _internalTickerManager.AcquireDelayedChildrenAsync(due.ToArray(), cancellationToken).ConfigureAwait(false);
+            if (claimed.Length > 0)
+                await dispatcher.DispatchAsync(claimed, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Handing off delayed chain children was cancelled; the fallback runs them.");
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Handing off delayed chain children {TickerIds} failed; they run when the scheduler or the fallback picks them up.",
+                string.Join(", ", due ?? []));
+        }
+    }
+
+    // Resolved on first use: the dispatcher and the scheduler service depend on this handler.
+    private ISharpTickerDispatcher Dispatcher => _dispatcher ??= _serviceProvider.GetService<ISharpTickerDispatcher>();
+    private ISharpTickerHostScheduler HostScheduler => _hostScheduler ??= _serviceProvider.GetService<ISharpTickerHostScheduler>();
+    private ILogger Logger => _logger ??= _serviceProvider.GetService<ILoggerFactory>()?.CreateLogger<TickerExecutionTaskHandler>();
+    private ISharpTickerDispatcher _dispatcher;
+    private ISharpTickerHostScheduler _hostScheduler;
+    private ILogger _logger;
 
     private void SkipWithDescendants(InternalFunctionContext child, InternalFunctionContext parent, List<InternalFunctionContext> childrenToSkip)
     {

@@ -404,6 +404,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         public Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default) => inner.ReleaseDeadNodeResources(instanceIdentifier, cancellationToken);
         public Task ReleaseEarlierRunResources(string nodeIdentifier, DateTime runStartedAt, CancellationToken cancellationToken = default) => inner.ReleaseEarlierRunResources(nodeIdentifier, runStartedAt, cancellationToken);
         public Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] context, CancellationToken cancellationToken = default) => inner.UpdateSkipTimeTickersWithUnifiedContextAsync(context, cancellationToken);
+        public Task<InternalFunctionContext[]> AcquireDelayedChildrenAsync(Guid[] ids, CancellationToken cancellationToken = default) => inner.AcquireDelayedChildrenAsync(ids, cancellationToken);
         public Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => inner.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken);
     }
 
