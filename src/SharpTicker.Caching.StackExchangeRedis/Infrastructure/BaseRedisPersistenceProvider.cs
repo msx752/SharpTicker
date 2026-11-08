@@ -267,6 +267,9 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             at => occurrence.UpdatedAt = at);
     }
 
+    // Children live inside the parent's record, so a child with an execution time of its own has no row the store could
+    // hand out later. Its time is left out on purpose: the handler then runs it right after its parent, by its
+    // RunCondition, instead of leaving it to the store as a delayed child.
     protected static TimeTickerEntity MapForQueue(TTimeTicker ticker)
     {
         return new TimeTickerEntity

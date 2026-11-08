@@ -104,6 +104,12 @@ namespace SharpTicker.Provider
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // A delayed child whose parent ended with an outcome it does not run on never will; the parent's run
+                // skips it, and this covers a node that stopped before doing so. A child whose parent has not ended
+                // waits.
+                if (SkipIfParentOutcomeDoesNotMatch(ticker, now) || !ChainGateOpen(ticker))
+                    continue;
+
                 // Now update the actual ticker in storage
                 if (TimeTickers.TryGetValue(ticker.Id, out var existingTicker))
                 {
@@ -164,10 +170,13 @@ namespace SharpTicker.Provider
             var oneSecondAgo = now.AddSeconds(-1);
 
             // Base query: same filter as EF provider, but over the snapshot
+            // The chain gate is part of the base query: a delayed child that still waits for its parent must not hide the
+            // rows due after it.
             var baseQuery = TimeTickers.Values
                 .Where(x => x.ExecutionTime != null)
                 .Where(CanAcquire)
                 .Where(x => x.ExecutionTime >= oneSecondAgo)
+                .Where(ChainGateOpen)
                 .ToArray();
 
             // Get minimum execution time
@@ -296,7 +305,7 @@ namespace SharpTicker.Provider
                 if (!TimeTickers.TryGetValue(id, out var ticker))
                     continue;
 
-                if (!CanAcquire(ticker))
+                if (!CanAcquire(ticker) || !ChainGateOpen(ticker))
                     continue;
 
                 var updatedTicker = CloneTicker(ticker);
@@ -1178,10 +1187,8 @@ namespace SharpTicker.Provider
                     if (!TimeTickers.TryGetValue(childId, out var ch))
                         continue;
 
-                    // Only children with null ExecutionTime, matching EF mapping
-                    if (ch.ExecutionTime != null)
-                        continue;
-
+                    // A delayed child (one with a time of its own) is carried with its time: the handler never runs
+                    // it inline, it skips it when the parent's outcome does not match.
                     var childEntity = new TimeTickerEntity
                     {
                         Id = ch.Id,
@@ -1189,6 +1196,7 @@ namespace SharpTicker.Provider
                         Retries = ch.Retries,
                         RetryIntervals = ch.RetryIntervals,
                         RunCondition = ch.RunCondition,
+                        ExecutionTime = ch.ExecutionTime,
                         Children = new List<TimeTickerEntity>()
                     };
 
@@ -1208,7 +1216,8 @@ namespace SharpTicker.Provider
                                 Function = gch.Function,
                                 Retries = gch.Retries,
                                 RetryIntervals = gch.RetryIntervals,
-                                RunCondition = gch.RunCondition
+                                RunCondition = gch.RunCondition,
+                                ExecutionTime = gch.ExecutionTime
                             });
                         }
 
@@ -1250,6 +1259,35 @@ namespace SharpTicker.Provider
                 return Array.Empty<Guid>();
 
             return children.Keys.ToArray();
+        }
+
+        // A row of a chain (a delayed child) may be handed out only once its parent's status lets it run (ChainRunGate).
+        private static bool ChainGateOpen(TTimeTicker ticker)
+            => ticker.ParentId == null
+               || (TimeTickers.TryGetValue(ticker.ParentId.Value, out var parent) && ChainRunGate.Allows(ticker.RunCondition, parent.Status));
+
+        // Skips a delayed child whose parent has ended with an outcome it does not run on; true when it did.
+        private bool SkipIfParentOutcomeDoesNotMatch(TTimeTicker snapshot, DateTime now)
+        {
+            if (snapshot.ParentId == null
+                || !TimeTickers.TryGetValue(snapshot.ParentId.Value, out var parent)
+                || !ChainRunGate.IsFinal(parent.Status)
+                || ChainRunGate.Allows(snapshot.RunCondition, parent.Status))
+                return false;
+
+            if (!TimeTickers.TryGetValue(snapshot.Id, out var current)
+                || (current.Status != TickerStatus.Idle && current.Status != TickerStatus.Queued)
+                || current.UpdatedAt > snapshot.UpdatedAt)
+                return false;
+
+            var skipped = CloneTicker(current);
+            skipped.Status = TickerStatus.Skipped;
+            skipped.ExecutedAt = now;
+            skipped.SkippedReason = ChainRunGate.NotMatchedReason;
+            skipped.LockHolder = null;
+            skipped.LockedAt = null;
+            skipped.UpdatedAt = now;
+            return TimeTickers.TryUpdate(snapshot.Id, skipped, current);
         }
 
         private bool CanAcquire(TTimeTicker ticker)

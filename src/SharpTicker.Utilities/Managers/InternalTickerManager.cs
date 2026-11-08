@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.ExceptionServices;
@@ -162,6 +162,8 @@ namespace SharpTicker.Utilities.Managers
                         RetryIntervals = ch.RetryIntervals,
                         ParentId = ch.ParentId,
                         RunCondition = ch.RunCondition ?? RunCondition.OnAnyCompletedStatus,
+                        ExecutionTime = ch.ExecutionTime ?? default,
+                        IsDelayed = ch.ExecutionTime.HasValue,
                         TimeTickerChildren = ch.Children.Select(gch => new InternalFunctionContext
                         {
                             FunctionName = gch.Function,
@@ -170,7 +172,9 @@ namespace SharpTicker.Utilities.Managers
                             Retries = gch.Retries,
                             RetryIntervals = gch.RetryIntervals,
                             ParentId = gch.ParentId,
-                            RunCondition = gch.RunCondition ?? RunCondition.OnAnyCompletedStatus
+                            RunCondition = gch.RunCondition ?? RunCondition.OnAnyCompletedStatus,
+                            ExecutionTime = gch.ExecutionTime ?? default,
+                            IsDelayed = gch.ExecutionTime.HasValue
                         }).ToList()
                     }).ToList()
                 });
@@ -393,7 +397,7 @@ namespace SharpTicker.Utilities.Managers
             var unifiedFunctionContext = new InternalFunctionContext()
                 .SetProperty(x => x.Status, TickerStatus.Skipped)
                 .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                .SetProperty(x => x.ExceptionDetails, "Rule RunCondition did not match!");
+                .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
             
             if (resources.Length != 0)
                 await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(resources.Select(x => x.TickerId).ToArray(), unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
@@ -402,7 +406,7 @@ namespace SharpTicker.Utilities.Managers
             {
                 resource.ExecutedAt = _clock.UtcNow;
                 resource.Status = TickerStatus.Skipped;
-                resource.ExceptionDetails = "Rule RunCondition did not match!";
+                resource.ExceptionDetails = ChainRunGate.NotMatchedReason;
                 if(resource.Type == TickerType.TimeTicker)
                     await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(resource).ConfigureAwait(false);
                 else
@@ -489,6 +493,8 @@ namespace SharpTicker.Utilities.Managers
                         RetryIntervals = ch.RetryIntervals,
                         ParentId = ch.ParentId,
                         RunCondition = ch.RunCondition ?? RunCondition.OnAnyCompletedStatus,
+                        ExecutionTime = ch.ExecutionTime ?? default,
+                        IsDelayed = ch.ExecutionTime.HasValue,
                         TimeTickerChildren = ch.Children.Select(gch => new InternalFunctionContext
                         {
                             FunctionName = gch.Function,
@@ -497,7 +503,9 @@ namespace SharpTicker.Utilities.Managers
                             Retries = gch.Retries,
                             RetryIntervals = gch.RetryIntervals,
                             ParentId = gch.ParentId,
-                            RunCondition = gch.RunCondition ?? RunCondition.OnAnyCompletedStatus
+                            RunCondition = gch.RunCondition ?? RunCondition.OnAnyCompletedStatus,
+                            ExecutionTime = gch.ExecutionTime ?? default,
+                            IsDelayed = gch.ExecutionTime.HasValue
                         }).ToList()
                     }).ToList()
                 });

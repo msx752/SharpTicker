@@ -37,13 +37,16 @@ namespace SharpTicker.Utilities.Infrastructure
                     Retries = ch.Retries,
                     RetryIntervals = ch.RetryIntervals,
                     RunCondition = ch.RunCondition,
+                    // A child with a time of its own is a delayed child: carried so the handler knows of it, never run inline.
+                    ExecutionTime = ch.ExecutionTime,
                     Children = ch.Children.Select(gch => new TimeTickerEntity
                     {
                         Function = gch.Function,
                         Retries = gch.Retries,
                         RetryIntervals = gch.RetryIntervals,
                         Id = gch.Id,
-                        RunCondition = gch.RunCondition
+                        RunCondition = gch.RunCondition,
+                        ExecutionTime = gch.ExecutionTime
                     }).ToArray()
                 }).ToArray()
             };

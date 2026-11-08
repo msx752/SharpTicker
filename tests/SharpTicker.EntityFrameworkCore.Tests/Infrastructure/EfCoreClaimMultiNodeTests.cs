@@ -1107,6 +1107,46 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
+    // A delayed child (a child with an execution time of its own) is a row of its own. Every claim path carries it in its
+    // parent's payload with its time, so the handler never runs it inline as well (it used to run twice: the filtered
+    // Include was ignored under the projection, so the payload carried it without its time).
+    [Fact]
+    public async Task DelayedChildAndGrandchild_AreCarriedWithTheirTimes_ByEveryClaimPath()
+    {
+        var delayedGrandchild = NewTimeTicker(executionTime: T0.AddHours(3));
+        delayedGrandchild.Function = "delayed-grandchild-fn";
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "claim-child-fn";
+        child.Children = [delayedGrandchild];
+        var delayedChild = NewTimeTicker(executionTime: T0.AddHours(2));
+        delayedChild.Function = "delayed-child-fn";
+        var parent = NewTimeTicker();
+        parent.Children = [child, delayedChild];
+        await using (var context = CreateContext())
+        {
+            context.Set<TimeTickerEntity>().Add(parent);
+            await context.SaveChangesAsync();
+        }
+
+        void AssertCarried(TimeTickerEntity payload)
+        {
+            Assert.Equal(T0.AddHours(2), Assert.Single(payload.Children, x => x.Id == delayedChild.Id).ExecutionTime);
+            var carried = Assert.Single(payload.Children, x => x.Id == child.Id);
+            Assert.Null(carried.ExecutionTime);
+            Assert.Equal(T0.AddHours(3), Assert.Single(carried.Children, x => x.Id == delayedGrandchild.Id).ExecutionTime);
+        }
+
+        AssertCarried(Assert.Single(await CreateProvider("node-A").GetEarliestTimeTickers(CancellationToken.None), x => x.Id == parent.Id));
+        AssertCarried(Assert.Single(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([parent.Id], CancellationToken.None)));
+
+        await using (var context = CreateContext())
+            await context.Set<TimeTickerEntity>().Where(x => x.Id == parent.Id)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, TickerStatus.Idle).SetProperty(x => x.LockHolder, (string?)null).SetProperty(x => x.LockedAt, (DateTime?)null));
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        AssertCarried(Assert.Single(await Drain(CreateProvider("node-C").QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == parent.Id));
+    }
+
     #endregion
 }
 

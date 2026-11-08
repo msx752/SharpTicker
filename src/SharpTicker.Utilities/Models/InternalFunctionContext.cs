@@ -43,6 +43,13 @@ namespace SharpTicker.Utilities.Models
         /// </summary>
         internal DateTime? ClaimMarker { get; set; }
 
+        /// <summary>
+        /// True for a chain child (or grandchild) that has an execution time of its own. Such a child is a row of its own: its
+        /// parent's run never runs it, the store hands it out once the parent has ended with a status its
+        /// <see cref="RunCondition"/> accepts and its time has come (see <see cref="ChainRunGate"/>).
+        /// </summary>
+        internal bool IsDelayed { get; set; }
+
         [DynamicDependency(DynamicallyAccessedMemberTypes.PublicProperties, typeof(InternalFunctionContext))]
         public InternalFunctionContext SetProperty<T>(Expression<Func<InternalFunctionContext, T>> property, T value)
         {
