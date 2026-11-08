@@ -1,4 +1,6 @@
 using System;
+using System.Diagnostics;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpTicker.SharpTickerThreadPool;
@@ -57,6 +59,46 @@ public class SharpTickerTaskSchedulerThreadTests
         Assert.True(before.IsWorkerThread);
         Assert.True(after.IsThreadPoolThread);
         Assert.False(after.IsWorkerThread);
+    }
+
+    // A worker lives for many jobs. Whatever started it (the host at startup, a dashboard request whose "Run now" queued a
+    // job, a worker that was leaving; all go through the same start) must not hand its ambient state to all of them: its
+    // AsyncLocals, its culture, its Activity.Current (which would make every job's span a child of an old request trace).
+    [Fact]
+    public async Task AWorker_DoesNotCarryTheAmbientStateOfTheCodeThatStartedIt()
+    {
+        var originalCulture = CultureInfo.CurrentCulture;
+        SharpTickerTaskScheduler scheduler;
+        using (var activity = new Activity("request that started the worker").Start())
+        {
+            Ambient.Value = "the starter's value";
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("ja-JP");
+            try
+            {
+                // The constructor starts the first worker from here, inside the starter's state.
+                scheduler = new SharpTickerTaskScheduler(1);
+            }
+            finally
+            {
+                Ambient.Value = null;
+                CultureInfo.CurrentCulture = originalCulture;
+            }
+        }
+
+        await using (scheduler)
+        {
+            var seen = new TaskCompletionSource<(string? Ambient, string Culture, string? Activity)>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await scheduler.QueueAsync(_ =>
+            {
+                seen.TrySetResult((Ambient.Value, CultureInfo.CurrentCulture.Name, Activity.Current?.OperationName));
+                return Task.CompletedTask;
+            }, TickerTaskPriority.Normal);
+
+            var state = await Within(seen.Task);
+            Assert.Null(state.Ambient);
+            Assert.NotEqual("ja-JP", state.Culture);
+            Assert.Null(state.Activity);
+        }
     }
 
     private static readonly AsyncLocal<string?> Ambient = new();

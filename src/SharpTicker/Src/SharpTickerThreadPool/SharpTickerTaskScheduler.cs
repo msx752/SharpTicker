@@ -303,7 +303,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     Name = $"SharpTicker.Worker-{workerId}"
                 };
                 OnWorkerThreadStarting?.Invoke(workerId);
-                thread.Start();
+                // Without the ExecutionContext of the caller: the worker runs many jobs, and whatever started it (the
+                // host, a request whose "Run now" queued a job, a leaving worker) must not give all of them its
+                // AsyncLocals, its culture or its Activity.Current.
+                thread.UnsafeStart();
             }
             catch (Exception ex)
             {
