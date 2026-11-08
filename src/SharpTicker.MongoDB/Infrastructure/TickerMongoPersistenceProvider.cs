@@ -1045,9 +1045,25 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Find(fb.And(fb.In(x => x.Id, won.Keys), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.Status, TickerStatus.InProgress)))
                     .ToListAsync(CancellationToken.None).ConfigureAwait(false);
 
+                // The caller runs each row from its cron (function, retries, intervals), which an occurrence document
+                // does not hold; it is loaded as the fallback does. A failure here puts the won rows back below.
+                var cronById = await LoadCronTickers(rows.Select(r => r.CronTickerId).Distinct().ToArray(), CancellationToken.None).ConfigureAwait(false);
+
                 // Each row is handed back with the marker its claim wrote, for a put-back.
                 foreach (var row in rows)
+                {
                     row.UpdatedAt = won[row.Id];
+                    if (cronById.TryGetValue(row.CronTickerId, out var cron))
+                    {
+                        row.CronTicker = new TCronTicker
+                        {
+                            Id = cron.Id,
+                            Function = cron.Function,
+                            RetryIntervals = cron.RetryIntervals,
+                            Retries = cron.Retries
+                        };
+                    }
+                }
                 return rows.ToArray();
             }
             catch (Exception failure) when (won.Count > 0)

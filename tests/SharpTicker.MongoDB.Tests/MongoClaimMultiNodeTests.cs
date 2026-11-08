@@ -443,6 +443,25 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         }
     }
 
+    // The read of the crons (the second find, after the read of the won occurrences) fails: nobody runs the won rows.
+    [Fact]
+    public async Task AcquireImmediate_CronReadFailsAfterAWin_PutsTheWonRowsBackAndThrows_CronOccurrence()
+    {
+        var seed = CreateProvider("node-A");
+        var ids = new[] { await QueueOccurrenceOn(seed), await QueueOccurrenceOn(seed) };
+        await seed.ReleaseAcquiredCronTickerOccurrences(ids, CancellationToken.None);
+        var node = CreateFailingNode("find", 2);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => node.AcquireImmediateCronOccurrencesAsync(ids, CancellationToken.None));
+
+        foreach (var id in ids)
+        {
+            var row = await ReadOccurrence(id);
+            Assert.Equal(TickerStatus.Idle, row.Status);
+            Assert.Null(row.LockHolder);
+        }
+    }
+
     // A claim's write lands, then its reply is lost (the call throws). The row is InProgress for this node with nothing to
     // run it, so it must be put back like a won row. Covers run-now and the fallback, on time tickers and cron occurrences.
     [Theory]
@@ -859,6 +878,44 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal((await ReadOccurrence(id)).UpdatedAt, taken.UpdatedAt);
         Assert.True(await nodeA.TryReleaseCronOccurrenceClaim(id, taken.UpdatedAt));
         Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(id)).Status);
+    }
+
+    // The dashboard's "Run now" on a cron inserts an occurrence with only CronTickerId set, claims it with run-now and
+    // reads the function, retries and intervals from occurrence.CronTicker. Without the cron the claimed row was
+    // InProgress and the read threw, so the job never ran and nothing put the row back.
+    [Fact]
+    public async Task RunNowClaim_ReturnsTheCronOfEachOccurrence()
+    {
+        var nodeA = CreateProvider("node-A");
+        var cron = new CronTickerEntity
+        {
+            Id = Guid.NewGuid(),
+            Function = "run-now-cron-fn",
+            Expression = "* * * * *",
+            Retries = 3,
+            RetryIntervals = [5, 10],
+            CreatedAt = T0.AddHours(-2),
+            UpdatedAt = T0.AddHours(-2),
+            IsEnabled = true,
+            Request = []
+        };
+        await _f.CronTickers.InsertOneAsync(cron);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(),
+            Status = TickerStatus.Idle,
+            ExecutionTime = T0,
+            CronTickerId = cron.Id
+        };
+        await nodeA.InsertCronTickerOccurrences([occurrence], CancellationToken.None);
+
+        var taken = Assert.Single(await nodeA.AcquireImmediateCronOccurrencesAsync([occurrence.Id], CancellationToken.None));
+
+        Assert.NotNull(taken.CronTicker);
+        Assert.Equal(cron.Id, taken.CronTicker.Id);
+        Assert.Equal("run-now-cron-fn", taken.CronTicker.Function);
+        Assert.Equal(3, taken.CronTicker.Retries);
+        Assert.Equal([5, 10], taken.CronTicker.RetryIntervals);
     }
 
     // Run-now returns only the rows its own call claimed. A row this node's fallback holds is already running; handing it
