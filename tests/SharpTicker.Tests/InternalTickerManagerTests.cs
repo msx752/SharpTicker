@@ -1098,6 +1098,83 @@ public class InternalTickerManagerTests
         Assert.Equal(childId, grandchildResult.ParentId);
     }
 
+    // A parent with a child that has no time of its own (which carries a delayed grandchild) and a delayed child.
+    private TimeTickerEntity ParentWithDelayedDescendants()
+        => new()
+        {
+            Id = Guid.NewGuid(),
+            Function = "ParentFunc",
+            ExecutionTime = _now.AddMinutes(-5),
+            RetryIntervals = [],
+            Children = new List<TimeTickerEntity>
+            {
+                new()
+                {
+                    Id = Guid.NewGuid(), Function = "ChildFunc", RetryIntervals = [],
+                    Children = new List<TimeTickerEntity>
+                    {
+                        new() { Id = Guid.NewGuid(), Function = "DelayedGrandchild", ExecutionTime = _now.AddHours(3), RetryIntervals = [] },
+                        new() { Id = Guid.NewGuid(), Function = "Grandchild", RetryIntervals = [] }
+                    }
+                },
+                new() { Id = Guid.NewGuid(), Function = "DelayedChild", ExecutionTime = _now.AddHours(2), RetryIntervals = [] }
+            }
+        };
+
+    // The handler leaves a delayed child to the store only when its context says so; a context that missed it would run
+    // the child inline as well as at its own time.
+    private static void AssertMarksTheDelayedOnes(InternalFunctionContext root, DateTime now)
+    {
+        Assert.False(root.IsDelayed);
+        var child = Assert.Single(root.TimeTickerChildren, x => x.FunctionName == "ChildFunc");
+        Assert.False(child.IsDelayed);
+        var delayedChild = Assert.Single(root.TimeTickerChildren, x => x.FunctionName == "DelayedChild");
+        Assert.True(delayedChild.IsDelayed);
+        Assert.Equal(now.AddHours(2), delayedChild.ExecutionTime);
+        Assert.True(Assert.Single(child.TimeTickerChildren, x => x.FunctionName == "DelayedGrandchild").IsDelayed);
+        Assert.False(Assert.Single(child.TimeTickerChildren, x => x.FunctionName == "Grandchild").IsDelayed);
+    }
+
+    [Fact]
+    public async Task RunTimedOutTickers_MarksDelayedChildrenAndGrandchildren()
+    {
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>())
+            .Returns(ToAsyncEnumerable(new[] { ParentWithDelayedDescendants() }));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+
+        var results = await _manager.RunTimedOutTickers(CancellationToken.None);
+
+        AssertMarksTheDelayedOnes(Assert.Single(results), _now);
+    }
+
+    [Fact]
+    public async Task GetNextTickers_MarksDelayedChildrenAndGrandchildren()
+    {
+        var parent = ParentWithDelayedDescendants();
+        parent.ExecutionTime = _now.AddMinutes(5);
+        _persistence.GetEarliestTimeTickers(Arg.Any<CancellationToken>()).Returns(Task.FromResult(new[] { parent }));
+        _persistence.QueueTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>()).Returns(ToAsyncEnumerable(new[] { parent }));
+
+        var (_, functions) = await _manager.GetNextTickers(CancellationToken.None);
+
+        AssertMarksTheDelayedOnes(Assert.Single(functions), _now);
+    }
+
+    // Run-now builds its contexts in TickerManager.
+    [Fact]
+    public void RunNowContexts_MarkDelayedChildrenAndGrandchildren()
+    {
+        var build = typeof(IInternalTickerManager).Assembly
+            .GetType("SharpTicker.Utilities.Managers.TickerManager`2")!
+            .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker))
+            .GetMethod("BuildImmediateContextsFromNonGeneric", BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var contexts = (InternalFunctionContext[])build.Invoke(null, [new[] { ParentWithDelayedDescendants() }])!;
+
+        AssertMarksTheDelayedOnes(Assert.Single(contexts), _now);
+    }
+
     [Fact]
     public async Task RunTimedOutTickers_NotifiesHub_ForTimeTickers()
     {

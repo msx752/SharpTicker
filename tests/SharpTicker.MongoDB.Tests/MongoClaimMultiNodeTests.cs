@@ -1023,8 +1023,8 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
-    // Parent -> child -> grandchild, where neither descendant has an execution time of its own; plus a delayed grandchild
-    // (one with a time of its own).
+    // Parent -> child -> grandchild, where neither descendant has an execution time of its own; plus a grandchild that
+    // has one (it is scheduled on its own, so no claim path carries it inside the chain).
     private async Task<(Guid ParentId, Guid ChildId, Guid GrandchildId, Guid ScheduledGrandchildId)> SeedThreeLevelChain()
     {
         var grandchild = NewTimeTicker();
@@ -1048,15 +1048,10 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
     {
         var child = Assert.Single(parent.Children);
         Assert.Equal(childId, child.Id);
-        Assert.Null(child.ExecutionTime);
-        Assert.Equal(2, child.Children.Count);
-        var grandchild = Assert.Single(child.Children, x => x.Id == grandchildId);
+        var grandchild = Assert.Single(child.Children);
+        Assert.Equal(grandchildId, grandchild.Id);
         Assert.Equal("claim-grandchild-fn", grandchild.Function);
         Assert.Equal(RunCondition.OnSuccess, grandchild.RunCondition);
-        Assert.Null(grandchild.ExecutionTime);
-        // The delayed grandchild is carried with its time, so the handler knows of it but never runs it inline.
-        var delayed = Assert.Single(child.Children, x => x.Id != grandchildId);
-        Assert.Equal(T0.AddHours(1), delayed.ExecutionTime);
     }
 
     [Fact]
