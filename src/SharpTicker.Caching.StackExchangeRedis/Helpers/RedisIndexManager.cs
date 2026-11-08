@@ -28,8 +28,8 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
 
         var t1 = batch.SetAddAsync(TimeTickerIdsKey, idStr);
         Task t2;
-        // A chain child runs inside its parent's run, never from the pending index.
-        if (ticker.ParentId == null && ticker.ExecutionTime.HasValue && CanAcquire(ticker.Status, ticker.LockHolder, _lockHolder))
+        // A delayed child (an execution time of its own) is pending like any row; the claim paths gate it on its parent.
+        if (ticker.ExecutionTime.HasValue && CanAcquire(ticker.Status, ticker.LockHolder, _lockHolder))
             t2 = batch.SortedSetAddAsync(TimeTickerPendingKey, idStr, ToScore(ticker.ExecutionTime.Value));
         else
             t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
