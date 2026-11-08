@@ -11,8 +11,9 @@ namespace SharpTicker.Utilities
     /// <remarks>
     /// A finished status (Done, DueDone, Failed, Cancelled, Skipped) is never changed back, so once a finished parent lets a
     /// child run it always will: a store can check the parent when it reads the row, without fencing the claim on it. The
-    /// exception is an <see cref="RunCondition.InProgress"/> child, which may run once its parent has started; a parent put
-    /// back after a claim goes from InProgress to Idle again, which only delays such a child.
+    /// exception is an <see cref="RunCondition.InProgress"/> child, which may run once its parent has started. A parent put
+    /// back after a claim goes from InProgress to Idle again: such a child claimed in between runs although its parent's
+    /// job has not really started yet. This is accepted: the parent is not lost, it is claimed and runs again later.
     /// </remarks>
     internal static class ChainRunGate
     {

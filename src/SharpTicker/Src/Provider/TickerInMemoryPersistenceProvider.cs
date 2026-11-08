@@ -502,23 +502,30 @@ namespace SharpTicker.Provider
                     // Clean children index
                     if (removed.ParentId.HasValue)
                         RemoveChildIndex(removed.ParentId.Value, removed.Id);
-                    
-                    // Remove children
-                    var childrenIds = GetChildrenIds(id);
-                        
-                    foreach (var childId in childrenIds)
-                    {
-                        if (TimeTickers.TryRemove(childId, out var child))
-                        {
-                            count++;
-                            if (child.ParentId.HasValue)
-                                RemoveChildIndex(child.ParentId.Value, child.Id);
-                        }
-                    }
+
+                    // Remove every descendant, as the other stores do: a grandchild left without its parent row would
+                    // never run, and a delayed one would wait for that parent forever.
+                    count += RemoveDescendants(id);
                 }
             }
-            
+
             return Task.FromResult(count);
+        }
+
+        private static int RemoveDescendants(Guid parentId)
+        {
+            var count = 0;
+            foreach (var childId in GetChildrenIds(parentId))
+            {
+                if (TimeTickers.TryRemove(childId, out var child))
+                {
+                    count++;
+                    if (child.ParentId.HasValue)
+                        RemoveChildIndex(child.ParentId.Value, child.Id);
+                    count += RemoveDescendants(childId);
+                }
+            }
+            return count;
         }
 
         public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)

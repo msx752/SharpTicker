@@ -175,6 +175,23 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Idle, await StatusOf(child.Id));
     }
 
+    // A grandchild left without its parent row would wait for that parent forever.
+    [Fact]
+    public async Task RemovingARoot_RemovesItsGrandchildrenToo()
+    {
+        var grandchild = Row(Now.AddSeconds(30), condition: RunCondition.OnSuccess, function: "delayed-grandchild");
+        var child = Row(null, function: "child");
+        child.Children = [grandchild];
+        var parent = Row(Now.AddHours(-1), TickerStatus.Done);
+        parent.Children = [child];
+        await _provider.AddTimeTickers([parent], CancellationToken.None);
+
+        Assert.Equal(3, await _provider.RemoveTimeTickers([parent.Id], CancellationToken.None));
+
+        Assert.Null(await _provider.GetTimeTickerById(grandchild.Id, CancellationToken.None));
+        Assert.Null(await _provider.GetTimeTickerById(child.Id, CancellationToken.None));
+    }
+
     [Fact]
     public async Task TheParentsPayload_CarriesItsDelayedChildAndGrandchild_WithTheirTimes()
     {

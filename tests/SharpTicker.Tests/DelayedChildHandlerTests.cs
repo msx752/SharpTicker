@@ -72,6 +72,21 @@ public class DelayedChildHandlerTests : IDisposable
         Assert.Empty(SkippedIds());
     }
 
+    // A parent that failed or was cancelled has started, so an InProgress delayed child may still run.
+    [Fact]
+    public async Task AnInProgressDelayedChild_IsLeftToTheStore_WhenItsParentFails()
+    {
+        var ran = false;
+        var parent = Job(Fails);
+        parent.TimeTickerChildren.Add(Job((_, _, _) => { ran = true; return Task.CompletedTask; }, RunCondition.InProgress, delayed: true));
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(TickerStatus.Failed, parent.Status);
+        Assert.False(ran);
+        Assert.Empty(SkippedIds());
+    }
+
     [Fact]
     public async Task ADelayedChildWhoseConditionTheOutcomeDoesNotMatch_IsSkippedWithWhatItCarries()
     {
