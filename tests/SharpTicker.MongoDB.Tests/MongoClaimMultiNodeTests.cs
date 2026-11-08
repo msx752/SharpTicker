@@ -1023,6 +1023,71 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Empty(await Drain(nodeB.QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
+    // Parent -> child -> grandchild, where neither descendant has an execution time of its own; plus a grandchild that
+    // has one (it is scheduled on its own, so no claim path carries it inside the chain).
+    private async Task<(Guid ParentId, Guid ChildId, Guid GrandchildId, Guid ScheduledGrandchildId)> SeedThreeLevelChain()
+    {
+        var grandchild = NewTimeTicker();
+        grandchild.ExecutionTime = null;
+        grandchild.Function = "claim-grandchild-fn";
+        grandchild.RunCondition = RunCondition.OnSuccess;
+        var scheduledGrandchild = NewTimeTicker(executionTime: T0.AddHours(1));
+        scheduledGrandchild.Function = "claim-scheduled-grandchild-fn";
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "claim-child-fn";
+        child.RunCondition = RunCondition.OnSuccess;
+        child.Children = [grandchild, scheduledGrandchild];
+        var parent = NewTimeTicker();
+        parent.Children = [child];
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+        return (parent.Id, child.Id, grandchild.Id, scheduledGrandchild.Id);
+    }
+
+    private static void AssertCarriesTheChain(TimeTickerEntity parent, Guid childId, Guid grandchildId)
+    {
+        var child = Assert.Single(parent.Children);
+        Assert.Equal(childId, child.Id);
+        var grandchild = Assert.Single(child.Children);
+        Assert.Equal(grandchildId, grandchild.Id);
+        Assert.Equal("claim-grandchild-fn", grandchild.Function);
+        Assert.Equal(RunCondition.OnSuccess, grandchild.RunCondition);
+    }
+
+    [Fact]
+    public async Task Window_CarriesTheGrandchildrenOfAChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+
+        var window = await nodeA.GetEarliestTimeTickers(CancellationToken.None);
+
+        AssertCarriesTheChain(Assert.Single(window, x => x.Id == parentId), childId, grandchildId);
+    }
+
+    [Fact]
+    public async Task Fallback_CarriesTheGrandchildrenOfAChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var fallback = await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        AssertCarriesTheChain(Assert.Single(fallback, x => x.Id == parentId), childId, grandchildId);
+    }
+
+    [Fact]
+    public async Task RunNow_CarriesTheGrandchildrenOfAChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parentId, childId, grandchildId, _) = await SeedThreeLevelChain();
+
+        var acquired = await nodeA.AcquireImmediateTimeTickersAsync([parentId], CancellationToken.None);
+
+        AssertCarriesTheChain(Assert.Single(acquired, x => x.Id == parentId), childId, grandchildId);
+    }
+
     #endregion
 
     #region Racing
