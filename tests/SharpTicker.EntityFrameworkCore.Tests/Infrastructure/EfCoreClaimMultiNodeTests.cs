@@ -1189,6 +1189,40 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(ChainRunGate.Allows(condition, parentStatus), claimed.Any(x => x.Id == childId));
     }
 
+    // The fallback's skip query is the negation of the gate; both must agree with ChainRunGate everywhere: an overdue
+    // delayed child is claimed when its parent's status lets it run, skipped when its parent ended without a match, and
+    // left waiting otherwise.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task OverdueDelayedChild_IsClaimedSkippedOrLeftByTheFallback_ExactlyAsChainRunGateSays(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var (_, childId) = await SeedDelayedChild(parentStatus, condition, T0.AddSeconds(-30));
+
+        var fallback = await Drain(CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None));
+
+        var claimed = fallback.Any(x => x.Id == childId);
+        var status = (await ReadRow(childId)).Status;
+        if (ChainRunGate.Allows(condition, parentStatus))
+            Assert.True(claimed, "a child its parent's status lets run was not claimed");
+        else if (ChainRunGate.IsFinal(parentStatus))
+            Assert.True(!claimed && status == TickerStatus.Skipped, $"claimed={claimed}, status={status}; expected Skipped");
+        else
+            Assert.True(!claimed && status == TickerStatus.Idle, $"claimed={claimed}, status={status}; expected it to wait");
+    }
+
+    // A delayed child is a row of its own; removing its parent removes it, and its children, with it.
+    [Fact]
+    public async Task RemovingAParent_RemovesItsDelayedDescendants()
+    {
+        var grandchild = NewTimeTicker(executionTime: T0.AddHours(3));
+        var (parentId, childId) = await SeedDelayedChild(TickerStatus.Done, RunCondition.OnSuccess, T0.AddHours(2), grandchild);
+
+        await CreateProvider("node-A").RemoveTimeTickers([parentId], CancellationToken.None);
+
+        await using var context = CreateContext();
+        Assert.False(await context.Set<TimeTickerEntity>().AnyAsync(x => x.Id == parentId || x.Id == childId || x.Id == grandchild.Id));
+    }
+
     [Theory]
     [InlineData(TickerStatus.Idle, 30)]
     [InlineData(TickerStatus.Queued, 30)]

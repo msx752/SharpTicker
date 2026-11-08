@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using System;
 using System.Collections.Generic;
@@ -45,8 +47,11 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         RedisContext = redisContext;
         _serviceProvider = serviceProvider;
         _lockHolder = optionsBuilder.NodeIdentifier;
+        _logger = (serviceProvider.GetService(typeof(ILoggerFactory)) as ILoggerFactory)?.CreateLogger("SharpTicker.EntityFrameworkCore")
+                  ?? NullLogger.Instance;
     }
 
+    private readonly ILogger _logger;
     protected readonly IServiceProvider _serviceProvider;
     protected readonly string _lockHolder;
     protected readonly ITickerClock _clock;
@@ -100,29 +105,16 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var now = _clock.UtcNow;
         var fallbackThreshold = now.AddSeconds(-1);  // Fallback picks up tasks older than main 1-second window
 
-        // A delayed child whose parent ended with an outcome it does not run on never will. The parent's run skips it;
-        // this covers a node that stopped before doing so. Its own delayed children follow on a later pass.
-        // Read first, then write by id: an UPDATE through the parent join does not translate on every provider (SQLite),
-        // and such a row can never become claimable meanwhile, as its parent's finished status does not change.
-        var outcomeDoesNotMatch = await context
-            .AsNoTracking()
-            .Where(x => x.ExecutionTime != null && x.ExecutionTime <= fallbackThreshold)
-            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-            .WhereParentEndedWithoutMatch()
-            .Select(x => x.Id)
-            .ToListAsync(cancellationToken).ConfigureAwait(false);
-
-        if (outcomeDoesNotMatch.Count > 0)
-            await context
-                .Where(x => outcomeDoesNotMatch.Contains(x.Id))
-                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-                .ExecuteUpdateAsync(setter => setter
-                .SetProperty(x => x.Status, TickerStatus.Skipped)
-                .SetProperty(x => x.ExecutedAt, now)
-                .SetProperty(x => x.SkippedReason, ChainRunGate.NotMatchedReason)
-                .SetProperty(x => x.LockHolder, _ => null)
-                .SetProperty(x => x.LockedAt, _ => null)
-                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
+        // A failure here must not stop this pass from taking the overdue jobs: the rows it would skip can never be claimed,
+        // and the next pass tries again.
+        try
+        {
+            await SkipDelayedChildrenWhoseParentDoesNotMatchAsync(context, fallbackThreshold, now, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Skipping delayed chain children whose parent's outcome does not match failed; the next fallback pass tries again.");
+        }
 
         // A delayed child whose parent has not ended (with a status its condition accepts) waits.
         var timeTickersToUpdate =  await context
@@ -166,6 +158,35 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             timeTicker.UpdatedAt = claimMarker;
             yield return timeTicker;
         }
+    }
+
+    // A delayed child whose parent ended with an outcome it does not run on never will. The parent's run skips it; this
+    // covers a node that stopped before doing so. Its own delayed children follow on a later pass.
+    // Read first, then write by id: an UPDATE through the parent join does not translate on every provider (SQLite), and
+    // such a row can never become claimable meanwhile, as its parent's finished status does not change.
+    private static async Task SkipDelayedChildrenWhoseParentDoesNotMatchAsync(DbSet<TTimeTicker> context, DateTime fallbackThreshold, DateTime now, CancellationToken cancellationToken)
+    {
+        var outcomeDoesNotMatch = await context
+            .AsNoTracking()
+            .Where(x => x.ExecutionTime != null && x.ExecutionTime <= fallbackThreshold)
+            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+            .WhereParentEndedWithoutMatch()
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        if (outcomeDoesNotMatch.Count == 0)
+            return;
+
+        await context
+            .Where(x => outcomeDoesNotMatch.Contains(x.Id))
+            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Skipped)
+                .SetProperty(x => x.ExecutedAt, now)
+                .SetProperty(x => x.SkippedReason, ChainRunGate.NotMatchedReason)
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task ReleaseAcquiredTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken)
@@ -362,9 +383,10 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         // A delayed child is claimable only once its parent's status lets it run. Read first, then claim by id: an UPDATE
         // through the parent join does not translate on every provider (SQLite), and the gate does not close again once
         // open, as a finished parent status does not change.
+        var idList = ids.ToList(); // a List, not the array: see the note on span overloads in TickerManager
         var gateOpen = await set
             .AsNoTracking()
-            .Where(x => ids.Contains(x.Id))
+            .Where(x => idList.Contains(x.Id))
             .WhereChainGateOpen()
             .Select(x => x.Id)
             // A cancelled caller is answered by the loop below (it stops before claiming), not by a throw here.
