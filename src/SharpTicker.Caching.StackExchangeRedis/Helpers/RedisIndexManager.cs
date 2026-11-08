@@ -28,7 +28,8 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
 
         var t1 = batch.SetAddAsync(TimeTickerIdsKey, idStr);
         Task t2;
-        if (ticker.ExecutionTime.HasValue && CanAcquire(ticker.Status, ticker.LockHolder, _lockHolder))
+        // A chain child runs inside its parent's run, never from the pending index.
+        if (ticker.ParentId == null && ticker.ExecutionTime.HasValue && CanAcquire(ticker.Status, ticker.LockHolder, _lockHolder))
             t2 = batch.SortedSetAddAsync(TimeTickerPendingKey, idStr, ToScore(ticker.ExecutionTime.Value));
         else
             t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
@@ -37,16 +38,28 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return Task.WhenAll(t1, t2);
     }
 
-    internal Task RemoveTimeTickerIndexesAsync(Guid id)
+    // Scored by the child's position in its chain, so children read back in the order the chain was built. A child
+    // already linked keeps its place.
+    internal Task AddTimeTickerChildAsync(Guid parentId, Guid childId, int position)
+        => _db.SortedSetAddAsync(TimeTickerChildrenKey(parentId), childId.ToString(), position, When.NotExists);
+
+    // In chain order.
+    internal async Task<Guid[]> GetTimeTickerChildIdsAsync(Guid parentId)
+        => ParseGuidSet(await _db.SortedSetRangeByRankAsync(TimeTickerChildrenKey(parentId)).ConfigureAwait(false));
+
+    // Also drops the row's own children set and its entry in its parent's children set.
+    internal Task RemoveTimeTickerIndexesAsync(Guid id, Guid? parentId = null)
     {
         var batch = _db.CreateBatch();
         var idStr = (RedisValue)id.ToString();
 
         var t1 = batch.SetRemoveAsync(TimeTickerIdsKey, idStr);
         var t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
+        var t3 = batch.KeyDeleteAsync(TimeTickerChildrenKey(id));
+        var t4 = parentId.HasValue ? batch.SortedSetRemoveAsync(TimeTickerChildrenKey(parentId.Value), idStr) : Task.CompletedTask;
 
         batch.Execute();
-        return Task.WhenAll(t1, t2);
+        return Task.WhenAll(t1, t2, t3, t4);
     }
 
     internal Task AddCronIndexesAsync(TCronTicker ticker)

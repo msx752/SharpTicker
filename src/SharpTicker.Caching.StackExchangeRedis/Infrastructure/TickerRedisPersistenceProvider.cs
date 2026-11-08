@@ -35,6 +35,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             var list = await Serializer.LoadAllFromSetAsync<TTimeTicker>(
                 TimeTickerIdsKey, TimeTickerKey, ct).ConfigureAwait(false);
+            await LinkLoadedChildrenAsync(list).ConfigureAwait(false);
             return list;
         });
     }
@@ -63,18 +64,25 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     #region Time_Ticker_Shared_Methods
     public async Task<TTimeTicker> GetTimeTickerById(Guid id, CancellationToken cancellationToken = default)
     {
-        return await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+        var ticker = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+        if (ticker != null)
+            await AttachChildrenAsync([ticker], cancellationToken).ConfigureAwait(false);
+        return ticker;
     }
 
     public async Task<TTimeTicker[]> GetTimeTickers(Expression<Func<TTimeTicker, bool>> predicate, CancellationToken cancellationToken)
     {
         var compiled = predicate?.Compile();
 
+        // Children are rows too: every row is linked first, so the predicate sees a root with its children.
         var list = await Serializer.LoadAllFromSetAsync<TTimeTicker>(
-            TimeTickerIdsKey, TimeTickerKey, cancellationToken,
-            t => t.ParentId == null && (compiled == null || compiled(t))).ConfigureAwait(false);
+            TimeTickerIdsKey, TimeTickerKey, cancellationToken).ConfigureAwait(false);
+        await LinkLoadedChildrenAsync(list).ConfigureAwait(false);
 
-        return list.OrderByDescending(x => x.ExecutionTime).ToArray();
+        return list
+            .Where(t => t.ParentId == null && (compiled == null || compiled(t)))
+            .OrderByDescending(x => x.ExecutionTime)
+            .ToArray();
     }
 
     public async Task<PaginationResult<TTimeTicker>> GetTimeTickersPaginated(Expression<Func<TTimeTicker, bool>> predicate, int pageNumber, int pageSize, CancellationToken cancellationToken = default)
@@ -89,40 +97,112 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     {
         var now = Clock.UtcNow;
         foreach (var ticker in tickers)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            ticker.CreatedAt = ticker.CreatedAt == default ? now : ticker.CreatedAt;
-            ticker.UpdatedAt = ticker.UpdatedAt == default ? now : ticker.UpdatedAt;
-            await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
-            await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
-        }
+            await WriteChainAsync(ticker, now, adding: true, depth: 0, cancellationToken).ConfigureAwait(false);
         return tickers.Length;
     }
 
+    // An update also writes the chain nodes it carries, as rows of their own. Children it does not carry are kept; a row
+    // stored by an older version with its children nested is split into rows, with the nested children when the update
+    // carries none.
     public async Task<int> UpdateTimeTickers(TTimeTicker[] tickers, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
         foreach (var ticker in tickers)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            ticker.UpdatedAt = now;
-            await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
-            await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
-        }
+            await WriteChainAsync(ticker, now, adding: false, depth: 0, cancellationToken).ConfigureAwait(false);
         return tickers.Length;
     }
 
+    // Every chain node is a row of its own. Children are written before their parent, so a parent is never stored
+    // without them, and a child is linked to its parent before its row exists: a link without a row is skipped on read.
+    // Cancellation is checked only before a chain starts, so a cancel does not leave half a chain behind.
+    private async Task WriteChainAsync(TTimeTicker ticker, DateTime now, bool adding, int depth, CancellationToken cancellationToken)
+    {
+        if (depth == 0)
+            cancellationToken.ThrowIfCancellationRequested();
+
+        var children = depth < MaxChainDepth ? ticker.Children?.Where(c => c != null).ToList() ?? [] : [];
+
+        if (!adding)
+        {
+            var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(ticker.Id)).ConfigureAwait(false);
+            if (stored != null)
+            {
+                KeepStoredChainState(ticker, stored);
+                if (children.Count == 0 && stored.Children is { Count: > 0 } nested)
+                    children = nested.Where(c => c != null).ToList();
+            }
+        }
+
+        for (var position = 0; position < children.Count; position++)
+        {
+            var child = children[position];
+            child.ParentId = ticker.Id;
+            await IndexManager.AddTimeTickerChildAsync(ticker.Id, child.Id, position).ConfigureAwait(false);
+            await WriteChainAsync(child, now, adding, depth + 1, cancellationToken).ConfigureAwait(false);
+        }
+
+        ticker.CreatedAt = ticker.CreatedAt == default ? now : ticker.CreatedAt;
+        ticker.UpdatedAt = adding && ticker.UpdatedAt != default ? ticker.UpdatedAt : now;
+
+        // The row is stored without its children; they are rows of their own. The caller's entity keeps them.
+        var carried = ticker.Children;
+        ticker.Children = new List<TTimeTicker>();
+        try
+        {
+            await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
+        }
+        finally
+        {
+            ticker.Children = carried;
+        }
+        await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
+    }
+
+    // A chain child's link and run belong to the store: an update carries a copy read earlier, whose run state may be
+    // stale, and the dashboard's edit form carries no ParentId or RunCondition. The update's definition is applied. A
+    // root keeps the update's run state, as before.
+    private static void KeepStoredChainState(TTimeTicker ticker, TTimeTicker stored)
+    {
+        if (stored.ParentId == null) return;
+
+        ticker.ParentId = stored.ParentId;
+        ticker.RunCondition ??= stored.RunCondition;
+        ticker.Status = stored.Status;
+        ticker.LockHolder = stored.LockHolder;
+        ticker.LockedAt = stored.LockedAt;
+        ticker.ExecutedAt = stored.ExecutedAt;
+        ticker.ExceptionMessage = stored.ExceptionMessage;
+        ticker.SkippedReason = stored.SkippedReason;
+        ticker.ElapsedTime = stored.ElapsedTime;
+        ticker.RetryCount = stored.RetryCount;
+    }
+
+    // Removes the rows with every descendant, as the other stores do: a child left without its parent would never run.
     public async Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default)
     {
         var count = 0;
         foreach (var id in tickerIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await IndexManager.RemoveTimeTickerIndexesAsync(id).ConfigureAwait(false);
+            var row = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+            await RemoveDescendantsAsync(id, depth: 0).ConfigureAwait(false);
+            await IndexManager.RemoveTimeTickerIndexesAsync(id, row?.ParentId).ConfigureAwait(false);
             if (await Db.KeyDeleteAsync(TimeTickerKey(id)).ConfigureAwait(false))
                 count++;
         }
         return count;
+    }
+
+    private async Task RemoveDescendantsAsync(Guid parentId, int depth)
+    {
+        if (depth >= MaxChainDepth) return;
+
+        foreach (var childId in await IndexManager.GetTimeTickerChildIdsAsync(parentId).ConfigureAwait(false))
+        {
+            await RemoveDescendantsAsync(childId, depth + 1).ConfigureAwait(false);
+            await IndexManager.RemoveTimeTickerIndexesAsync(childId).ConfigureAwait(false);
+            await Db.KeyDeleteAsync(TimeTickerKey(childId)).ConfigureAwait(false);
+        }
     }
     #endregion
 

@@ -267,9 +267,87 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             at => occurrence.UpdatedAt = at);
     }
 
-    // Children live inside the parent's record, so a child with an execution time of its own has no row the store could
-    // hand out later. Its time is left out on purpose: the handler then runs it right after its parent, by its
-    // RunCondition, instead of leaving it to the store as a delayed child.
+    #region Chain rows
+    // Chains are at most root, child, grandchild; the bound only guards against a corrupt link loop.
+    protected const int MaxChainDepth = 4;
+
+    // Each chain node is a row of its own, linked to its parent through the parent's children set. A row written by an
+    // older version holds its children nested and has no children set; it is returned as it was stored.
+    protected async Task AttachChildrenAsync(IReadOnlyCollection<TTimeTicker> rows, CancellationToken cancellationToken)
+    {
+        var level = rows.Where(r => r.Children == null || r.Children.Count == 0).ToList();
+
+        for (var depth = 0; level.Count > 0 && depth < MaxChainDepth; depth++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var order = await ReadChildOrderAsync(level.Select(r => r.Id)).ConfigureAwait(false);
+            var childIds = order.Keys.ToArray();
+            if (childIds.Length == 0) return;
+
+            var byParent = (await Serializer.LoadByIdsAsync<TTimeTicker>(childIds, TimeTickerKey, cancellationToken).ConfigureAwait(false))
+                .Where(c => c.ParentId.HasValue)
+                .ToLookup(c => c.ParentId.Value);
+
+            var next = new List<TTimeTicker>();
+            foreach (var row in level.Where(r => byParent.Contains(r.Id)))
+            {
+                row.Children = InChildOrder(byParent[row.Id], order);
+                next.AddRange(row.Children);
+            }
+            level = next;
+        }
+    }
+
+    // Each child's position under its parent, read from the parents' children sets in one pipelined round trip.
+    private async Task<Dictionary<Guid, int>> ReadChildOrderAsync(IEnumerable<Guid> parentIds)
+    {
+        var reads = parentIds.Select(id => Db.SortedSetRangeByRankAsync(TimeTickerChildrenKey(id))).ToArray();
+        var order = new Dictionary<Guid, int>();
+        foreach (var members in await Task.WhenAll(reads).ConfigureAwait(false))
+        {
+            var ids = ParseGuidSet(members);
+            for (var i = 0; i < ids.Length; i++)
+                order.TryAdd(ids[i], i);
+        }
+        return order;
+    }
+
+    // The children of the row with this id, read before the row is claimed: a failed read then leaves nothing claimed.
+    protected async Task<ICollection<TTimeTicker>> LoadChildrenAsync(Guid id, CancellationToken cancellationToken)
+    {
+        var holder = new TTimeTicker { Id = id };
+        await AttachChildrenAsync([holder], cancellationToken).ConfigureAwait(false);
+        return holder.Children;
+    }
+
+    // For reads that load every row anyway: links them by ParentId, reading only the order of the children.
+    protected async Task LinkLoadedChildrenAsync(IReadOnlyCollection<TTimeTicker> rows)
+    {
+        var byParent = rows.Where(r => r.ParentId.HasValue).ToLookup(r => r.ParentId.Value);
+        var parents = rows.Where(r => byParent.Contains(r.Id)).ToList();
+        if (parents.Count == 0) return;
+
+        var order = await ReadChildOrderAsync(parents.Select(p => p.Id)).ConfigureAwait(false);
+        foreach (var row in parents)
+            row.Children = InChildOrder(byParent[row.Id], order);
+    }
+
+    // A claimed root carries the children read before its claim, unless it holds them nested (older format).
+    protected static TTimeTicker WithChildren(TTimeTicker row, ICollection<TTimeTicker> children)
+    {
+        if ((row.Children == null || row.Children.Count == 0) && children.Count > 0)
+            row.Children = children;
+        return row;
+    }
+
+    // A child missing from the order (its link was dropped) goes last.
+    private static List<TTimeTicker> InChildOrder(IEnumerable<TTimeTicker> children, Dictionary<Guid, int> order)
+        => children.OrderBy(c => order.TryGetValue(c.Id, out var position) ? position : int.MaxValue)
+            .ThenBy(c => c.CreatedAt).ThenBy(c => c.Id).ToList();
+    #endregion
+
+    // A delayed child is carried without its time on purpose: the handler then runs it right after its parent, by its
+    // RunCondition, instead of leaving it to the store, which does not hand children out as rows of their own yet.
     protected static TimeTickerEntity MapForQueue(TTimeTicker ticker)
     {
         return new TimeTickerEntity
@@ -342,13 +420,14 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             cancellationToken.ThrowIfCancellationRequested();
             if (!Guid.TryParse(redisValue.ToString(), out var id)) continue;
 
+            var children = await LoadChildrenAsync(id, cancellationToken).ConfigureAwait(false);
             var acquired = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
             if (acquired == null) continue;
 
             await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
 
-            yield return MapForQueue(acquired);
+            yield return MapForQueue(WithChildren(acquired, children));
         }
     }
 
@@ -404,10 +483,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         var tickers = await Serializer.LoadByIdsAsync<TTimeTicker>(idsInWindow, TimeTickerKey, cancellationToken).ConfigureAwait(false);
 
-        return tickers
-            .Where(t => CanAcquire(t.Status, t.LockHolder, LockHolder))
-            .Select(MapForQueue)
-            .ToArray();
+        var claimable = tickers.Where(t => CanAcquire(t.Status, t.LockHolder, LockHolder)).ToList();
+        await AttachChildrenAsync(claimable, cancellationToken).ConfigureAwait(false);
+
+        return claimable.Select(MapForQueue).ToArray();
     }
 
     public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContexts, CancellationToken cancellationToken = default)
@@ -456,13 +535,21 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested) break;
 
+                // A chain child runs inside its parent's run and is never handed out on its own. Its ParentId never
+                // changes, so reading it before the claim is enough. A row that does not deserialize still goes to the
+                // claim script, which rewrites it in a readable form.
+                var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+                if (stored?.ParentId != null) continue;
+
+                // Not cancelled by the caller's token: a cancel here must not turn the rows already won into a failure.
+                var children = await LoadChildrenAsync(id, CancellationToken.None).ConfigureAwait(false);
                 var ticker = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
                 if (ticker == null) continue;
 
                 won[ticker.Id] = ticker.UpdatedAt;
                 await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
-                acquired.Add(MapForQueue(ticker));
+                acquired.Add(MapForQueue(WithChildren(ticker, children)));
             }
 
             return acquired.ToArray();
