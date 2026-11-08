@@ -141,6 +141,24 @@ A chain has up to five children per parent and up to five grandchildren per chil
 | `OnAnyCompletedStatus` | finished in any way except being skipped |
 | `InProgress` | starts; the child runs in parallel with it |
 
+A child stored without a condition runs as `OnAnyCompletedStatus`. A skipped parent runs none of its children, and a child that does not run is recorded as `Skipped` together with everything below it.
+
+When the application stops while a parent runs, the parent is recorded as `Cancelled`. Its `OnCancelled`, `OnFailureOrCancelled` and `OnAnyCompletedStatus` children then run, and its `OnSuccess` children are skipped. A deploy can therefore start the chains you set up for cancellations.
+
+### Delayed children
+
+A child or grandchild can have an execution time of its own (`SetExecutionTime` on the child or grandchild builder). Such a **delayed child** follows the same rules as any other child, and in addition does not start before its own time:
+
+- It runs only when its parent has ended with a status its `RunCondition` accepts, and never before its own execution time. If that time has already passed when the parent ends, it runs right after the parent.
+- When the parent ends with a status its condition does not accept, it is skipped with everything below it.
+- An `InProgress` delayed child runs at its time once its parent has started, whatever the parent's outcome. It is skipped only when the parent was skipped.
+- A delayed grandchild depends on its own parent (the child), not on the root of the chain.
+- It runs once, on one node, also with several nodes and across restarts. A child that has already started keeps the status of its own run.
+
+Pass the child's time in UTC.
+
+Store support: EF Core and the in-memory store behave as described. On MongoDB a delayed child currently runs at its own time without waiting for its parent. On Redis, children are stored inside the parent's record, so a delayed child runs right after its parent, by its `RunCondition`, and its own time is ignored. The remaining stores follow in the next releases. Upgrade all nodes together: a node on an older version hands out delayed children without waiting for their parent.
+
 ## Seeding
 
 A seeder is code that creates tickers when the application starts. Register it on the options builder:
