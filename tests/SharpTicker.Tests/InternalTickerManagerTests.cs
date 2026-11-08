@@ -1203,18 +1203,68 @@ public class InternalTickerManagerTests
             Arg.Is<Guid[]>(x => x.SequenceEqual(ids)), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
     }
 
-    // Run-now builds its contexts in TickerManager.
+    // Run-now and the hand-off after a parent build their contexts with one builder.
     [Fact]
     public void RunNowContexts_MarkDelayedChildrenAndGrandchildren()
     {
         var build = typeof(IInternalTickerManager).Assembly
-            .GetType("SharpTicker.Utilities.Managers.TickerManager`2")!
-            .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker))
-            .GetMethod("BuildImmediateContextsFromNonGeneric", BindingFlags.NonPublic | BindingFlags.Static)!;
+            .GetType("SharpTicker.Utilities.Managers.ClaimedTimeTickerContexts")!
+            .GetMethod("Build", BindingFlags.NonPublic | BindingFlags.Static, [typeof(IEnumerable<TimeTickerEntity>)])!;
 
-        var contexts = (InternalFunctionContext[])build.Invoke(null, [new[] { ParentWithDelayedDescendants() }])!;
+        var contexts = (InternalFunctionContext[])build.Invoke(null, [new TimeTickerEntity[] { ParentWithDelayedDescendants() }])!;
 
         AssertMarksTheDelayedOnes(Assert.Single(contexts), _now);
+    }
+
+    // The hand-off claims through run-now's store call; each row comes back with the marker its claim wrote, and the
+    // dashboard is told.
+    [Fact]
+    public async Task AcquireDelayedChildren_ReturnsTheClaimedRows_WithTheirMarkers()
+    {
+        var row = ParentWithDelayedDescendants();
+        row.UpdatedAt = _now.AddMilliseconds(7);
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns(new TimeTickerEntity[] { row });
+
+        var contexts = await _manager.AcquireDelayedChildrenAsync([row.Id], CancellationToken.None);
+
+        var context = Assert.Single(contexts);
+        Assert.Equal(row.Id, context.TickerId);
+        Assert.Equal(_now.AddMilliseconds(7), context.ClaimMarker);
+        AssertMarksTheDelayedOnes(context, _now);
+        await _persistence.Received(1).AcquireImmediateTimeTickersAsync(Arg.Is<Guid[]>(x => x.SequenceEqual(new[] { row.Id })), Arg.Any<CancellationToken>());
+        await _notificationHub.Received(1).UpdateTimeTickerNotifyAsync(row);
+    }
+
+    // A failed claim is logged and returns nothing to run; the fallback runs the rows.
+    [Fact]
+    public async Task AcquireDelayedChildren_ReturnsNothing_WhenTheClaimFails()
+    {
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw new InvalidOperationException("store failed"));
+
+        Assert.Empty(await _manager.AcquireDelayedChildrenAsync([Guid.NewGuid()], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AcquireDelayedChildren_IsCancelledWithItsToken()
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(call => throw new OperationCanceledException((CancellationToken)call[1]));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _manager.AcquireDelayedChildrenAsync([Guid.NewGuid()], cancelled.Token));
+    }
+
+    // A dashboard that cannot be told must not drop a row the claim already took.
+    [Fact]
+    public async Task AcquireDelayedChildren_KeepsTheClaimedRows_WhenTheDashboardCannotBeTold()
+    {
+        var row = ParentWithDelayedDescendants();
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns(new TimeTickerEntity[] { row });
+        _notificationHub.UpdateTimeTickerNotifyAsync(Arg.Any<object>()).Returns<Task>(_ => throw new InvalidOperationException("hub down"));
+
+        Assert.Equal(row.Id, Assert.Single(await _manager.AcquireDelayedChildrenAsync([row.Id], CancellationToken.None)).TickerId);
     }
 
     [Fact]

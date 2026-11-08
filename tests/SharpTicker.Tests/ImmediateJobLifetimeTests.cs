@@ -60,11 +60,14 @@ public class ImmediateJobLifetimeTests : IAsyncLifetime
         await store.RemoveTimeTickers(times.Select(t => t.Id).ToArray());
     }
 
-    private async Task StartHostAsync()
+    private async Task StartHostAsync(TimeSpan? fallbackInterval = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
-        builder.Services.AddSharpTicker();
+        if (fallbackInterval is { } interval)
+            builder.Services.AddSharpTicker(o => o.ConfigureScheduler(s => s.FallbackIntervalChecker = interval));
+        else
+            builder.Services.AddSharpTicker();
         _app = builder.Build();
         _app.UseSharpTicker();
         await _app.StartAsync();
@@ -109,6 +112,38 @@ public class ImmediateJobLifetimeTests : IAsyncLifetime
         Assert.Same(seen.Task, finished);
         Assert.True((await seen.Task).Finished);
         var stored = await WaitForStatusAsync(added.Result.Id, TickerStatus.Done, TickerStatus.Failed, TickerStatus.Cancelled);
+        Assert.Equal(TickerStatus.Done, stored!.Status);
+    }
+
+    // A delayed chain child whose time passed while its parent ran starts right after its parent, not at the next fallback
+    // pass (set far off here): the window only takes rows due within the last second.
+    [Fact]
+    public async Task AnOverdueDelayedChild_StartsRightAfterItsParent_NotAtTheNextFallbackPass()
+    {
+        var parentEnded = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var childStarted = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var services = new ServiceCollection();
+        services.MapTicker<LifetimeOrder>("HandOff.Parent", async (ctx, ct) =>
+        {
+            await Task.Delay(2000, ct);
+            parentEnded.TrySetResult(DateTime.UtcNow);
+        });
+        services.MapTicker<LifetimeOrder>("HandOff.Child", (ctx, ct) =>
+        {
+            childStarted.TrySetResult(DateTime.UtcNow);
+            return Task.CompletedTask;
+        });
+        TickerFunctionProvider.Build();
+        await StartHostAsync(fallbackInterval: TimeSpan.FromMinutes(10));
+
+        var now = DateTime.UtcNow;
+        var child = new TimeTickerEntity { Function = "HandOff.Child", ExecutionTime = now.AddMilliseconds(200), RunCondition = RunCondition.OnSuccess };
+        var added = await Times.AddAsync(new TimeTickerEntity { Function = "HandOff.Parent", ExecutionTime = now, Children = [child] });
+
+        Assert.True(added.IsSucceeded, added.Exception?.ToString());
+        Assert.Same(childStarted.Task, await Task.WhenAny(childStarted.Task, Task.Delay(TimeSpan.FromSeconds(15))));
+        Assert.True(await childStarted.Task >= await parentEnded.Task, "the child started before its parent ended");
+        var stored = await WaitForStatusAsync(child.Id, TickerStatus.Done, TickerStatus.DueDone, TickerStatus.Failed);
         Assert.Equal(TickerStatus.Done, stored!.Status);
     }
 
