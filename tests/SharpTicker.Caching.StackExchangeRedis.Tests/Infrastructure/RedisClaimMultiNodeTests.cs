@@ -387,9 +387,184 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Empty(await Drain(CreateProvider("node-B").QueueTimedOutTimeTickers(CancellationToken.None)));
     }
 
-    // Until delayed children are rows of their own on Redis, a child with an execution time of its own stays inside its
-    // parent's record and is carried without its time: it runs right after its parent, by its RunCondition, once, and
-    // never early. Carrying its time would make the handler leave it to the store, where it would never run.
+    // The handler writes a child's status by the child's id, while it runs and when it ends. The write must land, and
+    // the parent read for the dashboard must show it.
+    [Fact]
+    public async Task AChildsStatusWrites_AreStored_AndShownUnderItsParent()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parentId, childId) = await SeedParentWithChild(nodeA);
+
+        Assert.Equal(1, await nodeA.UpdateTimeTicker(StatusContext(childId, TickerStatus.InProgress), CancellationToken.None));
+        Assert.Equal(TickerStatus.InProgress, Assert.Single((await ReadTimeTicker(nodeA, parentId)).Children).Status);
+
+        await nodeA.UpdateTimeTickersWithUnifiedContext([childId], StatusContext(childId, TickerStatus.Done), CancellationToken.None);
+
+        Assert.Equal(TickerStatus.Done, Assert.Single((await ReadTimeTicker(nodeA, parentId)).Children).Status);
+        Assert.Equal(TickerStatus.Done, Assert.Single(await nodeA.GetTimeTickers(x => x.Id == parentId, CancellationToken.None)).Children.Single().Status);
+    }
+
+    private static (TimeTickerEntity Parent, TimeTickerEntity Child, TimeTickerEntity Grandchild) NewChain()
+    {
+        var grandchild = NewTimeTicker();
+        grandchild.ExecutionTime = null;
+        grandchild.Function = "chain-grandchild";
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "chain-child";
+        child.RunCondition = RunCondition.OnSuccess;
+        child.Children = [grandchild];
+        var parent = NewTimeTicker();
+        parent.Children = [child];
+        return (parent, child, grandchild);
+    }
+
+    // A chain stored by an older version: the children nested in the parent's row, no rows or links of their own.
+    private async Task<(TimeTickerEntity Parent, TimeTickerEntity Child, TimeTickerEntity Grandchild)> SeedOldFormatChain()
+    {
+        var chain = NewChain();
+        var db = fixture.Database;
+        await db.StringSetAsync(RedisKeyBuilder.TimeTickerKey(chain.Parent.Id), System.Text.Json.JsonSerializer.Serialize(chain.Parent));
+        await db.SetAddAsync(RedisKeyBuilder.TimeTickerIdsKey, chain.Parent.Id.ToString());
+        await db.SortedSetAddAsync(RedisKeyBuilder.TimeTickerPendingKey, chain.Parent.Id.ToString(), RedisKeyBuilder.ToScore(chain.Parent.ExecutionTime!.Value));
+        return chain;
+    }
+
+    private static void AssertCarriesTheChain(TimeTickerEntity root, Guid childId, Guid grandchildId)
+    {
+        var child = Assert.Single(root.Children);
+        Assert.Equal(childId, child.Id);
+        Assert.Equal(RunCondition.OnSuccess, child.RunCondition);
+        Assert.Equal(grandchildId, Assert.Single(child.Children).Id);
+    }
+
+    [Fact]
+    public async Task AChain_IsStoredAsOneRowPerNode_AndReadBackWhole()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        // The caller's entity keeps its children.
+        Assert.Equal(child.Id, Assert.Single(parent.Children).Id);
+        Assert.Contains("\"Children\":[]", (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.TimeTickerKey(parent.Id)))!);
+
+        var childRow = await ReadTimeTicker(nodeA, child.Id);
+        Assert.Equal(parent.Id, childRow.ParentId);
+        Assert.Equal(grandchild.Id, Assert.Single(childRow.Children).Id);
+        Assert.Equal(child.Id, (await ReadTimeTicker(nodeA, grandchild.Id)).ParentId);
+
+        AssertCarriesTheChain(await ReadTimeTicker(nodeA, parent.Id), child.Id, grandchild.Id);
+        AssertCarriesTheChain(Assert.Single(await nodeA.GetTimeTickers(null!, CancellationToken.None)), child.Id, grandchild.Id);
+        Assert.Single(await nodeA.GetTimeTickers(x => x.Children.Any(), CancellationToken.None));
+
+        // The dashboard lists a node's children through the queryable.
+        Assert.Equal(child.Id, Assert.Single(await nodeA.TimeTickersQuery().Where(x => x.ParentId == parent.Id).ToArrayAsync()).Id);
+        Assert.Equal(3, (await nodeA.TimeTickersQuery().ToArrayAsync()).Length);
+
+        // Only the root is pending; a child runs inside its parent's run.
+        Assert.Equal([parent.Id.ToString()], (await fixture.Database.SortedSetRangeByRankAsync(RedisKeyBuilder.TimeTickerPendingKey)).Select(x => x.ToString()));
+    }
+
+    [Fact]
+    public async Task EveryClaimPath_CarriesTheChainReadFromTheChildRows()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        AssertCarriesTheChain(Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None)), child.Id, grandchild.Id);
+        AssertCarriesTheChain(Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([parent.Id], CancellationToken.None)), child.Id, grandchild.Id);
+
+        var (other, otherChild, otherGrandchild) = NewChain();
+        await nodeA.AddTimeTickers([other], CancellationToken.None);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        AssertCarriesTheChain(Assert.Single(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None))), otherChild.Id, otherGrandchild.Id);
+    }
+
+    [Fact]
+    public async Task AnOldFormatChain_IsReadAndCarriedAsStored()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = await SeedOldFormatChain();
+
+        AssertCarriesTheChain(await ReadTimeTicker(nodeA, parent.Id), child.Id, grandchild.Id);
+        AssertCarriesTheChain(Assert.Single(await nodeA.GetTimeTickers(null!, CancellationToken.None)), child.Id, grandchild.Id);
+        AssertCarriesTheChain(Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None)), child.Id, grandchild.Id);
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        AssertCarriesTheChain(Assert.Single(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None))), child.Id, grandchild.Id);
+
+        // The claim script rewrote the row and kept the nested children.
+        AssertCarriesTheChain(await ReadTimeTicker(nodeA, parent.Id), child.Id, grandchild.Id);
+    }
+
+    [Fact]
+    public async Task UpdatingAnOldFormatChain_StoresEachNodeAsARowOfItsOwn()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = await SeedOldFormatChain();
+
+        Assert.Equal(1, await nodeA.UpdateTimeTickers([await ReadTimeTicker(nodeA, parent.Id)], CancellationToken.None));
+
+        Assert.Contains("\"Children\":[]", (string)(await fixture.Database.StringGetAsync(RedisKeyBuilder.TimeTickerKey(parent.Id)))!);
+        Assert.Equal(parent.Id, (await ReadTimeTicker(nodeA, child.Id)).ParentId);
+        Assert.Equal(1, await nodeA.UpdateTimeTicker(StatusContext(grandchild.Id, TickerStatus.Done), CancellationToken.None));
+
+        var read = await ReadTimeTicker(nodeA, parent.Id);
+        AssertCarriesTheChain(read, child.Id, grandchild.Id);
+        Assert.Equal(TickerStatus.Done, read.Children.Single().Children.Single().Status);
+    }
+
+    [Fact]
+    public async Task RemovingAParent_RemovesItsWholeChain()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        Assert.Equal(1, await nodeA.RemoveTimeTickers([parent.Id], CancellationToken.None));
+
+        var db = fixture.Database;
+        foreach (var id in new[] { parent.Id, child.Id, grandchild.Id })
+        {
+            Assert.False(await db.KeyExistsAsync(RedisKeyBuilder.TimeTickerKey(id)));
+            Assert.False(await db.KeyExistsAsync(RedisKeyBuilder.TimeTickerChildrenKey(id)));
+        }
+        Assert.Empty(await db.SetMembersAsync(RedisKeyBuilder.TimeTickerIdsKey));
+        Assert.Empty(await db.SortedSetRangeByRankAsync(RedisKeyBuilder.TimeTickerPendingKey));
+    }
+
+    [Fact]
+    public async Task RemovingAChild_RemovesItsGrandchildren_AndUnlinksItFromItsParent()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, grandchild) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        Assert.Equal(1, await nodeA.RemoveTimeTickers([child.Id], CancellationToken.None));
+
+        Assert.Empty((await ReadTimeTicker(nodeA, parent.Id)).Children);
+        Assert.False(await fixture.Database.KeyExistsAsync(RedisKeyBuilder.TimeTickerKey(grandchild.Id)));
+        Assert.Equal([parent.Id.ToString()], (await fixture.Database.SetMembersAsync(RedisKeyBuilder.TimeTickerIdsKey)).Select(x => x.ToString()));
+    }
+
+    // A write that stopped after linking a child but before storing its row leaves a link without a row.
+    [Fact]
+    public async Task AChildLinkWithoutItsRow_IsSkippedOnRead()
+    {
+        var nodeA = CreateProvider("node-A");
+        var (parent, child, _) = NewChain();
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+        await fixture.Database.SetAddAsync(RedisKeyBuilder.TimeTickerChildrenKey(parent.Id), Guid.NewGuid().ToString());
+
+        Assert.Equal(child.Id, Assert.Single((await ReadTimeTicker(nodeA, parent.Id)).Children).Id);
+        Assert.Equal(child.Id, Assert.Single(Assert.Single(await nodeA.GetEarliestTimeTickers(CancellationToken.None)).Children).Id);
+    }
+
+    // Until the Redis claim paths gate delayed children, a child with an execution time of its own is never pending and is
+    // carried without its time: it runs right after its parent, by its RunCondition, once, and never early. Carrying its
+    // time would make the handler leave it to the store, which would not hand it out.
     [Fact]
     public async Task ChildWithItsOwnTime_IsCarriedWithoutIt_SoItRunsWithItsParent()
     {
@@ -411,6 +586,12 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(child.Id, carried.Id);
         Assert.Null(carried.ExecutionTime);
         Assert.Null(Assert.Single(carried.Children).ExecutionTime);
+
+        // Due, the child is still not handed out on its own.
+        _clock.Advance(TimeSpan.FromHours(4));
+        Assert.Equal([parent.Id], (await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
+        Assert.Empty(await nodeA.AcquireImmediateTimeTickersAsync([child.Id, grandchild.Id], CancellationToken.None));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(nodeA, child.Id)).Status);
     }
 
     #endregion

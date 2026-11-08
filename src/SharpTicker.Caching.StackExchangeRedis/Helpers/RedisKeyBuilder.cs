@@ -18,6 +18,8 @@ internal static class RedisKeyBuilder
     internal const string CronOccurrencePendingKey = $"{Prefix}:co:pending";
 
     internal static string TimeTickerKey(Guid id) => $"{Prefix}:tt:{id}";
+    // The ids of a chain node's children; each child is a row of its own under TimeTickerKey.
+    internal static string TimeTickerChildrenKey(Guid parentId) => $"{Prefix}:tt:{parentId}:children";
     internal static string CronKey(Guid id) => $"{Prefix}:cron:{id}";
     internal static string CronOccurrenceKey(Guid id) => $"{Prefix}:co:{id}";
     internal static string CronOccurrencesByCronKey(Guid cronId) => $"{Prefix}:cron:{cronId}:occurrences";

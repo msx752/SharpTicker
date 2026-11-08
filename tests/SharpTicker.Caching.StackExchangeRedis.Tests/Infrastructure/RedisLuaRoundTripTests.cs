@@ -116,9 +116,10 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
                 break;
         }
 
+        // The child is a row of its own, so the parent's row holds an empty Children array.
         var json = await RawJson(ticker.Id);
         AssertEmptyCollectionsAreArrays(json);
-        Assert.Contains("\"Children\":[{", json);
+        Assert.Contains("\"Children\":[]", json);
         var read = await node.GetTimeTickerById(ticker.Id, CancellationToken.None);
         Assert.NotNull(read);
         Assert.Empty(read!.Children.Single().Children);
