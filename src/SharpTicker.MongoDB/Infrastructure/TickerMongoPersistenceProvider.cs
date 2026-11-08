@@ -1108,42 +1108,50 @@ namespace SharpTicker.MongoDB.Infrastructure
         // Private helpers
         // ===================================================================
 
+        // The dispatched payload holds the two levels below each row that the execution handler runs (children and
+        // grandchildren), as on the other stores. Mongo keeps each descendant as a document of its own, so this is one
+        // query per level. Only descendants without an execution time of their own run inside the chain; one that has
+        // a time is scheduled as a row of its own.
         private async Task<Dictionary<Guid, List<TTimeTicker>>> LoadChildrenLookup(Guid[] parentIds, CancellationToken ct)
         {
-            if (parentIds.Length == 0) return new Dictionary<Guid, List<TTimeTicker>>();
+            var byParent = new Dictionary<Guid, List<TTimeTicker>>();
+            if (parentIds.Length == 0) return byParent;
+
+            var children = await LoadUnscheduledChildren(parentIds, ct).ConfigureAwait(false);
+            var grandchildren = children.Count == 0
+                ? children
+                : await LoadUnscheduledChildren(children.Select(c => c.Id).ToArray(), ct).ConfigureAwait(false);
+
+            foreach (var row in children.Concat(grandchildren))
+            {
+                if (!byParent.TryGetValue(row.ParentId!.Value, out var list))
+                    byParent[row.ParentId.Value] = list = new List<TTimeTicker>();
+                list.Add(row);
+            }
+            return byParent;
+        }
+
+        private Task<List<TTimeTicker>> LoadUnscheduledChildren(Guid[] parentIds, CancellationToken ct)
+        {
             var fb = Builders<TTimeTicker>.Filter;
-            var rows = await _context.TimeTickers
+            return _context.TimeTickers
                 .Find(fb.And(
                     fb.In(x => x.ParentId, parentIds.Select(p => (Guid?)p)),
                     fb.Eq(x => x.ExecutionTime, null)))
-                .ToListAsync(ct)
-                .ConfigureAwait(false);
-            return rows
-                .Where(r => r.ParentId.HasValue)
-                .GroupBy(r => r.ParentId.Value)
-                .ToDictionary(g => g.Key, g => g.ToList());
+                .ToListAsync(ct);
         }
 
         private TimeTickerEntity BuildQueuedEntity(TTimeTicker ticker, Dictionary<Guid, List<TTimeTicker>> byParent)
         {
-            // The ForQueueTimeTickers projection expects nested .Children with grandchildren.
-            // Since we already filter children to ExecutionTime == null, attach them in-memory
-            // then invoke the compiled projection to produce the shape the scheduler expects.
-            if (byParent.TryGetValue(ticker.Id, out var directChildren))
-            {
-                ticker.Children = directChildren;
-                // Mongo-side we don't fetch grandchildren in LoadChildrenLookup (they'd cascade widely).
-                // Grandchildren are rare in practice and only needed for deeply-nested time tickers;
-                // when needed the dashboard goes through ITickerQueryable.WithRelated(ChildrenDeep).
-                foreach (var ch in directChildren)
-                    ch.Children = new List<TTimeTicker>();
-            }
-            else
-            {
-                ticker.Children = new List<TTimeTicker>();
-            }
+            // Attach the loaded children and grandchildren, then run the shared projection, which keeps two levels.
+            ticker.Children = ChildrenOf(ticker.Id, byParent);
+            foreach (var child in ticker.Children)
+                child.Children = ChildrenOf(child.Id, byParent);
             return ProjectTimeTicker(ticker);
         }
+
+        private static List<TTimeTicker> ChildrenOf(Guid id, Dictionary<Guid, List<TTimeTicker>> byParent)
+            => byParent.TryGetValue(id, out var children) ? children : new List<TTimeTicker>();
 
         private async Task<Dictionary<Guid, TCronTicker>> LoadCronTickers(Guid[] ids, CancellationToken ct)
         {
