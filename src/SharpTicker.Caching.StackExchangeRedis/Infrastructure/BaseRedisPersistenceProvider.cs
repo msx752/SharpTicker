@@ -14,7 +14,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 
-internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> : IClaimFanOut
+internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
@@ -39,6 +39,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     private static readonly string RecoverDeadNodeScript = LuaScriptLoader.Load("RecoverDeadNode");
     private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
     private static readonly string ReleaseClaimScript = LuaScriptLoader.Load("ReleaseClaim");
+    private static readonly string SkipNotStartedScript = LuaScriptLoader.Load("SkipNotStarted");
 
     protected BaseRedisPersistenceProvider(
         IDatabase db,
@@ -332,12 +333,75 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             row.Children = InChildOrder(byParent[row.Id], order);
     }
 
-    // A claimed root carries the children read before its claim, unless it holds them nested (older format).
-    protected static TTimeTicker WithChildren(TTimeTicker row, ICollection<TTimeTicker> children)
+    // A claimed row as the handler gets it, with the children read before its claim, unless it holds them nested (older
+    // format).
+    protected static TimeTickerEntity ForQueue(TTimeTicker row, ICollection<TTimeTicker> children)
     {
-        if ((row.Children == null || row.Children.Count == 0) && children.Count > 0)
+        if (HoldsNestedChildren(row))
+            return MapForQueue(row, childrenAreRows: false);
+        if (children.Count > 0)
             row.Children = children;
-        return row;
+        return MapForQueue(row, childrenAreRows: true);
+    }
+
+    // A row written by an older version holds its children nested; they have no rows of their own.
+    protected static bool HoldsNestedChildren(TTimeTicker row) => row.Children is { Count: > 0 };
+
+    // The status of each parent of the given rows, for the chain gate. A parent that is not found is left out, so its
+    // children wait.
+    protected async Task<Dictionary<Guid, TickerStatus>> LoadParentStatusesAsync(IEnumerable<TTimeTicker> rows, CancellationToken cancellationToken)
+    {
+        var ids = rows.Where(r => r?.ParentId != null).Select(r => r.ParentId.Value).Distinct().ToArray();
+        if (ids.Length == 0) return new Dictionary<Guid, TickerStatus>();
+        var parents = await Serializer.LoadByIdsAsync<TTimeTicker>(ids, TimeTickerKey, cancellationToken).ConfigureAwait(false);
+        return parents.ToDictionary(p => p.Id, p => p.Status);
+    }
+
+    // A row may be handed out on its own when it has no parent, or when it is a delayed child (an execution time of its
+    // own) whose parent's status lets it run (ChainRunGate). A child without a time of its own runs only inside its
+    // parent's run. A finished status never changes back, so the gate read before a claim still holds at the claim.
+    protected static bool ChainGateOpen(TTimeTicker row, Dictionary<Guid, TickerStatus> parentStatuses)
+        => row.ParentId == null
+           || (row.ExecutionTime.HasValue
+               && parentStatuses.TryGetValue(row.ParentId.Value, out var status)
+               && ChainRunGate.Allows(row.RunCondition, status));
+
+    // A delayed child whose parent ended with an outcome it does not run on never will.
+    protected static bool ParentEndedWithoutMatch(TTimeTicker row, Dictionary<Guid, TickerStatus> parentStatuses)
+        => row.ParentId != null
+           && row.ExecutionTime.HasValue
+           && parentStatuses.TryGetValue(row.ParentId.Value, out var status)
+           && ChainRunGate.IsFinal(status)
+           && !ChainRunGate.Allows(row.RunCondition, status);
+
+    // IChildSkipWriter: only a row that has not started is skipped (SkipNotStarted.lua), so a delayed child this store
+    // already handed out keeps the status of its run.
+    public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+    {
+        var now = Clock.UtcNow;
+        foreach (var id in timeTickerIds)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await SkipNotStartedAsync(id, skip.ExceptionDetails ?? ChainRunGate.NotMatchedReason, skip.ExecutedAt == default ? now : skip.ExecutedAt, now).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SkipNotStartedAsync(Guid id, string reason, DateTime executedAt, DateTime now)
+    {
+        var result = await Db.ScriptEvaluateAsync(
+            SkipNotStartedScript,
+            [(RedisKey)TimeTickerKey(id)],
+            [LuaStatusIdle, LuaStatusQueued, (RedisValue)(int)TickerStatus.Skipped, (RedisValue)reason,
+             (RedisValue)executedAt.ToString("O"), (RedisValue)now.ToString("O")]
+        ).ConfigureAwait(false);
+
+        if (result.IsNull) return;
+
+        // The row key and the index keys live in different hash slots; a stale pending entry is harmless, Acquire.lua
+        // rejects a skipped row.
+        var skipped = Serializer.DeserializeOrNull<TTimeTicker>((string)result);
+        if (skipped != null)
+            await IndexManager.AddTimeTickerIndexesAsync(skipped).ConfigureAwait(false);
     }
 
     // A child missing from the order (its link was dropped) goes last.
@@ -346,9 +410,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             .ThenBy(c => c.CreatedAt).ThenBy(c => c.Id).ToList();
     #endregion
 
-    // A delayed child is carried without its time on purpose: the handler then runs it right after its parent, by its
-    // RunCondition, instead of leaving it to the store, which does not hand children out as rows of their own yet.
-    protected static TimeTickerEntity MapForQueue(TTimeTicker ticker)
+    // A delayed child (one with an execution time of its own) is carried with its time, so the handler leaves it to the
+    // store. Children nested in a row of an older version have no row the store could hand out: their time is left out,
+    // so the handler runs them right after their parent, by their RunCondition, as before.
+    protected static TimeTickerEntity MapForQueue(TTimeTicker ticker, bool childrenAreRows)
     {
         return new TimeTickerEntity
         {
@@ -370,6 +435,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 RetryIntervals = ch.RetryIntervals,
                 RunCondition = ch.RunCondition,
                 ParentId = ch.ParentId,
+                ExecutionTime = childrenAreRows ? ch.ExecutionTime : null,
                 Children = (ch.Children ?? []).Select(gch => new TimeTickerEntity
                 {
                     Id = gch.Id,
@@ -377,7 +443,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                     Retries = gch.Retries,
                     RetryIntervals = gch.RetryIntervals,
                     RunCondition = gch.RunCondition,
-                    ParentId = gch.ParentId
+                    ParentId = gch.ParentId,
+                    ExecutionTime = childrenAreRows ? gch.ExecutionTime : null
                 }).ToArray()
             }).ToArray()
         };
@@ -411,24 +478,100 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     public async IAsyncEnumerable<TimeTickerEntity> QueueTimedOutTimeTickers([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var threshold = Clock.UtcNow.AddSeconds(-1);
+        var now = Clock.UtcNow;
+        var threshold = now.AddSeconds(-1);
 
-        var dueIds = await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, double.NegativeInfinity, ToScore(threshold)).ConfigureAwait(false);
+        var dueIds = ParseGuidSet(await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, double.NegativeInfinity, ToScore(threshold)).ConfigureAwait(false));
 
-        foreach (var redisValue in dueIds)
+        // Rows claimed in this pass: their delayed children wait for their run, also when read on a later page.
+        var claimedThisPass = new HashSet<Guid>();
+
+        foreach (var page in dueIds.Chunk(FallbackPage))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (!Guid.TryParse(redisValue.ToString(), out var id)) continue;
 
-            var children = await LoadChildrenAsync(id, cancellationToken).ConfigureAwait(false);
-            var acquired = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            // A delayed child is claimed only once its parent's status lets it run; one whose parent ended without a match
+            // is skipped; one whose parent has not ended waits. The parents are read before the page's claims.
+            var rows = (await Serializer.LoadByIdsAsync<TTimeTicker>(page, TimeTickerKey, cancellationToken).ConfigureAwait(false))
+                .ToDictionary(r => r.Id);
+            var parentStatuses = await LoadParentStatusesAsync(rows.Values, cancellationToken).ConfigureAwait(false);
+            foreach (var claimedParent in claimedThisPass)
+                parentStatuses.Remove(claimedParent);
 
-            if (acquired == null) continue;
+            await DropEndedPendingEntriesAsync(rows.Values, cancellationToken).ConfigureAwait(false);
+            await SkipChildrenWhoseParentEndedWithoutMatchAsync(rows.Values, parentStatuses, now, cancellationToken).ConfigureAwait(false);
 
-            await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
+            foreach (var id in page)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            yield return MapForQueue(WithChildren(acquired, children));
+                // A row that does not deserialize still goes to the claim script, which rewrites it in a readable form;
+                // its gate is checked on the row the script returns.
+                if (rows.TryGetValue(id, out var row) && !ChainGateOpen(row, parentStatuses)) continue;
+
+                var children = await LoadChildrenAsync(id, cancellationToken).ConfigureAwait(false);
+                var acquired = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+
+                if (acquired == null) continue;
+                if (row == null && !await KeepClaimOfUnreadRowAsync(acquired, claimedThisPass).ConfigureAwait(false)) continue;
+
+                claimedThisPass.Add(acquired.Id);
+                await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
+
+                yield return ForQueue(acquired, children);
+            }
         }
+    }
+
+    private const int FallbackPage = 256;
+
+    // A pending entry whose row is no longer Idle or Queued (an index write that never landed after a skip or a run) is
+    // dropped: the row never runs again. Its status is final for every node, so the drop does not depend on the lock.
+    private async Task DropEndedPendingEntriesAsync(IEnumerable<TTimeTicker> rows, CancellationToken cancellationToken)
+    {
+        foreach (var row in rows.Where(r => r.Status is not (TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await TryUpdateIndexAfterClaim(row.Id, () => IndexManager.AddTimeTickerIndexesAsync(row)).ConfigureAwait(false);
+        }
+    }
+
+    // The parent's run skips a delayed child its outcome does not let run; this covers a node that stopped before doing
+    // so. A failure here must not stop the pass from taking the overdue jobs: the rows it would skip can never be
+    // claimed, and the next pass tries again. Their own delayed children follow on a later pass.
+    private async Task SkipChildrenWhoseParentEndedWithoutMatchAsync(IEnumerable<TTimeTicker> rows, Dictionary<Guid, TickerStatus> parentStatuses,
+        DateTime now, CancellationToken cancellationToken)
+    {
+        var ids = rows.Where(r => r.Status is TickerStatus.Idle or TickerStatus.Queued && ParentEndedWithoutMatch(r, parentStatuses))
+            .Select(r => r.Id).ToArray();
+        if (ids.Length == 0) return;
+
+        try
+        {
+            foreach (var id in ids)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await SkipNotStartedAsync(id, ChainRunGate.NotMatchedReason, now, now).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Skipping delayed chain children whose parent's outcome does not match failed; the next fallback pass tries again.");
+        }
+    }
+
+    // A row read only after its claim (it did not deserialize before) is kept when it may run on its own; a delayed child
+    // whose gate is closed is put back for a later pass, and a child without a time of its own is put back too.
+    private async Task<bool> KeepClaimOfUnreadRowAsync(TTimeTicker acquired, ICollection<Guid> claimedThisPass)
+    {
+        if (acquired.ParentId == null) return true;
+
+        var parentStatuses = await LoadParentStatusesAsync([acquired], CancellationToken.None).ConfigureAwait(false);
+        if (!claimedThisPass.Contains(acquired.ParentId.Value) && ChainGateOpen(acquired, parentStatuses)) return true;
+
+        await ClaimPutBack.PutBackOrThrowAsync(acquired.Id, acquired.UpdatedAt,
+            new InvalidOperationException("A chain child was claimed before its gate was checked."), TryReleaseTimeTickerClaim).ConfigureAwait(false);
+        return false;
     }
 
     public async Task ReleaseAcquiredTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken = default)
@@ -471,22 +614,51 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         var now = Clock.UtcNow;
         var oneSecondAgoScore = ToScore(now.AddSeconds(-1));
 
-        var first = await Db.SortedSetRangeByScoreWithScoresAsync(TimeTickerPendingKey, oneSecondAgoScore, double.PositiveInfinity, Exclude.None, Order.Ascending, 0, 1).ConfigureAwait(false);
-        if (first.Length == 0) return [];
+        // The first entry whose gate is open defines the window. A delayed child that still waits for its parent must not
+        // hide the rows due after it, so the scan reads past such entries, a page at a time and up to a limit. Rows past
+        // the limit are left to the next read, or to the fallback once overdue.
+        double? earliestScore = null;
+        for (long offset = 0; earliestScore == null && offset < WindowScanLimit; offset += WindowScanPage)
+        {
+            var page = await Db.SortedSetRangeByScoreWithScoresAsync(TimeTickerPendingKey, oneSecondAgoScore, double.PositiveInfinity,
+                Exclude.None, Order.Ascending, offset, WindowScanPage).ConfigureAwait(false);
+            if (page.Length == 0) return [];
 
-        var earliestScore = first[0].Score;
-        var minSecond = new DateTime((long)earliestScore, DateTimeKind.Utc);
+            var pageRows = await LoadGatedAsync(page.Select(e => e.Element), cancellationToken).ConfigureAwait(false);
+            foreach (var entry in page)
+            {
+                if (Guid.TryParse(entry.Element.ToString(), out var id) && pageRows.ContainsKey(id))
+                {
+                    earliestScore = entry.Score;
+                    break;
+                }
+            }
+        }
+        if (earliestScore == null) return [];
+
+        var minSecond = new DateTime((long)earliestScore.Value, DateTimeKind.Utc);
         var maxScore = ToScore(minSecond.AddSeconds(1));
 
-        var entries = await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, earliestScore, maxScore).ConfigureAwait(false);
-        var idsInWindow = ParseGuidSet(entries);
+        var entries = await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, earliestScore.Value, maxScore).ConfigureAwait(false);
+        var open = (await LoadGatedAsync(entries, cancellationToken).ConfigureAwait(false)).Values.ToList();
 
-        var tickers = await Serializer.LoadByIdsAsync<TTimeTicker>(idsInWindow, TimeTickerKey, cancellationToken).ConfigureAwait(false);
+        var nested = open.Where(HoldsNestedChildren).Select(r => r.Id).ToHashSet();
+        await AttachChildrenAsync(open, cancellationToken).ConfigureAwait(false);
 
-        var claimable = tickers.Where(t => CanAcquire(t.Status, t.LockHolder, LockHolder)).ToList();
-        await AttachChildrenAsync(claimable, cancellationToken).ConfigureAwait(false);
+        return open.Select(r => MapForQueue(r, childrenAreRows: !nested.Contains(r.Id))).ToArray();
+    }
 
-        return claimable.Select(MapForQueue).ToArray();
+    private const int WindowScanPage = 64;
+    private const int WindowScanLimit = 1024;
+
+    // The rows of these pending entries that this node may claim and whose chain gate is open.
+    private async Task<Dictionary<Guid, TTimeTicker>> LoadGatedAsync(IEnumerable<RedisValue> entries, CancellationToken cancellationToken)
+    {
+        var rows = (await Serializer.LoadByIdsAsync<TTimeTicker>(ParseGuidSet(entries.ToArray()), TimeTickerKey, cancellationToken).ConfigureAwait(false))
+            .Where(t => CanAcquire(t.Status, t.LockHolder, LockHolder))
+            .ToList();
+        var parentStatuses = await LoadParentStatusesAsync(rows, cancellationToken).ConfigureAwait(false);
+        return rows.Where(r => ChainGateOpen(r, parentStatuses)).ToDictionary(r => r.Id);
     }
 
     public async Task<int> UpdateTimeTicker(InternalFunctionContext functionContexts, CancellationToken cancellationToken = default)
@@ -535,21 +707,24 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested) break;
 
-                // A chain child runs inside its parent's run and is never handed out on its own. Its ParentId never
-                // changes, so reading it before the claim is enough. A row that does not deserialize still goes to the
-                // claim script, which rewrites it in a readable form.
+                // A chain child is handed out on its own only when it is a delayed child whose parent's status lets it run
+                // (ChainGateOpen); a finished status never changes back, so the gate read here holds at the claim. A row
+                // that does not deserialize still goes to the claim script, which rewrites it in a readable form.
                 var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
-                if (stored?.ParentId != null) continue;
+                if (stored?.ParentId != null
+                    && !ChainGateOpen(stored, await LoadParentStatusesAsync([stored], CancellationToken.None).ConfigureAwait(false)))
+                    continue;
 
                 // Not cancelled by the caller's token: a cancel here must not turn the rows already won into a failure.
                 var children = await LoadChildrenAsync(id, CancellationToken.None).ConfigureAwait(false);
                 var ticker = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
                 if (ticker == null) continue;
+                if (stored == null && !await KeepClaimOfUnreadRowAsync(ticker, Array.Empty<Guid>()).ConfigureAwait(false)) continue;
 
                 won[ticker.Id] = ticker.UpdatedAt;
                 await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
-                acquired.Add(MapForQueue(WithChildren(ticker, children)));
+                acquired.Add(ForQueue(ticker, children));
             }
 
             return acquired.ToArray();
