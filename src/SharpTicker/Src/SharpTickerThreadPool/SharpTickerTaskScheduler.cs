@@ -52,9 +52,11 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
     /// </summary>
     internal Action<int> OnWorkerThreadStarting;
 
-    // Thread-local flag to detect if we're on a SharpTicker worker thread
+    /// <summary>
+    /// True on the scheduler's worker threads, where a job runs up to its first await. What the job does after an await
+    /// runs on the .NET thread pool, where this is false.
+    /// </summary>
     [ThreadStatic] public static bool IsSharpTickerWorkerThread;
-    [ThreadStatic] private static int _threadWorkerIndex = -1;
     
     public SharpTickerTaskScheduler(
         int maxConcurrency,
@@ -301,7 +303,10 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     Name = $"SharpTicker.Worker-{workerId}"
                 };
                 OnWorkerThreadStarting?.Invoke(workerId);
-                thread.Start();
+                // Without the ExecutionContext of the caller: the worker runs many jobs, and whatever started it (the
+                // host, a request whose "Run now" queued a job, a leaving worker) must not give all of them its
+                // AsyncLocals, its culture or its Activity.Current.
+                thread.UnsafeStart();
             }
             catch (Exception ex)
             {
@@ -341,23 +346,22 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
 
     private void WorkerLoop(int workerId)
     {
-        // Set thread-local state
-        _threadWorkerIndex = workerId;
+        // The loop runs on this thread, so a job starts even when the .NET thread pool has no free thread. No
+        // synchronization context is installed: what a job does after its first await runs on the .NET thread pool.
         IsSharpTickerWorkerThread = true;
-        
-        // Set a simple synchronization context if needed for continuations
-        var originalContext = SynchronizationContext.Current;
-        var sharpTickerContext = new SharpTickerSynchronizationContext(this);
-        SynchronizationContext.SetSynchronizationContext(sharpTickerContext);
-        
+
         try
         {
-            // Run the async worker loop
-            Task.Run(async () => await WorkerLoopCoreAsync(workerId)).GetAwaiter().GetResult();
+            WorkerLoopCore(workerId);
+        }
+        catch (Exception ex)
+        {
+            // This is a plain thread, where an exception ends the process. Jobs are caught where they run, so this is the
+            // scheduler's own failure: the worker leaves, and the finally below starts another one when work is waiting.
+            _logger.LogCritical(ex, "A worker of the task scheduler failed and left. Another one starts when jobs are queued.");
         }
         finally
         {
-            SynchronizationContext.SetSynchronizationContext(originalContext);
             // The id goes back before the count goes down, so a worker that is started because the count is lower can
             // always find a free id.
             ReleaseWorkerId(workerId);
@@ -384,31 +388,34 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         }
     }
     
-    private async Task WorkerLoopCoreAsync(int workerId)
+    private void WorkerLoopCore(int workerId)
     {
         var lastWorkTime = DateTime.UtcNow;
         var consecutiveStealFailures = 0;
-        
+
         while (!_shutdownToken.IsCancellationRequested && !_disposed)
         {
             WorkItem workItem = default;
             bool foundWork = false;
-            
+
             // The highest priority job that is waiting, from this worker's queue first and then from the others
             if (TryTakeNext(workerId, out workItem))
             {
                 foundWork = true;
                 consecutiveStealFailures = 0;
             }
-            else
+            else if (consecutiveStealFailures < IdlePassesBeforeLongestSleep)
             {
                 consecutiveStealFailures++;
             }
-            
+
             if (foundWork)
             {
                 lastWorkTime = DateTime.UtcNow;
-                await ExecuteWorkAsync(workItem);
+                // An async method on purpose: when the job's synchronous part returns, it restores the ExecutionContext
+                // and the synchronization context of this thread, so an AsyncLocal or a context the job set does not
+                // reach the next job on this worker. It awaits only completed tasks, so it has finished on return.
+                ExecuteWorkAsync(workItem).GetAwaiter().GetResult();
             }
             else
             {
@@ -437,18 +444,22 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                     lastWorkTime = DateTime.UtcNow;
                 }
                 
-                // Brief sleep to avoid spinning
+                // Brief sleep to avoid spinning. Not a wait on the shutdown token's handle: its source is disposed at the
+                // end of DisposeAsync, and the handle then throws on this plain thread.
                 if (consecutiveStealFailures > 3)
                 {
-                    await Task.Delay(Math.Min(consecutiveStealFailures * 2, 50));
+                    Thread.Sleep(Math.Min(consecutiveStealFailures * 2, 50));
                 }
                 else
                 {
-                    await Task.Yield();
+                    Thread.Yield();
                 }
             }
         }
     }
+
+    // The idle sleep grows by 2 ms per empty pass up to 50 ms; counting further would only let the counter overflow.
+    private const int IdlePassesBeforeLongestSleep = 25;
     
     // A job reports its own failure through the ticker handler, so an exception that gets this far was handled by nothing.
     private void LogUnhandledJobFailure(Exception exception)
@@ -491,7 +502,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
                 }
                 else
                 {
-                    // Task already completed synchronously – observe any exception
+                    // Task already completed synchronously â€“ observe any exception
                     try
                     {
                         await task;
@@ -517,43 +528,6 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             // Swallowed so a failing job does not crash the worker thread, but not silently
             LogUnhandledJobFailure(ex);
         }
-    }
-    
-    /// <summary>
-    /// Posts a continuation work item to the scheduler.
-    /// Used by SharpTickerSynchronizationContext.
-    /// </summary>
-    internal void PostContinuation(SendOrPostCallback callback, object state)
-    {
-        if (_disposed || _shutdownToken.IsCancellationRequested)
-            return;
-        
-        // Continuations get queued to the current worker's queue if possible
-        var queueIndex = _threadWorkerIndex >= 0 ? _threadWorkerIndex : GetNextQueueIndex();
-        var targetQueue = _workerQueues[queueIndex];
-        
-        var workItem = new WorkItem(
-            ct => 
-            {
-                try
-                {
-                    callback(state);
-                }
-                catch
-                {
-                    // Swallow exceptions in continuations
-                }
-                return Task.CompletedTask;
-            },
-            CancellationToken.None);
-        
-        // A continuation belongs to a job that is already running, so it goes before the jobs that have not started
-        targetQueue.Enqueue(workItem, HighBucket);
-        // Count continuations to keep counter accurate
-        Interlocked.Increment(ref _totalQueuedTasks);
-        
-        // Ensure worker is available
-        EnsureWorkerAvailable();
     }
     
     /// <summary>
@@ -620,7 +594,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         // Discrepancy check
         if (totalInQueues != _totalQueuedTasks)
         {
-            text += $"\n⚠️ DISCREPANCY: Counter shows {_totalQueuedTasks} but queues have {totalInQueues} tasks!\n";
+            text += $"\nâš ï¸ DISCREPANCY: Counter shows {_totalQueuedTasks} but queues have {totalInQueues} tasks!\n";
         }
         
         return text;

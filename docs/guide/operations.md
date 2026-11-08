@@ -68,6 +68,8 @@ Set through `options.ConfigureScheduler(scheduler => ...)`:
 
 The default `NodeIdentifier` is the machine name, which in a container is the container id and changes with every new container. Jobs keep the identifier of the node that locked them, so the Machines panel of the dashboard lists every identifier that ever locked a job, with its job count since the beginning, not only the nodes that are running now (the one marked Current is this node). Set a stable name, such as the pod name of a StatefulSet or a fixed name per service, to keep that list short, and so that jobs left running by a node that stopped can be released.
 
+A worker thread runs a job up to its first `await` of a task that has not completed yet; what the job does after that runs on the .NET thread pool. So `MaxConcurrency` limits how many jobs start at once and how many synchronous (blocking) parts run at once, not how many asynchronous jobs are in progress. Because jobs start on the scheduler's own threads, they start on time even when the application has used up the .NET thread pool, but under such starvation a job still waits at its first `await` until the pool has a free thread. A job that a worker runs does not inherit ambient state (`AsyncLocal` values, culture, `Activity.Current`) from the code that queued it or from earlier jobs on the same worker; set what it needs inside the job. A `LongRunning` job does not go through a worker and starts with the ambient state of the code that queued it.
+
 To limit how many runs of one function execute at the same time on an instance, use `maxConcurrency` on `[TickerFunction]` or `WithMaxConcurrency` on code-first registrations.
 
 ## Start modes
