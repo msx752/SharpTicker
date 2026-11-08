@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using MongoDB.Bson;
+using MongoDB.Bson.IO;
 using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using SharpTicker.Utilities;
@@ -1277,13 +1278,21 @@ namespace SharpTicker.MongoDB.Infrastructure
             public static ChainGateStages For(string collectionName)
             {
                 var classMap = BsonClassMap.LookupClassMap(typeof(TTimeTicker));
-                string ElementOf(string member) => classMap.AllMemberMaps.Single(m => m.MemberName == member).ElementName;
+                BsonMemberMap MemberOf(string member)
+                    => classMap.AllMemberMaps.FirstOrDefault(m => m.MemberName == member)
+                       ?? throw new InvalidOperationException(
+                           $"The MongoDB class map of {typeof(TTimeTicker).FullName} does not map {member}, which SharpTicker needs to run chains.");
 
-                var parentId = ElementOf(nameof(TimeTickerEntity.ParentId));
-                var runCondition = ElementOf(nameof(TimeTickerEntity.RunCondition));
-                var parentStatus = ParentField + "." + ElementOf(nameof(TimeTickerEntity.Status));
-                var executionTime = ElementOf(nameof(TimeTickerEntity.ExecutionTime));
+                var parentIdMember = MemberOf(nameof(TimeTickerEntity.ParentId));
+                var runConditionMember = MemberOf(nameof(TimeTickerEntity.RunCondition));
+                var statusMember = MemberOf(nameof(TimeTickerEntity.Status));
+                var parentId = parentIdMember.ElementName;
+                var runCondition = runConditionMember.ElementName;
+                var status = statusMember.ElementName;
+                var executionTime = MemberOf(nameof(TimeTickerEntity.ExecutionTime)).ElementName;
 
+                // Values are written by the members' own serializers, so a class map that stores the enums differently
+                // (as strings, say) is matched as the typed filters match it.
                 var open = new BsonArray { new BsonDocument(parentId, BsonNull.Value) };
                 foreach (var condition in Enum.GetValues(typeof(RunCondition)).Cast<RunCondition?>().Append(null))
                 {
@@ -1291,18 +1300,24 @@ namespace SharpTicker.MongoDB.Infrastructure
                     if (statuses.Length == 0) continue;
                     open.Add(new BsonDocument
                     {
-                        { runCondition, condition.HasValue ? (BsonValue)(int)condition.Value : BsonNull.Value },
-                        { parentStatus, new BsonDocument("$in", new BsonArray(statuses.Select(s => (int)s))) }
+                        { runCondition, Serialize(runConditionMember, condition) },
+                        { ParentField + "." + status, new BsonDocument("$in", new BsonArray(statuses.Select(s => Serialize(statusMember, s)))) }
                     });
                 }
 
                 return new ChainGateStages
                 {
+                    // Only the parent's status is read: the parent is matched on _id (indexed) and nothing else is copied.
                     LookupParent = new BsonDocument("$lookup", new BsonDocument
                     {
                         { "from", collectionName },
-                        { "localField", parentId },
-                        { "foreignField", "_id" },
+                        { "let", new BsonDocument("parentId", "$" + parentId) },
+                        { "pipeline", new BsonArray
+                            {
+                                new BsonDocument("$match", new BsonDocument("$expr", new BsonDocument("$eq", new BsonArray { "$_id", "$$parentId" }))),
+                                new BsonDocument("$project", new BsonDocument { { "_id", 0 }, { status, 1 } })
+                            }
+                        },
                         { "as", ParentField }
                     }),
                     Open = new BsonDocument("$or", open),
@@ -1310,6 +1325,19 @@ namespace SharpTicker.MongoDB.Infrastructure
                     ExecutionTimeOnly = new BsonDocument { { "_id", 0 }, { executionTime, 1 } },
                     ExecutionTimeElement = executionTime
                 };
+            }
+
+            private static BsonValue Serialize(BsonMemberMap member, object value)
+            {
+                var document = new BsonDocument();
+                using (var writer = new BsonDocumentWriter(document))
+                {
+                    writer.WriteStartDocument();
+                    writer.WriteName("v");
+                    member.GetSerializer().Serialize(BsonSerializationContext.CreateRoot(writer), value);
+                    writer.WriteEndDocument();
+                }
+                return document["v"];
             }
         }
 
