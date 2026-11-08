@@ -38,13 +38,22 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         _internalTickerManager = internalTickerManager;
     }
 
-    public async Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
+    public Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
+        => ExecuteTaskAsync(context, isDue, isChild: false, cancellationToken);
+
+    private async Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, bool isChild, CancellationToken cancellationToken)
     {
         if (context.Type == TickerType.CronTickerOccurrence)
         {
             await RunContextFunctionAsync(context, isDue, cancellationToken);
             return;
         }
+
+        // A chain child without a time of its own runs inside its parent's run and was never claimed: its row is recorded
+        // InProgress here, before it starts and before its InProgress delayed children are handed off (the store lets them
+        // run once this row is InProgress).
+        if (isChild)
+            await RecordChildInProgressAsync(context, cancellationToken);
 
         var childCount = context.TimeTickerChildren.Count;
         var childrenToRunAfter = new InternalFunctionContext[childCount];
@@ -57,7 +66,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         List<InternalFunctionContext> delayedChildren = null;
 
         // Add parent task
-        tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken);
+        tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken, isChild);
 
         if (hasChildren)
         {
@@ -261,9 +270,6 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         _sharpTickerInstrumentation.LogJobEnqueued(typeName, context.FunctionName, context.TickerId, "ExecutionTaskHandler");
         
         context.SetProperty(x => x.Status, TickerStatus.InProgress);
-
-        if (isChild)
-            await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
 
         var stopWatch = new Stopwatch();
         // Total wall-clock from first attempt start through the final outcome,
@@ -536,11 +542,31 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
     }
 
+    // The status is for the dashboard and the chain gate; a failed write must not stop the child, which nothing else would
+    // ever run, nor the rest of the chain. Its final status is written as usual.
+    private async Task RecordChildInProgressAsync(InternalFunctionContext child, CancellationToken cancellationToken)
+    {
+        child.SetProperty(x => x.Status, TickerStatus.InProgress);
+        try
+        {
+            await _internalTickerManager.UpdateTickerAsync(child, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway.",
+                child.FunctionName, child.TickerId);
+        }
+        finally
+        {
+            child.ResetUpdateProps();
+        }
+    }
+
     private Task SafeRecursiveExecution(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
     {
         try
         {
-            return ExecuteTaskAsync(context, isDue, cancellationToken);
+            return ExecuteTaskAsync(context, isDue, isChild: true, cancellationToken);
         }
         catch
         {

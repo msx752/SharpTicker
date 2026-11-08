@@ -147,6 +147,39 @@ public class ImmediateJobLifetimeTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Done, stored!.Status);
     }
 
+    // An inline chain child (no time of its own) is recorded InProgress while it runs, so an InProgress delayed child below it
+    // starts while it still runs, not once it has ended.
+    [Fact]
+    public async Task AnInProgressDelayedGrandchild_StartsWhileTheInlineChildAboveItRuns()
+    {
+        var childEnded = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var grandchildStarted = new TaskCompletionSource<DateTime>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var services = new ServiceCollection();
+        services.MapTicker<LifetimeOrder>("InlineChild.Parent", (ctx, ct) => Task.CompletedTask);
+        services.MapTicker<LifetimeOrder>("InlineChild.Child", async (ctx, ct) =>
+        {
+            await Task.Delay(3000, ct);
+            childEnded.TrySetResult(DateTime.UtcNow);
+        });
+        services.MapTicker<LifetimeOrder>("InlineChild.Grandchild", (ctx, ct) =>
+        {
+            grandchildStarted.TrySetResult(DateTime.UtcNow);
+            return Task.CompletedTask;
+        });
+        TickerFunctionProvider.Build();
+        await StartHostAsync(fallbackInterval: TimeSpan.FromMinutes(10));
+
+        var now = DateTime.UtcNow;
+        var grandchild = new TimeTickerEntity { Function = "InlineChild.Grandchild", ExecutionTime = now.AddMilliseconds(500), RunCondition = RunCondition.InProgress };
+        var child = new TimeTickerEntity { Function = "InlineChild.Child", RunCondition = RunCondition.OnSuccess, Children = [grandchild] };
+        var added = await Times.AddAsync(new TimeTickerEntity { Function = "InlineChild.Parent", ExecutionTime = now, Children = [child] });
+
+        Assert.True(added.IsSucceeded, added.Exception?.ToString());
+        Assert.Same(grandchildStarted.Task, await Task.WhenAny(grandchildStarted.Task, Task.Delay(TimeSpan.FromSeconds(15))));
+        Assert.Same(childEnded.Task, await Task.WhenAny(childEnded.Task, Task.Delay(TimeSpan.FromSeconds(15))));
+        Assert.True(await grandchildStarted.Task < await childEnded.Task, "the grandchild waited for the inline child to end");
+    }
+
     [Fact]
     public async Task AJobAddedWithATokenThatIsAlreadyCancelled_StillRunsAndFinishes()
     {

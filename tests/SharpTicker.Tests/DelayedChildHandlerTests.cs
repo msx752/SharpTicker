@@ -381,6 +381,79 @@ public class DelayedChildHandlerTests : IDisposable
         Assert.Equal([onSuccess.TickerId], SkippedIds());
     }
 
+    // A chain child without a time of its own runs inside its parent's run. Its row must be recorded InProgress before its
+    // function starts, as the parent's is, so the dashboard shows it running and an InProgress delayed child below it can
+    // start while it runs.
+    [Theory]
+    [InlineData(RunCondition.OnSuccess)]
+    [InlineData(RunCondition.InProgress)]
+    public async Task AnInlineChild_IsRecordedInProgress_BeforeItsFunctionStarts(RunCondition condition)
+    {
+        var steps = new List<string>();
+        var parent = Job(Succeeds);
+        var child = Job((_, _, _) => { lock (steps) steps.Add("child runs"); return Task.CompletedTask; }, condition);
+        parent.TimeTickerChildren.Add(child);
+        _internalManager.When(m => m.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(c => { lock (steps) steps.Add($"write {((InternalFunctionContext)c[0]).Status}"); });
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(["write InProgress", "child runs", "write Done"], steps);
+    }
+
+    // The InProgress delayed child of an inline child is handed off once that child is recorded InProgress, so the store's
+    // gate is open when it is claimed.
+    [Fact]
+    public async Task AnInProgressDelayedGrandchild_IsHandedOffAfterTheInlineChildIsRecordedInProgress()
+    {
+        var steps = new List<string>();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parent = Job(Succeeds);
+        var child = Job(async (_, _, _) => await release.Task, RunCondition.OnSuccess);
+        var grandchild = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.InProgress);
+        child.TimeTickerChildren.Add(grandchild);
+        parent.TimeTickerChildren.Add(child);
+        _internalManager.When(m => m.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(c => { lock (steps) steps.Add($"write {((InternalFunctionContext)c[0]).Status}"); });
+        _internalManager.When(m => m.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()))
+            .Do(_ => { lock (steps) steps.Add("claim grandchild"); });
+
+        var run = _handler.ExecuteTaskAsync(parent, isDue: false);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (HandedOffIds().Length == 0 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        // Claimed while the child still runs, after it was recorded InProgress.
+        Assert.False(run.IsCompleted);
+        lock (steps) Assert.Equal(["write InProgress", "claim grandchild"], steps);
+        release.SetResult();
+        await run;
+    }
+
+    // A failed InProgress write does not stop the child, nothing else would run it; its outcome is still written.
+    [Fact]
+    public async Task AnInlineChild_StillRuns_WhenItCannotBeRecordedInProgress()
+    {
+        var ran = false;
+        var parent = Job(Succeeds);
+        var child = Job((_, _, _) => { ran = true; return Task.CompletedTask; }, RunCondition.OnSuccess);
+        parent.TimeTickerChildren.Add(child);
+        var finalWrites = new List<TickerStatus>();
+        _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
+            .Returns(c =>
+            {
+                var status = ((InternalFunctionContext)c[0]).Status;
+                if (status == TickerStatus.InProgress) throw new InvalidOperationException("store failed");
+                finalWrites.Add(status);
+                return Task.CompletedTask;
+            });
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.True(ran);
+        Assert.Equal([TickerStatus.Done], finalWrites);
+    }
+
     // With the background services off nothing would start a claimed row, so nothing is claimed.
     [Fact]
     public async Task WithoutARunningDispatcher_NoDelayedChildIsClaimed()
