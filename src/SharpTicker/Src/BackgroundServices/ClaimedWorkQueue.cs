@@ -67,6 +67,16 @@ internal sealed class ClaimedWorkQueue
 
                 try
                 {
+                    // The wait can get the slot after the stop began: the job that held it ended on the stop and freed it
+                    // before the stop reached this wait. The job does not start then; its claim stays pending and the
+                    // stop's put-back moves the row back to Idle.
+                    if (ct.IsCancellationRequested)
+                    {
+                        _logger?.LogDebug("Job {FunctionName} ({TickerId}) got its slot as the application was stopping; it does not start and the stop puts its claim back.",
+                            function.FunctionName, function.TickerId);
+                        return;
+                    }
+
                     // A claim that is being put back, or whose put-back was tried, does not start.
                     if (!entry.TryStart())
                         return;

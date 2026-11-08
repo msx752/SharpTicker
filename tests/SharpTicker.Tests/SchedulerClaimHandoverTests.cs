@@ -86,6 +86,32 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         public Task<bool> WaitForRunningTasksAsync(TimeSpan? timeout = null) => Task.FromResult(true);
     }
 
+    /// <summary>
+    /// Starts the queued work on the calling thread with the job's token, so the work has reached its first wait when
+    /// <see cref="QueueAsync"/> returns.
+    /// </summary>
+    private sealed class InlineTaskScheduler : ISharpTickerTaskScheduler
+    {
+        private readonly ConcurrentQueue<Task> _running = new();
+        public bool IsFrozen => false;
+        public bool IsDisposed => false;
+        public int ActiveWorkers => 0;
+        public int TotalQueuedTasks => 0;
+
+        public ValueTask QueueAsync(Func<CancellationToken, Task> work, TickerTaskPriority priority, CancellationToken cancellationToken = default)
+        {
+            _running.Enqueue(work(cancellationToken));
+            return ValueTask.CompletedTask;
+        }
+
+        public Task WhenAllIdleAsync() => Task.WhenAll(_running.ToArray());
+
+        public void Freeze() { }
+        public void Resume() { }
+        public string GetDiagnostics() => string.Empty;
+        public Task<bool> WaitForRunningTasksAsync(TimeSpan? timeout = null) => Task.FromResult(true);
+    }
+
     private readonly List<Guid> _timeTickerIds = [];
     private readonly List<Guid> _occurrenceIds = [];
     private readonly List<Guid> _cronTickerIds = [];
@@ -604,6 +630,40 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
 
         await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+    }
+
+    // A claimed job waits for its function's only slot, and the application stops. The job that holds the slot ends on that
+    // stop and frees the slot before the stop reaches the waiting job, so its wait succeeds although the stop has begun. It
+    // must not start: it would run with a cancelled token and end Cancelled. Its claim stays pending and the stop puts it back.
+    [Fact]
+    public async Task ASlotFreedByTheStop_DoesNotStartTheWaitingJob_TheStopPutsItBack()
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A")));
+        var gate = new TickerFunctionConcurrencyGate();
+        var function = Function("Handover.SlotFreedByTheStop");
+        function.CachedMaxConcurrency = 1;
+        var slot = gate.GetSemaphoreOrNull(function.FunctionName, 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var scheduler = new InlineTaskScheduler();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        using var stopping = new CancellationTokenSource();
+        var entry = work.Record(function, manager.NextClaimMarker());
+
+        await work.QueueWork(entry, isDue: false, stopping.Token);
+        // Registered after the waiting job's wait, so it runs first: the holder ends on the stop and frees the slot. This relies
+        // on cancellation callbacks running in reverse order of registration; if that changed, the wait would be cancelled, the
+        // job's task would end Canceled and WhenAllIdleAsync would throw, so the test fails instead of passing for no reason.
+        stopping.Token.Register(() => slot.Release());
+        stopping.Cancel();
+        await scheduler.WhenAllIdleAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+        Assert.True(entry.IsPending);
+        Assert.Equal(1, slot.CurrentCount);
+        await work.PutBackUnstartedAsync();
+        Assert.Equal(1, manager.PutBackAttempts);
     }
 
     // The fallback stops first (the host stops services in reverse order) and sweeps the shared ledger while the loop's claim
