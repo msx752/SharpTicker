@@ -311,6 +311,76 @@ public class DelayedChildHandlerTests : IDisposable
         Assert.Equal([due.TickerId], HandedOffIds());
     }
 
+    // Waking the scheduler for a child due later must not keep a due sibling from being claimed.
+    [Fact]
+    public async Task AFailedSchedulerWake_DoesNotKeepADueChildFromBeingClaimed()
+    {
+        _hostScheduler.When(s => s.RestartIfNeeded(Arg.Any<DateTime?>())).Do(_ => throw new InvalidOperationException("boom"));
+        var parent = Job(Succeeds);
+        var due = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.OnSuccess);
+        parent.TimeTickerChildren.Add(due);
+        parent.TimeTickerChildren.Add(DelayedChild(TimeSpan.FromMinutes(5), RunCondition.OnSuccess));
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal([due.TickerId], HandedOffIds());
+        await _dispatcher.Received(1).DispatchAsync(Arg.Any<InternalFunctionContext[]>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task AFailedDispatch_DoesNotFailTheParentsRun()
+    {
+        _dispatcher.DispatchAsync(Arg.Any<InternalFunctionContext[]>(), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("boom"));
+        var inlineRan = false;
+        var parent = Job(Succeeds);
+        parent.TimeTickerChildren.Add(DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.OnSuccess));
+        parent.TimeTickerChildren.Add(Job((_, _, _) => { inlineRan = true; return Task.CompletedTask; }, RunCondition.OnSuccess));
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(TickerStatus.Done, parent.Status);
+        Assert.True(inlineRan);
+    }
+
+    // An InProgress delayed child due later wakes the scheduler as soon as its parent starts.
+    [Fact]
+    public async Task AnInProgressDelayedChildDueLater_WakesTheSchedulerWhileItsParentRuns()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parent = Job(async (_, _, _) => await release.Task);
+        var child = DelayedChild(TimeSpan.FromMinutes(5), RunCondition.InProgress);
+        parent.TimeTickerChildren.Add(child);
+
+        var run = _handler.ExecuteTaskAsync(parent, isDue: false);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (!_hostScheduler.ReceivedCalls().Any() && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
+        Assert.False(run.IsCompleted);
+        _hostScheduler.Received().RestartIfNeeded(child.ExecutionTime);
+        Assert.Empty(HandedOffIds());
+        release.SetResult();
+        await run;
+    }
+
+    // A cancelled parent has an outcome too: its OnCancelled delayed child is handed off.
+    [Fact]
+    public async Task ADueOnCancelledDelayedChild_IsHandedOff_WhenItsParentIsCancelled()
+    {
+        var parent = Job((_, _, _) => throw new TaskCanceledException());
+        var onCancelled = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.OnCancelled);
+        var onSuccess = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.OnSuccess);
+        parent.TimeTickerChildren.Add(onCancelled);
+        parent.TimeTickerChildren.Add(onSuccess);
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(TickerStatus.Cancelled, parent.Status);
+        Assert.Equal([onCancelled.TickerId], HandedOffIds());
+        Assert.Equal([onSuccess.TickerId], SkippedIds());
+    }
+
     // With the background services off nothing would start a claimed row, so nothing is claimed.
     [Fact]
     public async Task WithoutARunningDispatcher_NoDelayedChildIsClaimed()

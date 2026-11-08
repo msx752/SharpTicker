@@ -94,8 +94,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         // Wait for concurrent tasks (parent + InProgress children)
         await Task.WhenAll(tasksToRunNow.AsSpan(0, tasksToRunNowCount).ToArray());
 
-        // The parent's outcome is written, so the store now hands out the delayed children it lets run. Handed off before
-        // anything below that can take long or throw, so a child that is due is not held back by its siblings.
+        // The parent's outcome is written, so the store now hands out the delayed children it lets run. The InProgress ones
+        // again too: the claim at the start finds a closed gate when the parent was not recorded InProgress, and a row
+        // already claimed is simply not claimed twice. Handed off before anything below that can take long or throw, so a
+        // child that is due is not held back by its siblings.
         if (delayedChildren != null && ChainRunGate.IsFinal(context.Status))
             await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, context.Status)), cancellationToken);
 
@@ -162,31 +164,52 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 nextTime = child.ExecutionTime;
         }
 
-        if (due == null && nextTime == null)
+        if (nextTime != null)
+        {
+            try
+            {
+                HostScheduler?.RestartIfNeeded(nextTime);
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogWarning(ex, "Waking the scheduler for a delayed chain child due at {ExecutionTime} failed; the fallback runs it.", nextTime);
+            }
+        }
+
+        // Without a running dispatcher (background services off) a claimed row would never start.
+        var dispatcher = due == null ? null : Dispatcher;
+        if (dispatcher is not { IsEnabled: true })
+            return;
+
+        InternalFunctionContext[] claimed;
+        try
+        {
+            claimed = await _internalTickerManager.AcquireDelayedChildrenAsync(due.ToArray(), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Claiming delayed chain children was cancelled; the fallback runs them.");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} failed; the fallback runs them.", string.Join(", ", due));
+            return;
+        }
+
+        if (claimed.Length == 0)
             return;
 
         try
         {
-            if (nextTime != null)
-                HostScheduler?.RestartIfNeeded(nextTime);
-
-            // Without a running dispatcher (background services off) a claimed row would never start.
-            var dispatcher = Dispatcher;
-            if (due == null || dispatcher is not { IsEnabled: true })
-                return;
-
-            var claimed = await _internalTickerManager.AcquireDelayedChildrenAsync(due.ToArray(), cancellationToken).ConfigureAwait(false);
-            if (claimed.Length > 0)
-                await dispatcher.DispatchAsync(claimed, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
-        {
-            Logger?.LogDebug(ex, "Handing off delayed chain children was cancelled; the fallback runs them.");
+            await dispatcher.DispatchAsync(claimed, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Handing off delayed chain children {TickerIds} failed; they run when the scheduler or the fallback picks them up.",
-                string.Join(", ", due ?? []));
+            // The claimed-work queue does not fail a dispatch, so this is not expected; but the rows are InProgress for this
+            // node now, and the fallback does not take them.
+            Logger?.LogError(ex, "Delayed chain children {TickerIds} were claimed but could not be dispatched. They stay InProgress until the store releases the rows of this node.",
+                string.Join(", ", claimed.Select(c => c.TickerId)));
         }
     }
 

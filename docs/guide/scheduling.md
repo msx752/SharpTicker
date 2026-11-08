@@ -157,7 +157,9 @@ A child or grandchild can have an execution time of its own (`SetExecutionTime` 
 
 Pass the child's time in UTC.
 
-A delayed child whose time has come is started by the node that ran its parent as soon as the parent's outcome is recorded. If that node stops first, the fallback starts it, up to `FallbackIntervalChecker` later. An `InProgress` delayed grandchild below a child without a time of its own starts only once that child has ended, since such a child is recorded as running only when it ends.
+When a parent ends, the node that ran it at once starts the delayed children that may run and whose time has come, and wakes its scheduler for the next one due later. An `InProgress` delayed child is handled the same way when its parent starts. If that node stops before this, for example when the application stops while the parent runs, the fallback starts them after the restart, up to `FallbackIntervalChecker` later. A delayed child started right after its parent ends as `Done`, one started by the fallback as `DueDone`; a `RunCondition` treats both as success.
+
+Known limit: a child without a time of its own is not recorded as `InProgress` while it runs, so an `InProgress` delayed grandchild below it starts only once that child has ended.
 
 Store support: EF Core, MongoDB and the in-memory store behave as described. On Redis, children are stored inside the parent's record, so a delayed child runs right after its parent, by its `RunCondition`, and its own time is ignored. Redis follows in a later release.
 
