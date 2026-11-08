@@ -931,6 +931,60 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(nodeA, child.Id)).Status);
     }
 
+    // A skip whose index write never landed (the node stopped in between) leaves a pending entry for a row that will
+    // never run; the fallback drops it instead of trying the row again on every pass.
+    [Fact]
+    public async Task TheFallback_DropsAPendingEntryLeftForARowThatEnded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.Failed, RunCondition.OnSuccess, T0.AddSeconds(-30));
+        var node = CreateProvider("node-A");
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Equal(TickerStatus.Skipped, (await ReadTimeTicker(node, childId)).Status);
+        await fixture.Database.SortedSetAddAsync(RedisKeyBuilder.TimeTickerPendingKey, childId.ToString(), RedisKeyBuilder.ToScore(T0.AddSeconds(-30)));
+
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        Assert.Null(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.TimeTickerPendingKey, childId.ToString()));
+    }
+
+    // A stored row that does not deserialize goes to the claim script, which rewrites it in a readable form. A delayed
+    // child among them must still wait for its parent: it is put back, not run.
+    [Fact]
+    public async Task AnUnreadableDelayedChild_IsPutBack_WhileItsParentHasNotEnded()
+    {
+        var (_, childId) = await SeedDelayedChild(TickerStatus.InProgress, RunCondition.OnSuccess, T0.AddSeconds(-30));
+        var key = RedisKeyBuilder.TimeTickerKey(childId);
+        var json = (string)(await fixture.Database.StringGetAsync(key))!;
+        await fixture.Database.StringSetAsync(key, json.Replace("\"Children\":[]", "\"Children\":{}"));
+        var node = CreateProvider("node-A");
+        var broken = json.Replace("\"Children\":[]", "\"Children\":{}");
+
+        Assert.Empty(await node.AcquireImmediateTimeTickersAsync([childId], CancellationToken.None));
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(node, childId)).Status);
+
+        await fixture.Database.StringSetAsync(key, broken);
+        Assert.Empty(await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        var row = await ReadTimeTicker(node, childId);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.NotNull(await fixture.Database.SortedSetScoreAsync(RedisKeyBuilder.TimeTickerPendingKey, childId.ToString()));
+    }
+
+    // The fallback reads the overdue rows a page at a time and still takes every one.
+    [Fact]
+    public async Task TheFallback_TakesEveryOverdueRow_AcrossPages()
+    {
+        var node = CreateProvider("node-A");
+        var ids = new List<Guid>();
+        for (var i = 0; i < 300; i++)
+            ids.Add(await SeedTimeTicker(node, executionTime: T0.AddSeconds(-30).AddMilliseconds(i)));
+
+        var fallback = await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Equal(ids.OrderBy(x => x), fallback.Select(x => x.Id).OrderBy(x => x));
+    }
+
     // A child without a time of its own runs only inside its parent's run, also once its parent has ended.
     [Fact]
     public async Task AChildWithoutATimeOfItsOwn_IsNeverHandedOutOnItsOwn()
