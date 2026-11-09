@@ -474,21 +474,28 @@ namespace SharpTicker.MongoDB.Infrastructure
 
             var existingByFunction = existing
                 .GroupBy(c => c.Function)
-                .ToDictionary(g => g.Key, g => g.First());
+                .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList());
 
             foreach (var (function, expression) in cronTickers)
             {
-                if (existingByFunction.TryGetValue(function, out var cron))
+                if (existingByFunction.TryGetValue(function, out var rows))
                 {
-                    if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                    // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
+                    foreach (var cron in SeededCronTickers.Owned(rows))
                     {
-                        await cronSet.UpdateOneAsync(
-                            fb.Eq(x => x.Id, cron.Id),
-                            Builders<TCronTicker>.Update
-                                .Set(x => x.Expression, expression)
-                                .Set(x => x.UpdatedAt, now),
-                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                        if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                        {
+                            await cronSet.UpdateOneAsync(
+                                fb.Eq(x => x.Id, cron.Id),
+                                Builders<TCronTicker>.Update
+                                    .Set(x => x.Expression, expression)
+                                    .Set(x => x.UpdatedAt, now),
+                                cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }
                     }
+
+                    if (SeededCronTickers.IsAmbiguous(rows))
+                        _logger.LogWarning(SeededCronTickers.AmbiguousWarning, function, expression, rows.Count);
                 }
                 else
                 {
@@ -497,7 +504,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                         Id = Guid.NewGuid(),
                         Function = function,
                         Expression = expression,
-                        InitIdentifier = $"MemoryTicker_Seeded_{function}",
+                        InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
                         CreatedAt = now,
                         UpdatedAt = now,
                         Request = Array.Empty<byte>()
