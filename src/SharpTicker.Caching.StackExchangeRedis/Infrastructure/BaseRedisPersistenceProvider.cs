@@ -759,7 +759,6 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     public async Task MigrateDefinedCronTickers((string Function, string Expression)[] cronTickers, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
-        const string seedPrefix = "MemoryTicker_Seeded_";
 
         var allRegisteredFunctions = TickerFunctionProvider.TickerFunctions.Keys
             .ToHashSet(StringComparer.Ordinal);
@@ -778,20 +777,30 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
 
         var orphanedSet = orphanedToDelete.ToHashSet();
+        // A function can have several crons (a user's next to the seeded one, or a seeded copy from two nodes starting
+        // together): grouped, not one per function, which threw and stopped the host on every start.
         var existingByFunction = existingList
             .Where(c => !orphanedSet.Contains(c.Id))
-            .ToDictionary(c => c.Function, c => c, StringComparer.Ordinal);
+            .GroupBy(c => c.Function, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList(), StringComparer.Ordinal);
 
         foreach (var (function, expression) in cronTickers)
         {
-            if (existingByFunction.TryGetValue(function, out var cron))
+            if (existingByFunction.TryGetValue(function, out var rows))
             {
-                if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
+                foreach (var cron in SeededCronTickers.Owned(rows))
                 {
-                    cron.Expression = expression;
-                    cron.UpdatedAt = now;
-                    await Serializer.SetAsync(CronKey(cron.Id), cron).ConfigureAwait(false);
+                    if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                    {
+                        cron.Expression = expression;
+                        cron.UpdatedAt = now;
+                        await Serializer.SetAsync(CronKey(cron.Id), cron).ConfigureAwait(false);
+                    }
                 }
+
+                if (SeededCronTickers.IsAmbiguous(rows))
+                    _logger.LogWarning(SeededCronTickers.AmbiguousWarning, function, expression, rows.Count);
             }
             else
             {
@@ -800,7 +809,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                     Id = Guid.NewGuid(),
                     Function = function,
                     Expression = expression,
-                    InitIdentifier = $"{seedPrefix}{function}",
+                    InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
                     CreatedAt = now,
                     UpdatedAt = now,
                     Request = []

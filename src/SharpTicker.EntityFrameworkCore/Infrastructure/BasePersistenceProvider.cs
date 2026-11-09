@@ -513,18 +513,24 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
         var existingByFunction = existing
             .GroupBy(c => c.Function)
-            .ToDictionary(g => g.Key, g => g.First());
+            .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList());
 
         foreach (var (function, expression) in cronTickers)
         {
-            if (existingByFunction.TryGetValue(function, out var cron))
+            if (existingByFunction.TryGetValue(function, out var rows))
             {
-                // Update expression if it changed
-                if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
+                foreach (var cron in SeededCronTickers.Owned(rows))
                 {
-                    cron.Expression = expression;
-                    cron.UpdatedAt = now;
+                    if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                    {
+                        cron.Expression = expression;
+                        cron.UpdatedAt = now;
+                    }
                 }
+
+                if (SeededCronTickers.IsAmbiguous(rows))
+                    _logger.LogWarning(SeededCronTickers.AmbiguousWarning, function, expression, rows.Count);
             }
             else
             {
@@ -534,7 +540,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                     Id = Guid.NewGuid(),
                     Function = function,
                     Expression = expression,
-                    InitIdentifier = $"MemoryTicker_Seeded_{function}",
+                    InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
                     CreatedAt = now,
                     UpdatedAt = now,
                     Request = Array.Empty<byte>()
