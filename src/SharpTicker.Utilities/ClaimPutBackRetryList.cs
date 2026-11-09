@@ -17,6 +17,12 @@ internal sealed class ClaimPutBackRetryList
 
     internal bool IsEmpty => _claims.IsEmpty;
 
+    /// <summary>
+    /// Raised after rows were added. The scheduler loop may be asleep (up to a day when nothing is due), so it subscribes and
+    /// wakes up to put them back. A handler that throws is ignored: the caller is already handling a failure.
+    /// </summary>
+    internal event Action Added;
+
     /// <summary>Adds the rows of every <see cref="ClaimPutBackFailedException"/> in <paramref name="failure"/>; returns how many.</summary>
     internal int AddFrom(Exception failure)
     {
@@ -26,6 +32,18 @@ internal sealed class ClaimPutBackRetryList
         {
             _claims.Enqueue(claim);
             added++;
+        }
+
+        if (added > 0)
+        {
+            try
+            {
+                Added?.Invoke();
+            }
+            catch
+            {
+                // The rows are listed; the loop takes them at its next pass even if it was not woken.
+            }
         }
         return added;
     }

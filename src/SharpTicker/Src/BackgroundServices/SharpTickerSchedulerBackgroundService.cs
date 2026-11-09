@@ -19,6 +19,7 @@ namespace SharpTicker.BackgroundServices;
 internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharpTickerHostScheduler
 {
     private readonly RestartThrottleManager _restartThrottle;
+    private readonly Action _stopWakingOnPutBacks;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly TickerExecutionContext _executionContext;
     private readonly TimeSpan _minPollingInterval;
@@ -57,6 +58,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _minPollingInterval = ResolveMinPollingInterval(schedulerOptions);
         _work = claimedWork ?? new ClaimedWorkQueue(_internalTickerManager, taskScheduler, taskHandler, concurrencyGate, logger);
         _restartThrottle = new RestartThrottleManager(() => _schedulerLoopCancellationTokenSource?.Cancel());
+        // A row whose put-back failed inside a claim call (the fallback, run-now) may reach the retry list while the loop
+        // sleeps; it wakes the loop, which tries the put-back first thing.
+        _stopWakingOnPutBacks = _work.WakeOnPutBacksToRetry(Restart);
     }
     
     public override Task StartAsync(CancellationToken ct)
@@ -543,6 +547,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
     public override void Dispose()
     {
+        _stopWakingOnPutBacks();
         _restartThrottle.Dispose();
         base.Dispose();
     }

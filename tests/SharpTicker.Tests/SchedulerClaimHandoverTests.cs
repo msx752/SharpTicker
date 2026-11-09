@@ -747,7 +747,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
     [Fact]
     public async Task ARowWhosePutBackFailedInsideAClaimCall_IsPutBackByTheLoop_OnceTheStoreAnswers()
     {
-        var (node, id, retry, manager, service, handler) = await RowWhosePutBackFailed(markerMatches: true);
+        var (node, id, retry, manager, service, handler, _) = await RowWhosePutBackFailed(markerMatches: true);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -767,12 +767,58 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
     }
 
+    // The usual case: the loop has nothing to do and sleeps (up to a day) when the fallback's claim call fails and its row
+    // reaches the retry list. Adding it wakes the loop, so the row is put back at once and not at the next planned wake-up.
+    [Fact]
+    public async Task ARowAddedToTheRetryListWhileTheLoopSleeps_WakesItAndIsPutBack()
+    {
+        var (node, id, retry, manager, service, _, add) = await RowWhosePutBackFailed(markerMatches: true, addNow: false);
+        service.PutBackRetryInterval = TimeSpan.FromMinutes(10); // only a wake-up can put the row back within the wait below
+        manager.FailPutBacks = 0; // the store answers again by the time the row is added
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.Polls >= 1), "the loop never polled");
+            await Task.Delay(200); // the loop is asleep now: nothing is due
+            add();
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Contains(id), seconds: 5), "adding the row did not wake the loop");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.True(retry.IsEmpty);
+    }
+
+    // At the stop: the fallback's sweep (with its owner) leaves such a row alone, since the scheduler may still try it; the
+    // scheduler's sweep, the last one, takes it from the retry list and puts it back.
+    [Fact]
+    public async Task AtTheStop_OnlyTheSchedulersSweep_PutsBackARowFromTheRetryList()
+    {
+        var (node, id, retry, manager, _, _, _) = await RowWhosePutBackFailed(markerMatches: true);
+        manager.FailPutBacks = 0;
+        var work = new ClaimedWorkQueue(manager, new RecordingTaskScheduler(), Substitute.For<ITickerExecutionTaskHandler>(),
+            new TickerFunctionConcurrencyGate(), null, retry);
+
+        await work.PutBackUnstartedAsync(owner: new object());
+        Assert.False(retry.IsEmpty);
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+
+        await work.PutBackUnstartedAsync();
+        Assert.True(retry.IsEmpty);
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.Equal(0, work.Claims.Count);
+    }
+
     // The row moved on before the retry (this node's fallback took it again, under a new marker): the fenced put-back leaves
     // it alone, so a row that is running is never put back.
     [Fact]
     public async Task ARowWhosePutBackFailed_ThatMovedOnSince_IsLeftAlone()
     {
-        var (node, id, _, manager, service, _) = await RowWhosePutBackFailed(markerMatches: false);
+        var (node, id, _, manager, service, _, _) = await RowWhosePutBackFailed(markerMatches: false);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -791,8 +837,10 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
 
     // The fallback of node-A claims a row; the store's put-back of it failed, so it is in the retry list with that claim's
     // marker (or another one: the row moved on since). The first put-back by the loop fails as well, the next ones reach the store.
+    // With addNow false the row is added only when the test calls Add.
     private async Task<(TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> Node, Guid Id, ClaimPutBackRetryList Retry,
-        HookedManager Manager, SharpTickerSchedulerBackgroundService Service, ITickerExecutionTaskHandler Handler)> RowWhosePutBackFailed(bool markerMatches)
+        HookedManager Manager, SharpTickerSchedulerBackgroundService Service, ITickerExecutionTaskHandler Handler, Action Add)> RowWhosePutBackFailed(
+        bool markerMatches, bool addNow = true)
     {
         var node = CreateProvider("node-A");
         var id = await SeedTimeTicker("PutBack.InsideAClaimCall");
@@ -804,8 +852,10 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
 
         var retry = new ClaimPutBackRetryList();
-        retry.AddFrom(new ClaimPutBackFailedException(1, [new InvalidOperationException("store failed"), new TimeoutException("release failed")],
+        Action add = () => retry.AddFrom(new ClaimPutBackFailedException(1, [new InvalidOperationException("store failed"), new TimeoutException("release failed")],
             [new NotPutBackClaim(id, markerMatches ? marker : marker.AddTicks(-1), TickerType.TimeTicker)]));
+        if (addNow)
+            add();
 
         var manager = new HookedManager(CreateRealManager(node)) { FailPutBacks = 1 };
         var scheduler = new RecordingTaskScheduler();
@@ -818,7 +868,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             // Nothing else to do, so the loop would sleep a day; a row to put back keeps its sleep short.
             PutBackRetryInterval = TimeSpan.FromMilliseconds(50)
         };
-        return (node, id, retry, manager, service, handler);
+        return (node, id, retry, manager, service, handler, add);
     }
 
     // The batch is claimed as many rows at once as the store takes, and the won rows are still handed over in priority order.

@@ -192,6 +192,15 @@ internal sealed class ClaimedWorkQueue
     /// Whether a put-back waits to be tried again: one that failed here, or one that failed inside a claim call and is still
     /// in <see cref="ClaimPutBackRetryList"/>. The loop keeps its sleep short while there is one.
     /// </summary>
+    /// <summary>Calls <paramref name="wake"/> whenever a claim call adds rows whose put-back failed; returns the unsubscribe.</summary>
+    internal Action WakeOnPutBacksToRetry(Action wake)
+    {
+        if (_putBackRetry == null)
+            return () => { };
+        _putBackRetry.Added += wake;
+        return () => _putBackRetry.Added -= wake;
+    }
+
     internal bool HasPutBacksToRetry => !(_putBackRetry?.IsEmpty ?? true) || Claims.PendingPutBacks().Count > 0;
 
     // The rows whose put-back failed inside a claim call become claims of the ledger that can never start, so the loop tries
