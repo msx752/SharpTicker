@@ -1,0 +1,7 @@
+<Solution>
+  <!-- The container scenario tests. Local only: not part of SharpTicker.slnx and not run in CI. -->
+  <Folder Name="/tests/">
+    <Project Path="tests/SharpTicker.Scenarios/SharpTicker.Scenarios.csproj" />
+    <Project Path="tests/SharpTicker.Scenarios.Host/SharpTicker.Scenarios.Host.csproj" />
+  </Folder>
+</Solution>

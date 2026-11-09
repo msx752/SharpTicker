@@ -1,0 +1,20 @@
+# Build context of the scenario node image (tests/SharpTicker.Scenarios.Host/Dockerfile): an allowlist, so only src, the
+# host and the build files at the root go into the image's context.
+*
+!src
+!tests/Directory.Build.props
+!tests/SharpTicker.Scenarios.Host
+!*.props
+!*.targets
+!*.json
+!*.config
+!icon.png
+!LICENSE
+!README.md
+
+**/bin
+**/obj
+**/node_modules
+**/TestResults
+# The image builds the dashboard front end itself (node stage); a local build is not used.
+src/SharpTicker.Dashboard/wwwroot/dist

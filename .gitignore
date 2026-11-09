@@ -54,3 +54,6 @@ docs/_site/
 docs/api/*.yml
 docs/api/.manifest
 docs/obj/
+
+# Scenario test runs: logs, run records and git worktrees of older commits (tests/SharpTicker.Scenarios/README.md).
+artifacts/
