@@ -151,7 +151,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 }
                 catch (Exception failure)
                 {
-                    await ClaimPutBack.PutBackOrThrowAsync(candidate.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                    await ClaimPutBack.PutBackOrThrowAsync(candidate.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
                     throw;
                 }
 
@@ -399,7 +399,7 @@ namespace SharpTicker.MongoDB.Infrastructure
             catch (Exception failure) when (won.Count > 0)
             {
                 // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
                 throw;
             }
         }
@@ -685,7 +685,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 }
                 catch (Exception failure)
                 {
-                    await ClaimPutBack.PutBackOrThrowAsync(occ.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                    await ClaimPutBack.PutBackOrThrowAsync(occ.Id, claimMarker, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
                     throw;
                 }
 
@@ -1146,7 +1146,7 @@ namespace SharpTicker.MongoDB.Infrastructure
             catch (Exception failure) when (won.Count > 0)
             {
                 // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
                 throw;
             }
         }

@@ -494,10 +494,68 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
     }
 
+    // As above, and the store's own put-back fails too (the store is still failing). The row stays InProgress for this node;
+    // the exception names it with the marker of the claim and its type, and a put-back with that marker frees it once the
+    // store answers. That is what the scheduler loop does with the row (candidate row 50).
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_AndItsPutBackFails_NamesTheRowSoItCanBePutBackLater(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seed = CreateProvider("node-A");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seed);
+            if (path.StartsWith("immediate"))
+                await seed.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker();
+        }
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        var node = CreateProvider("node-A", Clock, new LandThenFailOnce(failPutBackToo: true));
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        // PostgreSQL runs with a retrying execution strategy, which may wrap the failure.
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        var failed = Assert.Single(ClaimPutBackFailedException.FindIn(thrown));
+        var row = Assert.Single(failed.NotPutBack);
+        Assert.Equal(id, row.Id);
+        Assert.Equal(cron ? TickerType.CronTickerOccurrence : TickerType.TimeTicker, row.Type);
+
+        var healthy = CreateProvider("node-A");
+        if (cron)
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
+            Assert.True(await healthy.TryReleaseCronOccurrenceClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(id)).Status);
+        }
+        else
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+            Assert.True(await healthy.TryReleaseTimeTickerClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(id)).Status);
+        }
+    }
+
     // The first write runs and lands, then the call throws as if its reply was lost; every later command runs normally.
-    private sealed class LandThenFailOnce : DbCommandInterceptor
+    // With failPutBackToo, the next write (the put-back) fails before it reaches the store.
+    private sealed class LandThenFailOnce(bool failPutBackToo = false) : DbCommandInterceptor
     {
         private bool _failed;
+        private bool _putBackFailed;
 
         public override ValueTask<int> NonQueryExecutedAsync(
             DbCommand command, CommandExecutedEventData eventData, int result, CancellationToken cancellationToken = default)
@@ -508,6 +566,17 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
                 throw new TimeoutException("the reply of the claim was lost");
             }
             return base.NonQueryExecutedAsync(command, eventData, result, cancellationToken);
+        }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (failPutBackToo && _failed && !_putBackFailed)
+            {
+                _putBackFailed = true;
+                throw new InvalidOperationException("the store failed again, before the put-back reached it");
+            }
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
         }
     }
 

@@ -23,6 +23,7 @@ namespace SharpTicker.Utilities.Managers
         private readonly ITickerClock _clock;
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
         private readonly ILogger _logger;
+        private readonly ClaimPutBackRetryList _putBackRetry;
 
         public InternalTickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -37,11 +38,24 @@ namespace SharpTicker.Utilities.Managers
             ITickerClock clock,
             ISharpTickerNotificationHubSender notificationHubSender,
             ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger)
+            : this(persistenceProvider, clock, notificationHubSender, logger, null)
+        {
+        }
+
+        // putBackRetry: registered only when the background services run; null keeps the rows of a failed put-back InProgress
+        // until the store releases the rows of this node.
+        public InternalTickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger,
+            ClaimPutBackRetryList putBackRetry)
         {
             _persistenceProvider = persistenceProvider;
             _clock = clock ?? throw new ArgumentNullException(nameof(clock));
             _notificationHubSender = notificationHubSender;
             _logger = logger;
+            _putBackRetry = putBackRetry;
         }
         
         public async Task<(TimeSpan TimeRemaining, InternalFunctionContext[] Functions)> GetNextTickers(CancellationToken cancellationToken = default)
@@ -435,12 +449,15 @@ namespace SharpTicker.Utilities.Managers
             }
             catch (ClaimPutBackFailedException ex)
             {
+                // Not inside the log call: with no logger its arguments are not evaluated.
+                var retried = _putBackRetry?.AddFrom(ex) > 0;
                 _logger?.LogError(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed, and some of the rows it claimed could not be put back. " +
-                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                    "{WhatHappens}; the others run when the fallback picks them up.", string.Join(", ", ids), ClaimPutBackRetryList.WhatHappens(retried));
                 return [];
             }
             catch (Exception ex)
             {
+                _putBackRetry?.AddFrom(ex);
                 _logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed. They run when the fallback picks them up.",
                     string.Join(", ", ids));
                 return [];
@@ -479,7 +496,8 @@ namespace SharpTicker.Utilities.Managers
 
         // The stores claim the overdue rows one by one while they are enumerated, so a failure in the middle (a dropped
         // connection, a cancelled token) comes after some rows were claimed. Those rows are InProgress for this node; they are
-        // handed back with the failure so the fallback runs them, instead of being dropped with the list.
+        // handed back with the failure so the fallback runs them, instead of being dropped with the list. A row the store
+        // could not put back after such a failure goes to the retry list, so the scheduler loop puts it back later.
         public async Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default)
         {
             var results = new List<InternalFunctionContext>();
@@ -488,9 +506,12 @@ namespace SharpTicker.Utilities.Managers
             {
                 await ClaimTimedOutTickersAsync(results, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (results.Count > 0)
+            catch (Exception ex)
             {
-                throw new ClaimsInterruptedException(results.ToArray(), ex);
+                _putBackRetry?.AddFrom(ex);
+                if (results.Count > 0)
+                    throw new ClaimsInterruptedException(results.ToArray(), ex);
+                throw;
             }
 
             return results.ToArray();

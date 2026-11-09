@@ -1031,6 +1031,28 @@ public class TickerManagerTests : IDisposable
         Assert.Contains(logger.Entries, e => e.Level == expected && e.Message.Contains(entity.Id.ToString()));
     }
 
+    // The claim for the immediate run failed and so did the put-back of a row it had claimed: that row is InProgress for this
+    // node with nothing to run it. It goes to the retry list, so the scheduler loop puts it back once the store answers.
+    [Fact]
+    public async Task AddTimeTickerAsync_ThePutBackOfTheImmediateClaimFailed_HandsTheRowToTheRetryList()
+    {
+        _dispatcher.IsEnabled.Returns(true);
+        var retry = new ClaimPutBackRetryList();
+        var manager = new TickerManager<TimeTickerEntity, CronTickerEntity>(
+            _persistenceProvider, _hostScheduler, _clock, _notificationHubSender, _executionContext, _dispatcher, new RecordingLogger(), retry);
+        var entity = new TimeTickerEntity { Function = ValidFunctionName, ExecutionTime = FixedUtcNow };
+        _persistenceProvider.AddTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>()).Returns(1);
+        var row = new NotPutBackClaim(Guid.NewGuid(), FixedUtcNow, TickerType.TimeTicker);
+        _persistenceProvider.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw new ClaimPutBackFailedException(1,
+                [new InvalidOperationException("store failed"), new TimeoutException("release failed")], [row]));
+
+        var result = await ((ITimeTickerManager<TimeTickerEntity>)manager).AddAsync(entity, CancellationToken.None);
+
+        Assert.True(result.IsSucceeded);
+        Assert.Equal([row], retry.TakeAll());
+    }
+
     [Fact]
     public async Task AddTimeTickersBatchAsync_StoredButTheImmediateClaimFails_SucceedsAndLogs()
     {
