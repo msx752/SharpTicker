@@ -159,7 +159,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
 
             // A put-back that failed is tried again on the loop's next pass, and an idle loop could sleep up to a day.
-            if (sleepDuration > PutBackRetryInterval && _work.Claims.PendingPutBacks().Count > 0)
+            if (sleepDuration > PutBackRetryInterval && _work.HasPutBacksToRetry)
                 sleepDuration = PutBackRetryInterval;
 
             var notify = _executionContext.NotifyCoreAction;

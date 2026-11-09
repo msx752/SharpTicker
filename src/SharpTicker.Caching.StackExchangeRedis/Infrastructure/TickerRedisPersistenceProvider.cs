@@ -346,7 +346,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
             throw;
         }
     }

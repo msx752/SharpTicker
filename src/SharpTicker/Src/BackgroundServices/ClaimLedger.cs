@@ -32,6 +32,18 @@ internal sealed class ClaimLedger
     }
 
     /// <summary>
+    /// Records a claim whose put-back already failed once, inside the claim call that won it (the store's own put-back): its
+    /// job never starts, and only a later put-back ends it. That first failure was already logged by the caller of the claim
+    /// call, so the next one is written at Debug.
+    /// </summary>
+    internal Entry RecordFailedPutBack(InternalFunctionContext function, DateTime claimMarker)
+    {
+        var entry = new Entry(this, function, claimMarker, putBackFailed: true);
+        _entries.TryAdd(entry, 0);
+        return entry;
+    }
+
+    /// <summary>
     /// The claims that are neither started nor being put back right now; with <paramref name="owner"/>, only the claims that
     /// owner recorded.
     /// </summary>
@@ -57,13 +69,15 @@ internal sealed class ClaimLedger
         private readonly ClaimLedger _ledger;
         private int _state;
 
-        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false, object owner = null)
+        internal Entry(ClaimLedger ledger, InternalFunctionContext function, DateTime claimMarker, bool claimInFlight = false, object owner = null,
+            bool putBackFailed = false)
         {
             _ledger = ledger;
             Function = function;
             ClaimMarker = claimMarker;
             Owner = owner;
-            _state = claimInFlight ? ClaimInFlightState : PendingState;
+            _state = putBackFailed ? PutBackFailedState : claimInFlight ? ClaimInFlightState : PendingState;
+            _failedPutBacks = putBackFailed ? 1 : 0;
         }
 
         /// <summary>The service that recorded the claim, so its stop puts back only its own claims; null for run-now.</summary>

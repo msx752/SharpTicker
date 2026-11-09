@@ -81,7 +81,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
         catch (Exception failure)
         {
-            await ClaimPutBack.PutBackOrThrowAsync(id, claimMarker, failure, release).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(id, claimMarker,
+                typeof(T) == typeof(TTimeTicker) ? TickerType.TimeTicker : TickerType.CronTickerOccurrence, failure, release).ConfigureAwait(false);
             throw;
         }
     }
@@ -569,7 +570,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         var parentStatuses = await LoadParentStatusesAsync([acquired], CancellationToken.None).ConfigureAwait(false);
         if (!claimedThisPass.Contains(acquired.ParentId.Value) && ChainGateOpen(acquired, parentStatuses)) return true;
 
-        await ClaimPutBack.PutBackOrThrowAsync(acquired.Id, acquired.UpdatedAt,
+        await ClaimPutBack.PutBackOrThrowAsync(acquired.Id, acquired.UpdatedAt, TickerType.TimeTicker,
             new InvalidOperationException("A chain child was claimed before its gate was checked."), TryReleaseTimeTickerClaim).ConfigureAwait(false);
         return false;
     }
@@ -732,7 +733,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
             throw;
         }
     }

@@ -147,7 +147,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             }
             catch (Exception failure)
             {
-                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
                 throw;
             }
 
@@ -453,7 +453,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
             throw;
         }
     }
@@ -625,7 +625,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             }
             catch (Exception failure)
             {
-                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
                 throw;
             }
 

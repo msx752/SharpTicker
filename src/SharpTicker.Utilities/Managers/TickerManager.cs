@@ -28,6 +28,7 @@ namespace SharpTicker.Utilities.Managers
         private readonly ISharpTickerDispatcher _dispatcher;
         private readonly TickerExecutionContext _executionContext;
         private readonly ILogger _logger;
+        private readonly ClaimPutBackRetryList _putBackRetry;
 
         public TickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -50,8 +51,24 @@ namespace SharpTicker.Utilities.Managers
             ISharpTickerDispatcher dispatcher,
             ILogger<TickerManager<TTimeTicker, TCronTicker>> logger
             )
+            : this(persistenceProvider, sharpTickerHostScheduler, clock, notificationHubSender, executionContext, dispatcher, logger, null)
+        {
+        }
+
+        // putBackRetry: registered only when the background services run; see InternalTickerManager.
+        public TickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ISharpTickerHostScheduler sharpTickerHostScheduler,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            TickerExecutionContext executionContext,
+            ISharpTickerDispatcher dispatcher,
+            ILogger<TickerManager<TTimeTicker, TCronTicker>> logger,
+            ClaimPutBackRetryList putBackRetry
+            )
         {
             _logger = logger;
+            _putBackRetry = putBackRetry;
             _persistenceProvider = persistenceProvider;
             _sharpTickerHostScheduler = sharpTickerHostScheduler ?? throw new ArgumentNullException(nameof(sharpTickerHostScheduler));
             _clock = clock;
@@ -71,12 +88,15 @@ namespace SharpTicker.Utilities.Managers
             }
             catch (ClaimPutBackFailedException ex)
             {
+                // Not inside the log call: with no logger its arguments are not evaluated.
+                var retried = _putBackRetry?.AddFrom(ex) > 0;
                 _logger?.LogError(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed and some of the rows it claimed could not be put back. " +
-                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                    "{WhatHappens}; the others run when the fallback picks them up.", string.Join(", ", ids), ClaimPutBackRetryList.WhatHappens(retried));
                 return [];
             }
             catch (Exception ex)
             {
+                _putBackRetry?.AddFrom(ex);
                 _logger?.LogWarning(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed. They run when the fallback picks them up.",
                     string.Join(", ", ids));
                 return [];
