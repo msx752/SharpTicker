@@ -22,7 +22,8 @@ namespace SharpTicker.Utilities
                 CancellationSource = cancellationSource,
                 IsDue = isDue,
                 ParentId = context.ParentId ?? Guid.Empty,
-                Owner = owner
+                Owner = owner,
+                RunMarker = context.RunMarker
             };
             
             TickerCancellationTokens.TryAdd(context.TickerId, details);
@@ -44,7 +45,7 @@ namespace SharpTicker.Utilities
         internal static RunningJob[] GetRunningJobs(object owner)
             => TickerCancellationTokens
                 .Where(x => ReferenceEquals(x.Value.Owner, owner))
-                .Select(x => new RunningJob(x.Key, x.Value.FunctionName, x.Value.Type, x.Value.ParentId))
+                .Select(x => new RunningJob(x.Key, x.Value.FunctionName, x.Value.Type, x.Value.ParentId, x.Value.RunMarker))
                 .ToArray();
 
         internal static bool RemoveTickerCancellationToken(Guid tickerId)
@@ -199,6 +200,8 @@ namespace SharpTicker.Utilities
         public Guid ParentId { get; set; }
         // Who started the job, a host; not part of the public surface.
         internal object Owner { get; set; }
+        // The marker that fences the run's writes (InternalFunctionContext.RunMarker), for the stop's write of a job still running.
+        internal DateTime? RunMarker { get; set; }
     }
     
     /// <summary>
@@ -267,8 +270,9 @@ namespace SharpTicker.Utilities
     /// <summary>A job that is running, as <see cref="TickerCancellationTokenManager.GetRunningJobs"/> reports it.</summary>
     internal readonly struct RunningJob
     {
-        public RunningJob(Guid tickerId, string functionName, TickerType type, Guid parentId)
+        public RunningJob(Guid tickerId, string functionName, TickerType type, Guid parentId, DateTime? runMarker = null)
         {
+            RunMarker = runMarker;
             TickerId = tickerId;
             FunctionName = functionName;
             Type = type;
@@ -279,5 +283,7 @@ namespace SharpTicker.Utilities
         public string FunctionName { get; }
         public TickerType Type { get; }
         public Guid ParentId { get; }
+        /// <summary>The marker that fences the run's writes, or null when the run is not fenced.</summary>
+        public DateTime? RunMarker { get; }
     }
 }

@@ -20,6 +20,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 {
     private readonly RestartThrottleManager _restartThrottle;
     private readonly Action _stopWakingOnPutBacks;
+    private readonly Action _stopWakingOnLostOutcomes;
+    // Writes again the outcomes whose final write threw; null when the service was built without it (tests).
+    private readonly LostOutcomeDrain _lostOutcomes;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly TickerExecutionContext _executionContext;
     private readonly TimeSpan _minPollingInterval;
@@ -45,8 +48,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ILogger<SharpTickerSchedulerBackgroundService> logger = null,
         ITickerClock clock = null,
         IOptions<HostOptions> hostOptions = null,
-        ClaimedWorkQueue claimedWork = null)
+        ClaimedWorkQueue claimedWork = null,
+        LostOutcomeDrain lostOutcomes = null)
     {
+        _lostOutcomes = lostOutcomes;
         _logger = logger;
         _clock = clock;
         _hostOptions = hostOptions;
@@ -61,6 +66,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         // A row whose put-back failed inside a claim call (the fallback, run-now) may reach the retry list while the loop
         // sleeps; it wakes the loop, which tries the put-back first thing.
         _stopWakingOnPutBacks = _work.WakeOnPutBacksToRetry(Restart);
+        // An outcome whose final write threw is listed while the loop may sleep; it wakes the loop the same way.
+        _stopWakingOnLostOutcomes = _lostOutcomes?.WakeOnLostOutcomes(Restart) ?? (() => { });
     }
     
     public override Task StartAsync(CancellationToken ct)
@@ -73,7 +80,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         }
         
         _taskScheduler.Resume();
-        return Interlocked.CompareExchange(ref _started, 1, 0) != 0 
+        // A stop closed the list of lost outcomes; a start (the dashboard stops and starts the scheduler) takes them again,
+        // and writes those the stop could not store.
+        _lostOutcomes?.Open();
+        return Interlocked.CompareExchange(ref _started, 1, 0) != 0
             ? Task.CompletedTask : base.StartAsync(ct);
     }
 
@@ -127,6 +137,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             // The put-backs of every claim of this node (loop, fallback, run-now) are tried again here.
             await _work.RetryFailedPutBacksAsync();
 
+            // The outcomes whose final write threw are written again here, fenced: their rows stay InProgress until then.
+            if (_lostOutcomes != null)
+                await _lostOutcomes.RetryAsync();
+
             if (_executionContext.Functions.Length != 0)
             {
 
@@ -162,8 +176,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 _executionContext.SetNextPlannedOccurrence(DateTime.UtcNow.Add(sleepDuration));
             }
 
-            // A put-back that failed is tried again on the loop's next pass, and an idle loop could sleep up to a day.
-            if (sleepDuration > PutBackRetryInterval && _work.HasPutBacksToRetry)
+            // A put-back or an outcome write that failed is tried again on the loop's next pass, and an idle loop could sleep
+            // up to a day.
+            if (sleepDuration > PutBackRetryInterval && (_work.HasPutBacksToRetry || (_lostOutcomes?.HasEntries ?? false)))
                 sleepDuration = PutBackRetryInterval;
 
             var notify = _executionContext.NotifyCoreAction;
@@ -441,10 +456,17 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        // Taken before the wait: a start that comes while the stop waits for its jobs keeps the list open for itself.
+        var lostOutcomesEpoch = _lostOutcomes?.Epoch ?? 0;
         _taskScheduler.Freeze();
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
-        await WaitForRunningJobsAsync(cancellationToken);
+        var stillRunning = await WaitForRunningJobsAsync(cancellationToken);
+        // The outcomes whose final write threw get one last write, whether or not a job is still running, and before the
+        // Cancelled writes: those must not take a row whose real outcome is about to be stored.
+        if (_lostOutcomes != null)
+            await _lostOutcomes.StoreAtStopAsync(lostOutcomesEpoch);
+        await RecordAsCancelledAsync(stillRunning);
         // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
         // the host gives the stop.
         await _work.PutBackUnstartedAsync(cancellationToken: cancellationToken);
@@ -481,11 +503,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         return limit > TimeSpan.Zero ? limit : TimeSpan.Zero;
     }
 
-    private async Task WaitForRunningJobsAsync(CancellationToken hostToken)
+    // Returns the jobs still running when the wait ended.
+    private async Task<RunningJob[]> WaitForRunningJobsAsync(CancellationToken hostToken)
     {
         var running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
         if (running.Length == 0)
-            return;
+            return running;
 
         _logger?.LogWarning("The application is stopping and {JobCount} job(s) are running. Waiting for them to finish: {Jobs}.",
             running.Length, DescribeJobs(running));
@@ -506,6 +529,14 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
         }
 
+        return running;
+    }
+
+    // What is still running when the wait ended is recorded as cancelled, with its lock released. A fenced run's write lands only
+    // while its row is still this run and still InProgress: not over an outcome the job stored just before it left the list of
+    // running jobs, nor over a run of another node that took the row.
+    private async Task RecordAsCancelledAsync(RunningJob[] running)
+    {
         if (running.Length == 0)
             return;
 
@@ -517,7 +548,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 TickerId = job.TickerId,
                 FunctionName = job.FunctionName,
                 Type = job.Type,
-                ParentId = job.ParentId == Guid.Empty ? null : job.ParentId
+                ParentId = job.ParentId == Guid.Empty ? null : job.ParentId,
+                RunMarker = job.RunMarker
             };
             context.SetProperty(x => x.Status, TickerStatus.Cancelled)
                 .SetProperty(x => x.ExecutedAt, now)
@@ -526,7 +558,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
             try
             {
-                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None).ConfigureAwait(false);
+                if (!await _internalTickerManager.RecordStoppedRunAsync(context, CancellationToken.None).ConfigureAwait(false))
+                    _logger?.LogInformation("Job {FunctionName} ({TickerId}) had already stored its outcome, or its row was taken by another run; it was not recorded as Cancelled.",
+                        job.FunctionName, job.TickerId);
             }
             catch (Exception ex)
             {
@@ -534,7 +568,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
         }
 
-        _logger?.LogWarning("{JobCount} job(s) had not finished when the wait for them ended and are recorded as Cancelled: {Jobs}. " +
+        _logger?.LogWarning("{JobCount} job(s) had not finished when the wait for them ended and are recorded as Cancelled, unless an entry above says otherwise: {Jobs}. " +
                             "A job that ignores its cancellation token keeps running until the process ends.",
             running.Length, DescribeJobs(running));
     }
@@ -548,6 +582,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     public override void Dispose()
     {
         _stopWakingOnPutBacks();
+        _stopWakingOnLostOutcomes();
         _restartThrottle.Dispose();
         base.Dispose();
     }

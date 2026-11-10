@@ -398,34 +398,80 @@ namespace SharpTicker.Utilities.Managers
         
         public async Task<bool> UpdateTickerAsync(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
-            var isCron = functionContext.Type == TickerType.CronTickerOccurrence;
-            bool stored;
+            var stored = await WriteAsync(functionContext, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false);
+            await NotifyUpdatedAsync(functionContext).ConfigureAwait(false);
+            return stored;
+        }
 
-            // A fenced run writes only to the row it still holds (see IFencedRunWriter); any other write is by Id, as before.
+        public bool FencesRuns => _persistenceProvider is IFencedRunWriter;
+
+        public async Task<bool> StoreLostOutcomeAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+        {
+            if (context.RunMarker is null || _persistenceProvider is not IFencedRunWriter)
+                throw new InvalidOperationException(
+                    $"The outcome of {context.FunctionName} ({context.TickerId}) is not written again: only a run fenced by its marker is, and a write by Id could land on a later run.");
+
+            if (!await WriteAsync(context, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false))
+                return false;
+
+            // The outcome is stored. A notification that fails must not make it look lost, which would write it again forever.
+            try
+            {
+                await NotifyUpdatedAsync(context).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "The {Status} outcome of {FunctionName} ({TickerId}) was stored, but the dashboard could not be notified.",
+                    context.Status, context.FunctionName, context.TickerId);
+            }
+            return true;
+        }
+
+        public async Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+        {
+            var written = await WriteAsync(context, onlyWhileRunning: true, cancellationToken).ConfigureAwait(false);
+            if (!written)
+                return false;
+
+            // Written: a failing notification must not make the stop log it as not recorded.
+            try
+            {
+                await NotifyUpdatedAsync(context).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was recorded as Cancelled, but the dashboard could not be notified.",
+                    context.FunctionName, context.TickerId);
+            }
+            return true;
+        }
+
+        // A fenced run writes only to the row it still holds (see IFencedRunWriter); any other write is by Id, as before.
+        private async Task<bool> WriteAsync(InternalFunctionContext functionContext, bool onlyWhileRunning, CancellationToken cancellationToken)
+        {
+            var isCron = functionContext.Type == TickerType.CronTickerOccurrence;
+
             if (functionContext.RunMarker is { } runMarker && _persistenceProvider is IFencedRunWriter fenced)
             {
                 var written = isCron
-                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false)
-                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false);
-                stored = written > 0;
-            }
-            else if (isCron)
-            {
-                await _persistenceProvider.UpdateCronTickerOccurrence(functionContext, cancellationToken).ConfigureAwait(false);
-                stored = true;
-            }
-            else
-            {
-                stored = await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false) > 0;
+                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, onlyWhileRunning, cancellationToken).ConfigureAwait(false)
+                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, onlyWhileRunning, cancellationToken).ConfigureAwait(false);
+                return written > 0;
             }
 
             if (isCron)
-                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext).ConfigureAwait(false);
-            else
-                await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext).ConfigureAwait(false);
+            {
+                await _persistenceProvider.UpdateCronTickerOccurrence(functionContext, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
 
-            return stored;
+            return await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false) > 0;
         }
+
+        private Task NotifyUpdatedAsync(InternalFunctionContext functionContext)
+            => functionContext.Type == TickerType.CronTickerOccurrence
+                ? _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext)
+                : _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext);
 
         public async Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default)
         {

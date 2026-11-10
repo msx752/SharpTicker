@@ -432,4 +432,33 @@ public class MongoFencedRunTests : IClassFixture<MongoTestFixture>, IAsyncLifeti
         Assert.Equal(1, await ((IFencedRunWriter)a.Store).UpdateNotStartedCronOccurrenceAsync(move));
         Assert.Equal(T0.AddHours(1), (await OccurrenceRow(id)).ExecutionTime);
     }
+
+    // PR-C: the stop's Cancelled write (onlyWhileRunning) lands only on a row that is still running, not over an outcome the
+    // run stored with the same marker (an outcome write keeps the lock and the marker, so the fence alone still holds).
+    [Fact]
+    public async Task OnlyWhileRunning_LeavesAStoredOutcomeAlone_AndWritesARunningRow()
+    {
+        var a = CreateNode("node-A");
+        var done = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Outcome(done, TickerStatus.Done, T0.AddMinutes(1))));
+        var doneOccurrence = await ClaimOccurrence(a);
+        Assert.True(await a.Manager.UpdateTickerAsync(Outcome(doneOccurrence, TickerStatus.Done, T0.AddMinutes(1))));
+        var running = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        var writer = (IFencedRunWriter)a.Store;
+
+        Assert.Equal(0, await writer.UpdateTimeTickerFencedAsync(Stopped(done), done.RunMarker!.Value, onlyWhileRunning: true));
+        Assert.Equal(0, await writer.UpdateCronOccurrenceFencedAsync(Stopped(doneOccurrence), doneOccurrence.RunMarker!.Value, onlyWhileRunning: true));
+        Assert.Equal(1, await writer.UpdateTimeTickerFencedAsync(Stopped(running), running.RunMarker!.Value, onlyWhileRunning: true));
+
+        Assert.Equal(TickerStatus.Done, (await Row(done.TickerId)).Status);
+        Assert.Equal(TickerStatus.Done, (await OccurrenceRow(doneOccurrence.TickerId)).Status);
+        var stopped = await Row(running.TickerId);
+        Assert.Equal(TickerStatus.Cancelled, stopped.Status);
+        Assert.Null(stopped.LockHolder);
+    }
+
+    private static InternalFunctionContext Stopped(InternalFunctionContext run)
+        => new InternalFunctionContext { TickerId = run.TickerId, Type = run.Type }
+            .SetProperty(x => x.Status, TickerStatus.Cancelled)
+            .SetProperty(x => x.ReleaseLock, true);
 }

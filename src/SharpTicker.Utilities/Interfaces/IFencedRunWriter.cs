@@ -15,11 +15,15 @@ namespace SharpTicker.Utilities.Interfaces;
 /// </summary>
 internal interface IFencedRunWriter
 {
-    /// <summary>Writes the changed fields of a running time ticker. Returns the rows written, 0 when the fence does not hold.</summary>
-    Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Writes the changed fields of a running time ticker. Returns the rows written, 0 when the fence does not hold. With
+    /// <paramref name="onlyWhileRunning"/>, the row must also still be InProgress: the stop's Cancelled write, which must not
+    /// replace an outcome the run stored with the same marker (an outcome write keeps the lock and the marker).
+    /// </summary>
+    Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default);
 
-    /// <summary>Writes the changed fields of a running cron occurrence. Returns the rows written, 0 when the fence does not hold.</summary>
-    Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default);
+    /// <summary>Writes the changed fields of a running cron occurrence, as <see cref="UpdateTimeTickerFencedAsync"/>.</summary>
+    Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Records an inline chain child (one without a time of its own, never claimed) as started by this node: InProgress, this
