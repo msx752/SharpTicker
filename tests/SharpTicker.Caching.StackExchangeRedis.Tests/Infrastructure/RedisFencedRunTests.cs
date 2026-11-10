@@ -322,6 +322,26 @@ public class RedisFencedRunTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal(TickerStatus.Done, (await Row(child.Id)).Status);
     }
 
+    // A body read before the job ran (a dialog opened before, saved after) must not write the ended job back as not started:
+    // the row stays Done and is not handed out again.
+    [Fact]
+    public async Task AnEditWithABodyReadBeforeTheJobRan_DoesNotRunItAgain()
+    {
+        var a = CreateNode("node-A");
+        var ticker = await SeedTimeTicker(T0);
+        var readBefore = await Row(ticker.Id);
+        var run = await ClaimTimeTicker(a, ticker.Id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Outcome(run, TickerStatus.Done, T0.AddMinutes(1))));
+        readBefore.Description = "edited";
+
+        await a.Provider.UpdateTimeTickers([readBefore], CancellationToken.None);
+
+        var row = await Row(ticker.Id);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.DoesNotContain(await a.Provider.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == ticker.Id);
+    }
+
     // T16: a body read while the job ran and sent after it ended must not bring the run back: the row stays Done, with the
     // lock its run left, not the one the body shows.
     [Fact]

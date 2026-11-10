@@ -23,6 +23,14 @@ internal static class RunStateOnEdit
             return;
         }
 
+        // A job that has ended keeps its outcome: a body read before it ran (a dialog opened before, saved after) would write
+        // it back as not started, and it would run again. To run it again, add a new job.
+        if (ChainRunGate.IsFinal(stored.Status))
+        {
+            KeepRunOf(body, stored);
+            return;
+        }
+
         if (body.Status == TickerStatus.InProgress)
         {
             body.Status = stored.Status;

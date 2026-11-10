@@ -1022,13 +1022,16 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
             var byId = fb.Eq(x => x.Id, ticker.Id);
-            var notRunning = fb.And(byId, fb.Ne(x => x.Status, TickerStatus.InProgress));
+            // A row that runs or has ended keeps its run (RunStateOnEdit): an ended job written back as not started would run
+            // again. Only a row that has not started (Idle, Queued) is replaced.
+            TickerStatus[] notStartedStatuses = [TickerStatus.Idle, TickerStatus.Queued];
+            var notRunning = fb.And(byId, fb.In(x => x.Status, notStartedStatuses));
             var duplicateKeySeen = false;
 
             for (var attempt = 0; attempt < MaxEditAttempts; attempt++)
             {
                 var edit = await coll.UpdateOneAsync(
-                    fb.And(byId, fb.Eq(x => x.Status, TickerStatus.InProgress)),
+                    fb.And(byId, fb.Nin(x => x.Status, notStartedStatuses)),
                     MongoUpdateBuilders.BuildEditOfRunningTimeTicker(ticker, coll.DocumentSerializer),
                     cancellationToken: ct).ConfigureAwait(false);
                 if (edit.MatchedCount > 0)

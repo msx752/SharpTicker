@@ -1595,6 +1595,26 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.True(await a.Manager.UpdateTickerAsync(Ended(childRun, TickerStatus.Done, T0.AddMinutes(1))));
     }
 
+    // A body read before the job ran (a dialog opened before, saved after) must not write the ended job back as not started:
+    // the row stays Done and is not handed out again.
+    [Fact]
+    public async Task Fence_AnEditWithABodyReadBeforeTheJobRan_DoesNotRunItAgain()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var readBefore = await ReadTimeTicker(id);
+        var run = await ClaimRun(a, id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(1))));
+        readBefore.Description = "edited";
+
+        await a.Store.UpdateTimeTickers([readBefore], CancellationToken.None);
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.DoesNotContain(await a.Store.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == id);
+    }
+
     // T16: a body read while the job ran and sent after it ended must not bring the run back: the row stays Done.
     [Fact]
     public async Task Fence_AnEditWithABodyReadWhileTheJobRan_DoesNotBringTheRunBack()
