@@ -127,18 +127,24 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
     }
 
     // The block is copied into every script that re-encodes a row (EVAL cannot share code), and a script that misses
-    // it silently loses jobs. Every embedded script must carry the same block, and any new script must carry it too.
+    // it silently loses jobs. Every embedded script that re-encodes a row must carry the same block, and any new one must
+    // carry it too. A script that only compares and sets the text it is given (CompareAndSet) does not re-encode.
     [Fact]
     public void LuaScripts_ShareTheSameEmptyCollectionBlock()
     {
         var assembly = typeof(SharpTicker.Caching.StackExchangeRedis.Infrastructure.TickerRedisPersistenceProvider<,>).Assembly;
-        var names = assembly.GetManifestResourceNames().Where(x => x.EndsWith(".lua", StringComparison.Ordinal)).ToArray();
+        var texts = assembly.GetManifestResourceNames().Where(x => x.EndsWith(".lua", StringComparison.Ordinal))
+            .ToDictionary(name => name, name =>
+            {
+                using var reader = new StreamReader(assembly.GetManifestResourceStream(name)!);
+                return reader.ReadToEnd().Replace("\r\n", "\n");
+            });
+        var names = texts.Where(x => x.Value.Contains("cjson.encode", StringComparison.Ordinal)).Select(x => x.Key).ToArray();
         Assert.True(names.Length >= 4, "expected Acquire, Release, RecoverDeadNode and MarkInProgress");
 
         var blocks = names.ToDictionary(name => name, name =>
         {
-            using var reader = new StreamReader(assembly.GetManifestResourceStream(name)!);
-            var text = reader.ReadToEnd().Replace("\r\n", "\n");
+            var text = texts[name];
             var start = text.IndexOf("-- cjson writes an empty array", StringComparison.Ordinal);
             var endMarker = "'\"RetryIntervals\":[]'))";
             var end = text.IndexOf(endMarker, StringComparison.Ordinal);
