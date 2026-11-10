@@ -26,6 +26,8 @@ public class DelayedChildHandlerTests : IDisposable
         clock.UtcNow.Returns(_now);
         var instrumentation = Substitute.For<ISharpTickerInstrumentation>();
         _dispatcher.IsEnabled.Returns(true);
+        // The store has every write, unless a test says otherwise.
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         _internalManager.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
             .Returns(call => ((Guid[])call[0]).Select(id => new InternalFunctionContext { TickerId = id, FunctionName = "fn", ClaimMarker = _now }).ToArray());
         var services = new ServiceCollection();
@@ -445,7 +447,7 @@ public class DelayedChildHandlerTests : IDisposable
                 var status = ((InternalFunctionContext)c[0]).Status;
                 if (status == TickerStatus.InProgress) throw new InvalidOperationException("store failed");
                 finalWrites.Add(status);
-                return Task.CompletedTask;
+                return Task.FromResult(true);
             });
 
         await _handler.ExecuteTaskAsync(parent, isDue: false);

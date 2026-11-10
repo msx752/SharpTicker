@@ -23,7 +23,10 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         Task NotifyInProgress(InternalFunctionContext function);
         // Sends the function's current status to the dashboard.
         Task NotifyStatusChanged(InternalFunctionContext function);
-        Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // Writes the function's changed fields to its row. True when the store has them: a time ticker store reports the rows
+        // it wrote, so 0 rows (the row was deleted while the job ran) is false. A cron occurrence store reports nothing, so
+        // there a write that did not throw counts as stored.
+        Task<bool> UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);
         Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default);

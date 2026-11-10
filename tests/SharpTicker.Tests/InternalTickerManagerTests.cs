@@ -1568,4 +1568,36 @@ public class InternalTickerManagerTests
     }
 
     #endregion
+
+    #region UpdateTickerAsync - stored or not
+
+    // The handler runs or skips chain children only on an outcome the store has, so the manager says whether it does: a time
+    // ticker store reports the rows it wrote.
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(0, false)]
+    public async Task UpdateTickerAsync_TimeTicker_IsStored_OnlyWhenTheStoreWroteARow(int rowsWritten, bool expected)
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker };
+        _persistence.UpdateTimeTicker(context, Arg.Any<CancellationToken>()).Returns(rowsWritten);
+
+        var stored = await _manager.UpdateTickerAsync(context, CancellationToken.None);
+
+        Assert.Equal(expected, stored);
+    }
+
+    // A cron occurrence store reports no row count, so a write that did not throw counts as stored.
+    [Fact]
+    public async Task UpdateTickerAsync_CronOccurrence_IsStored_WhenTheWriteDoesNotThrow()
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.CronTickerOccurrence };
+        _persistence.UpdateCronTickerOccurrence(context, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var stored = await _manager.UpdateTickerAsync(context, CancellationToken.None);
+
+        Assert.True(stored);
+        await _persistence.Received(1).UpdateCronTickerOccurrence(context, Arg.Any<CancellationToken>());
+    }
+
+    #endregion
 }

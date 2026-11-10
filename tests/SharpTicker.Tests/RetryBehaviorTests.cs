@@ -91,6 +91,7 @@ public class RetryBehaviorTests : IDisposable
         var services = new ServiceCollection();
         var clock = Substitute.For<ITickerClock>();
         var internalManager = Substitute.For<IInternalTickerManager>();
+        internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         var instrumentation = Substitute.For<ISharpTickerInstrumentation>();
 
         clock.UtcNow.Returns(DateTime.UtcNow);
