@@ -70,6 +70,7 @@ namespace SharpTicker.DependencyInjection
                 // the loop nothing would write them, and the handler then logs the lost write as before.
                 services.AddSingleton<LostOutcomeRetryList>();
                 services.AddSingleton<ILateOutcomeFollowUp>(sp => sp.GetRequiredService<ITickerExecutionTaskHandler>() as ILateOutcomeFollowUp);
+                services.AddSingleton<LostOutcomeDrain>();
                 services.AddSingleton(sp => new ClaimedWorkQueue(
                     sp.GetRequiredService<IInternalTickerManager>(),
                     sp.GetRequiredService<ISharpTickerTaskScheduler>(),

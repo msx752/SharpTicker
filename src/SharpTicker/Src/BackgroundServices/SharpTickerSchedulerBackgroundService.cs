@@ -20,6 +20,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 {
     private readonly RestartThrottleManager _restartThrottle;
     private readonly Action _stopWakingOnPutBacks;
+    private readonly Action _stopWakingOnLostOutcomes;
+    // Writes again the outcomes whose final write threw; null when the service was built without it (tests).
+    private readonly LostOutcomeDrain _lostOutcomes;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly TickerExecutionContext _executionContext;
     private readonly TimeSpan _minPollingInterval;
@@ -45,8 +48,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ILogger<SharpTickerSchedulerBackgroundService> logger = null,
         ITickerClock clock = null,
         IOptions<HostOptions> hostOptions = null,
-        ClaimedWorkQueue claimedWork = null)
+        ClaimedWorkQueue claimedWork = null,
+        LostOutcomeDrain lostOutcomes = null)
     {
+        _lostOutcomes = lostOutcomes;
         _logger = logger;
         _clock = clock;
         _hostOptions = hostOptions;
@@ -61,6 +66,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         // A row whose put-back failed inside a claim call (the fallback, run-now) may reach the retry list while the loop
         // sleeps; it wakes the loop, which tries the put-back first thing.
         _stopWakingOnPutBacks = _work.WakeOnPutBacksToRetry(Restart);
+        // An outcome whose final write threw is listed while the loop may sleep; it wakes the loop the same way.
+        _stopWakingOnLostOutcomes = _lostOutcomes?.WakeOnLostOutcomes(Restart) ?? (() => { });
     }
     
     public override Task StartAsync(CancellationToken ct)
@@ -127,6 +134,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             // The put-backs of every claim of this node (loop, fallback, run-now) are tried again here.
             await _work.RetryFailedPutBacksAsync();
 
+            // The outcomes whose final write threw are written again here, fenced: their rows stay InProgress until then.
+            if (_lostOutcomes != null)
+                await _lostOutcomes.RetryAsync();
+
             if (_executionContext.Functions.Length != 0)
             {
 
@@ -162,8 +173,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 _executionContext.SetNextPlannedOccurrence(DateTime.UtcNow.Add(sleepDuration));
             }
 
-            // A put-back that failed is tried again on the loop's next pass, and an idle loop could sleep up to a day.
-            if (sleepDuration > PutBackRetryInterval && _work.HasPutBacksToRetry)
+            // A put-back or an outcome write that failed is tried again on the loop's next pass, and an idle loop could sleep
+            // up to a day.
+            if (sleepDuration > PutBackRetryInterval && (_work.HasPutBacksToRetry || (_lostOutcomes?.HasEntries ?? false)))
                 sleepDuration = PutBackRetryInterval;
 
             var notify = _executionContext.NotifyCoreAction;
@@ -548,6 +560,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     public override void Dispose()
     {
         _stopWakingOnPutBacks();
+        _stopWakingOnLostOutcomes();
         _restartThrottle.Dispose();
         base.Dispose();
     }
