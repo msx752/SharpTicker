@@ -1,3 +1,4 @@
+using System;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 
@@ -28,6 +29,27 @@ internal static class RunStateOnEdit
             body.LockHolder = stored.LockHolder;
             body.LockedAt = stored.LockedAt;
         }
+    }
+
+    /// <summary>The run fields of a row as the caller sent it, so an update that is tried again starts from them.</summary>
+    internal readonly record struct RunFields(TickerStatus Status, string LockHolder, DateTime? LockedAt, DateTime UpdatedAt,
+        int RetryCount, DateTime? ExecutedAt, long ElapsedTime, string ExceptionMessage, string SkippedReason);
+
+    internal static RunFields Snapshot<TTicker>(TTicker body) where TTicker : TimeTickerEntity<TTicker>
+        => new(body.Status, body.LockHolder, body.LockedAt, body.UpdatedAt, body.RetryCount, body.ExecutedAt, body.ElapsedTime,
+            body.ExceptionMessage, body.SkippedReason);
+
+    internal static void Restore<TTicker>(TTicker body, RunFields sent) where TTicker : TimeTickerEntity<TTicker>
+    {
+        body.Status = sent.Status;
+        body.LockHolder = sent.LockHolder;
+        body.LockedAt = sent.LockedAt;
+        body.UpdatedAt = sent.UpdatedAt;
+        body.RetryCount = sent.RetryCount;
+        body.ExecutedAt = sent.ExecutedAt;
+        body.ElapsedTime = sent.ElapsedTime;
+        body.ExceptionMessage = sent.ExceptionMessage;
+        body.SkippedReason = sent.SkippedReason;
     }
 
     /// <summary>Copies the run state of <paramref name="stored"/> onto <paramref name="body"/>, all but the run marker.</summary>

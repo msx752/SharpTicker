@@ -225,6 +225,11 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 .ConfigureAwait(false);
             if (result == 1) return row;
             if (result == -1 && create == null) return null;
+
+            // Another writer changed the key in between: wait a short, random moment before reading it again, so writers
+            // that keep meeting each other spread out instead of using up their rounds together.
+            if (round + 1 < MaxCompareAndSetRounds)
+                await Task.Delay(Random.Shared.Next(1, 4 << round)).ConfigureAwait(false);
         }
 
         throw new InvalidOperationException(

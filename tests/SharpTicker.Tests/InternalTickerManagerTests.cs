@@ -1586,6 +1586,17 @@ public class InternalTickerManagerTests
         Assert.Equal(expected, stored);
     }
 
+    // T7: a provider that does not fence (a custom one) keeps its write by Id, also for a run that has a marker.
+    [Fact]
+    public async Task UpdateTickerAsync_OnAProviderThatDoesNotFence_WritesById_AsBefore()
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, RunMarker = _now };
+        _persistence.UpdateTimeTicker(context, Arg.Any<CancellationToken>()).Returns(1);
+
+        Assert.True(await _manager.UpdateTickerAsync(context, CancellationToken.None));
+        await _persistence.Received(1).UpdateTimeTicker(context, Arg.Any<CancellationToken>());
+    }
+
     // A cron occurrence store reports no row count, so a write that did not throw counts as stored.
     [Fact]
     public async Task UpdateTickerAsync_CronOccurrence_IsStored_WhenTheWriteDoesNotThrow()

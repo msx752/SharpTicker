@@ -151,9 +151,13 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             var dbContext = session.Context;
             var rowsToWrite = WithDescendants(timeTickers);
             var ids = rowsToWrite.Select(x => x.Id).Distinct().ToList(); // a List: see the note on Contains in TickerManager
+            // The rule below changes the rows; a retried attempt starts again from what the caller sent.
+            var sent = rowsToWrite.Select(RunStateOnEdit.Snapshot).ToArray();
 
             return await dbContext.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
             {
+                for (var i = 0; i < rowsToWrite.Count; i++)
+                    RunStateOnEdit.Restore(rowsToWrite[i], sent[i]);
                 dbContext.ChangeTracker.Clear();
                 await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 

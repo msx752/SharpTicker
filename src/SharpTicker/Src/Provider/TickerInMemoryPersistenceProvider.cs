@@ -474,7 +474,14 @@ namespace SharpTicker.Provider
             {
                 if (!TimeTickers.TryGetValue(ticker.Id, out var existing))
                 {
-                    // If it doesn't exist, add it (this can happen for new children)
+                    // If it doesn't exist, add it (this can happen for new children). A body that still shows a run does not
+                    // create a running row that nobody runs.
+                    if (ticker.Status == TickerStatus.InProgress)
+                    {
+                        ticker.Status = TickerStatus.Idle;
+                        ticker.LockHolder = null;
+                        ticker.LockedAt = null;
+                    }
                     return count + AddTickerWithChildren(ticker, parentId);
                 }
 

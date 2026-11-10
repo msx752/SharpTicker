@@ -213,6 +213,27 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         Assert.Equal(second.ClaimMarker, row.UpdatedAt);
     }
 
+    // T13: the stop records a job that did not end in time as Cancelled and frees its lock. A write the run sends after
+    // that changes nothing: the row stays Cancelled with no lock, so it is neither stuck nor taken back by the old run.
+    [Fact]
+    public async Task ALateWriteAfterTheStopRecordedTheJobAsCancelled_ChangesNothing()
+    {
+        var a = CreateNode("node-A");
+        var ticker = await SeedTimeTicker(T0);
+        var run = await ClaimTimeTicker(a, ticker.Id);
+        var stop = new InternalFunctionContext { TickerId = ticker.Id, Type = TickerType.TimeTicker }
+            .SetProperty(x => x.Status, TickerStatus.Cancelled)
+            .SetProperty(x => x.ReleaseLock, true);
+        Assert.True(await a.Manager.UpdateTickerAsync(stop));
+
+        var stored = await a.Manager.UpdateTickerAsync(Outcome(run, TickerStatus.Done, T0.AddMinutes(1)));
+
+        Assert.False(stored);
+        var row = await Row(ticker.Id);
+        Assert.Equal(TickerStatus.Cancelled, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
     // T4 (guard): a final write sent twice (it landed, but the caller could not tell) lands again on the same row.
     [Fact]
     public async Task AFinalWriteSentAgain_IsStoredAgain()
