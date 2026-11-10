@@ -47,13 +47,13 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         await node.Store.RemoveCronTickerOccurrences(_occurrenceIds.ToArray(), CancellationToken.None);
     }
 
-    private Node CreateNode(string nodeIdentifier)
+    private Node CreateNode(string nodeIdentifier, ISharpTickerNotificationHubSender? hub = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton<ITickerClock>(_clock);
         services.AddSingleton(new SchedulerOptionsBuilder { NodeIdentifier = nodeIdentifier });
         var store = new TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity>(services.BuildServiceProvider());
-        var manager = new InternalTickerManager<TimeTickerEntity, CronTickerEntity>(store, _clock, Substitute.For<ISharpTickerNotificationHubSender>());
+        var manager = new InternalTickerManager<TimeTickerEntity, CronTickerEntity>(store, _clock, hub ?? Substitute.For<ISharpTickerNotificationHubSender>());
         return new Node(store, manager);
     }
 
@@ -463,6 +463,81 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         var stopped = await Row(running.TickerId);
         Assert.Equal(TickerStatus.Cancelled, stopped.Status);
         Assert.Null(stopped.LockHolder);
+    }
+
+    // PR-C: the manager writes a lost outcome again fenced, and reports a row that is no longer this run's as not stored.
+    [Fact]
+    public async Task StoreLostOutcome_WritesFenced_AndReportsARowThatIsNoLongerThisRun()
+    {
+        var a = CreateNode("node-A");
+        var kept = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        var released = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        await ReleaseToIdle(a, released);
+
+        Assert.True(a.Manager.FencesRuns);
+        Assert.True(await a.Manager.StoreLostOutcomeAsync(Outcome(kept, TickerStatus.Done, T0.AddMinutes(1))));
+        Assert.False(await a.Manager.StoreLostOutcomeAsync(Outcome(released, TickerStatus.Done, T0.AddMinutes(1))));
+
+        Assert.Equal(TickerStatus.Done, (await Row(kept.TickerId)).Status);
+        Assert.Equal(TickerStatus.Idle, (await Row(released.TickerId)).Status);
+    }
+
+    // PR-C: an outcome is never written again by Id: without a marker, or on a store that does not fence, the manager refuses,
+    // as such a write could land on a later run of the row.
+    [Fact]
+    public async Task StoreLostOutcome_RefusesAWriteThatIsNotFenced()
+    {
+        var run = new InternalFunctionContext { TickerId = Guid.NewGuid(), FunctionName = "fenced-fn", Type = TickerType.TimeTicker }
+            .SetProperty(x => x.Status, TickerStatus.Done);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => CreateNode("node-A").Manager.StoreLostOutcomeAsync(run));
+
+        var store = Substitute.For<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        var unfenced = new InternalTickerManager<TimeTickerEntity, CronTickerEntity>(store, _clock, Substitute.For<ISharpTickerNotificationHubSender>());
+        run.RunMarker = T0;
+
+        Assert.False(unfenced.FencesRuns);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => unfenced.StoreLostOutcomeAsync(run));
+        await store.DidNotReceiveWithAnyArgs().UpdateTimeTicker(default!, default);
+    }
+
+    // PR-C: a stored outcome whose dashboard notification fails is still reported as stored, or it would be written again forever.
+    [Fact]
+    public async Task StoreLostOutcome_ReportsTheOutcomeAsStored_WhenTheNotificationFails()
+    {
+        var hub = Substitute.For<ISharpTickerNotificationHubSender>();
+        hub.UpdateTimeTickerFromInternalFunctionContext<TimeTickerEntity>(Arg.Any<InternalFunctionContext>())
+            .Returns(Task.FromException(new InvalidOperationException("hub down")));
+        var a = CreateNode("node-A", hub);
+        var run = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+
+        Assert.True(await a.Manager.StoreLostOutcomeAsync(Outcome(run, TickerStatus.Done, T0.AddMinutes(1))));
+
+        Assert.Equal(TickerStatus.Done, (await Row(run.TickerId)).Status);
+    }
+
+    // PR-C: the stop's write lands on the running row of this run, not on a row whose outcome the run stored.
+    [Fact]
+    public async Task RecordStoppedRun_WritesARunningRow_AndLeavesAStoredOutcomeAlone()
+    {
+        var a = CreateNode("node-A");
+        var done = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Outcome(done, TickerStatus.Done, T0.AddMinutes(1))));
+        var running = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+
+        Assert.False(await a.Manager.RecordStoppedRunAsync(StoppedWithMarker(done)));
+        Assert.True(await a.Manager.RecordStoppedRunAsync(StoppedWithMarker(running)));
+
+        Assert.Equal(TickerStatus.Done, (await Row(done.TickerId)).Status);
+        var stopped = await Row(running.TickerId);
+        Assert.Equal(TickerStatus.Cancelled, stopped.Status);
+        Assert.Null(stopped.LockHolder);
+
+        static InternalFunctionContext StoppedWithMarker(InternalFunctionContext run)
+        {
+            var stopped = Stopped(run);
+            stopped.RunMarker = run.RunMarker;
+            return stopped;
+        }
     }
 
     private static InternalFunctionContext Stopped(InternalFunctionContext run)
