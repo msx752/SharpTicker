@@ -1095,15 +1095,17 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     }
 
     #region IFencedRunWriter
-    // The fence of IFencedRunWriter: the row this node holds with the run's marker, compared as DateTime.
-    private bool HoldsRun(string lockHolder, DateTime updatedAt, DateTime runMarker)
-        => lockHolder == LockHolder && updatedAt == runMarker;
+    // The fence of IFencedRunWriter: the row this node holds with the run's marker, compared as DateTime, and with
+    // onlyWhileRunning still InProgress. Checked here in C# on the row that was read; the compare-and-set then sets it only
+    // while the key still holds that text.
+    private bool HoldsRun(string lockHolder, DateTime updatedAt, TickerStatus status, DateTime runMarker, bool onlyWhileRunning)
+        => lockHolder == LockHolder && updatedAt == runMarker && (!onlyWhileRunning || status == TickerStatus.InProgress);
 
-    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
     {
         var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(context.TickerId), row =>
         {
-            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, runMarker)) return null;
+            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, row.Status, runMarker, onlyWhileRunning)) return null;
             ApplyFunctionContextToTicker(row, context, runMarker);
             return row;
         }).ConfigureAwait(false);
@@ -1113,11 +1115,11 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return 1;
     }
 
-    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
     {
         var occurrence = await CompareAndSetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(context.TickerId), row =>
         {
-            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, runMarker)) return null;
+            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, row.Status, runMarker, onlyWhileRunning)) return null;
             ApplyFunctionContextToCronOccurrence(row, context, runMarker);
             return row;
         }).ConfigureAwait(false);

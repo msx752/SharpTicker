@@ -65,35 +65,41 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
     #region IFencedRunWriter
 
-    // The writes of a run land only on the row this node holds with the run's marker, and keep the marker in UpdatedAt.
-    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+    // The writes of a run land only on the row this node holds with the run's marker (and, with onlyWhileRunning, that is still
+    // InProgress), and keep the marker in UpdatedAt.
+    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var rows = session.Context.Set<TTimeTicker>();
         var id = context.TickerId;
 
         var written = await rows
-            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker)
+            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress))
             .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(context, runMarker), cancellationToken).ConfigureAwait(false);
 
         // A provider that counts only the rows it changed (MySQL with UseAffectedRows) reports 0 for a write sent again with
-        // the same values; the row still held with the marker has the write.
-        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker, cancellationToken).ConfigureAwait(false)
+        // the same values; the row that still matches the fence has the write. The same fence, status included: a Done row
+        // with the marker was not written by a write that needed InProgress.
+        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                                                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress), cancellationToken).ConfigureAwait(false)
             ? 1
             : 0;
     }
 
-    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var rows = session.Context.Set<CronTickerOccurrenceEntity<TCronTicker>>();
         var id = context.TickerId;
 
         var written = await rows
-            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker)
+            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress))
             .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(context, runMarker), cancellationToken).ConfigureAwait(false);
 
-        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker, cancellationToken).ConfigureAwait(false)
+        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                                                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress), cancellationToken).ConfigureAwait(false)
             ? 1
             : 0;
     }

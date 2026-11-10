@@ -768,24 +768,31 @@ namespace SharpTicker.MongoDB.Infrastructure
         // The counts are MatchedCount, not ModifiedCount: a write that landed and is sent again writes the same values, which
         // Mongo reports as not modified, and it is still stored.
 
-        public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        // With onlyWhileRunning the row must also still be InProgress (the stop's Cancelled write).
+        public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
         {
             var fb = Builders<TTimeTicker>.Filter;
+            var fence = fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker));
+            if (onlyWhileRunning)
+                fence = fb.And(fence, fb.Eq(x => x.Status, TickerStatus.InProgress));
             var result = await _context.TimeTickers
                 .UpdateOneAsync(
-                    fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker)),
+                    fence,
                     MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(context, runMarker),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             return (int)result.MatchedCount;
         }
 
-        public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
         {
             var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            var fence = fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker));
+            if (onlyWhileRunning)
+                fence = fb.And(fence, fb.Eq(x => x.Status, TickerStatus.InProgress));
             var result = await _context.CronTickerOccurrences
                 .UpdateOneAsync(
-                    fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker)),
+                    fence,
                     MongoUpdateBuilders.BuildCronOccurrenceUpdate<TCronTicker>(context, runMarker),
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);

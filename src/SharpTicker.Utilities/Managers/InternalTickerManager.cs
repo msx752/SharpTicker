@@ -405,8 +405,8 @@ namespace SharpTicker.Utilities.Managers
             if (functionContext.RunMarker is { } runMarker && _persistenceProvider is IFencedRunWriter fenced)
             {
                 var written = isCron
-                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false)
-                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false);
+                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false)
+                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false);
                 stored = written > 0;
             }
             else if (isCron)

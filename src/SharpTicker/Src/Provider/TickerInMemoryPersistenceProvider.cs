@@ -883,18 +883,18 @@ namespace SharpTicker.Provider
 
         private const int MaxSwapAttempts = 16;
 
-        // The fence of IFencedRunWriter: the row this node holds with the run's marker.
-        private bool HoldsRun(string lockHolder, DateTime updatedAt, DateTime runMarker)
-            => lockHolder == _lockHolder && updatedAt == runMarker;
+        // The fence of IFencedRunWriter: the row this node holds with the run's marker, and with onlyWhileRunning still InProgress.
+        private bool HoldsRun(string lockHolder, DateTime updatedAt, TickerStatus status, DateTime runMarker, bool onlyWhileRunning)
+            => lockHolder == _lockHolder && updatedAt == runMarker && (!onlyWhileRunning || status == TickerStatus.InProgress);
 
-        public Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        public Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
             => Task.FromResult(SwapTimeTicker(context.TickerId,
-                ticker => HoldsRun(ticker.LockHolder, ticker.UpdatedAt, runMarker),
+                ticker => HoldsRun(ticker.LockHolder, ticker.UpdatedAt, ticker.Status, runMarker, onlyWhileRunning),
                 ticker => ApplyFunctionContextToTicker(ticker, context, runMarker)));
 
-        public Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        public Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
             => Task.FromResult(SwapCronOccurrence(context.TickerId,
-                occurrence => HoldsRun(occurrence.LockHolder, occurrence.UpdatedAt, runMarker),
+                occurrence => HoldsRun(occurrence.LockHolder, occurrence.UpdatedAt, occurrence.Status, runMarker, onlyWhileRunning),
                 occurrence => ApplyFunctionContextToCronOccurrence(occurrence, context, runMarker)));
 
         public Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
