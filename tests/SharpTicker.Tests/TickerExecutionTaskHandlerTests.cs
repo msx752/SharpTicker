@@ -843,7 +843,8 @@ public class TickerExecutionTaskHandlerTests : IDisposable
     }
 
     // The stop waits for the jobs that are still running and records each as Cancelled. A job whose final write failed has
-    // ended, so the stop neither waits for it nor writes Cancelled over its row.
+    // ended, so the stop neither waits for it nor writes Cancelled over its row. (Whether its outcome is written again is the
+    // lost-outcome list's: this handler has none.)
     [Fact]
     public async Task AStop_AfterAJobsFinalWriteFailed_NeitherWaitsForItNorRecordsItAsCancelled()
     {
@@ -868,6 +869,8 @@ public class TickerExecutionTaskHandlerTests : IDisposable
         service.Dispose();
 
         await serviceManager.DidNotReceive().UpdateTickerAsync(
+            Arg.Is<InternalFunctionContext>(c => c.TickerId == context.TickerId), Arg.Any<CancellationToken>());
+        await serviceManager.DidNotReceive().RecordStoppedRunAsync(
             Arg.Is<InternalFunctionContext>(c => c.TickerId == context.TickerId), Arg.Any<CancellationToken>());
         Assert.True(stopping.Elapsed < TimeSpan.FromSeconds(4), $"the stop waited {stopping.Elapsed} for a job that had ended");
     }

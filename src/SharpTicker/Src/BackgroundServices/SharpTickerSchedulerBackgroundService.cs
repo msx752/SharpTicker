@@ -80,7 +80,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         }
         
         _taskScheduler.Resume();
-        return Interlocked.CompareExchange(ref _started, 1, 0) != 0 
+        // A stop closed the list of lost outcomes; a start (the dashboard stops and starts the scheduler) takes them again,
+        // and writes those the stop could not store.
+        _lostOutcomes?.Open();
+        return Interlocked.CompareExchange(ref _started, 1, 0) != 0
             ? Task.CompletedTask : base.StartAsync(ct);
     }
 
@@ -456,7 +459,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         _taskScheduler.Freeze();
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
-        await WaitForRunningJobsAsync(cancellationToken);
+        var stillRunning = await WaitForRunningJobsAsync(cancellationToken);
+        // The outcomes whose final write threw get one last write, whether or not a job is still running, and before the
+        // Cancelled writes: those must not take a row whose real outcome is about to be stored.
+        if (_lostOutcomes != null)
+            await _lostOutcomes.StoreAtStopAsync();
+        await RecordAsCancelledAsync(stillRunning);
         // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
         // the host gives the stop.
         await _work.PutBackUnstartedAsync(cancellationToken: cancellationToken);
@@ -493,11 +501,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         return limit > TimeSpan.Zero ? limit : TimeSpan.Zero;
     }
 
-    private async Task WaitForRunningJobsAsync(CancellationToken hostToken)
+    // Returns the jobs still running when the wait ended.
+    private async Task<RunningJob[]> WaitForRunningJobsAsync(CancellationToken hostToken)
     {
         var running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
         if (running.Length == 0)
-            return;
+            return running;
 
         _logger?.LogWarning("The application is stopping and {JobCount} job(s) are running. Waiting for them to finish: {Jobs}.",
             running.Length, DescribeJobs(running));
@@ -518,6 +527,14 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             running = TickerCancellationTokenManager.GetRunningJobs(_taskHandler);
         }
 
+        return running;
+    }
+
+    // What is still running when the wait ended is recorded as cancelled, with its lock released. A fenced run's write lands only
+    // while its row is still this run and still InProgress: not over an outcome the job stored just before it left the list of
+    // running jobs, nor over a run of another node that took the row.
+    private async Task RecordAsCancelledAsync(RunningJob[] running)
+    {
         if (running.Length == 0)
             return;
 
@@ -529,7 +546,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 TickerId = job.TickerId,
                 FunctionName = job.FunctionName,
                 Type = job.Type,
-                ParentId = job.ParentId == Guid.Empty ? null : job.ParentId
+                ParentId = job.ParentId == Guid.Empty ? null : job.ParentId,
+                RunMarker = job.RunMarker
             };
             context.SetProperty(x => x.Status, TickerStatus.Cancelled)
                 .SetProperty(x => x.ExecutedAt, now)
@@ -538,7 +556,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
             try
             {
-                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None).ConfigureAwait(false);
+                if (!await _internalTickerManager.RecordStoppedRunAsync(context, CancellationToken.None).ConfigureAwait(false))
+                    _logger?.LogInformation("Job {FunctionName} ({TickerId}) had already stored its outcome, or its row was taken by another run; it was not recorded as Cancelled.",
+                        job.FunctionName, job.TickerId);
             }
             catch (Exception ex)
             {

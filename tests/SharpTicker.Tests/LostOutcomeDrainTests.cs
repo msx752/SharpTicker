@@ -472,6 +472,137 @@ public class LostOutcomeDrainTests : IAsyncLifetime
         Assert.Equal(runB.ClaimMarker, row.UpdatedAt);
     }
 
+    private SharpTickerSchedulerBackgroundService Scheduler(IInternalTickerManager manager, TickerExecutionTaskHandler handler,
+        LostOutcomeDrain drain, TickerExecutionContext? executionContext = null)
+        => new(executionContext ?? new TickerExecutionContext(), handler, Substitute.For<ISharpTickerTaskScheduler>(), manager,
+            new SchedulerOptionsBuilder(), new TickerFunctionConcurrencyGate(),
+            logger: new LoggerFactory([_logs]).CreateLogger<SharpTickerSchedulerBackgroundService>(), lostOutcomes: drain)
+        {
+            ShutdownWaitLimit = TimeSpan.FromMilliseconds(100),
+            PutBackRetryInterval = TimeSpan.FromHours(1)
+        };
+
+    // A job the stop finds running, as the registry of running jobs lists it for the handler.
+    private static void ListAsRunning(TickerExecutionTaskHandler handler, InternalFunctionContext run)
+    {
+        run.RunMarker = run.ClaimMarker;
+        TickerCancellationTokenManager.AddTickerCancellationToken(new CancellationTokenSource(), run, isDue: false, handler);
+    }
+
+    // T6: an outcome lost while the application ran, and nothing running at the stop: the stop still writes it, even when the
+    // host's time for the stop is used up (its token is cancelled), as each attempt has its own limit.
+    [Fact]
+    public async Task AStopWithNothingRunning_StoresALostOutcome_EvenWhenTheHostsTimeIsUp()
+    {
+        var real = RealManager("node-A");
+        var flaky = new FlakyFinalWrite(real);
+        var (handler, list) = Handler(flaky.Manager);
+        var service = Scheduler(flaky.Manager, handler, Drain(list, flaky.Manager, handler));
+        var id = await SeedTimeTicker();
+        await handler.ExecuteTaskAsync(await Claim(real, "node-A", id, (_, _, _) => Task.CompletedTask), isDue: false);
+        Assert.Single(list.Snapshot());
+
+        await service.StopAsync(new CancellationToken(canceled: true));
+        service.Dispose();
+
+        Assert.Equal(TickerStatus.Done, (await Row(id)).Status);
+        Assert.True(list.IsEmpty);
+    }
+
+    // T7a: the stop finds a job still listed as running whose outcome is already stored with the same marker (it stored it and
+    // had not left the list yet). The Cancelled write must not replace that outcome.
+    [Fact]
+    public async Task AStop_DoesNotRecordAsCancelled_AJobWhoseOutcomeIsStored()
+    {
+        var real = RealManager("node-A");
+        var (handler, list) = Handler(real);
+        var service = Scheduler(real, handler, Drain(list, real, handler));
+        var id = await SeedTimeTicker();
+        var run = await Claim(real, "node-A", id, (_, _, _) => Task.CompletedTask);
+        ListAsRunning(handler, run);
+        Assert.True(await real.UpdateTickerAsync(run.ResetUpdateProps().SetProperty(x => x.Status, TickerStatus.Done).SetProperty(x => x.ExecutedAt, T0.AddMinutes(1))));
+
+        await service.StopAsync(CancellationToken.None);
+        service.Dispose();
+
+        var row = await Row(id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal(T0.AddMinutes(1), row.ExecutedAt);
+        Assert.Contains(_logs.Entries, e => e.Level == LogLevel.Information && e.Message.Contains("it was not recorded as Cancelled"));
+    }
+
+    // T7b: the row of the job the stop finds running was released and another node took it: the Cancelled write must not
+    // touch the other node's run.
+    [Fact]
+    public async Task AStop_DoesNotRecordAsCancelled_ARowAnotherNodeTook()
+    {
+        var real = RealManager("node-A");
+        var (handler, list) = Handler(real);
+        var service = Scheduler(real, handler, Drain(list, real, handler));
+        var id = await SeedTimeTicker();
+        var run = await Claim(real, "node-A", id, (_, _, _) => Task.CompletedTask);
+        ListAsRunning(handler, run);
+        Assert.True(await CreateStore("node-A").TryReleaseTimeTickerClaim(id, run.ClaimMarker!.Value, CancellationToken.None));
+        var runB = await Claim(RealManager("node-B"), "node-B", id, (_, _, _) => Task.CompletedTask);
+
+        await service.StopAsync(CancellationToken.None);
+        service.Dispose();
+
+        var row = await Row(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-B", row.LockHolder);
+        Assert.Equal(runB.ClaimMarker, row.UpdatedAt);
+    }
+
+    // T7c: a job still running at the end of the wait is recorded as Cancelled, with its lock released, as before.
+    [Fact]
+    public async Task AStop_RecordsAJobStillRunningAsCancelled_AndReleasesIt()
+    {
+        var real = RealManager("node-A");
+        var (handler, list) = Handler(real);
+        var service = Scheduler(real, handler, Drain(list, real, handler));
+        var id = await SeedTimeTicker();
+        ListAsRunning(handler, await Claim(real, "node-A", id, (_, _, _) => Task.CompletedTask));
+
+        await service.StopAsync(CancellationToken.None);
+        service.Dispose();
+
+        var row = await Row(id);
+        Assert.Equal(TickerStatus.Cancelled, row.Status);
+        Assert.Null(row.LockHolder);
+    }
+
+    // T12: the dashboard stops and starts the scheduler while the application runs. The stop closed the list; the start opens
+    // it again, so a later lost outcome is written again.
+    [Fact]
+    public async Task AfterTheSchedulerIsStoppedAndStartedAgain_ALostOutcomeIsWrittenAgain()
+    {
+        var real = RealManager("node-A");
+        var flaky = new FlakyFinalWrite(real);
+        var (handler, list) = Handler(flaky.Manager);
+        var service = Scheduler(flaky.Manager, handler, Drain(list, flaky.Manager, handler));
+        await service.StartAsync(CancellationToken.None);
+        await service.StopAsync(CancellationToken.None);
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            var id = await SeedTimeTicker();
+            await handler.ExecuteTaskAsync(await Claim(real, "node-A", id, (_, _, _) => Task.CompletedTask), isDue: false);
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while ((await Row(id)).Status != TickerStatus.Done && DateTime.UtcNow < deadline)
+                await Task.Delay(25);
+
+            Assert.Equal(TickerStatus.Done, (await Row(id)).Status);
+            Assert.DoesNotContain(_logs.Entries, e => e.Message.Contains("not written again"));
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            service.Dispose();
+        }
+    }
+
     // T4: the final write landed and then threw (a lost reply). Written again on the same marker it lands again: stored, and
     // followed up once.
     [Fact]
