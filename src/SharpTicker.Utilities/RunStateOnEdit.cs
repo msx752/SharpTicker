@@ -1,0 +1,45 @@
+using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Enums;
+
+namespace SharpTicker.Utilities;
+
+/// <summary>
+/// What a full-entity update of a time ticker (an edit through <c>UpdateAsync</c> or the dashboard) writes over the state
+/// of a run. A running row keeps its run: its status, lock, run marker (UpdatedAt) and the fields the run writes, or the
+/// run's fenced writes would no longer match and its outcome would be lost, leaving the row InProgress or running the job
+/// again. A body that still shows a run the store no longer has (read while the job ran, sent after it ended) does not bring
+/// that run back. The stores apply this to every row an update writes, the root and its chain rows.
+/// </summary>
+internal static class RunStateOnEdit
+{
+    /// <summary>Changes <paramref name="body"/>, the row to be written, against <paramref name="stored"/>, the row in the store.</summary>
+    internal static void Apply<TTicker>(TTicker body, TTicker stored) where TTicker : TimeTickerEntity<TTicker>
+    {
+        if (stored.Status == TickerStatus.InProgress)
+        {
+            KeepRunOf(body, stored);
+            body.UpdatedAt = stored.UpdatedAt;
+            return;
+        }
+
+        if (body.Status == TickerStatus.InProgress)
+        {
+            body.Status = stored.Status;
+            body.LockHolder = stored.LockHolder;
+            body.LockedAt = stored.LockedAt;
+        }
+    }
+
+    /// <summary>Copies the run state of <paramref name="stored"/> onto <paramref name="body"/>, all but the run marker.</summary>
+    private static void KeepRunOf<TTicker>(TTicker body, TTicker stored) where TTicker : TimeTickerEntity<TTicker>
+    {
+        body.Status = stored.Status;
+        body.LockHolder = stored.LockHolder;
+        body.LockedAt = stored.LockedAt;
+        body.RetryCount = stored.RetryCount;
+        body.ExecutedAt = stored.ExecutedAt;
+        body.ElapsedTime = stored.ElapsedTime;
+        body.ExceptionMessage = stored.ExceptionMessage;
+        body.SkippedReason = stored.SkippedReason;
+    }
+}

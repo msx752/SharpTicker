@@ -696,6 +696,86 @@ public class TickerManagerTests : IDisposable
             .UpdateCronTickerOccurrence(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
     }
 
+    // The occurrence the scheduler planned for an edited cron may already run: its claim won and its job holds the context.
+    // The edit moves the occurrence through a context of its own and leaves the scheduler's one as it is, so the run's pending
+    // writes are not wiped and the run is not handed a time it did not run at (#74).
+    [Fact]
+    public async Task UpdateCronTickerAsync_LeavesTheContextOfThePlannedOccurrenceAsItIs()
+    {
+        var cronTickerId = Guid.NewGuid();
+        var planned = PlannedOccurrence(cronTickerId);
+        _executionContext.Functions = new[] { planned };
+        var moves = RecordOccurrenceMoves(cronTickerId);
+
+        var result = await _cronTickerManager.UpdateAsync(
+            new CronTickerEntity { Id = cronTickerId, Function = ValidFunctionName, Expression = ValidCronExpression }, CancellationToken.None);
+
+        Assert.True(result.IsSucceeded);
+        AssertUntouched(planned);
+        var move = Assert.Single(moves);
+        Assert.NotSame(planned, move.Written);
+        Assert.Equal(planned.TickerId, move.TickerId);
+        Assert.Equal([nameof(InternalFunctionContext.ExecutionTime)], move.Props);
+    }
+
+    [Fact]
+    public async Task UpdateCronTickersBatch_LeavesTheContextOfThePlannedOccurrenceAsItIs()
+    {
+        var cronTickerId = Guid.NewGuid();
+        var planned = PlannedOccurrence(cronTickerId);
+        _executionContext.Functions = new[] { planned };
+        var moves = RecordOccurrenceMoves(cronTickerId);
+
+        var result = await _cronTickerManager.UpdateBatchAsync(
+            [new CronTickerEntity { Id = cronTickerId, Function = ValidFunctionName, Expression = ValidCronExpression }], CancellationToken.None);
+
+        Assert.True(result.IsSucceeded);
+        AssertUntouched(planned);
+        var move = Assert.Single(moves);
+        Assert.NotSame(planned, move.Written);
+        Assert.Equal(planned.TickerId, move.TickerId);
+    }
+
+    private static readonly DateTime PlannedTime = new(2030, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    // A claimed occurrence whose run has a write pending (a retry count it has not stored yet).
+    private static InternalFunctionContext PlannedOccurrence(Guid cronTickerId)
+        => new InternalFunctionContext
+        {
+            TickerId = Guid.NewGuid(),
+            ParentId = cronTickerId,
+            FunctionName = ValidFunctionName,
+            Type = TickerType.CronTickerOccurrence,
+            ExecutionTime = PlannedTime
+        }.SetProperty(x => x.RetryCount, 1);
+
+    private static void AssertUntouched(InternalFunctionContext planned)
+    {
+        Assert.Equal(PlannedTime, planned.ExecutionTime);
+        Assert.Equal([nameof(InternalFunctionContext.RetryCount)], planned.GetPropsToUpdate());
+    }
+
+    // Each occurrence write: the context written, its id and the fields it changes, as they were when it was written.
+    private List<(InternalFunctionContext Written, Guid TickerId, string[] Props)> RecordOccurrenceMoves(Guid cronTickerId)
+    {
+        var moves = new List<(InternalFunctionContext, Guid, string[])>();
+        _persistenceProvider
+            .UpdateCronTickers(Arg.Any<CronTickerEntity[]>(), Arg.Any<CancellationToken>())
+            .Returns(1);
+        _persistenceProvider
+            .GetCronTickers(Arg.Any<System.Linq.Expressions.Expression<Func<CronTickerEntity, bool>>>(), Arg.Any<CancellationToken>())
+            .Returns(new[] { new CronTickerEntity { Id = cronTickerId } });
+        _persistenceProvider
+            .UpdateCronTickerOccurrence(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var written = call.Arg<InternalFunctionContext>();
+                moves.Add((written, written.TickerId, written.GetPropsToUpdate().ToArray()));
+                return Task.CompletedTask;
+            });
+        return moves;
+    }
+
     // ---------------------------------------------------------------
     // DeleteTimeTickerAsync
     // ---------------------------------------------------------------

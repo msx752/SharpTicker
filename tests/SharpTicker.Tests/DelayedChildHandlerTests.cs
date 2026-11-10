@@ -383,6 +383,15 @@ public class DelayedChildHandlerTests : IDisposable
         Assert.Equal([onSuccess.TickerId], SkippedIds());
     }
 
+    // The writes of an inline child, in order: its start (recorded InProgress) and its other writes with their status.
+    private void RecordChildWrites(InternalFunctionContext child, List<string> steps)
+    {
+        _internalManager.When(m => m.RecordChildStartedAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(_ => { lock (steps) steps.Add("write InProgress"); });
+        _internalManager.When(m => m.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(c => { lock (steps) steps.Add($"write {((InternalFunctionContext)c[0]).Status}"); });
+    }
+
     // A chain child without a time of its own runs inside its parent's run. Its row must be recorded InProgress before its
     // function starts, as the parent's is, so the dashboard shows it running and an InProgress delayed child below it can
     // start while it runs.
@@ -395,8 +404,7 @@ public class DelayedChildHandlerTests : IDisposable
         var parent = Job(Succeeds);
         var child = Job((_, _, _) => { lock (steps) steps.Add("child runs"); return Task.CompletedTask; }, condition);
         parent.TimeTickerChildren.Add(child);
-        _internalManager.When(m => m.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
-            .Do(c => { lock (steps) steps.Add($"write {((InternalFunctionContext)c[0]).Status}"); });
+        RecordChildWrites(child, steps);
 
         await _handler.ExecuteTaskAsync(parent, isDue: false);
 
@@ -415,8 +423,7 @@ public class DelayedChildHandlerTests : IDisposable
         var grandchild = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.InProgress);
         child.TimeTickerChildren.Add(grandchild);
         parent.TimeTickerChildren.Add(child);
-        _internalManager.When(m => m.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
-            .Do(c => { lock (steps) steps.Add($"write {((InternalFunctionContext)c[0]).Status}"); });
+        RecordChildWrites(child, steps);
         _internalManager.When(m => m.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()))
             .Do(_ => { lock (steps) steps.Add("claim grandchild"); });
 
@@ -432,7 +439,8 @@ public class DelayedChildHandlerTests : IDisposable
         await run;
     }
 
-    // A failed InProgress write does not stop the child, nothing else would run it; its outcome is still written.
+    // A failed start write does not stop the child, nothing else would run it; its outcome is still written, by Id, as the
+    // start gave the child no run marker to fence its writes with.
     [Fact]
     public async Task AnInlineChild_StillRuns_WhenItCannotBeRecordedInProgress()
     {
@@ -440,20 +448,21 @@ public class DelayedChildHandlerTests : IDisposable
         var parent = Job(Succeeds);
         var child = Job((_, _, _) => { ran = true; return Task.CompletedTask; }, RunCondition.OnSuccess);
         parent.TimeTickerChildren.Add(child);
-        var finalWrites = new List<TickerStatus>();
+        _internalManager.RecordChildStartedAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("store failed"));
+        var finalWrites = new List<(TickerStatus Status, DateTime? RunMarker)>();
         _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
             .Returns(c =>
             {
-                var status = ((InternalFunctionContext)c[0]).Status;
-                if (status == TickerStatus.InProgress) throw new InvalidOperationException("store failed");
-                finalWrites.Add(status);
+                var written = (InternalFunctionContext)c[0];
+                finalWrites.Add((written.Status, written.RunMarker));
                 return Task.FromResult(true);
             });
 
         await _handler.ExecuteTaskAsync(parent, isDue: false);
 
         Assert.True(ran);
-        Assert.Equal([TickerStatus.Done], finalWrites);
+        Assert.Equal([(TickerStatus.Done, (DateTime?)null)], finalWrites);
     }
 
     // With the background services off nothing would start a claimed row, so nothing is claimed.

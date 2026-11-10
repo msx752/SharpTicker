@@ -332,7 +332,11 @@ namespace SharpTicker.Utilities.Managers
                 : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
 
             if (won)
+            {
                 function.Status = TickerStatus.InProgress;
+                // The run's writes are fenced by the marker this claim wrote, as on the other claim paths.
+                function.ClaimMarker = claimMarker;
+            }
 
             return won;
         }
@@ -394,16 +398,51 @@ namespace SharpTicker.Utilities.Managers
         
         public async Task<bool> UpdateTickerAsync(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
-            if (functionContext.Type == TickerType.CronTickerOccurrence)
+            var isCron = functionContext.Type == TickerType.CronTickerOccurrence;
+            bool stored;
+
+            // A fenced run writes only to the row it still holds (see IFencedRunWriter); any other write is by Id, as before.
+            if (functionContext.RunMarker is { } runMarker && _persistenceProvider is IFencedRunWriter fenced)
+            {
+                var written = isCron
+                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false)
+                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, cancellationToken).ConfigureAwait(false);
+                stored = written > 0;
+            }
+            else if (isCron)
             {
                 await _persistenceProvider.UpdateCronTickerOccurrence(functionContext, cancellationToken).ConfigureAwait(false);
-                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext).ConfigureAwait(false);
-                return true;
+                stored = true;
+            }
+            else
+            {
+                stored = await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false) > 0;
             }
 
-            var written = await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false);
-            await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext).ConfigureAwait(false);
-            return written > 0;
+            if (isCron)
+                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext).ConfigureAwait(false);
+            else
+                await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext).ConfigureAwait(false);
+
+            return stored;
+        }
+
+        public async Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default)
+        {
+            child.SetProperty(x => x.Status, TickerStatus.InProgress);
+
+            if (_persistenceProvider is IFencedRunWriter fenced)
+            {
+                var marker = _clock.NextClaimMarker();
+                if (await fenced.StartInlineChildAsync(child.TickerId, marker, cancellationToken).ConfigureAwait(false) > 0)
+                    child.RunMarker = marker;
+            }
+            else
+            {
+                await _persistenceProvider.UpdateTimeTicker(child, cancellationToken).ConfigureAwait(false);
+            }
+
+            await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(child).ConfigureAwait(false);
         }
         
         public async Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
