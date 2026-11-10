@@ -9,12 +9,12 @@ public class CronSeedScenarios(ITestOutputHelper output)
     // #92 (#102): a user's cron next to the seeded cron of the same function. A node started with a new expression in code
     // brings only the seeded cron to it. Before the fix Redis failed to start on the second cron of a function, and EF Core
     // and MongoDB updated whichever cron of the function came first, which could be the user's. Redis only: on EF Core and
-    // MongoDB the seeded cron, stored first, also comes first, so the code before the fix passes there as well (see
-    // deferred-scenarios).
-    [Theory]
-    [InlineData(Store.Redis)]
-    public async Task ANewExpressionInCode_LeavesAUsersCronOfTheSameFunctionAlone(Store store)
+    // MongoDB the seeded cron, stored first, is also read first, so the code before the fix passes there as well and the
+    // scenario would prove nothing; the unit tests of #102 cover those stores.
+    [Fact]
+    public async Task ANewExpressionInCode_LeavesAUsersCronOfTheSameFunctionAlone()
     {
+        const Store store = Store.Redis;
         // Far away (about half a year), so none of them runs during the scenario. Node 0 has the old code, node 1 the new.
         var tail = Crons.Far[5..];
         string oldCode = "0 0 0" + tail, newCode = "0 30 0" + tail, users = "0 15 0" + tail;
@@ -29,7 +29,11 @@ public class CronSeedScenarios(ITestOutputHelper output)
         // The new code starts. Before the fix a Redis node throws here, at the seed, on every start.
         await env.StartNodeAsync(1);
 
-        var crons = await SeededCrons(env, 1);
+        // Read until node 1's seed shows, not once: the dashboard answering does not by itself say the seed is done.
+        List<CronView> crons = [];
+        await env.UntilAsync(async () => (crons = await SeededCrons(env, 1)).Any(c => c.Expression == newCode),
+            () => $"node 1 did not bring the seeded cron to the new expression: {string.Join("; ", crons.Select(c => c.Expression))}",
+            TimeSpan.FromSeconds(30));
         output.WriteLine(string.Join("; ", crons.Select(c => $"{c.Id} {c.Expression}")));
         Assert.Equal(2, crons.Count);
         Assert.Single(crons, c => c.Expression == newCode);

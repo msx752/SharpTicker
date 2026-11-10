@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using SharpTicker.Scenarios.Harness;
 using Xunit.Abstractions;
 
@@ -113,12 +114,14 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         // All five run 6 s. They are seen started at most a fallback pass (2 s) after the first start, so the earliest end is
         // at least 4 s away; the cut starts 2 s from here and lasts past the latest end. MongoDB 40 s: longer than its
         // driver's server selection wait (30 s), which otherwise waits out the cut and writes late on its own, so no final
-        // write fails there. Redis 15 s: shorter than its heartbeat TTL (25 s); a longer outage makes the nodes release
-        // their own running rows when Redis returns (candidate 45, no fix yet), which is not what this scenario checks.
+        // write fails there. Redis 10 s: well inside its heartbeat TTL (25 s), counting the last heartbeat (up to 5 s before
+        // the cut) and the 5 s retry delay after a failed one; a longer outage can make the nodes release their own running
+        // rows when Redis returns (a known Redis behaviour, not fixed yet), which is not what this scenario checks. The
+        // jobs end at most 6 s into the cut, so 10 s still fails their final writes.
         await env.UntilAsync(() => Task.FromResult(ids.All(id => env.Runs.Starts(id) == 1)),
             () => $"{ids.Count(id => env.Runs.Starts(id) == 1)} of {ids.Count} started", TimeSpan.FromSeconds(30));
         await Task.Delay(TimeSpan.FromSeconds(2));
-        var cut = TimeSpan.FromSeconds(store == Store.MongoDb ? 40 : 15);
+        var cut = TimeSpan.FromSeconds(store switch { Store.MongoDb => 40, Store.Redis => 10, _ => 15 });
         var window = new FaultEvent("cut") { At = DateTimeOffset.UtcNow, Until = DateTimeOffset.UtcNow + cut };
         await env.CutStoreAsync(cut);
 
@@ -156,7 +159,12 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         // Node 0's job ends as soon as it runs again, and writes its outcome.
         await env.UntilAsync(() => Task.FromResult(env.Runs.For(id).Any(e => e.IsEnd && e.Node == frozen)),
             () => $"node 0's job did not end after the pause: {Describe(env, id)}", TimeSpan.FromSeconds(20));
-        await Task.Delay(TimeSpan.FromSeconds(3));
+
+        // The row is read once node 0's write is done: with the fence it logs the refusal; without it there is no such
+        // line, so the wait ends after 10 s and the row shows what the write did.
+        var refusalWait = Stopwatch.StartNew();
+        while (env.CountNodeLogLines("was not stored", node: 0) == 0 && refusalWait.Elapsed < TimeSpan.FromSeconds(10))
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
 
         var row = (await env.Nodes[1].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id);
         Assert.False(env.Runs.For(id).Any(e => e.IsEnd && e.Node == taker), $"inconclusive: node 1's run ended already: {Describe(env, id)}");
@@ -167,7 +175,7 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         var final = TickerStatus.InProgress;
         await env.UntilAsync(async () => (final = (await env.Nodes[1].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id).Status) is TickerStatus.Done or TickerStatus.DueDone,
             () => $"node 1's run did not end the row: {final}; {Describe(env, id)}", TimeSpan.FromSeconds(60));
-        Assert.True(env.CountNodeLogLines("was not stored") >= 1, $"node 0 logged no refused late write; see {env.LogFolder}");
+        Assert.True(env.CountNodeLogLines("was not stored", node: 0) >= 1, $"node 0 logged no refused late write; see {env.LogFolder}");
         output.WriteLine($"starts: {env.Runs.Starts(id)} (node 0, then node 1 after it was taken for dead)");
     }
 

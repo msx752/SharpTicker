@@ -57,10 +57,10 @@ there), the control is the current code with only that fix taken out, as a local
 
 The composite scenarios and the soak have no single commit before a fix: they run several faults together (kills,
 stops, pauses, store cuts, latency) and check the invariants (no job started twice without a reason, nothing left
-InProgress, every due job ended). They do not prove one fix; the scenarios above do. Rows left by the known open
-issues #74 and #84 are allowed only when an injected fault explains them, and are counted in the output. For #74 that is
-now the documented at-least-once case only: a node killed or restarted before it wrote a lost outcome again. A node that
-lives on writes it (`AStoreCutAtTheEndOfJobs_TheirOutcomesAreStoredOnceTheStoreIsBack`).
+InProgress, every due job ended). They do not prove one fix; the scenarios above do. Rows left by #84 (open) and by
+the documented at-least-once limit of #74 are allowed only when an injected fault explains them, and are counted in the
+output. That limit is a node killed or restarted before it wrote a lost outcome again; a node that lives on writes it
+(`AStoreCutAtTheEndOfJobs_TheirOutcomesAreStoredOnceTheStoreIsBack`).
 
 ### The soak
 
