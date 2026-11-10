@@ -45,8 +45,9 @@ namespace SharpTicker.Utilities.Models
 
         /// <summary>
         /// The marker that fences the writes of this run (see <see cref="Interfaces.IFencedRunWriter"/>): the claim marker of a
-        /// claimed job, or the start marker of an inline chain child. Null when the run is not fenced: the job was not
-        /// claimed, its start could not be recorded, or the store does not fence.
+        /// claimed job, or the start marker of an inline chain child. Null when the job was not claimed or its start could not
+        /// be recorded. A claimed job carries it whatever the store; a store that does not fence writes it by Id, so whether
+        /// the run is fenced is the store's (see <c>IInternalTickerManager.FencesRuns</c>).
         /// </summary>
         internal DateTime? RunMarker { get; set; }
 
@@ -90,5 +91,17 @@ namespace SharpTicker.Utilities.Models
 
         public HashSet<string> GetPropsToUpdate()
             => ParametersToUpdate;
+
+        /// <summary>
+        /// A copy of this context for writing its outcome again later (<see cref="LostOutcomeRetryList"/>): every field with its
+        /// value and its own set of changed fields, so the copy writes exactly what this context wrote, and nothing done to this
+        /// context afterwards changes it. The chain children are shared: they are only read once the run has ended.
+        /// </summary>
+        internal InternalFunctionContext CopyForOutcomeRetry()
+        {
+            var copy = (InternalFunctionContext)MemberwiseClone();
+            copy.ParametersToUpdate = ParametersToUpdate == null ? [] : new HashSet<string>(ParametersToUpdate);
+            return copy;
+        }
     }
 }

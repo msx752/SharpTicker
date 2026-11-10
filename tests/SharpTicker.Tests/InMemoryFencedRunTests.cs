@@ -408,4 +408,36 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         Assert.Equal(run.ClaimMarker, (await OccurrenceRow(run.TickerId)).UpdatedAt);
         Assert.True(await a.Manager.UpdateTickerAsync(Outcome(run, TickerStatus.Done, T0.AddMinutes(1))));
     }
+
+    // PR-C: a lost outcome is written again from a copy of the run's context. The copy must write the row exactly as the run's
+    // own context does.
+    [Fact]
+    public async Task TheCopyOfAnOutcome_WritesTheSameRowAsTheRunsOwnContext()
+    {
+        var a = CreateNode("node-A");
+        var first = await SeedTimeTicker(T0);
+        var second = await SeedTimeTicker(T0);
+        var original = FailedOutcome(await ClaimTimeTicker(a, first.Id));
+        var copied = FailedOutcome(await ClaimTimeTicker(a, second.Id)).CopyForOutcomeRetry();
+
+        Assert.True(await a.Manager.UpdateTickerAsync(original));
+        Assert.True(await a.Manager.UpdateTickerAsync(copied));
+
+        var fromOriginal = await Row(first.Id);
+        var fromCopy = await Row(second.Id);
+        Assert.Equal(TickerStatus.Failed, fromCopy.Status);
+        Assert.Equal(original.RunMarker, fromOriginal.UpdatedAt);
+        Assert.Equal(copied.RunMarker, fromCopy.UpdatedAt);
+        Assert.Equal(
+            (fromOriginal.Status, fromOriginal.ExecutedAt, fromOriginal.ElapsedTime, fromOriginal.ExceptionMessage, fromOriginal.RetryCount, fromOriginal.LockHolder),
+            (fromCopy.Status, fromCopy.ExecutedAt, fromCopy.ElapsedTime, fromCopy.ExceptionMessage, fromCopy.RetryCount, fromCopy.LockHolder));
+
+        static InternalFunctionContext FailedOutcome(InternalFunctionContext run)
+            => run.ResetUpdateProps()
+                .SetProperty(x => x.Status, TickerStatus.Failed)
+                .SetProperty(x => x.ExecutedAt, T0.AddMinutes(3))
+                .SetProperty(x => x.ElapsedTime, 1234L)
+                .SetProperty(x => x.ExceptionDetails, "boom")
+                .SetProperty(x => x.RetryCount, 2);
+    }
 }
