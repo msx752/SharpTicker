@@ -296,7 +296,7 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
             var workerId = -1;
             try
             {
-                workerId = ReserveWorkerId();
+                workerId = currentWorkers; // control: the id before #23
                 var thread = new Thread(() => WorkerLoop(workerId))
                 {
                     IsBackground = true,
