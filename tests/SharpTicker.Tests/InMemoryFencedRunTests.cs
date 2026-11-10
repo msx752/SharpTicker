@@ -515,6 +515,24 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Done, (await Row(run.TickerId)).Status);
     }
 
+    // PR-C: a stop's Cancelled write that landed is reported as written even when the notification fails, so the stop does not
+    // log it as not recorded.
+    [Fact]
+    public async Task RecordStoppedRun_ReportsTheWriteAsWritten_WhenTheNotificationFails()
+    {
+        var hub = Substitute.For<ISharpTickerNotificationHubSender>();
+        hub.UpdateTimeTickerFromInternalFunctionContext<TimeTickerEntity>(Arg.Any<InternalFunctionContext>())
+            .Returns(Task.FromException(new InvalidOperationException("hub down")));
+        var a = CreateNode("node-A", hub);
+        var run = await ClaimTimeTicker(a, (await SeedTimeTicker(T0)).Id);
+        var stopped = Stopped(run);
+        stopped.RunMarker = run.RunMarker;
+
+        Assert.True(await a.Manager.RecordStoppedRunAsync(stopped));
+
+        Assert.Equal(TickerStatus.Cancelled, (await Row(run.TickerId)).Status);
+    }
+
     // PR-C: the stop's write lands on the running row of this run, not on a row whose outcome the run stored.
     [Fact]
     public async Task RecordStoppedRun_WritesARunningRow_AndLeavesAStoredOutcomeAlone()

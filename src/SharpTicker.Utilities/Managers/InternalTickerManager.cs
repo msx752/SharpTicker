@@ -430,9 +430,20 @@ namespace SharpTicker.Utilities.Managers
         public async Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
         {
             var written = await WriteAsync(context, onlyWhileRunning: true, cancellationToken).ConfigureAwait(false);
-            if (written)
+            if (!written)
+                return false;
+
+            // Written: a failing notification must not make the stop log it as not recorded.
+            try
+            {
                 await NotifyUpdatedAsync(context).ConfigureAwait(false);
-            return written;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was recorded as Cancelled, but the dashboard could not be notified.",
+                    context.FunctionName, context.TickerId);
+            }
+            return true;
         }
 
         // A fenced run writes only to the row it still holds (see IFencedRunWriter); any other write is by Id, as before.

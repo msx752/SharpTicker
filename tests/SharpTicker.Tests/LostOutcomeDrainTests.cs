@@ -119,25 +119,54 @@ public class LostOutcomeDrainTests : IAsyncLifetime
         Assert.Contains("was not stored", warning.Message);
     }
 
-    // The first write that fails again ends the pass: the store is still out of reach. The rest wait for the next pass.
+    // A write that waits for the store until the token given to it ends, as a call to a store out of reach does.
+    private static Task<bool> Hang(CancellationToken cancellationToken)
+        => Task.Delay(Timeout.Infinite, cancellationToken).ContinueWith(t => { t.Wait(); return true; });
+
+    // A write the store refuses keeps that outcome, but the pass goes on: an outcome the store keeps refusing (for its own
+    // content) must not hold back the others, whose jobs would otherwise run again after a release.
     [Fact]
-    public async Task AWriteThatFailsAgain_KeepsTheOutcome_AndEndsThePass()
+    public async Task AWriteTheStoreRefuses_KeepsTheOutcome_AndTheOthersAreStillWritten()
     {
         var list = new LostOutcomeRetryList();
         var manager = Substitute.For<IInternalTickerManager>();
-        var first = Outcome();
-        var second = Outcome();
+        var refused = Outcome();
+        var next = Outcome();
+        manager.StoreLostOutcomeAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == refused.TickerId), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<bool>(new InvalidOperationException("the store refuses this row")));
+        manager.StoreLostOutcomeAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == next.TickerId), Arg.Any<CancellationToken>())
+            .Returns(true);
+        List(list, refused);
+        List(list, next);
+
+        await Drain(list, manager).RetryAsync();
+
+        var kept = Assert.Single(list.Snapshot());
+        Assert.Equal(refused.TickerId, kept.Context.TickerId);
+        Assert.Equal(1, kept.FailedAttempts);
+        Assert.Contains(_logs.Entries, e => e.Message.Contains("was stored late") && e.Message.Contains(next.TickerId.ToString()));
+    }
+
+    // A write that runs out of its limit ends the pass: the store is out of reach, and waiting once per outcome would hold the
+    // loop that long. The rest wait for the next pass.
+    [Fact]
+    public async Task AWriteThatTimesOut_KeepsTheOutcome_AndEndsThePass()
+    {
+        var list = new LostOutcomeRetryList();
+        var manager = Substitute.For<IInternalTickerManager>();
+        var calls = 0;
         manager.StoreLostOutcomeAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromException<bool>(new InvalidOperationException("the store is down")), Task.FromResult(true));
-        List(list, first);
-        List(list, second);
+            .Returns(call => Interlocked.Increment(ref calls) == 1 ? Hang(call.Arg<CancellationToken>()) : Task.FromResult(true));
+        List(list, Outcome());
+        List(list, Outcome());
         var drain = Drain(list, manager);
+        drain.OutcomeAttemptLimit = TimeSpan.FromMilliseconds(100);
 
         await drain.RetryAsync();
 
+        Assert.Equal(1, calls);
         Assert.Equal(2, list.Snapshot().Count);
         Assert.Equal(1, list.Snapshot()[0].FailedAttempts);
-        await manager.Received(1).StoreLostOutcomeAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
         Assert.DoesNotContain(_logs.Entries, e => e.Level >= LogLevel.Warning);
 
         await drain.RetryAsync();
@@ -219,7 +248,7 @@ public class LostOutcomeDrainTests : IAsyncLifetime
 
         var loopPass = drain.RetryAsync();
         await loopWriteEntered.Task;
-        await drain.StoreAtStopAsync();
+        await drain.StoreAtStopAsync(drain.Epoch);
         releaseLoopWrite.SetResult(true);
         await loopPass;
 
@@ -229,33 +258,64 @@ public class LostOutcomeDrainTests : IAsyncLifetime
     }
 
     // The stop writes each listed outcome once more: a stored one is followed up without claims (the stopped scheduler would
-    // refuse a claimed child); after the first that fails no more are tried, and each one not stored is an error and stays
-    // listed for a start of the scheduler in this process. The list takes nothing more.
+    // refuse a claimed child); one the store refuses does not stop the others, one that runs out of its limit does; each one
+    // not stored is an error and stays listed for a start of the scheduler in this process. The list takes nothing more.
     [Fact]
     public async Task AtTheStop_StoredOutcomesClaimNoChild_AndTheOnesNotStoredAreErrors()
     {
         var list = new LostOutcomeRetryList();
         var manager = Substitute.For<IInternalTickerManager>();
+        var refused = Outcome();
         var stored = Outcome();
-        var failing = Outcome();
+        var timedOut = Outcome();
         var notTried = Outcome();
+        var tried = new System.Collections.Concurrent.ConcurrentQueue<Guid>();
         manager.StoreLostOutcomeAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(Task.FromResult(true), Task.FromException<bool>(new InvalidOperationException("the store is down")));
+            .Returns(call =>
+            {
+                var id = call.Arg<InternalFunctionContext>().TickerId;
+                tried.Enqueue(id);
+                return id == refused.TickerId ? Task.FromException<bool>(new InvalidOperationException("the store refuses this row"))
+                    : id == stored.TickerId ? Task.FromResult(true)
+                    : Hang(call.Arg<CancellationToken>());
+            });
         var followUp = new RecordingFollowUp();
+        List(list, refused);
         List(list, stored);
-        List(list, failing);
+        List(list, timedOut);
         List(list, notTried);
+        var drain = Drain(list, manager, followUp);
+        drain.OutcomeAttemptLimit = TimeSpan.FromMilliseconds(100);
 
-        await Drain(list, manager, followUp).StoreAtStopAsync();
+        await drain.StoreAtStopAsync(list.Epoch);
 
+        Assert.Equal([refused.TickerId, stored.TickerId, timedOut.TickerId], tried);
         Assert.Equal([(stored.TickerId, false)], followUp.Calls);
-        await manager.Received(2).StoreLostOutcomeAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
         var errors = _logs.Entries.Where(e => e.Level == LogLevel.Error).ToList();
-        Assert.Equal(2, errors.Count);
-        Assert.Contains(errors, e => e.Message.Contains(failing.TickerId.ToString()));
-        Assert.Contains(errors, e => e.Message.Contains(notTried.TickerId.ToString()));
-        Assert.Equal(new[] { failing.TickerId, notTried.TickerId }, list.Snapshot().Select(e => e.Context.TickerId));
+        Assert.Equal(3, errors.Count);
+        foreach (var notStored in new[] { refused, timedOut, notTried })
+            Assert.Contains(errors, e => e.Message.Contains(notStored.TickerId.ToString()));
+        Assert.Equal(new[] { refused.TickerId, timedOut.TickerId, notTried.TickerId }, list.Snapshot().Select(e => e.Context.TickerId));
         Assert.False(list.TryAdd(Outcome(), isChild: false, T0));
+    }
+
+    // A start that came while the stop waited for its jobs (the dashboard) keeps the list for the running scheduler: the stop
+    // writes nothing and does not close it.
+    [Fact]
+    public async Task AStopThatAStartOvertook_WritesNothing_AndLeavesTheListOpen()
+    {
+        var list = new LostOutcomeRetryList();
+        var manager = Substitute.For<IInternalTickerManager>();
+        List(list, Outcome());
+        var drain = Drain(list, manager);
+        var stopEpoch = drain.Epoch;
+        drain.Open();
+
+        await drain.StoreAtStopAsync(stopEpoch);
+
+        await manager.DidNotReceiveWithAnyArgs().StoreLostOutcomeAsync(default!, default);
+        Assert.Single(list.Snapshot());
+        Assert.True(list.TryAdd(Outcome(), isChild: false, T0));
     }
 
     [Fact]

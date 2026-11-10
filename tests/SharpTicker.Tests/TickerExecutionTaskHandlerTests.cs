@@ -1076,7 +1076,7 @@ public class TickerExecutionTaskHandlerTests : IDisposable
     {
         var (handler, list, logs) = HandlerWithLostOutcomes();
         _internalManager.FencesRuns.Returns(true);
-        list.Close();
+        list.Close(list.Epoch);
         var context = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
         TheStoreRefusesEveryWrite();
 

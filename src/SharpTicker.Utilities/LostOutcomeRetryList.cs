@@ -90,23 +90,46 @@ internal sealed class LostOutcomeRetryList
     }
 
     /// <summary>
+    /// Which start of the scheduler the list belongs to: <see cref="Open"/> moves it on. A stop takes it when it begins and
+    /// closes the list only if no start came in between (<see cref="Close"/>).
+    /// </summary>
+    internal long Epoch
+    {
+        get
+        {
+            lock (_gate)
+                return _epoch;
+        }
+    }
+
+    private long _epoch;
+
+    /// <summary>
     /// Closes the list as the scheduler stops and returns what is listed, in the same step: an outcome lost after this is not
     /// listed (its caller logs that it is not written again), and none slips in between. The entries stay listed until removed.
+    /// A stop whose <paramref name="epoch"/> is no longer the list's was overtaken by a start (the dashboard started the
+    /// scheduler again while the stop waited for its jobs): the list stays open for the running scheduler, and the stop gets
+    /// nothing to write.
     /// </summary>
-    internal IReadOnlyList<LostOutcome> Close()
+    internal IReadOnlyList<LostOutcome> Close(long epoch)
     {
         lock (_gate)
         {
+            if (epoch != _epoch)
+                return [];
             _open = false;
             return Ordered();
         }
     }
 
-    /// <summary>Opens the list again when the scheduler starts again (the dashboard stops and starts it).</summary>
+    /// <summary>Opens the list for a start of the scheduler (also again after the dashboard stopped and started it).</summary>
     internal void Open()
     {
         lock (_gate)
+        {
+            _epoch++;
             _open = true;
+        }
     }
 
     private List<LostOutcome> Ordered()

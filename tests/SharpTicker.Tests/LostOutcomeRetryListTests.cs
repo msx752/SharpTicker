@@ -97,7 +97,7 @@ public class LostOutcomeRetryListTests
         var before = Outcome();
         list.TryAdd(before, isChild: false, T0);
 
-        var atClose = list.Close();
+        var atClose = list.Close(list.Epoch);
 
         Assert.Equal(before.TickerId, Assert.Single(atClose).Context.TickerId);
         Assert.False(list.TryAdd(Outcome(), isChild: false, T0));
@@ -106,6 +106,25 @@ public class LostOutcomeRetryListTests
         list.Open();
         Assert.True(list.TryAdd(Outcome(), isChild: false, T0));
         Assert.Equal(2, list.Snapshot().Count);
+    }
+
+    // A start that comes while a stop waits for its jobs (the dashboard) opens the list for the running scheduler; the stop's
+    // close, taken with the epoch from before the start, leaves it open and gets nothing to write.
+    [Fact]
+    public void Close_WithTheEpochOfAStopThatAStartOvertook_LeavesTheListOpen()
+    {
+        var list = new LostOutcomeRetryList();
+        list.TryAdd(Outcome(), isChild: false, T0);
+        var stopEpoch = list.Epoch;
+
+        list.Open();
+        var atClose = list.Close(stopEpoch);
+
+        Assert.Empty(atClose);
+        Assert.True(list.TryAdd(Outcome(), isChild: false, T0));
+        Assert.Equal(2, list.Snapshot().Count);
+        Assert.NotEmpty(list.Close(list.Epoch));
+        Assert.False(list.TryAdd(Outcome(), isChild: false, T0));
     }
 
     [Fact]
@@ -119,7 +138,7 @@ public class LostOutcomeRetryListTests
         Assert.True(list.TryAdd(Outcome(), isChild: false, T0));
         Assert.Equal(1, raised);
 
-        list.Close();
+        list.Close(list.Epoch);
         Assert.False(list.TryAdd(Outcome(), isChild: false, T0));
         Assert.Equal(1, raised); // nothing listed, nothing raised
     }

@@ -456,6 +456,8 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        // Taken before the wait: a start that comes while the stop waits for its jobs keeps the list open for itself.
+        var lostOutcomesEpoch = _lostOutcomes?.Epoch ?? 0;
         _taskScheduler.Freeze();
         Interlocked.Exchange(ref _started, 0);
         await base.StopAsync(cancellationToken);
@@ -463,7 +465,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         // The outcomes whose final write threw get one last write, whether or not a job is still running, and before the
         // Cancelled writes: those must not take a row whose real outcome is about to be stored.
         if (_lostOutcomes != null)
-            await _lostOutcomes.StoreAtStopAsync();
+            await _lostOutcomes.StoreAtStopAsync(lostOutcomesEpoch);
         await RecordAsCancelledAsync(stillRunning);
         // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
         // the host gives the stop.
@@ -566,7 +568,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
         }
 
-        _logger?.LogWarning("{JobCount} job(s) had not finished when the wait for them ended and are recorded as Cancelled: {Jobs}. " +
+        _logger?.LogWarning("{JobCount} job(s) had not finished when the wait for them ended and are recorded as Cancelled, unless an entry above says otherwise: {Jobs}. " +
                             "A job that ignores its cancellation token keeps running until the process ends.",
             running.Length, DescribeJobs(running));
     }

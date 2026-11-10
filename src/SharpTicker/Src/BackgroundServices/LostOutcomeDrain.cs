@@ -29,7 +29,6 @@ internal sealed class LostOutcomeDrain
 
     // The reminder while outcomes stay unstored; only the loop's pass uses these.
     private DateTime _nextReminder = DateTime.MinValue;
-    private int _reminders;
 
     public LostOutcomeDrain(LostOutcomeRetryList list, IInternalTickerManager manager, ILateOutcomeFollowUp followUp = null,
         ILogger<LostOutcomeDrain> logger = null, ITickerClock clock = null)
@@ -45,8 +44,8 @@ internal sealed class LostOutcomeDrain
     internal TimeSpan OutcomeAttemptLimit { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// How long outcomes may stay unstored before a reminder is logged, and the time between reminders: the first at Error,
-    /// the later ones at Critical.
+    /// How long outcomes may stay unstored before a reminder is logged, and the time between reminders: at Error until the
+    /// oldest has waited twice this long, at Critical after that.
     /// </summary>
     internal static readonly TimeSpan ReminderInterval = TimeSpan.FromMinutes(5);
 
@@ -69,60 +68,78 @@ internal sealed class LostOutcomeDrain
     {
         Stored,
         NotStored,
-        Failed
+        // The store answered with an error: the next outcome may still be stored (this one may be refused for its own content).
+        Failed,
+        // The attempt used up its limit: the store is out of reach, and waiting for it once per outcome would hold the caller.
+        TimedOut
     }
 
+    /// <summary>The epoch of the list, for a stop to take when it begins (see <see cref="StoreAtStopAsync"/>).</summary>
+    internal long Epoch => _list.Epoch;
+
     /// <summary>
-    /// One pass of the loop: each listed outcome, oldest first, is written once. The first that fails again ends the pass: the
-    /// store is still out of reach, and waiting for it once per outcome would hold the loop that long.
+    /// One pass of the loop: each listed outcome, oldest first, is written once. An attempt that runs out of its limit ends the
+    /// pass: the store is out of reach, and waiting for it once per outcome would hold the loop that long. A write the store
+    /// refuses does not: an outcome it keeps refusing must not hold back the others.
     /// </summary>
     internal async Task RetryAsync()
     {
         var entries = _list.Snapshot();
         if (entries.Count == 0)
         {
-            _reminders = 0;
             _nextReminder = DateTime.MinValue;
             return;
         }
 
+        var failed = false;
         foreach (var entry in entries)
         {
             var (attempt, _) = await TryStoreAsync(entry).ConfigureAwait(false);
+            if (attempt == Attempt.TimedOut)
+            {
+                failed = true;
+                break;
+            }
+
             if (attempt == Attempt.Failed)
             {
-                RemindIfDue();
-                return;
+                failed = true;
+                continue;
             }
 
             await SettleAsync(entry, attempt, claimChildren: true).ConfigureAwait(false);
         }
+
+        if (failed)
+            RemindIfDue();
     }
 
     /// <summary>
-    /// The stop's last attempt: the list is closed (an outcome lost after this is not listed) and each listed outcome is written
-    /// once, each attempt within <see cref="OutcomeAttemptLimit"/> and not bound to the stop's token, which may be used up
-    /// already. The first that fails ends the attempts. A stored outcome claims no child: the stopped scheduler would refuse
-    /// it. Each one not stored is logged at Error and stays listed, for a start of the scheduler in this process.
+    /// The stop's last attempt. <paramref name="epoch"/> is the list's epoch when the stop began: when a start came in between,
+    /// the running scheduler writes the outcomes and the stop does nothing. Otherwise the list is closed (an outcome lost after
+    /// this is not listed) and each listed outcome is written once, each attempt within <see cref="OutcomeAttemptLimit"/> and
+    /// not bound to the stop's token, which may be used up already. An attempt that runs out of its limit ends the attempts; one
+    /// the store refuses does not. A stored outcome claims no child: the stopped scheduler would refuse it. Each one not stored
+    /// is logged at Error and stays listed, for a start of the scheduler in this process.
     /// </summary>
-    internal async Task StoreAtStopAsync()
+    internal async Task StoreAtStopAsync(long epoch)
     {
-        var entries = _list.Close();
+        var entries = _list.Close(epoch);
         Exception storeFailure = null;
-        var storeFailed = false;
+        var outOfReach = false;
 
         foreach (var entry in entries)
         {
-            if (!storeFailed)
+            if (!outOfReach)
             {
                 var (attempt, failure) = await TryStoreAsync(entry).ConfigureAwait(false);
-                if (attempt != Attempt.Failed)
+                if (attempt is Attempt.Stored or Attempt.NotStored)
                 {
                     await SettleAsync(entry, attempt, claimChildren: false).ConfigureAwait(false);
                     continue;
                 }
 
-                storeFailed = true;
+                outOfReach = attempt == Attempt.TimedOut;
                 storeFailure = failure;
             }
 
@@ -146,7 +163,7 @@ internal sealed class LostOutcomeDrain
             var attempts = entry.RecordFailedAttempt();
             _logger?.LogDebug(ex, "Writing the {Status} outcome of {FunctionName} ({TickerId}) again failed, attempt {Attempts}.",
                 entry.Context.Status, entry.Context.FunctionName, entry.Context.TickerId, attempts);
-            return (Attempt.Failed, ex);
+            return (limit.IsCancellationRequested ? Attempt.TimedOut : Attempt.Failed, ex);
         }
     }
 
@@ -161,7 +178,7 @@ internal sealed class LostOutcomeDrain
         if (attempt == Attempt.NotStored)
         {
             _logger?.LogWarning(
-                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: its row was released or taken by another run meanwhile, so the job may run again. Its chain children are neither run nor skipped.",
+                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: its row is no longer this run's (it was released, taken by another run, or ended meanwhile), so the job may run again. Its chain children are neither run nor skipped.",
                 context.Status, context.FunctionName, context.TickerId);
             return;
         }
@@ -184,7 +201,8 @@ internal sealed class LostOutcomeDrain
     }
 
     // While outcomes stay unstored their rows stay InProgress, and the attempts are written at Debug: once the oldest has
-    // waited ReminderInterval, a reminder names them, at Error the first time and at Critical after that, every interval.
+    // waited ReminderInterval, a reminder names them every interval: at Error while the oldest has waited less than twice the
+    // interval, at Critical after that.
     private void RemindIfDue()
     {
         var entries = _list.Snapshot();
@@ -197,7 +215,7 @@ internal sealed class LostOutcomeDrain
             return;
 
         _nextReminder = now + ReminderInterval;
-        var level = _reminders++ == 0 ? LogLevel.Error : LogLevel.Critical;
+        var level = waiting < ReminderInterval * 2 ? LogLevel.Error : LogLevel.Critical;
         var listed = string.Join(", ", entries.Take(MaxJobsInLog).Select(e => $"{e.Context.FunctionName} ({e.Context.TickerId})"));
         if (entries.Count > MaxJobsInLog)
             listed += $" and {entries.Count - MaxJobsInLog} more";
