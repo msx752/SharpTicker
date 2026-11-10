@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.Exceptions;
 using SharpTicker.Utilities;
@@ -29,6 +30,8 @@ public class TickerExecutionTaskHandlerTests : IDisposable
         _clock = Substitute.For<ITickerClock>();
         _clock.UtcNow.Returns(DateTime.UtcNow);
         _internalManager = Substitute.For<IInternalTickerManager>();
+        // The store has every write, unless a test says otherwise.
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         _instrumentation = Substitute.For<ISharpTickerInstrumentation>();
 
         var services = new ServiceCollection();
@@ -206,7 +209,7 @@ public class TickerExecutionTaskHandlerTests : IDisposable
     {
         var tokens = new List<CancellationToken>();
         _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
-            .Returns(call => { tokens.Add(call.ArgAt<CancellationToken>(1)); return Task.CompletedTask; });
+            .Returns(call => { tokens.Add(call.ArgAt<CancellationToken>(1)); return Task.FromResult(true); });
         return tokens;
     }
 
@@ -746,6 +749,221 @@ public class TickerExecutionTaskHandlerTests : IDisposable
             Arg.Is(context.TickerId),
             Arg.Is(context.FunctionName),
             Arg.Any<string>());
+    }
+
+    #endregion
+
+    #region Outcome not stored
+
+    // Each final outcome a job can end with, and a function that ends with it.
+    public static TheoryData<TickerStatus> FinalOutcomes => new()
+    {
+        TickerStatus.Done, TickerStatus.Failed, TickerStatus.Cancelled, TickerStatus.Skipped
+    };
+
+    private static TickerFunctionDelegate EndingWith(TickerStatus outcome) => outcome switch
+    {
+        TickerStatus.Done => (_, _, _) => Task.CompletedTask,
+        TickerStatus.Failed => (_, _, _) => throw new InvalidOperationException("the job failed"),
+        TickerStatus.Cancelled => (_, _, _) => throw new TaskCanceledException("the job was cancelled"),
+        TickerStatus.Skipped => (_, _, _) => throw new TerminateExecutionException(TickerStatus.Skipped, "the job skipped itself"),
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome))
+    };
+
+    private void TheStoreRefusesEveryWrite() =>
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<bool>(new InvalidOperationException("the store is down")));
+
+    private (TickerExecutionTaskHandler Handler, CapturedLogs Logs) HandlerWithLogs()
+    {
+        var logs = new CapturedLogs();
+        var services = new ServiceCollection();
+        services.AddSingleton(_internalManager);
+        services.AddSingleton(_instrumentation);
+        services.AddLogging(b => b.AddProvider(logs));
+        return (new TickerExecutionTaskHandler(services.BuildServiceProvider(), _clock, _instrumentation, _internalManager), logs);
+    }
+
+    // The final status write can fail, for example while the store is unreachable. The job has ended all the same, so it must
+    // leave the registry of running jobs: a stop would otherwise wait for it and record it as Cancelled, and with a parent id
+    // every later occurrence of its cron ticker would see it as running and skip itself.
+    [Theory]
+    [MemberData(nameof(FinalOutcomes))]
+    public async Task ExecuteTaskAsync_WhenTheFinalWriteFails_TheJobIsNoLongerListedAsRunning(TickerStatus outcome)
+    {
+        var parentId = Guid.NewGuid();
+        var context = CreateContext(ct: EndingWith(outcome));
+        context.ParentId = parentId;
+        TheStoreRefusesEveryWrite();
+
+        var failure = await Record.ExceptionAsync(() => _handler.ExecuteTaskAsync(context, isDue: false));
+
+        Assert.Null(failure);
+        Assert.Equal(outcome, context.Status);
+        Assert.Empty(TickerCancellationTokenManager.GetRunningJobs(_handler));
+        Assert.False(TickerCancellationTokenManager.IsParentRunning(parentId),
+            "the ended job still counts as a running occurrence of its cron ticker");
+    }
+
+    // A lost outcome leaves the row InProgress in the store, so it is logged where an operator looks: as an error that names
+    // the job and the outcome that was lost.
+    [Theory]
+    [MemberData(nameof(FinalOutcomes))]
+    public async Task ExecuteTaskAsync_WhenTheFinalWriteFails_TheLostOutcomeIsLoggedAsAnError(TickerStatus outcome)
+    {
+        var (handler, logs) = HandlerWithLogs();
+        var context = CreateContext(ct: EndingWith(outcome));
+        TheStoreRefusesEveryWrite();
+
+        await Record.ExceptionAsync(() => handler.ExecuteTaskAsync(context, isDue: false));
+
+        var error = Assert.Single(logs.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains(context.TickerId.ToString(), error.Message);
+        Assert.Contains(context.FunctionName, error.Message);
+        Assert.Contains($"The {outcome} outcome", error.Message);
+        Assert.Equal("the store is down", error.Exception?.Message);
+    }
+
+    // A final write that matched no row (the row was deleted while the job ran) stored nothing either. That is logged as a
+    // warning that names the job and the outcome, not as an error: there is no row left to be stuck.
+    [Fact]
+    public async Task ExecuteTaskAsync_WhenTheFinalWriteMatchesNoRow_TheOutcomeNotStoredIsLoggedAsAWarning()
+    {
+        var (handler, logs) = HandlerWithLogs();
+        var context = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.DoesNotContain(logs.Entries, e => e.Level == LogLevel.Error);
+        var warning = Assert.Single(logs.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains(context.TickerId.ToString(), warning.Message);
+        Assert.Contains(context.FunctionName, warning.Message);
+        Assert.Contains("The Done outcome", warning.Message);
+    }
+
+    // The stop waits for the jobs that are still running and records each as Cancelled. A job whose final write failed has
+    // ended, so the stop neither waits for it nor writes Cancelled over its row.
+    [Fact]
+    public async Task AStop_AfterAJobsFinalWriteFailed_NeitherWaitsForItNorRecordsItAsCancelled()
+    {
+        var context = CreateContext(ct: (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+        await Record.ExceptionAsync(() => _handler.ExecuteTaskAsync(context, isDue: false));
+
+        var serviceManager = Substitute.For<IInternalTickerManager>();
+        serviceManager.GetNextTickers(Arg.Any<CancellationToken>())
+            .Returns((Timeout.InfiniteTimeSpan, Array.Empty<InternalFunctionContext>()));
+        var service = new SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService(
+            new TickerExecutionContext(), _handler, Substitute.For<ISharpTickerTaskScheduler>(), serviceManager,
+            new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(50) }, new TickerFunctionConcurrencyGate())
+        {
+            ShutdownWaitLimit = TimeSpan.FromSeconds(5)
+        };
+        await service.StartAsync(CancellationToken.None);
+
+        var stopping = System.Diagnostics.Stopwatch.StartNew();
+        await service.StopAsync(CancellationToken.None);
+        stopping.Stop();
+        service.Dispose();
+
+        await serviceManager.DidNotReceive().UpdateTickerAsync(
+            Arg.Is<InternalFunctionContext>(c => c.TickerId == context.TickerId), Arg.Any<CancellationToken>());
+        Assert.True(stopping.Elapsed < TimeSpan.FromSeconds(4), $"the stop waited {stopping.Elapsed} for a job that had ended");
+    }
+
+    // The write that records a failed attempt only keeps the dashboard current. When it fails, the retry still runs.
+    [Fact]
+    public async Task ExecuteTaskAsync_WhenRecordingAFailedAttemptFails_TheRetryStillRuns()
+    {
+        var calls = 0;
+        var context = CreateContext(ct: (_, _, _) => ++calls == 1 ? throw new InvalidOperationException("first attempt fails") : Task.CompletedTask);
+        context.Retries = 1;
+        context.RetryIntervals = [0];
+        var finalWrites = new List<TickerStatus>();
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var written = call.Arg<InternalFunctionContext>();
+                if (written.Status == TickerStatus.InProgress)
+                    return Task.FromException<bool>(new InvalidOperationException("the store is down for a moment"));
+                finalWrites.Add(written.Status);
+                return Task.FromResult(true);
+            });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.Equal(2, calls);
+        Assert.Equal([TickerStatus.Done], finalWrites);
+    }
+
+    // The write of the next retry's number is not an attempt of the job. When it fails, the retry still runs instead of the
+    // failed write being counted as the retry having failed.
+    [Fact]
+    public async Task ExecuteTaskAsync_WhenRecordingTheNextRetryFails_TheRetryStillRuns()
+    {
+        var calls = 0;
+        var context = CreateContext(ct: (_, _, _) => ++calls == 1 ? throw new InvalidOperationException("first attempt fails") : Task.CompletedTask);
+        context.Retries = 1;
+        context.RetryIntervals = [0];
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var written = call.Arg<InternalFunctionContext>();
+                return written.Status == TickerStatus.InProgress && written.RetryCount == 1
+                    ? Task.FromException<bool>(new InvalidOperationException("the store is down for a moment"))
+                    : Task.FromResult(true);
+            });
+
+        await _handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.Equal(2, calls);
+        Assert.Equal(TickerStatus.Done, context.Status);
+    }
+
+    // The children follow the parent's outcome as the store has it. When the parent's final write fails, the store does not
+    // have it, so no child runs and none is skipped: a child that runs on success, and one that would be skipped on success.
+    [Fact]
+    public async Task ExecuteTaskAsync_WhenTheParentsFinalWriteFails_NoChildRunsAndNoneIsSkipped()
+    {
+        var childRan = false;
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        var onSuccess = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { childRan = true; return Task.CompletedTask; });
+        onSuccess.RunCondition = RunCondition.OnSuccess;
+        var onFailure = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { childRan = true; return Task.CompletedTask; });
+        onFailure.RunCondition = RunCondition.OnFailure;
+        parent.TimeTickerChildren.Add(onSuccess);
+        parent.TimeTickerChildren.Add(onFailure);
+        _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == parent.TickerId), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<bool>(new InvalidOperationException("the store is down")));
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.False(childRan, "a child ran although its parent's outcome was never stored");
+        await _internalManager.DidNotReceive().UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Any<InternalFunctionContext[]>(), Arg.Any<CancellationToken>());
+    }
+
+    // The same when the write went through but matched no row: the store has no outcome to follow.
+    [Fact]
+    public async Task ExecuteTaskAsync_WhenTheParentsFinalWriteMatchesNoRow_NoChildRunsAndNoneIsSkipped()
+    {
+        var childRan = false;
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        var onSuccess = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { childRan = true; return Task.CompletedTask; });
+        onSuccess.RunCondition = RunCondition.OnSuccess;
+        var onFailure = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { childRan = true; return Task.CompletedTask; });
+        onFailure.RunCondition = RunCondition.OnFailure;
+        parent.TimeTickerChildren.Add(onSuccess);
+        parent.TimeTickerChildren.Add(onFailure);
+        _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == parent.TickerId), Arg.Any<CancellationToken>())
+            .Returns(false);
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.False(childRan, "a child ran although its parent's outcome was never stored");
+        await _internalManager.DidNotReceive().UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Any<InternalFunctionContext[]>(), Arg.Any<CancellationToken>());
     }
 
     #endregion

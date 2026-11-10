@@ -421,7 +421,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             Released.TrySetResult();
         }
 
-        public Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.UpdateTickerAsync(context, cancellationToken);
+        public Task<bool> UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.UpdateTickerAsync(context, cancellationToken);
         public Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default) => inner.GetRequestAsync<T>(tickerId, type, cancellationToken);
         public Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default) => inner.GetRequestAsync(tickerId, type, typeInfo, cancellationToken);
         public Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default) => inner.RunTimedOutTickers(cancellationToken);
