@@ -252,6 +252,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
     private static int Rvi(RedisValue v) => int.Parse(v.ToString());
 
     private static readonly string MarkInProgressScriptText = LuaScriptLoader.Load("MarkInProgress");
+    private static readonly string CompareAndSetScriptText = LuaScriptLoader.Load("CompareAndSet");
 
     private void SetupScriptOperations()
     {
@@ -264,6 +265,15 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
                 var keys = callInfo.ArgAt<RedisKey[]>(1);
                 var argv = callInfo.ArgAt<RedisValue[]>(2);
                 var entityKey = (string)keys[0];
+
+                // CompareAndSet: GET == ARGV[1] -> SET ARGV[2]; 1 written, 0 changed, -1 missing.
+                if (script == CompareAndSetScriptText)
+                {
+                    if (!_store.TryGetValue(entityKey, out var current)) return RedisResult.Create((RedisValue)(-1));
+                    if (current != (string)argv[0]) return RedisResult.Create((RedisValue)0);
+                    _store[entityKey] = (string)argv[1]!;
+                    return RedisResult.Create((RedisValue)1);
+                }
 
                 if (!_store.TryGetValue(entityKey, out var json))
                     return RedisResult.Create(RedisValue.Null);

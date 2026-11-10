@@ -279,6 +279,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         
         context.SetProperty(x => x.Status, TickerStatus.InProgress);
 
+        // A claimed job's writes are fenced by the marker its claim wrote. An inline chain child got its marker when its start
+        // was recorded (RecordChildInProgressAsync), or none when that failed.
+        if (!isChild)
+            context.RunMarker = context.ClaimMarker;
+
         var stopWatch = new Stopwatch();
         // Total wall-clock from first attempt start through the final outcome,
         // including retry wait intervals. Persisted as ElapsedTime so the
@@ -493,7 +498,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
                 return true;
 
             Logger?.LogWarning(
-                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: no stored row matched, as the row was deleted while the job ran (on the in-memory store, also when it was changed). Any chain children are neither run nor skipped.",
+                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: no stored row matched, as the row was deleted while the job ran, or released and taken by another run. Any chain children are neither run nor skipped.",
                 context.Status, context.FunctionName, context.TickerId);
             return false;
         }
@@ -609,10 +614,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
     // ever run, nor the rest of the chain. Its final status is written as usual.
     private async Task RecordChildInProgressAsync(InternalFunctionContext child, CancellationToken cancellationToken)
     {
-        child.SetProperty(x => x.Status, TickerStatus.InProgress);
         try
         {
-            await _internalTickerManager.UpdateTickerAsync(child, cancellationToken);
+            await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken);
         }
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
         {
@@ -620,7 +624,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway.",
+            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway, and its writes are by Id, not fenced.",
                 child.FunctionName, child.TickerId);
         }
         finally

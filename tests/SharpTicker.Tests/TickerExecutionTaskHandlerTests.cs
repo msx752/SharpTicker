@@ -968,6 +968,47 @@ public class TickerExecutionTaskHandlerTests : IDisposable
 
     #endregion
 
+    #region Run marker
+
+    // The store fences a run's writes with its RunMarker (#74): a claimed job's run uses the marker its claim wrote, and an
+    // inline child the marker its start was recorded with. Without it every write would go out unfenced.
+    [Fact]
+    public async Task ExecuteTaskAsync_FencesTheWritesOfAClaimedJob_WithItsClaimMarker()
+    {
+        var claimMarker = new DateTime(2025, 6, 15, 12, 0, 0, 123, DateTimeKind.Utc);
+        var context = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        context.ClaimMarker = claimMarker;
+        var markers = new List<DateTime?>();
+        _internalManager.When(x => x.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()))
+            .Do(call => markers.Add(call.Arg<InternalFunctionContext>().RunMarker));
+
+        await _handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.Equal([claimMarker], markers);
+    }
+
+    [Fact]
+    public async Task ExecuteTaskAsync_FencesTheWritesOfAnInlineChild_WithTheMarkerOfItsStart()
+    {
+        var startMarker = new DateTime(2025, 6, 15, 12, 0, 1, 456, DateTimeKind.Utc);
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        parent.ClaimMarker = startMarker.AddSeconds(-1);
+        var child = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        child.RunCondition = RunCondition.OnSuccess;
+        parent.TimeTickerChildren.Add(child);
+        _internalManager.When(x => x.RecordChildStartedAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(call => call.Arg<InternalFunctionContext>().RunMarker = startMarker);
+        var childMarkers = new List<DateTime?>();
+        _internalManager.When(x => x.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+            .Do(call => childMarkers.Add(call.Arg<InternalFunctionContext>().RunMarker));
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal([startMarker], childMarkers);
+    }
+
+    #endregion
+
     #region Helpers
 
     private static InternalFunctionContext CreateContext(

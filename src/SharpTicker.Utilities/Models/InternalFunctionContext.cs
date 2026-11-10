@@ -44,6 +44,13 @@ namespace SharpTicker.Utilities.Models
         internal DateTime? ClaimMarker { get; set; }
 
         /// <summary>
+        /// The marker that fences the writes of this run (see <see cref="Interfaces.IFencedRunWriter"/>): the claim marker of a
+        /// claimed job, or the start marker of an inline chain child. Null when the run is not fenced: the job was not
+        /// claimed, its start could not be recorded, or the store does not fence.
+        /// </summary>
+        internal DateTime? RunMarker { get; set; }
+
+        /// <summary>
         /// True for a chain child (or grandchild) that has an execution time of its own. Such a child is a row of its own: its
         /// parent's run never runs it, the store hands it out once the parent has ended with a status its
         /// <see cref="RunCondition"/> accepts and its time has come (see <see cref="ChainRunGate"/>).

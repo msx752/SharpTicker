@@ -26,7 +26,11 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         // Writes the function's changed fields to its row. True when the store has them: a time ticker store reports the rows
         // it wrote, so 0 rows (the row was deleted while the job ran) is false. A cron occurrence store reports nothing, so
         // there a write that did not throw counts as stored.
+        // A run with a RunMarker on a fencing store writes only to the row it still holds (IFencedRunWriter); 0 rows is false.
         Task<bool> UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // Records an inline chain child as started (InProgress). On a fencing store it also takes this node's lock and a run
+        // marker, set on the child when the row was written; otherwise the child's writes stay by Id. Throws when the store fails.
+        Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);
         Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default);
