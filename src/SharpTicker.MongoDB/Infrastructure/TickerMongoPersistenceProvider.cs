@@ -21,7 +21,7 @@ using SharpTicker.Utilities.Models;
 namespace SharpTicker.MongoDB.Infrastructure
 {
     internal sealed class TickerMongoPersistenceProvider<TTimeTicker, TCronTicker> :
-        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut, IChildSkipWriter
+        ITickerPersistenceProvider<TTimeTicker, TCronTicker>, IClaimFanOut, IChildSkipWriter, IFencedRunWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -761,6 +761,64 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .ConfigureAwait(false);
         }
 
+        // ===================================================================
+        // IFencedRunWriter — the writes of a run land only on the row it still holds
+        // ===================================================================
+
+        // The counts are MatchedCount, not ModifiedCount: a write that landed and is sent again writes the same values, which
+        // Mongo reports as not modified, and it is still stored.
+
+        public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<TTimeTicker>.Filter;
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker)),
+                    MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(context, runMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return (int)result.MatchedCount;
+        }
+
+        public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, context.TickerId), fb.Eq(x => x.LockHolder, _lockHolder), fb.Eq(x => x.UpdatedAt, runMarker)),
+                    MongoUpdateBuilders.BuildCronOccurrenceUpdate<TCronTicker>(context, runMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return (int)result.MatchedCount;
+        }
+
+        public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
+        {
+            var result = await _context.TimeTickers
+                .UpdateOneAsync(
+                    Builders<TTimeTicker>.Filter.Eq(x => x.Id, timeTickerId),
+                    Builders<TTimeTicker>.Update
+                        .Set(x => x.Status, TickerStatus.InProgress)
+                        .Set(x => x.LockHolder, _lockHolder)
+                        .Set(x => x.LockedAt, _clock.UtcNow)
+                        .Set(x => x.UpdatedAt, runMarker),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return (int)result.MatchedCount;
+        }
+
+        public async Task<int> UpdateNotStartedCronOccurrenceAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+        {
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
+            var result = await _context.CronTickerOccurrences
+                .UpdateOneAsync(
+                    fb.And(fb.Eq(x => x.Id, context.TickerId), fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued })),
+                    MongoUpdateBuilders.BuildCronOccurrenceUpdate<TCronTicker>(context, _clock.UtcNow),
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return (int)result.MatchedCount;
+        }
+
         public async Task ReleaseAcquiredCronTickerOccurrences(Guid[] occurrenceIds, CancellationToken cancellationToken = default)
         {
             var now = _clock.UtcNow;
@@ -933,18 +991,93 @@ namespace SharpTicker.MongoDB.Infrastructure
         private async Task<int> ReplaceWithChildren(TTimeTicker ticker, Guid? parentId, CancellationToken ct)
         {
             if (parentId.HasValue) ticker.ParentId = parentId.Value;
-            var result = await _context.TimeTickers.ReplaceOneAsync(
-                Builders<TTimeTicker>.Filter.Eq(x => x.Id, ticker.Id),
-                ticker,
-                new ReplaceOptions { IsUpsert = true },
-                ct).ConfigureAwait(false);
-            var count = (int)result.ModifiedCount + (result.UpsertedId is null ? 0 : 1);
+            var count = await ReplaceKeepingRunAsync(ticker, ct).ConfigureAwait(false);
             if (ticker.Children != null)
             {
                 foreach (var child in ticker.Children)
                     if (child is TTimeTicker c) count += await ReplaceWithChildren(c, ticker.Id, ct).ConfigureAwait(false);
             }
             return count;
+        }
+
+        // Bounds the rounds of an edit whose row keeps changing between its read and its write.
+        private const int MaxEditAttempts = 8;
+
+        /// <summary>
+        /// Writes one row of a full-entity update (UpdateAsync, the dashboard edit) and keeps the run of a running row
+        /// (<see cref="RunStateOnEdit"/>), atomically per row:
+        /// <list type="number">
+        /// <item>A row that is InProgress takes only the edit fields: its status, lock, run marker and the fields the run writes
+        /// stay, so the run's fenced writes still land and the job is not run again.</item>
+        /// <item>Any other row is replaced. A body that still shows a run (read while the job ran, sent after it ended) does not
+        /// bring the run back: the stored status and lock are kept, by a replace that matches the values read, or Idle with no
+        /// lock when there is no row.</item>
+        /// <item>A row that became InProgress in between fails the upsert with a duplicate key; that is tried once more, then
+        /// thrown.</item>
+        /// </list>
+        /// The replace upserts, as it did before: a row deleted in the meantime is created again (pre-existing behaviour).
+        /// </summary>
+        private async Task<int> ReplaceKeepingRunAsync(TTimeTicker ticker, CancellationToken ct)
+        {
+            var coll = _context.TimeTickers;
+            var fb = Builders<TTimeTicker>.Filter;
+            var byId = fb.Eq(x => x.Id, ticker.Id);
+            var notRunning = fb.And(byId, fb.Ne(x => x.Status, TickerStatus.InProgress));
+            var duplicateKeySeen = false;
+
+            for (var attempt = 0; attempt < MaxEditAttempts; attempt++)
+            {
+                var edit = await coll.UpdateOneAsync(
+                    fb.And(byId, fb.Eq(x => x.Status, TickerStatus.InProgress)),
+                    MongoUpdateBuilders.BuildEditOfRunningTimeTicker(ticker, coll.DocumentSerializer),
+                    cancellationToken: ct).ConfigureAwait(false);
+                if (edit.MatchedCount > 0)
+                    return (int)edit.ModifiedCount;
+
+                var body = ticker;
+                var filter = notRunning;
+                var upsert = true;
+                if (ticker.Status == TickerStatus.InProgress)
+                {
+                    var stored = await coll.Find(notRunning)
+                        .Project(x => new { x.Status, x.LockHolder, x.LockedAt })
+                        .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+
+                    body = MongoUpdateBuilders.CopyOf(ticker, coll.DocumentSerializer);
+                    if (stored is null)
+                    {
+                        body.Status = TickerStatus.Idle;
+                        body.LockHolder = null;
+                        body.LockedAt = null;
+                    }
+                    else
+                    {
+                        body.Status = stored.Status;
+                        body.LockHolder = stored.LockHolder;
+                        body.LockedAt = stored.LockedAt;
+                        // Only the row as read: one that changed after the read is read again.
+                        filter = fb.And(byId,
+                            fb.Eq(x => x.Status, stored.Status),
+                            fb.Eq(x => x.LockHolder, stored.LockHolder),
+                            fb.Eq(x => x.LockedAt, stored.LockedAt));
+                        upsert = false;
+                    }
+                }
+
+                try
+                {
+                    var replaced = await coll.ReplaceOneAsync(filter, body, new ReplaceOptions { IsUpsert = upsert }, ct).ConfigureAwait(false);
+                    if (replaced.MatchedCount > 0 || replaced.UpsertedId != null)
+                        return (int)replaced.ModifiedCount + (replaced.UpsertedId is null ? 0 : 1);
+                }
+                catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey && !duplicateKeySeen)
+                {
+                    // The row became InProgress after the first step: the next round writes the edit fields only.
+                    duplicateKeySeen = true;
+                }
+            }
+
+            throw new InvalidOperationException($"Time ticker {ticker.Id} kept changing while it was being updated; it was not updated.");
         }
 
         public async Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default)
