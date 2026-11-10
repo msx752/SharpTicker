@@ -968,6 +968,238 @@ public class TickerExecutionTaskHandlerTests : IDisposable
 
     #endregion
 
+    #region Lost outcome listed (#74 PR-C)
+
+    // The handler with the list the scheduler writes lost outcomes again from, as the background services register it.
+    private (TickerExecutionTaskHandler Handler, LostOutcomeRetryList List, CapturedLogs Logs) HandlerWithLostOutcomes(
+        ISharpTickerDispatcher? dispatcher = null)
+    {
+        var logs = new CapturedLogs();
+        var list = new LostOutcomeRetryList();
+        var services = new ServiceCollection();
+        services.AddSingleton(_internalManager);
+        services.AddSingleton(_instrumentation);
+        services.AddSingleton(list);
+        if (dispatcher != null)
+            services.AddSingleton(dispatcher);
+        services.AddLogging(b => b.AddProvider(logs));
+        return (new TickerExecutionTaskHandler(services.BuildServiceProvider(), _clock, _instrumentation, _internalManager), list, logs);
+    }
+
+    private static InternalFunctionContext ClaimedContext(TickerType type, TickerFunctionDelegate run)
+    {
+        var context = CreateContext(type: type, ct: run);
+        context.ClaimMarker = new DateTime(2025, 6, 15, 12, 0, 0, 123, DateTimeKind.Utc);
+        return context;
+    }
+
+    // A claimed job on a fencing store whose final write throws: its outcome is listed for the scheduler to write again, as a
+    // copy with the run's marker, and the error says so.
+    [Theory]
+    [InlineData(TickerType.TimeTicker)]
+    [InlineData(TickerType.CronTickerOccurrence)]
+    public async Task WhenTheFinalWriteThrows_OnAFencingStore_TheOutcomeIsListedToBeWrittenAgain(TickerType type)
+    {
+        var (handler, list, logs) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        var context = ClaimedContext(type, (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        var listed = Assert.Single(list.Snapshot());
+        Assert.Equal(context.TickerId, listed.Context.TickerId);
+        Assert.NotSame(context, listed.Context);
+        Assert.Equal(TickerStatus.Done, listed.Context.Status);
+        Assert.Equal(context.ClaimMarker, listed.RunMarker);
+        Assert.False(listed.IsChild);
+        var error = Assert.Single(logs.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains("The scheduler writes it again", error.Message);
+    }
+
+    // The outcome is listed before the job leaves the registry of running jobs, so a stop that finds no job running already
+    // finds the outcome in the list.
+    [Fact]
+    public async Task WhenTheFinalWriteThrows_TheOutcomeIsListedWhileTheJobStillCountsAsRunning()
+    {
+        var (handler, list, _) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        var context = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+        bool? runningWhenListed = null;
+        list.Added += () => runningWhenListed = TickerCancellationTokenManager.GetRunningJobs(handler).Any(j => j.TickerId == context.TickerId);
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.True(runningWhenListed);
+        Assert.Empty(TickerCancellationTokenManager.GetRunningJobs(handler));
+    }
+
+    // A claimed job carries its marker whatever the store. On a store that does not fence, a write again would be by Id and
+    // could land on a later run of the row, so nothing is listed and the loss is logged as before.
+    [Fact]
+    public async Task WhenTheFinalWriteThrows_OnAStoreThatDoesNotFence_NothingIsListed()
+    {
+        var (handler, list, logs) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(false);
+        var context = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.True(list.IsEmpty);
+        var error = Assert.Single(logs.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains("the job can then run again", error.Message);
+        Assert.DoesNotContain("writes it again", error.Message);
+    }
+
+    // A job that was not claimed (no marker) is not fenced either.
+    [Fact]
+    public async Task WhenTheFinalWriteThrows_ForAJobThatWasNotClaimed_NothingIsListed()
+    {
+        var (handler, list, _) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        var context = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.True(list.IsEmpty);
+    }
+
+    // While the scheduler stops its list takes nothing more; the loss is logged with that.
+    [Fact]
+    public async Task WhenTheFinalWriteThrows_WhileTheSchedulerStops_NothingIsListedAndTheErrorSaysWhy()
+    {
+        var (handler, list, logs) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        list.Close();
+        var context = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
+        TheStoreRefusesEveryWrite();
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.True(list.IsEmpty);
+        var error = Assert.Single(logs.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains("The scheduler is stopping, so it is not written again.", error.Message);
+    }
+
+    // A final write that matched no row: the fence did not hold, the row is not this run's, so there is nothing to write again.
+    [Fact]
+    public async Task WhenTheFinalWriteMatchesNoRow_NothingIsListed()
+    {
+        var (handler, list, _) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        var context = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(false);
+
+        await handler.ExecuteTaskAsync(context, isDue: false);
+
+        Assert.True(list.IsEmpty);
+    }
+
+    // An inline chain child is fenced by the marker its start was recorded with: listed then, and not when its start could
+    // not be recorded (no marker, its writes are by Id).
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WhenAnInlineChildsFinalWriteThrows_ItIsListedOnlyWithTheMarkerOfItsStart(bool startRecorded)
+    {
+        var (handler, list, _) = HandlerWithLostOutcomes();
+        _internalManager.FencesRuns.Returns(true);
+        var parent = ClaimedContext(TickerType.TimeTicker, (_, _, _) => Task.CompletedTask);
+        var child = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        child.RunCondition = RunCondition.OnSuccess;
+        parent.TimeTickerChildren.Add(child);
+        if (startRecorded)
+            _internalManager.When(x => x.RecordChildStartedAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>()))
+                .Do(call => call.Arg<InternalFunctionContext>().RunMarker = parent.ClaimMarker!.Value.AddSeconds(1));
+        _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
+            .Returns(Task.FromException<bool>(new InvalidOperationException("the store is down")));
+
+        await handler.ExecuteTaskAsync(parent, isDue: false);
+
+        if (startRecorded)
+            Assert.True(Assert.Single(list.Snapshot()).IsChild);
+        else
+            Assert.True(list.IsEmpty);
+    }
+
+    private static InternalFunctionContext DelayedChild(RunCondition condition, DateTime executionTime)
+    {
+        var child = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        child.RunCondition = condition;
+        child.ExecutionTime = executionTime;
+        child.IsDelayed = true;
+        return child;
+    }
+
+    // After a late store the delayed children follow the outcome: one it does not let run is skipped with its descendants; one
+    // it lets run is not skipped, and when due it is claimed to run now.
+    [Fact]
+    public async Task AfterALateStore_ADelayedChildTheOutcomeDoesNotLetRunIsSkipped_AndADueOneItLetsRunIsClaimed()
+    {
+        var dispatcher = Substitute.For<ISharpTickerDispatcher>();
+        dispatcher.IsEnabled.Returns(true);
+        var (handler, _, _) = HandlerWithLostOutcomes(dispatcher);
+        var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Done);
+        var onSuccess = DelayedChild(RunCondition.OnSuccess, DateTime.UtcNow.AddMinutes(-1));
+        var onFailure = DelayedChild(RunCondition.OnFailure, DateTime.UtcNow.AddMinutes(-1));
+        var grandchild = CreateContext(type: TickerType.TimeTicker);
+        onFailure.TimeTickerChildren.Add(grandchild);
+        outcome.TimeTickerChildren.Add(onSuccess);
+        outcome.TimeTickerChildren.Add(onFailure);
+        _internalManager.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns([]);
+
+        await handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+
+        await _internalManager.Received(1).AcquireDelayedChildrenAsync(
+            Arg.Is<Guid[]>(ids => ids.SequenceEqual(new[] { onSuccess.TickerId })), Arg.Any<CancellationToken>());
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { onFailure.TickerId, grandchild.TickerId })),
+            Arg.Any<CancellationToken>());
+    }
+
+    // At the stop nothing is claimed: the stopped scheduler would refuse it and put it back. The skips are still written.
+    [Fact]
+    public async Task AfterALateStore_WithoutClaims_NothingIsClaimed_AndTheSkipsAreWritten()
+    {
+        var dispatcher = Substitute.For<ISharpTickerDispatcher>();
+        dispatcher.IsEnabled.Returns(true);
+        var (handler, _, _) = HandlerWithLostOutcomes(dispatcher);
+        var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Failed);
+        var onSuccess = DelayedChild(RunCondition.OnSuccess, DateTime.UtcNow.AddMinutes(-1));
+        var onFailure = DelayedChild(RunCondition.OnFailure, DateTime.UtcNow.AddMinutes(-1));
+        outcome.TimeTickerChildren.Add(onSuccess);
+        outcome.TimeTickerChildren.Add(onFailure);
+
+        await handler.AfterLateStoreAsync(outcome, claimChildren: false, CancellationToken.None);
+
+        await _internalManager.DidNotReceiveWithAnyArgs().AcquireDelayedChildrenAsync(default!, default);
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { onSuccess.TickerId })),
+            Arg.Any<CancellationToken>());
+    }
+
+    // Inline children are not run or skipped after a late store (that is for a later change); only the delayed ones follow.
+    [Fact]
+    public async Task AfterALateStore_InlineChildrenAreLeftAlone()
+    {
+        var (handler, _, _) = HandlerWithLostOutcomes();
+        var ran = false;
+        var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Done);
+        var inline = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { ran = true; return Task.CompletedTask; });
+        inline.RunCondition = RunCondition.OnFailure;
+        outcome.TimeTickerChildren.Add(inline);
+
+        await handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+
+        Assert.False(ran);
+        await _internalManager.DidNotReceiveWithAnyArgs().UpdateSkipTimeTickersWithUnifiedContextAsync(default!, default);
+    }
+
+    #endregion
+
     #region Run marker
 
     // The store fences a run's writes with its RunMarker (#74): a claimed job's run uses the marker its claim wrote, and an

@@ -19,7 +19,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker;
 
-internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
+internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOutcomeFollowUp
 {
     // Cached lowercase TickerType names to avoid per-call ToString + ToLowerInvariant allocations
     private static readonly Dictionary<TickerType, string> TickerTypeNamesLower =
@@ -233,6 +233,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
     private ISharpTickerDispatcher Dispatcher => _dispatcher ??= _serviceProvider.GetService<ISharpTickerDispatcher>();
     private ISharpTickerHostScheduler HostScheduler => _hostScheduler ??= _serviceProvider.GetService<ISharpTickerHostScheduler>();
     private ILogger Logger => _logger ??= _serviceProvider.GetService<ILoggerFactory>()?.CreateLogger<TickerExecutionTaskHandler>();
+    // Registered only when the background services run: without the scheduler loop nothing would write a listed outcome.
+    private LostOutcomeRetryList LostOutcomes => _lostOutcomes ??= _serviceProvider.GetService<LostOutcomeRetryList>();
+    private LostOutcomeRetryList _lostOutcomes;
     private ISharpTickerDispatcher _dispatcher;
     private ISharpTickerHostScheduler _hostScheduler;
     private ILogger _logger;
@@ -504,17 +507,77 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
         catch (Exception ex)
         {
-            // An inline chain child was never claimed, so it has no lock of this node for the store to release.
-            if (isChild)
-                Logger?.LogError(ex,
-                    "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. Its row stays InProgress. Any chain children of it are neither run nor skipped.",
-                    context.Status, context.FunctionName, context.TickerId);
-            else
-                Logger?.LogError(ex,
-                    "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The row stays InProgress until the store releases the rows of this node, and the job can then run again. Any chain children are neither run nor skipped.",
-                    context.Status, context.FunctionName, context.TickerId);
+            // Listed before this returns, so before the run leaves the registry of running jobs: a stop that finds no job
+            // running finds this outcome in the list.
+            switch (ListLostOutcome(context, isChild))
+            {
+                case LostOutcomeListing.Listed when isChild:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        context.Status, context.FunctionName, context.TickerId);
+                    break;
+                case LostOutcomeListing.Listed:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node, and the job can then run again. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        context.Status, context.FunctionName, context.TickerId);
+                    break;
+                // An inline chain child that was not fenced was never claimed by this node's lock, so nothing releases it.
+                case var listing when isChild:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. Its row stays InProgress. Any chain children of it are neither run nor skipped.{Stopping}",
+                        context.Status, context.FunctionName, context.TickerId, StoppingNote(listing));
+                    break;
+                case var listing:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The row stays InProgress until the store releases the rows of this node, and the job can then run again. Any chain children are neither run nor skipped.{Stopping}",
+                        context.Status, context.FunctionName, context.TickerId, StoppingNote(listing));
+                    break;
+            }
             return false;
         }
+    }
+
+    private enum LostOutcomeListing
+    {
+        // The scheduler writes it again.
+        Listed,
+        // The scheduler is stopping: its list takes nothing more.
+        Closed,
+        // Not written again: no scheduler (background services off), or the run is not fenced (no marker, or a store that
+        // does not fence), where a write by Id could land on a later run of the row.
+        NotRetried
+    }
+
+    private LostOutcomeListing ListLostOutcome(InternalFunctionContext context, bool isChild)
+    {
+        if (LostOutcomes is not { } list || context.RunMarker is null || !_internalTickerManager.FencesRuns)
+            return LostOutcomeListing.NotRetried;
+        return list.TryAdd(context, isChild, _clock.UtcNow) ? LostOutcomeListing.Listed : LostOutcomeListing.Closed;
+    }
+
+    private static string StoppingNote(LostOutcomeListing listing)
+        => listing == LostOutcomeListing.Closed ? " The scheduler is stopping, so it is not written again." : string.Empty;
+
+    public async Task AfterLateStoreAsync(InternalFunctionContext outcome, bool claimChildren, CancellationToken cancellationToken)
+    {
+        var delayedChildren = outcome.TimeTickerChildren?.Where(c => c.IsDelayed).ToList();
+        if (delayedChildren is not { Count: > 0 })
+            return;
+
+        // As after an outcome stored at once (ExecuteTaskAsync): the store now hands out the delayed children the outcome
+        // lets run, and those it does not let run never will, so they are skipped with what they carry.
+        if (claimChildren && ChainRunGate.IsFinal(outcome.Status))
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, outcome.Status)), cancellationToken).ConfigureAwait(false);
+
+        var childrenToSkip = new List<InternalFunctionContext>();
+        foreach (var child in delayedChildren)
+        {
+            if (!ShouldRunChild(child, outcome.Status))
+                SkipWithDescendants(child, outcome, childrenToSkip);
+        }
+
+        if (childrenToSkip.Count > 0)
+            await _internalTickerManager.UpdateSkipTimeTickersWithUnifiedContextAsync(childrenToSkip.ToArray(), cancellationToken).ConfigureAwait(false);
     }
 
     // A write during the run (a failed attempt, the number of the next retry) keeps the dashboard current; the final outcome
