@@ -9,6 +9,7 @@ using SharpTicker.DependencyInjection;
 using SharpTicker.Provider;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using Xunit;
 
@@ -137,11 +138,19 @@ public class EarlyStartEndToEndTests : IAsyncLifetime
         var started = MapStartRecorder("EarlyStart.BesideCron");
         await StartHostAsync();
 
-        var time = second.AddMilliseconds(700);
+        var time = second.AddMilliseconds(400);
         var added = await Times.AddAsync(new TimeTickerEntity { Function = "EarlyStart.BesideCron", ExecutionTime = time });
         Assert.True(added.IsSucceeded, added.Exception?.ToString());
+        // A job added after the loop planned the cron occurrence, and due later than it, does not make the loop plan again:
+        // the loop would wake for the occurrence alone and start the job a pass later. The restart plans the two together.
+        _app!.Services.GetRequiredService<ISharpTickerHostScheduler>().Restart();
         Assert.True(second - DateTime.UtcNow > TimeSpan.FromSeconds(2), "the host started too slowly for this test's timing");
 
-        AssertNotEarly(await StartOf(started), time);
+        var startedAt = await StartOf(started);
+        AssertNotEarly(startedAt, time);
+        // Planned alone, the job starts a polling interval after the occurrence, 600 ms or more after its time, and this
+        // test would pass without having tested anything.
+        Assert.True(startedAt - time < TimeSpan.FromMilliseconds(400),
+            $"the job was not planned together with the cron occurrence (started {(startedAt - time).TotalMilliseconds:F0} ms after its time), so this run shows nothing");
     }
 }
