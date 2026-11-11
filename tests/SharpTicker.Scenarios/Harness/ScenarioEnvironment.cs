@@ -70,6 +70,7 @@ public sealed class Node
 public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
 {
     private const int ProxyListenPort = 8666;
+    private const int HeartbeatProxyFirstPort = 8700;
     private const int ToxiproxyControlPort = 8474;
 
     private readonly string _scenario;
@@ -78,6 +79,8 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
     private readonly List<StreamWriter> _files = new();
     private readonly List<IContainer> _allContainers = new();
     private readonly Func<int, IReadOnlyDictionary<string, string>>? _nodeEnvironment;
+    private readonly HashSet<int> _ownStoreProxy;
+    private readonly int _heartbeatProxies;
     private readonly List<Node> _nodes = new();
 
     private INetwork _network = null!;
@@ -91,8 +94,10 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
 
     public DateTimeOffset StartedAt => _startedAt;
 
-    private ScenarioEnvironment(string scenario, Store store, Func<int, IReadOnlyDictionary<string, string>>? nodeEnvironment, string test)
+    private ScenarioEnvironment(string scenario, Store store, Func<int, IReadOnlyDictionary<string, string>>? nodeEnvironment, string test, int[]? ownStoreProxy, int heartbeatProxies)
     {
+        _ownStoreProxy = new HashSet<int>(ownStoreProxy ?? []);
+        _heartbeatProxies = heartbeatProxies;
         _scenario = scenario;
         _test = test;
         Store = store;
@@ -116,21 +121,36 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
     public string DirectStoreConnection { get; private set; } = "";
 
     /// <summary>
+    /// The Redis that holds the node heartbeats, from the test process (not through a proxy): the heartbeat Redis when the
+    /// scenario has one, else the store's connection (which holds heartbeats only when the store is Redis).
+    /// </summary>
+    public string DirectHeartbeatConnection { get; private set; } = "";
+
+    /// <summary>
     /// Starts the network, the store, the proxy and the nodes. <paramref name="startedNodes"/> nodes are started now
     /// (all by default); the others wait for <see cref="StartNodeAsync"/>.
     /// <paramref name="nodeEnvironment"/> adds environment variables per node index.
+    /// The nodes in <paramref name="ownStoreProxy"/> reach the store through a proxy of their own, so the store can be
+    /// cut for them and not for the others (<see cref="SetStoreProxyAsync"/>); the faults without a node go to the proxy
+    /// the other nodes share.
+    /// With <paramref name="heartbeatRedis"/> (a store other than Redis; run with EF Core only so far) the nodes also
+    /// use a second Redis for the node heartbeat, each through its own proxy (<see cref="SetHeartbeatProxyAsync"/>).
     /// </summary>
     public static async Task<ScenarioEnvironment> StartAsync(
         string scenario,
         Store store,
         int nodes,
         int? startedNodes = null,
-        Func<int, IReadOnlyDictionary<string, string>>? nodeEnvironment = null)
+        Func<int, IReadOnlyDictionary<string, string>>? nodeEnvironment = null,
+        int[]? ownStoreProxy = null,
+        bool heartbeatRedis = false)
     {
         // Before the first await: the calling test is still on the stack.
         var test = CallingTest();
         var image = await ScenarioImage.GetAsync();
-        var env = new ScenarioEnvironment(scenario, store, nodeEnvironment, test);
+        if (heartbeatRedis && store == Store.Redis)
+            throw new ArgumentException("With Redis as the store the heartbeat is in the store already.", nameof(heartbeatRedis));
+        var env = new ScenarioEnvironment(scenario, store, nodeEnvironment, test, ownStoreProxy, heartbeatRedis ? nodes : 0);
         try
         {
             await env.StartInfrastructureAsync();
@@ -206,6 +226,16 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
         }
 
         _store = _allContainers[^1];
+        DirectHeartbeatConnection = DirectStoreConnection;
+        if (_heartbeatProxies > 0)
+        {
+            var heartbeat = new RedisBuilder("redis:7-alpine")
+                .WithNetwork(_network).WithNetworkAliases("heartbeat")
+                .WithOutputConsumer(Output("heartbeat", null))
+                .Build();
+            await StartTracked(heartbeat);
+            DirectHeartbeatConnection = heartbeat.GetConnectionString();
+        }
 
         _proxy = new ToxiproxyBuilder("ghcr.io/shopify/toxiproxy:2.12.0")
             .WithNetwork(_network).WithNetworkAliases("proxy")
@@ -216,23 +246,47 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
         {
             BaseAddress = new Uri($"http://{_proxy.Hostname}:{_proxy.GetMappedPublicPort(ToxiproxyControlPort)}"),
         };
-        await Check(await _proxyApi.PostAsJsonAsync("/proxies", new
+        // The shared proxy (null), then one for each node that has its own.
+        foreach (var owner in _ownStoreProxy.Select(i => (int?)i).Prepend(null))
         {
-            name = "store",
-            listen = $"0.0.0.0:{ProxyListenPort}",
-            upstream = $"store:{storePort}",
-            enabled = true,
-        }));
+            await Check(await _proxyApi.PostAsJsonAsync("/proxies", new
+            {
+                name = ProxyName(owner),
+                listen = $"0.0.0.0:{ProxyPort(owner)}",
+                upstream = $"store:{storePort}",
+                enabled = true,
+            }));
+        }
+
+        for (var i = 0; i < _heartbeatProxies; i++)
+        {
+            await Check(await _proxyApi.PostAsJsonAsync("/proxies", new
+            {
+                name = $"heartbeat-node-{i}",
+                listen = $"0.0.0.0:{HeartbeatProxyFirstPort + i}",
+                upstream = "heartbeat:6379",
+                enabled = true,
+            }));
+        }
     }
 
-    private string NodeConnection() => Store switch
+    // The shared proxy, or the own proxy of a node that has one.
+    private string ProxyName(int? node) => node is { } i && _ownStoreProxy.Contains(i) ? $"store-node-{i}" : "store";
+
+    private int ProxyPort(int? node) => node is { } i && _ownStoreProxy.Contains(i) ? ProxyListenPort + 1 + i : ProxyListenPort;
+
+    private string NodeConnection(int node)
     {
-        Store.EfCorePostgres => $"Host=proxy;Port={ProxyListenPort};Database={DatabaseName};Username=postgres;Password=postgres",
-        // The driver's default server selection wait, pinned: the store-cut scenarios are timed against it.
-        Store.MongoDb => $"mongodb://mongo:mongo@proxy:{ProxyListenPort}/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=30000",
-        Store.Redis => $"proxy:{ProxyListenPort},abortConnect=false",
-        _ => throw new ArgumentOutOfRangeException(nameof(Store)),
-    };
+        var port = ProxyPort(node);
+        return Store switch
+        {
+            Store.EfCorePostgres => $"Host=proxy;Port={port};Database={DatabaseName};Username=postgres;Password=postgres",
+            // The driver's default server selection wait, pinned: the store-cut scenarios are timed against it.
+            Store.MongoDb => $"mongodb://mongo:mongo@proxy:{port}/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=30000",
+            Store.Redis => $"proxy:{port},abortConnect=false",
+            _ => throw new ArgumentOutOfRangeException(nameof(Store)),
+        };
+    }
 
     /// <summary>Starts node <paramref name="i"/>: its first container, or a new one with the same identifier.</summary>
     public async Task StartNodeAsync(int i) => await StartNodeAsync(i, await ScenarioImage.GetAsync(), null);
@@ -258,12 +312,14 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
         var environment = new Dictionary<string, string>
         {
             ["SCENARIO_STORE"] = Store.HostValue(),
-            ["SCENARIO_CONNECTION"] = NodeConnection(),
+            ["SCENARIO_CONNECTION"] = NodeConnection(i),
             ["SCENARIO_DATABASE"] = DatabaseName,
             ["SCENARIO_NODE"] = node.Identifier,
             ["SCENARIO_REDIS_INSTANCE"] = RedisInstanceName,
             ["SCENARIO_CREATE_SCHEMA"] = i == 0 && node.Generation == 0 ? "1" : "0",
         };
+        if (_heartbeatProxies > 0)
+            environment["SCENARIO_HEARTBEAT_REDIS"] = $"proxy:{HeartbeatProxyFirstPort + i},abortConnect=false";
         if (_nodeEnvironment != null)
         {
             foreach (var (key, value) in _nodeEnvironment(i))
@@ -332,7 +388,10 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
         }
     }
 
-    /// <summary>Disables the store proxy (connections refused, open ones dropped) for <paramref name="duration"/>.</summary>
+    /// <summary>
+    /// Disables the shared store proxy (connections refused, open ones dropped) for <paramref name="duration"/>. Like the
+    /// toxics, it does not reach a node that has a store proxy of its own.
+    /// </summary>
     public async Task CutStoreAsync(TimeSpan duration)
     {
         await Check(await _proxyApi.PostAsJsonAsync("/proxies/store", new { enabled = false }));
@@ -345,6 +404,17 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
             await Check(await _proxyApi.PostAsJsonAsync("/proxies/store", new { enabled = true }));
         }
     }
+
+    /// <summary>
+    /// Disables or enables the store proxy node <paramref name="node"/> uses: its own one, or the shared one (then every
+    /// node without a proxy of its own is cut with it).
+    /// </summary>
+    public async Task SetStoreProxyAsync(int node, bool enabled)
+        => await Check(await _proxyApi.PostAsJsonAsync($"/proxies/{ProxyName(node)}", new { enabled }));
+
+    /// <summary>Disables or enables the proxy between node <paramref name="node"/> and the heartbeat Redis.</summary>
+    public async Task SetHeartbeatProxyAsync(int node, bool enabled)
+        => await Check(await _proxyApi.PostAsJsonAsync($"/proxies/heartbeat-node-{node}", new { enabled }));
 
     /// <summary>
     /// The number of lines in all node logs so far that contain <paramref name="text"/> (e.g. "fail:", the prefix of an

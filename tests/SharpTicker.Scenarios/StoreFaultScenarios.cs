@@ -115,9 +115,9 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         // at least 4 s away; the cut starts 2 s from here and lasts past the latest end. MongoDB 40 s: longer than its
         // driver's server selection wait (30 s), which otherwise waits out the cut and writes late on its own, so no final
         // write fails there. Redis 10 s: well inside its heartbeat TTL (25 s), counting the last heartbeat (up to 5 s before
-        // the cut) and the 5 s retry delay after a failed one; a longer outage can make the nodes release their own running
-        // rows when Redis returns (a known Redis behaviour, not fixed yet), which is not what this scenario checks. The
-        // jobs end at most 6 s into the cut, so 10 s still fails their final writes.
+        // the cut) and the 5 s retry delay after a failed one, so no heartbeat entry expires and this scenario does not
+        // depend on what the nodes do after an outage past the TTL (HeartbeatScenarios checks that). The jobs end at most
+        // 6 s into the cut, so 10 s still fails their final writes.
         await env.UntilAsync(() => Task.FromResult(ids.All(id => env.Runs.Starts(id) == 1)),
             () => $"{ids.Count(id => env.Runs.Starts(id) == 1)} of {ids.Count} started", TimeSpan.FromSeconds(30));
         await Task.Delay(TimeSpan.FromSeconds(2));
@@ -145,14 +145,17 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         await using var env = await ScenarioEnvironment.StartAsync("late-write", Store.Redis, nodes: 2, startedNodes: 1);
         string frozen = env.Nodes[0].Identifier, taker = env.Nodes[1].Identifier;
 
-        // 30 s: node 0's run outlasts nothing it needs to (its wait has passed when it is let go), and node 1's run, which
-        // starts at least 20 s into the pause (heartbeat ttl 25 s minus one 5 s interval), is still going 10 s after it.
+        // Node 1 releases node 0 when its heartbeat entry has been missing for one more TTL (25 s here). The entry expires
+        // 20 to 25 s into the pause, the check that first misses it comes up to 5 s later, the release one TTL and up to
+        // one check (5 s) after that, and node 1's fallback takes the row within 2 s: node 1's run starts 45 to 62 s into
+        // the pause, so the pause is 70 s. The job runs 45 s: node 0's wait has passed when it is let go, and node 1's run
+        // goes on until at least 90 s, 20 s after the pause.
         var id = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed
-            { Function = Functions.Slow, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 30 } });
+            { Function = Functions.Slow, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 45 } });
         await env.UntilAsync(() => Task.FromResult(env.Runs.Starts(id) == 1), () => "node 0 did not start the job", TimeSpan.FromSeconds(30));
         await env.StartNodeAsync(1);
 
-        await env.PauseNodeAsync(0, TimeSpan.FromSeconds(40));
+        await env.PauseNodeAsync(0, TimeSpan.FromSeconds(70));
         Assert.True(env.Runs.For(id).Any(e => e.IsStart && e.Node == taker),
             $"node 1 did not take the job while node 0 was frozen: {Describe(env, id)}");
 
