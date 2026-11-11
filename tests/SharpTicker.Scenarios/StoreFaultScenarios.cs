@@ -134,6 +134,63 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         Assert.True(lost >= ids.Count, $"{lost} lost final writes logged, expected one per job ({ids.Count}); see {env.LogFolder}");
     }
 
+    // #74: the store is cut over the end of a chain parent, so its final status write fails and its run returns before its
+    // inline children (no time of their own). Once the store is back the node writes the outcome again, and the inline
+    // children then follow it through the store: the OnSuccess child and its own child run once, the OnFailure child is
+    // skipped. Before the fix only delayed children followed a late outcome: the inline ones stayed Idle for good.
+    [Theory]
+    [InlineData(Store.EfCorePostgres)]
+    [InlineData(Store.MongoDb)]
+    [InlineData(Store.Redis)]
+    public async Task AStoreCutAtTheEndOfAChainParent_ItsInlineChildrenFollowOnceTheOutcomeIsStored(Store store)
+    {
+        await using var env = await ScenarioEnvironment.StartAsync("chain-outcome-cut", store, nodes: 2);
+        var node = env.Nodes[0];
+
+        var (root, tree) = await node.Api.AddChainAsync(new TickerSeed
+        {
+            Function = Functions.ChainStep, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 6 },
+            Children =
+            [
+                new TickerSeed
+                {
+                    Function = Functions.ChainStep, Request = new WaitRequest { Seconds = 1 }, RunCondition = RunCondition.OnSuccess,
+                    Children = [new TickerSeed { Function = Functions.ChainStep, Request = new WaitRequest { Seconds = 1 }, RunCondition = RunCondition.OnSuccess }],
+                },
+                new TickerSeed { Function = Functions.ChainStep, Request = new WaitRequest { Seconds = 1 }, RunCondition = RunCondition.OnFailure },
+            ],
+        });
+        var (child, grandchild, onFailure) = (tree[1], tree[2], tree[3]);
+
+        // The same timing as AStoreCutAtTheEndOfJobs: the parent runs 6 s and is seen started at most a fallback pass (2 s)
+        // after its start, so its end is at least 2 s into a cut that starts 2 s from here. The cut lasts past that end, and
+        // with MongoDB past the driver's server selection wait (30 s), which otherwise waits out the cut and writes late
+        // on its own; Redis stays inside its heartbeat TTL (25 s).
+        await env.UntilAsync(() => Task.FromResult(env.Runs.Starts(root) == 1), () => "the parent did not start", TimeSpan.FromSeconds(30));
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        var cut = TimeSpan.FromSeconds(store switch { Store.MongoDb => 40, Store.Redis => 10, _ => 15 });
+        var window = new FaultEvent("cut") { At = DateTimeOffset.UtcNow, Until = DateTimeOffset.UtcNow + cut };
+        await env.CutStoreAsync(cut);
+
+        // The parent can end DueDone (a fallback start); a child claimed after the late store ends Done.
+        await AssertEveryJobRanOnceAndEnded(env, [root, child, grandchild], finalOk: [TickerStatus.Done, TickerStatus.DueDone], window);
+
+        IReadOnlyList<TickerView> all = [];
+        await env.UntilAsync(async () =>
+        {
+            all = await node.Dashboard.GetAllTimeTickersAsync();
+            return all.SingleOrDefault(t => t.Id == onFailure)?.Status == TickerStatus.Skipped;
+        }, () => $"the OnFailure child is {all.SingleOrDefault(t => t.Id == onFailure)?.Status}, expected Skipped", TimeSpan.FromSeconds(30));
+        Assert.Equal(0, env.Runs.Starts(onFailure));
+        Assert.True(env.Runs.For(child).Single(e => e.IsStart).At >= window.Until,
+            $"the inline child started before the store was back, so not after a late store; see {env.LogFolder}");
+
+        // The fault reached the parent's final write, and the node stored it late: without this the scenario would pass on a
+        // run whose outcome was stored at once, where the children run inside the parent's run as always.
+        Assert.True(env.CountNodeLogLines("could not be stored") >= 1, $"no lost final write was logged; see {env.LogFolder}");
+        Assert.True(env.CountNodeLogLines("was stored late") >= 1, $"no outcome was stored late; see {env.LogFolder}");
+    }
+
     // #74 (#104): a node frozen past its heartbeat is taken for dead; the other node releases its rows and runs its job again
     // (the documented at-least-once of a node taken for dead). When the frozen node goes on, its job ends and writes its
     // outcome late. That write must not land on the row the other node now runs: before the fix it was by Id, so the row
