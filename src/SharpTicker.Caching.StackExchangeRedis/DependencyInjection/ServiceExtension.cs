@@ -43,7 +43,9 @@ public static class ServiceExtension
             services.AddKeyedSingleton<IDatabase>("sharpticker", (sp, _) =>
                 sp.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker").GetDatabase());
             services.AddHostedService<NodeHeartBeatBackgroundService>();
-            services.AddSingleton<ISharpTickerRedisContext, SharpTickerRedisContext>();
+            services.AddSingleton<SharpTickerRedisContext>();
+            services.AddSingleton<ISharpTickerRedisContext>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
+            services.AddSingleton<INodeHeartbeatRegistry>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
             services.AddKeyedSingleton<IDistributedCache>("sharpticker", (sp, _) =>
                 new RedisCache(new RedisCacheOptions
                 {
