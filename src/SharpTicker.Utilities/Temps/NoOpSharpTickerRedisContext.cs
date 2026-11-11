@@ -16,14 +16,4 @@ internal class NoOpSharpTickerRedisContext : ISharpTickerRedisContext
     {
         return factory(cancellationToken);
     }
-
-    public Task<string[]> GetDeadNodesAsync()
-    {
-        return Task.FromResult(Array.Empty<string>());
-    }
-
-    public Task NotifyNodeAliveAsync()
-    {
-       return Task.CompletedTask;
-    }
 }

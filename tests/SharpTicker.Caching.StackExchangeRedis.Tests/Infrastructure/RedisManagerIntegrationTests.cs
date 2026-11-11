@@ -241,6 +241,14 @@ public class RedisManagerIntegrationTests : IAsyncLifetime, IDisposable
                 var argv = ci.ArgAt<RedisValue[]>(2);
                 var entityKey = (string)keys[0];
 
+                if (script == LuaScriptLoader.Load("CompareAndSet")) // GET == ARGV[1] -> SET ARGV[2]; 1, 0 changed, -1 missing
+                {
+                    if (!_store.TryGetValue(entityKey, out var current)) return RedisResult.Create((RedisValue)(-1));
+                    if (current != (string)argv[0]) return RedisResult.Create((RedisValue)0);
+                    _store[entityKey] = (string)argv[1]!;
+                    return RedisResult.Create((RedisValue)1);
+                }
+
                 if (!_store.TryGetValue(entityKey, out var json))
                     return RedisResult.Create(RedisValue.Null);
 

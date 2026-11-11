@@ -28,6 +28,8 @@ public class RetryExhaustionTests : IDisposable
         _clock = Substitute.For<ITickerClock>();
         _clock.UtcNow.Returns(DateTime.UtcNow);
         _internalManager = Substitute.For<IInternalTickerManager>();
+        // The store has every write, unless a test says otherwise.
+        _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         _instrumentation = Substitute.For<ISharpTickerInstrumentation>();
 
         var services = new ServiceCollection();
@@ -361,6 +363,7 @@ public class RetryExhaustionTests : IDisposable
         // Arrange
         var exceptionHandler = Substitute.For<ITickerExceptionHandler>();
         var internalManager = Substitute.For<IInternalTickerManager>();
+        internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         var services = new ServiceCollection();
         services.AddSingleton(internalManager);
         services.AddSingleton(_instrumentation);

@@ -1712,8 +1712,64 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         }
     }
 
+    // As above, and the store's own put-back (the next script) fails too. The row stays InProgress for this node; the
+    // exception names it with the marker of the claim and its type, and a put-back with that marker frees it once the store
+    // answers, which is what the scheduler loop does with it (candidate row 50).
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_AndItsPutBackFails_NamesTheRowSoItCanBePutBackLater(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seeder = CreateProvider("seed");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seeder);
+            await seeder.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker(seeder);
+        }
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var node = fixture.CreateProvider("node-A", _clock,
+            FailingDatabase.Create(fixture.Database, nameof(IDatabase.ScriptEvaluateAsync), 1, landFirst: true, failNextToo: true));
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        var failed = Assert.Single(ClaimPutBackFailedException.FindIn(thrown));
+        var row = Assert.Single(failed.NotPutBack);
+        Assert.Equal(id, row.Id);
+        Assert.Equal(cron ? TickerType.CronTickerOccurrence : TickerType.TimeTicker, row.Type);
+
+        var healthy = CreateProvider("node-A");
+        if (cron)
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(seeder, id)).Status);
+            Assert.True(await healthy.TryReleaseCronOccurrenceClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(seeder, id)).Status);
+        }
+        else
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(seeder, id)).Status);
+            Assert.True(await healthy.TryReleaseTimeTickerClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(seeder, id)).Status);
+        }
+    }
+
     // Throws on the n-th call of one method, once; every other call goes through. By default the call fails before it
-    // reaches Redis; with landFirst (ScriptEvaluateAsync only) it runs and lands, then its reply is lost.
+    // reaches Redis; with landFirst (ScriptEvaluateAsync only) it runs and lands, then its reply is lost. With failNextToo
+    // the call after it fails as well, before it reaches Redis.
     public class FailingDatabase : DispatchProxy
     {
         private IDatabase _inner = null!;
@@ -1721,8 +1777,9 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         private int _failAt;
         private int _seen;
         private bool _landFirst;
+        private bool _failNextToo;
 
-        public static IDatabase Create(IDatabase inner, string method, int failAt, bool landFirst = false)
+        public static IDatabase Create(IDatabase inner, string method, int failAt, bool landFirst = false, bool failNextToo = false)
         {
             var proxy = DispatchProxy.Create<IDatabase, FailingDatabase>();
             var failing = (FailingDatabase)(object)proxy;
@@ -1730,6 +1787,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
             failing._method = method;
             failing._failAt = failAt;
             failing._landFirst = landFirst;
+            failing._failNextToo = failNextToo;
             return proxy;
         }
 
@@ -1747,6 +1805,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
                     return LandThenFail((Task<RedisResult>)targetMethod.Invoke(_inner, args)!);
                 throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
             }
+            if (_failNextToo && targetMethod.Name == _method && _seen == _failAt + 1)
+                throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed again");
 
             try
             {

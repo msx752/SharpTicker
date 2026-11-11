@@ -494,10 +494,68 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         }
     }
 
+    // As above, and the store's own put-back fails too (the store is still failing). The row stays InProgress for this node;
+    // the exception names it with the marker of the claim and its type, and a put-back with that marker frees it once the
+    // store answers. That is what the scheduler loop does with the row (candidate row 50).
+    [Theory]
+    [InlineData("immediate-time")]
+    [InlineData("immediate-cron")]
+    [InlineData("fallback-time")]
+    [InlineData("fallback-cron")]
+    public async Task AClaimWhoseReplyIsLost_AndItsPutBackFails_NamesTheRowSoItCanBePutBackLater(string path)
+    {
+        var cron = path.EndsWith("cron");
+        var seed = CreateProvider("node-A");
+        Guid id;
+        if (cron)
+        {
+            id = await QueueOccurrenceOn(seed);
+            if (path.StartsWith("immediate"))
+                await seed.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        }
+        else
+        {
+            id = await SeedTimeTicker();
+        }
+        Clock.Advance(TimeSpan.FromSeconds(2));
+        var node = CreateProvider("node-A", Clock, new LandThenFailOnce(failPutBackToo: true));
+
+        Func<Task> claim = path switch
+        {
+            "immediate-time" => () => node.AcquireImmediateTimeTickersAsync([id], CancellationToken.None),
+            "immediate-cron" => () => node.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None),
+            "fallback-time" => () => Drain(node.QueueTimedOutTimeTickers(CancellationToken.None)),
+            _ => () => Drain(node.QueueTimedOutCronTickerOccurrences(CancellationToken.None))
+        };
+        // PostgreSQL runs with a retrying execution strategy, which may wrap the failure.
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(claim);
+
+        var failed = Assert.Single(ClaimPutBackFailedException.FindIn(thrown));
+        var row = Assert.Single(failed.NotPutBack);
+        Assert.Equal(id, row.Id);
+        Assert.Equal(cron ? TickerType.CronTickerOccurrence : TickerType.TimeTicker, row.Type);
+
+        var healthy = CreateProvider("node-A");
+        if (cron)
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
+            Assert.True(await healthy.TryReleaseCronOccurrenceClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadOccurrence(id)).Status);
+        }
+        else
+        {
+            Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(id)).Status);
+            Assert.True(await healthy.TryReleaseTimeTickerClaim(id, row.ClaimMarker, CancellationToken.None));
+            Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(id)).Status);
+        }
+    }
+
     // The first write runs and lands, then the call throws as if its reply was lost; every later command runs normally.
-    private sealed class LandThenFailOnce : DbCommandInterceptor
+    // With failPutBackToo, the next write (the put-back) fails before it reaches the store.
+    private sealed class LandThenFailOnce(bool failPutBackToo = false) : DbCommandInterceptor
     {
         private bool _failed;
+        private bool _putBackFailed;
 
         public override ValueTask<int> NonQueryExecutedAsync(
             DbCommand command, CommandExecutedEventData eventData, int result, CancellationToken cancellationToken = default)
@@ -508,6 +566,17 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
                 throw new TimeoutException("the reply of the claim was lost");
             }
             return base.NonQueryExecutedAsync(command, eventData, result, cancellationToken);
+        }
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (failPutBackToo && _failed && !_putBackFailed)
+            {
+                _putBackFailed = true;
+                throw new InvalidOperationException("the store failed again, before the put-back reached it");
+            }
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
         }
     }
 
@@ -1305,6 +1374,309 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
         Assert.Equal(status, (await ReadRow(started)).Status);
         Assert.Equal(TickerStatus.Skipped, (await ReadRow(waiting)).Status);
+    }
+
+    #endregion
+
+    #region Fenced run writes (#74)
+
+    // A node: its store and the real internal manager over it, as a running node has them.
+    private (ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store, Utilities.Interfaces.Managers.IInternalTickerManager Manager) Node(string nodeIdentifier)
+    {
+        var store = CreateProvider(nodeIdentifier);
+        return (store, new Utilities.Managers.InternalTickerManager<TimeTickerEntity, CronTickerEntity>(store, Clock, Substitute.For<ISharpTickerNotificationHubSender>()));
+    }
+
+    // Queues the row on the node and claims it the way the scheduler does. Returns the context the run gets.
+    private static async Task<InternalFunctionContext> ClaimRun(
+        (ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store, Utilities.Interfaces.Managers.IInternalTickerManager Manager) node, Guid id)
+    {
+        var window = await node.Store.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(await Drain(node.Store.QueueTimeTickers(window.Where(x => x.Id == id).ToArray(), CancellationToken.None)));
+        var run = new InternalFunctionContext { TickerId = id, FunctionName = "claim-fn", Type = TickerType.TimeTicker };
+        Assert.True(await node.Manager.TryClaimDueTicker(run, node.Manager.NextClaimMarker(), CancellationToken.None));
+        run.RunMarker = run.ClaimMarker; // as the handler does when the run starts
+        return run;
+    }
+
+    private static async Task<InternalFunctionContext> ClaimOccurrenceRun(
+        (ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store, Utilities.Interfaces.Managers.IInternalTickerManager Manager) node, Guid id)
+    {
+        var run = new InternalFunctionContext { TickerId = id, FunctionName = "claim-cron-fn", Type = TickerType.CronTickerOccurrence };
+        Assert.True(await node.Manager.TryClaimDueTicker(run, node.Manager.NextClaimMarker(), CancellationToken.None));
+        run.RunMarker = run.ClaimMarker;
+        return run;
+    }
+
+    private static InternalFunctionContext Ended(InternalFunctionContext run, TickerStatus status, DateTime executedAt)
+    {
+        run.ResetUpdateProps().SetProperty(x => x.Status, status).SetProperty(x => x.ExecutedAt, executedAt);
+        return run;
+    }
+
+    private async Task<Guid> SeedChain(Guid childId)
+    {
+        var parent = NewTimeTicker(executionTime: T0.AddHours(1));
+        var child = NewTimeTicker(executionTime: null);
+        child.Id = childId;
+        child.Function = "claim-child";
+        child.ExecutionTime = null;
+        child.RunCondition = RunCondition.OnSuccess;
+        parent.Children = [child];
+        await using var context = CreateContext();
+        context.Set<TimeTickerEntity>().Add(parent);
+        await context.SaveChangesAsync();
+        return parent.Id;
+    }
+
+    // T6: the scheduler's due claim hands the run the marker it wrote, as the other claim paths do.
+    [Fact]
+    public async Task Fence_TheDueClaim_GivesTheRunTheMarkerItWrote()
+    {
+        var a = Node("node-A");
+        var run = await ClaimRun(a, await SeedTimeTicker());
+        var occurrence = await ClaimOccurrenceRun(a, await QueueOccurrenceOn(a.Store));
+
+        Assert.Equal((await ReadTimeTicker(run.TickerId)).UpdatedAt, run.ClaimMarker);
+        Assert.Equal((await ReadOccurrence(occurrence.TickerId)).UpdatedAt, occurrence.ClaimMarker);
+    }
+
+    // T1: node A's run lost its row (the release of an earlier run's rows freed it) and node B claimed it and finished. A's
+    // late write must not overwrite B's outcome.
+    [Fact]
+    public async Task Fence_ALateWriteOfARunWhoseRowAnotherNodeTook_ChangesNothing()
+    {
+        var a = Node("node-A");
+        var b = Node("node-B");
+        var id = await SeedTimeTicker();
+        var runA = await ClaimRun(a, id);
+        await a.Store.ReleaseDeadNodeTimeTickerResources("node-A", CancellationToken.None);
+        var runB = await ClaimRun(b, id);
+        Assert.True(await b.Manager.UpdateTickerAsync(Ended(runB, TickerStatus.Done, T0.AddMinutes(1))));
+
+        var stored = await a.Manager.UpdateTickerAsync(Ended(runA, TickerStatus.Failed, T0.AddMinutes(2)));
+
+        Assert.False(stored);
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal("node-B", row.LockHolder);
+        Assert.Equal(T0.AddMinutes(1), row.ExecutedAt);
+    }
+
+    // The same for a cron occurrence.
+    [Fact]
+    public async Task Fence_ALateWriteOfACronRunWhoseRowAnotherNodeTook_ChangesNothing()
+    {
+        var a = Node("node-A");
+        var b = Node("node-B");
+        var id = await QueueOccurrenceOn(a.Store);
+        var runA = await ClaimOccurrenceRun(a, id);
+        await a.Store.ReleaseDeadNodeOccurrenceResources("node-A", CancellationToken.None);
+        var runB = new InternalFunctionContext { TickerId = id, Type = TickerType.CronTickerOccurrence };
+        runB.RunMarker = Assert.Single(await b.Store.AcquireImmediateCronOccurrencesAsync([id], CancellationToken.None)).UpdatedAt;
+        Assert.True(await b.Manager.UpdateTickerAsync(Ended(runB, TickerStatus.Done, T0.AddMinutes(1))));
+
+        var stored = await a.Manager.UpdateTickerAsync(Ended(runA, TickerStatus.Failed, T0.AddMinutes(2)));
+
+        Assert.False(stored);
+        var row = await ReadOccurrence(id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal("node-B", row.LockHolder);
+    }
+
+    // T2: the same node claimed the row again after it was released: the first run's late write changes nothing.
+    [Fact]
+    public async Task Fence_ALateWriteOfAnEarlierRunOfTheSameNode_ChangesNothing()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var first = await ClaimRun(a, id);
+        await a.Store.ReleaseDeadNodeTimeTickerResources("node-A", CancellationToken.None);
+        var second = await ClaimRun(a, id);
+
+        Assert.False(await a.Manager.UpdateTickerAsync(Ended(first, TickerStatus.Done, T0.AddMinutes(1))));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal(second.ClaimMarker, row.UpdatedAt);
+    }
+
+    // PR-C: the stop's Cancelled write (onlyWhileRunning) lands only on a row that is still running, not over an outcome the
+    // run stored with the same marker (an outcome write keeps the lock and the marker, so the fence alone still holds). The
+    // count is 0 too: the confirming read that follows a write of 0 rows checks the same fence, status included.
+    [Fact]
+    public async Task Fence_OnlyWhileRunning_LeavesAStoredOutcomeAlone_AndWritesARunningRow()
+    {
+        var a = Node("node-A");
+        var done = await ClaimRun(a, await SeedTimeTicker());
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(done, TickerStatus.Done, T0.AddMinutes(1))));
+        var doneOccurrence = await ClaimOccurrenceRun(a, await QueueOccurrenceOn(a.Store));
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(doneOccurrence, TickerStatus.Done, T0.AddMinutes(1))));
+        var running = await ClaimRun(a, await SeedTimeTicker());
+        var writer = (IFencedRunWriter)a.Store;
+
+        Assert.Equal(0, await writer.UpdateTimeTickerFencedAsync(Stopped(done), done.RunMarker!.Value, onlyWhileRunning: true));
+        Assert.Equal(0, await writer.UpdateCronOccurrenceFencedAsync(Stopped(doneOccurrence), doneOccurrence.RunMarker!.Value, onlyWhileRunning: true));
+        Assert.Equal(1, await writer.UpdateTimeTickerFencedAsync(Stopped(running), running.RunMarker!.Value, onlyWhileRunning: true));
+
+        Assert.Equal(TickerStatus.Done, (await ReadTimeTicker(done.TickerId)).Status);
+        Assert.Equal(TickerStatus.Done, (await ReadOccurrence(doneOccurrence.TickerId)).Status);
+        var stopped = await ReadTimeTicker(running.TickerId);
+        Assert.Equal(TickerStatus.Cancelled, stopped.Status);
+        Assert.Null(stopped.LockHolder);
+
+        static InternalFunctionContext Stopped(InternalFunctionContext run)
+            => new InternalFunctionContext { TickerId = run.TickerId, Type = run.Type }
+                .SetProperty(x => x.Status, TickerStatus.Cancelled)
+                .SetProperty(x => x.ReleaseLock, true);
+    }
+
+    // T4 (guard) and the marker kept: every write of a run keeps the claim marker, and a final write sent again lands again.
+    [Fact]
+    public async Task Fence_TheWritesOfARunKeepItsMarker_AndAFinalWriteSentAgainIsStoredAgain()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var run = await ClaimRun(a, id);
+        Clock.UtcNow = T0.AddMinutes(5);
+
+        Assert.True(await a.Manager.UpdateTickerAsync(run.ResetUpdateProps().SetProperty(x => x.RetryCount, 1)));
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(6))));
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(6))));
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal(1, row.RetryCount);
+        Assert.Equal(run.ClaimMarker, row.UpdatedAt);
+    }
+
+    // T3 and T9: an inline child carries the lock of the node that started it and a marker of its own. Started again by
+    // another run of its parent, the first run's late write changes nothing; left by a node, the release frees it, and with
+    // no time of its own no claim path hands it out again.
+    [Fact]
+    public async Task Fence_AnInlineChild_IsHeldByTheRunThatStartedItLast_AndFreedWithItsNodesRows()
+    {
+        var a = Node("node-A");
+        var b = Node("node-B");
+        var childId = Guid.NewGuid();
+        await SeedChain(childId);
+        var childOfA = new InternalFunctionContext { TickerId = childId, Type = TickerType.TimeTicker };
+        var childOfB = new InternalFunctionContext { TickerId = childId, Type = TickerType.TimeTicker };
+        await a.Manager.RecordChildStartedAsync(childOfA);
+        await b.Manager.RecordChildStartedAsync(childOfB);
+
+        Assert.False(await a.Manager.UpdateTickerAsync(Ended(childOfA, TickerStatus.Done, T0.AddMinutes(1))));
+        Assert.Equal("node-B", (await ReadTimeTicker(childId)).LockHolder);
+
+        await b.Store.ReleaseDeadNodeTimeTickerResources("node-B", CancellationToken.None);
+        var freed = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.Idle, freed.Status);
+        Assert.Null(freed.LockHolder);
+        Assert.DoesNotContain(await a.Store.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == childId);
+        Assert.DoesNotContain(await Drain(a.Store.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == childId);
+    }
+
+    // T10: an edit of a running job (a full-entity update with no run state, as UpdateAsync and the dashboard send it) writes
+    // its fields and keeps the run, so the run's outcome is still stored and the job does not run again.
+    [Fact]
+    public async Task Fence_EditingARunningJob_KeepsItsRun_AndItsOutcomeIsStillStored()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var run = await ClaimRun(a, id);
+        var edit = NewTimeTicker(executionTime: T0.AddHours(3));
+        edit.Id = id;
+        edit.Description = "edited";
+
+        await a.Store.UpdateTimeTickers([edit], CancellationToken.None);
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(1))));
+        Assert.Equal(TickerStatus.Done, (await ReadTimeTicker(id)).Status);
+    }
+
+    // The same for an inline child that runs while its chain is edited.
+    [Fact]
+    public async Task Fence_EditingAChainWhileItsInlineChildRuns_KeepsTheChildsRun()
+    {
+        var a = Node("node-A");
+        var childId = Guid.NewGuid();
+        var parentId = await SeedChain(childId);
+        var childRun = new InternalFunctionContext { TickerId = childId, Type = TickerType.TimeTicker };
+        await a.Manager.RecordChildStartedAsync(childRun);
+        var parentEdit = NewTimeTicker(executionTime: T0.AddHours(2));
+        parentEdit.Id = parentId;
+        var childEdit = NewTimeTicker(executionTime: null);
+        childEdit.Id = childId;
+        childEdit.ExecutionTime = null;
+        childEdit.Function = "claim-child";
+        childEdit.Description = "child edited";
+        childEdit.RunCondition = RunCondition.OnSuccess;
+        parentEdit.Children = [childEdit];
+
+        await a.Store.UpdateTimeTickers([parentEdit], CancellationToken.None);
+
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal("child edited", row.Description);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(childRun, TickerStatus.Done, T0.AddMinutes(1))));
+    }
+
+    // A body read before the job ran (a dialog opened before, saved after) must not write the ended job back as not started:
+    // the row stays Done and is not handed out again.
+    [Fact]
+    public async Task Fence_AnEditWithABodyReadBeforeTheJobRan_DoesNotRunItAgain()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var readBefore = await ReadTimeTicker(id);
+        var run = await ClaimRun(a, id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(1))));
+        readBefore.Description = "edited";
+
+        await a.Store.UpdateTimeTickers([readBefore], CancellationToken.None);
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.DoesNotContain(await a.Store.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == id);
+    }
+
+    // T16: a body read while the job ran and sent after it ended must not bring the run back: the row stays Done.
+    [Fact]
+    public async Task Fence_AnEditWithABodyReadWhileTheJobRan_DoesNotBringTheRunBack()
+    {
+        var a = Node("node-A");
+        var id = await SeedTimeTicker();
+        var run = await ClaimRun(a, id);
+        var readWhileRunning = await ReadTimeTicker(id);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(1))));
+        readWhileRunning.Description = "edited";
+
+        await a.Store.UpdateTimeTickers([readWhileRunning], CancellationToken.None);
+
+        var row = await ReadTimeTicker(id);
+        Assert.Equal("edited", row.Description);
+        Assert.Equal(TickerStatus.Done, row.Status);
+    }
+
+    // T8 (store side): the write a cron edit makes to move the planned occurrence leaves a running one alone, and its
+    // outcome is still stored.
+    [Fact]
+    public async Task Fence_MovingAPlannedOccurrence_LeavesARunningOneAlone()
+    {
+        var a = Node("node-A");
+        var run = await ClaimOccurrenceRun(a, await QueueOccurrenceOn(a.Store));
+        var move = new InternalFunctionContext { TickerId = run.TickerId, Type = TickerType.CronTickerOccurrence }
+            .SetProperty(x => x.ExecutionTime, T0.AddHours(1));
+
+        Assert.Equal(0, await ((IFencedRunWriter)a.Store).UpdateNotStartedCronOccurrenceAsync(move));
+
+        Assert.Equal(run.ClaimMarker, (await ReadOccurrence(run.TickerId)).UpdatedAt);
+        Assert.True(await a.Manager.UpdateTickerAsync(Ended(run, TickerStatus.Done, T0.AddMinutes(1))));
     }
 
     #endregion

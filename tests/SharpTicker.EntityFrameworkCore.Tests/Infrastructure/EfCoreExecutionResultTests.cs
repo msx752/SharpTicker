@@ -470,6 +470,81 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.True(await db.Set<CronTickerEntity>().AnyAsync(x => x.Id == created.Id));
     }
 
+    // A user's cron next to the seeded cron of the same function: only the seeded one takes the expression in code. Both
+    // insertion orders, since which row came first decided it before.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ASeededCronAndAUsersCronOfOneFunction_OnlyTheSeededOneTakesTheExpressionInCode(bool userFirst)
+    {
+        CronTickerEntity user, seeded;
+        if (userFirst)
+        {
+            user = await AddCronTickerAsync("NewlyDefined", "0 0 1 * * *");
+            seeded = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+        }
+        else
+        {
+            seeded = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+            user = await AddCronTickerAsync("NewlyDefined", "0 0 1 * * *");
+        }
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var stored = await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").ToDictionaryAsync(x => x.Id);
+        Assert.Equal(2, stored.Count);
+        Assert.Equal("0 0 1 * * *", stored[user.Id].Expression);
+        Assert.Equal(Earlier, stored[user.Id].UpdatedAt);
+        Assert.Equal("0 0 4 * * *", stored[seeded.Id].Expression);
+    }
+
+    // Two seeded copies of one cron (two nodes that seeded it at the same time): neither keeps the old schedule.
+    [Fact]
+    public async Task TwoSeededCopiesOfOneCron_BothTakeTheExpressionInCode()
+    {
+        await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+        await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var stored = await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").ToListAsync();
+        Assert.Equal(2, stored.Count);
+        Assert.All(stored, c => Assert.Equal("0 0 4 * * *", c.Expression));
+    }
+
+    // Several crons of the function and none marked as seeded (a dashboard edit clears the mark): any choice could
+    // overwrite a user's schedule, so none is changed and none is added.
+    [Fact]
+    public async Task SeveralCronsOfOneFunction_NoneMarkedAsSeeded_NoneIsChanged()
+    {
+        await AddCronTickerAsync("NewlyDefined", "0 0 1 * * *");
+        await AddCronTickerAsync("NewlyDefined", "0 0 2 * * *");
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var expressions = await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined")
+            .Select(x => x.Expression).OrderBy(x => x).ToListAsync();
+        Assert.Equal(new[] { "0 0 1 * * *", "0 0 2 * * *" }, expressions);
+    }
+
+    // One cron of the function, not marked (most likely the seeded cron edited on the dashboard): it takes the expression
+    // in code, as before, and no second row is added.
+    [Fact]
+    public async Task OneUnmarkedCronOfTheFunction_TakesTheExpressionInCode()
+    {
+        var only = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *");
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var stored = await db.Set<CronTickerEntity>().AsNoTracking().SingleAsync(x => x.Function == "NewlyDefined");
+        Assert.Equal(only.Id, stored.Id);
+        Assert.Equal("0 0 4 * * *", stored.Expression);
+    }
+
     #endregion
 
     #region Occurrences that were pending when the application stopped

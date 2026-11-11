@@ -4,6 +4,7 @@ using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using StackExchange.Redis;
 using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 using SharpTicker.Utilities;
@@ -43,7 +44,16 @@ public static class ServiceExtension
             services.AddKeyedSingleton<IDatabase>("sharpticker", (sp, _) =>
                 sp.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker").GetDatabase());
             services.AddHostedService<NodeHeartBeatBackgroundService>();
-            services.AddSingleton<ISharpTickerRedisContext, SharpTickerRedisContext>();
+            // Redis is the store only when no other store was registered (TryAdd below); the startup release of an earlier
+            // run's jobs belongs to the store that holds them.
+            services.AddSingleton(sp => new EarlierRunRelease(
+                StoreIsRedis: sp.GetService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>() is TickerRedisPersistenceProvider<TTimeTicker, TCronTicker>,
+                Node: sp.GetRequiredService<SchedulerOptionsBuilder>().NodeIdentifier,
+                RunStartedAt: () => sp.GetService<TickerExecutionContext>()?.RunStartedAt,
+                ApplicationStarted: sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted));
+            services.AddSingleton<SharpTickerRedisContext>();
+            services.AddSingleton<ISharpTickerRedisContext>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
+            services.AddSingleton<INodeHeartbeatRegistry>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
             services.AddKeyedSingleton<IDistributedCache>("sharpticker", (sp, _) =>
                 new RedisCache(new RedisCacheOptions
                 {

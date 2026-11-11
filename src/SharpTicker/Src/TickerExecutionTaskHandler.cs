@@ -19,7 +19,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker;
 
-internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
+internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOutcomeFollowUp
 {
     // Cached lowercase TickerType names to avoid per-call ToString + ToLowerInvariant allocations
     private static readonly Dictionary<TickerType, string> TickerTypeNamesLower =
@@ -66,7 +66,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         List<InternalFunctionContext> delayedChildren = null;
 
         // Add parent task
-        tasksToRunNow[tasksToRunNowCount++] = RunContextFunctionAsync(context, isDue, cancellationToken, isChild);
+        var parentRun = RunContextFunctionAsync(context, isDue, cancellationToken, isChild);
+        tasksToRunNow[tasksToRunNowCount++] = parentRun;
 
         if (hasChildren)
         {
@@ -102,6 +103,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
 
         // Wait for concurrent tasks (parent + InProgress children)
         await Task.WhenAll(tasksToRunNow.AsSpan(0, tasksToRunNowCount).ToArray());
+
+        // The children follow the parent's outcome as the store has it. When the store does not have it, the row is not
+        // finished there: a child run or skipped now would act on an outcome that may never be stored, or that a later run
+        // of the parent replaces. So none is run or skipped (the lost write is logged where it failed).
+        if (!await parentRun)
+            return;
 
         // The parent's outcome is written, so the store now hands out the delayed children it lets run. The InProgress ones
         // again too: the claim at the start finds a closed gate when the parent was not recorded InProgress, and a row
@@ -226,6 +233,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
     private ISharpTickerDispatcher Dispatcher => _dispatcher ??= _serviceProvider.GetService<ISharpTickerDispatcher>();
     private ISharpTickerHostScheduler HostScheduler => _hostScheduler ??= _serviceProvider.GetService<ISharpTickerHostScheduler>();
     private ILogger Logger => _logger ??= _serviceProvider.GetService<ILoggerFactory>()?.CreateLogger<TickerExecutionTaskHandler>();
+    // Registered only when the background services run: without the scheduler loop nothing would write a listed outcome.
+    private LostOutcomeRetryList LostOutcomes => _lostOutcomes ??= _serviceProvider.GetService<LostOutcomeRetryList>();
+    private LostOutcomeRetryList _lostOutcomes;
     private ISharpTickerDispatcher _dispatcher;
     private ISharpTickerHostScheduler _hostScheduler;
     private ILogger _logger;
@@ -258,7 +268,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         return exception is TaskCanceledException && exception.InnerException is not TimeoutException;
     }
 
-    private async Task RunContextFunctionAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken, bool isChild = false)
+    // Returns whether the store has the job's final outcome.
+    private async Task<bool> RunContextFunctionAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken, bool isChild = false)
     {
         var typeName = TickerTypeNamesLower.GetValueOrDefault(context.Type, context.Type.ToString().ToLowerInvariant());
 
@@ -270,6 +281,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         _sharpTickerInstrumentation.LogJobEnqueued(typeName, context.FunctionName, context.TickerId, "ExecutionTaskHandler");
         
         context.SetProperty(x => x.Status, TickerStatus.InProgress);
+
+        // A claimed job's writes are fenced by the marker its claim wrote. An inline chain child got its marker when its start
+        // was recorded (RecordChildInProgressAsync), or none when that failed.
+        if (!isChild)
+            context.RunMarker = context.ClaimMarker;
 
         var stopWatch = new Stopwatch();
         // Total wall-clock from first attempt start through the final outcome,
@@ -283,193 +299,310 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         // This ensures the current occurrence is properly tracked when the callback checks for siblings
         TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this);
 
-        var tickerFunctionContext = new TickerFunctionContext
+        // The job leaves the registry of running jobs on every path, a failed outcome write included: a job left listed
+        // would hold a stop, which then records it as Cancelled, and make every later occurrence of its cron ticker skip
+        // itself as already running. RemoveTickerCancellationToken also disposes the token source.
+        try
         {
-            FunctionName = context.FunctionName,
-            Id = context.TickerId,
-            ParentId = context.ParentId,
-            Type = context.Type,
-            IsDue = isDue,
-            ScheduledFor = context.ExecutionTime,
-            // Forward retry config so delegates that defer execution elsewhere
-            // can pass it along.
-            Retries = context.Retries,
-            RetryIntervals = context.RetryIntervals,
-            RequestCancelOperationAction = () => cancellationTokenSource.Cancel(),
-            CronOccurrenceOperations = new CronOccurrenceOperations
+            var tickerFunctionContext = new TickerFunctionContext
             {
-                SkipIfAlreadyRunningAction = () =>
+                FunctionName = context.FunctionName,
+                Id = context.TickerId,
+                ParentId = context.ParentId,
+                Type = context.Type,
+                IsDue = isDue,
+                ScheduledFor = context.ExecutionTime,
+                // Forward retry config so delegates that defer execution elsewhere
+                // can pass it along.
+                Retries = context.Retries,
+                RetryIntervals = context.RetryIntervals,
+                RequestCancelOperationAction = () => cancellationTokenSource.Cancel(),
+                CronOccurrenceOperations = new CronOccurrenceOperations
                 {
-                    if (context.Type == TickerType.TimeTicker)
-                        return;
+                    SkipIfAlreadyRunningAction = () =>
+                    {
+                        if (context.Type == TickerType.TimeTicker)
+                            return;
 
-                    // Check for other running occurrences of the same parent (excluding self)
-                    // Since we're already registered, we need to exclude ourselves from the check
-                    var isRunning = context.ParentId.HasValue &&
-                                    TickerCancellationTokenManager.IsParentRunningExcludingSelf(context.ParentId.Value, context.TickerId);
+                        // Check for other running occurrences of the same parent (excluding self)
+                        // Since we're already registered, we need to exclude ourselves from the check
+                        var isRunning = context.ParentId.HasValue &&
+                                        TickerCancellationTokenManager.IsParentRunningExcludingSelf(context.ParentId.Value, context.TickerId);
 
-                    if (isRunning)
-                        throw new TerminateExecutionException("Another CronOccurrence is already running!");
-                },
-            }
-        };
-
-        Exception lastException = null;
-        var success = false;
-
-        for (var attempt = context.RetryCount; attempt <= context.Retries; attempt++)
-        {
-            tickerFunctionContext.RetryCount = attempt;
-            
-            // Update activity with current attempt information
-            jobActivity?.SetTag("sharpticker.job.current_attempt", attempt + 1);
-
-            try
-            {
-                if (await WaitForRetry(context, cancellationToken, attempt, cancellationTokenSource)) break;
-
-                stopWatch.Restart();
-
-                if (context.CachedDelegate is null)
-                {
-                    throw new InvalidOperationException(
-                        $"Ticker function '{context.FunctionName}' was not found in the registered functions. " +
-                        "Ensure the function is properly decorated with [TickerFunction] attribute and the containing class is registered.");
+                        if (isRunning)
+                            throw new TerminateExecutionException("Another CronOccurrence is already running!");
+                    },
                 }
+            };
 
-                // Create service scope - will be disposed automatically via await using
-                await using var scope = _serviceProvider.CreateAsyncScope();
-                tickerFunctionContext.SetServiceScope(scope);
-                await context.CachedDelegate(cancellationTokenSource.Token, scope.ServiceProvider, tickerFunctionContext);
+            Exception lastException = null;
+            var success = false;
 
-                success = true;
-                context.RetryCount = attempt;
-                break;
-            }
-            // A cancelled task counts, and so does any OperationCanceledException when this job's own token was cancelled,
-            // for example by the cancel button or by the application stopping. A plain OperationCanceledException that
-            // nobody asked for is an ordinary failure, and so is the TaskCanceledException that HttpClient throws when its own
-            // timeout runs out (see IsCancellation).
-            catch (OperationCanceledException ex) when (IsCancellation(ex, cancellationTokenSource))
+            for (var attempt = context.RetryCount; attempt <= context.Retries; attempt++)
             {
-                context.SetProperty(x => x.Status, TickerStatus.Cancelled)
-                    .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                    .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds)
-                    .SetProperty(x => x.ExceptionDetails, SerializeException(ex));
-                
-                // Add cancellation tags to activity
+                tickerFunctionContext.RetryCount = attempt;
+
+                // Update activity with current attempt information
+                jobActivity?.SetTag("sharpticker.job.current_attempt", attempt + 1);
+
+                try
+                {
+                    if (await WaitForRetry(context, cancellationToken, attempt, cancellationTokenSource)) break;
+
+                    stopWatch.Restart();
+
+                    if (context.CachedDelegate is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Ticker function '{context.FunctionName}' was not found in the registered functions. " +
+                            "Ensure the function is properly decorated with [TickerFunction] attribute and the containing class is registered.");
+                    }
+
+                    // Create service scope - will be disposed automatically via await using
+                    await using var scope = _serviceProvider.CreateAsyncScope();
+                    tickerFunctionContext.SetServiceScope(scope);
+                    await context.CachedDelegate(cancellationTokenSource.Token, scope.ServiceProvider, tickerFunctionContext);
+
+                    success = true;
+                    context.RetryCount = attempt;
+                    break;
+                }
+                // A cancelled task counts, and so does any OperationCanceledException when this job's own token was cancelled,
+                // for example by the cancel button or by the application stopping. A plain OperationCanceledException that
+                // nobody asked for is an ordinary failure, and so is the TaskCanceledException that HttpClient throws when its own
+                // timeout runs out (see IsCancellation).
+                catch (OperationCanceledException ex) when (IsCancellation(ex, cancellationTokenSource))
+                {
+                    context.SetProperty(x => x.Status, TickerStatus.Cancelled)
+                        .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
+                        .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds)
+                        .SetProperty(x => x.ExceptionDetails, SerializeException(ex));
+
+                    // Add cancellation tags to activity
+                    jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
+                    jobActivity?.SetTag("sharpticker.job.cancellation_reason", "Task was cancelled");
+
+                    // Log job cancelled
+                    _sharpTickerInstrumentation.LogJobCancelled(context.TickerId, context.FunctionName, "Task was cancelled");
+
+                    if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
+                        await handler.HandleCanceledExceptionAsync(ex, context.TickerId, context.Type);
+
+                    return await StoreOutcomeAsync(context, isChild);
+                }
+                catch (TerminateExecutionException ex)
+                {
+                    context.SetProperty(x => x.Status, ex.Status)
+                        .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
+                        .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds);
+
+                    if (ex.InnerException != null)
+                    {
+                        context.SetProperty(x => x.ExceptionDetails, ex.InnerException.Message);
+                        jobActivity?.SetTag("sharpticker.job.skip_reason", ex.InnerException.Message);
+                    }
+                    else
+                    {
+                        context.SetProperty(x => x.ExceptionDetails, ex.Message);
+                        jobActivity?.SetTag("sharpticker.job.skip_reason", ex.Message);
+                    }
+
+                    // Add skip tags to activity
+                    jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
+
+                    // Log job skipped
+                    _sharpTickerInstrumentation.LogJobSkipped(context.TickerId, context.FunctionName, ex.Message);
+
+                    return await StoreOutcomeAsync(context, isChild);
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+
+                    context.SetProperty(x => x.ExceptionDetails, SerializeException(ex));
+
+                    if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
+                        await handler.HandleExceptionAsync(ex, context.TickerId, context.Type);
+
+                    // Per-attempt failure log so retries are visible in trace/logs.
+                    // The terminal failure (last attempt that exhausts retries) is logged
+                    // by the post-loop block below as Error — guard with `attempt < Retries`
+                    // so non-terminal attempts log as Warning instead and the final attempt
+                    // isn't double-logged.
+                    if (attempt < context.Retries)
+                        _sharpTickerInstrumentation.LogJobAttemptFailed(
+                            context.TickerId, context.FunctionName, attempt, context.Retries, stopWatch.ElapsedMilliseconds, ex);
+
+                    await StoreAttemptAsync(context, cancellationToken);
+                }
+            }
+
+            stopWatch.Stop();
+            totalStopWatch.Stop();
+
+            // Persist the *total* time (first attempt start → final outcome, includes
+            // retry waits). The per-attempt stopWatch is still used for instrumentation
+            // ("attempt X failed in 200ms") but doesn't reflect user-lived duration.
+            context.SetProperty(x => x.ElapsedTime, totalStopWatch.ElapsedMilliseconds)
+                .SetProperty(x => x.ExecutedAt, _clock.UtcNow);
+
+            if (success)
+            {
+                context.SetProperty(x => x.Status, isDue ? TickerStatus.DueDone : TickerStatus.Done);
+
+                // Add success tags to activity
                 jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
-                jobActivity?.SetTag("sharpticker.job.cancellation_reason", "Task was cancelled");
-                
-                // Log job cancelled
-                _sharpTickerInstrumentation.LogJobCancelled(context.TickerId, context.FunctionName, "Task was cancelled");
+                jobActivity?.SetTag("sharpticker.job.final_retry_count", context.RetryCount);
 
-                if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
-                    await handler.HandleCanceledExceptionAsync(ex, context.TickerId, context.Type);
+                // Log job completed successfully
+                _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, true);
 
-                // The outcome is written with no cancellation: the token that cancelled the job would cancel the write
-                // too, and the job would stay InProgress instead of ending as cancelled.
-                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
-                
-                // Clean up and exit early on cancellation
-                TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
-                return;
+                return await StoreOutcomeAsync(context, isChild);
             }
-            catch (TerminateExecutionException ex)
+
+            if (lastException != null)
             {
-                context.SetProperty(x => x.Status, ex.Status)
-                    .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                    .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds);
+                context.SetProperty(x => x.Status, TickerStatus.Failed)
+                    .SetProperty(x => x.ExceptionDetails, SerializeException(lastException));
 
-                if (ex.InnerException != null)
-                {
-                    context.SetProperty(x => x.ExceptionDetails, ex.InnerException.Message);
-                    jobActivity?.SetTag("sharpticker.job.skip_reason", ex.InnerException.Message);
-                }
-                else
-                {
-                    context.SetProperty(x => x.ExceptionDetails, ex.Message);
-                    jobActivity?.SetTag("sharpticker.job.skip_reason", ex.Message);
-                }
-
-                // Add skip tags to activity
+                // Add failure tags to activity
                 jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
+                jobActivity?.SetTag("sharpticker.job.final_retry_count", context.RetryCount);
+                jobActivity?.SetTag("sharpticker.job.error_type", lastException.GetType().Name);
 
-                // Log job skipped
-                _sharpTickerInstrumentation.LogJobSkipped(context.TickerId, context.FunctionName, ex.Message);
+                // Log job failed
+                _sharpTickerInstrumentation.LogJobFailed(context.TickerId, context.FunctionName, lastException, context.RetryCount);
+                _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, false);
 
-                await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
-
-                // Clean up and exit early on termination
-                TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
-                return;
+                return await StoreOutcomeAsync(context, isChild);
             }
-            catch (Exception ex)
+
+            // No attempt ran (the retry count was already past the retries), so there is no outcome to store.
+            Logger?.LogWarning(
+                "{FunctionName} ({TickerId}) was not run: its retry count {RetryCount} is already past its {Retries} retries. No outcome is stored, and any chain children are neither run nor skipped.",
+                context.FunctionName, context.TickerId, context.RetryCount, context.Retries);
+            return false;
+        }
+        finally
+        {
+            TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
+        }
+    }
+
+    // The final outcome write. It never throws: the job has ended either way, and the caller still has to leave the registry
+    // of running jobs and decide on the chain children. The write has no cancellation: the token that cancelled the job would
+    // cancel the write too, and the job would stay InProgress instead of ending as cancelled. Returns whether the store has
+    // the outcome.
+    private async Task<bool> StoreOutcomeAsync(InternalFunctionContext context, bool isChild)
+    {
+        try
+        {
+            if (await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None))
+                return true;
+
+            Logger?.LogWarning(
+                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: no stored row matched, as the row was deleted while the job ran, or released and taken by another run. Any chain children are neither run nor skipped.",
+                context.Status, context.FunctionName, context.TickerId);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // Listed before this returns, so before the run leaves the registry of running jobs: a stop that finds no job
+            // running finds this outcome in the list.
+            switch (ListLostOutcome(context, isChild))
             {
-                lastException = ex;
-
-                context.SetProperty(x => x.ExceptionDetails, SerializeException(ex));
-
-                if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
-                    await handler.HandleExceptionAsync(ex, context.TickerId, context.Type);
-
-                // Per-attempt failure log so retries are visible in trace/logs.
-                // The terminal failure (last attempt that exhausts retries) is logged
-                // by the post-loop block below as Error — guard with `attempt < Retries`
-                // so non-terminal attempts log as Warning instead and the final attempt
-                // isn't double-logged.
-                if (attempt < context.Retries)
-                    _sharpTickerInstrumentation.LogJobAttemptFailed(
-                        context.TickerId, context.FunctionName, attempt, context.Retries, stopWatch.ElapsedMilliseconds, ex);
-
-                await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
-
-                context.ResetUpdateProps();
+                case LostOutcomeListing.Listed when isChild:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        context.Status, context.FunctionName, context.TickerId);
+                    break;
+                case LostOutcomeListing.Listed:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node, and the job can then run again. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        context.Status, context.FunctionName, context.TickerId);
+                    break;
+                // An inline chain child that was not fenced was never claimed by this node's lock, so nothing releases it.
+                case var listing when isChild:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. Its row stays InProgress. Any chain children of it are neither run nor skipped.{Stopping}",
+                        context.Status, context.FunctionName, context.TickerId, StoppingNote(listing));
+                    break;
+                case var listing:
+                    Logger?.LogError(ex,
+                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The row stays InProgress until the store releases the rows of this node, and the job can then run again. Any chain children are neither run nor skipped.{Stopping}",
+                        context.Status, context.FunctionName, context.TickerId, StoppingNote(listing));
+                    break;
             }
+            return false;
         }
+    }
 
-        stopWatch.Stop();
-        totalStopWatch.Stop();
+    private enum LostOutcomeListing
+    {
+        // The scheduler writes it again.
+        Listed,
+        // The scheduler is stopping: its list takes nothing more.
+        Closed,
+        // Not written again: no scheduler (background services off), or the run is not fenced (no marker, or a store that
+        // does not fence), where a write by Id could land on a later run of the row.
+        NotRetried
+    }
 
-        // Persist the *total* time (first attempt start → final outcome, includes
-        // retry waits). The per-attempt stopWatch is still used for instrumentation
-        // ("attempt X failed in 200ms") but doesn't reflect user-lived duration.
-        context.SetProperty(x => x.ElapsedTime, totalStopWatch.ElapsedMilliseconds)
-            .SetProperty(x => x.ExecutedAt, _clock.UtcNow);
+    private LostOutcomeListing ListLostOutcome(InternalFunctionContext context, bool isChild)
+    {
+        if (LostOutcomes is not { } list || context.RunMarker is null || !_internalTickerManager.FencesRuns)
+            return LostOutcomeListing.NotRetried;
+        return list.TryAdd(context, isChild, _clock.UtcNow) ? LostOutcomeListing.Listed : LostOutcomeListing.Closed;
+    }
 
-        if (success)
+    private static string StoppingNote(LostOutcomeListing listing)
+        => listing == LostOutcomeListing.Closed ? " The scheduler is stopping, so it is not written again." : string.Empty;
+
+    public async Task AfterLateStoreAsync(InternalFunctionContext outcome, bool claimChildren, CancellationToken cancellationToken)
+    {
+        var delayedChildren = outcome.TimeTickerChildren?.Where(c => c.IsDelayed).ToList();
+        if (delayedChildren is not { Count: > 0 })
+            return;
+
+        // As after an outcome stored at once (ExecuteTaskAsync): the store now hands out the delayed children the outcome
+        // lets run, and those it does not let run never will, so they are skipped with what they carry.
+        if (claimChildren && ChainRunGate.IsFinal(outcome.Status))
+            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, outcome.Status)), cancellationToken).ConfigureAwait(false);
+
+        var childrenToSkip = new List<InternalFunctionContext>();
+        foreach (var child in delayedChildren)
         {
-            context.SetProperty(x => x.Status, isDue ? TickerStatus.DueDone : TickerStatus.Done);
-            
-            // Add success tags to activity
-            jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
-            jobActivity?.SetTag("sharpticker.job.final_retry_count", context.RetryCount);
-            
-            // Log job completed successfully
-            _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, true);
-
-            await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
+            if (!ShouldRunChild(child, outcome.Status))
+                SkipWithDescendants(child, outcome, childrenToSkip);
         }
-        else if (lastException != null)
+
+        if (childrenToSkip.Count > 0)
+            await _internalTickerManager.UpdateSkipTimeTickersWithUnifiedContextAsync(childrenToSkip.ToArray(), cancellationToken).ConfigureAwait(false);
+    }
+
+    // A write during the run (a failed attempt, the number of the next retry) keeps the dashboard current; the final outcome
+    // write still follows. So it never throws, and a failure here neither fails the job nor counts as a failed attempt. That
+    // holds for a cancelled write too: the run goes on to its next step, which sees the cancellation and ends the job as
+    // cancelled, so an outcome is still written. The changed fields are kept when the write failed, so the next write carries
+    // them.
+    private async Task StoreAttemptAsync(InternalFunctionContext context, CancellationToken cancellationToken)
+    {
+        try
         {
-            context.SetProperty(x => x.Status, TickerStatus.Failed)
-                .SetProperty(x => x.ExceptionDetails, SerializeException(lastException));
-            
-            // Add failure tags to activity
-            jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
-            jobActivity?.SetTag("sharpticker.job.final_retry_count", context.RetryCount);
-            jobActivity?.SetTag("sharpticker.job.error_type", lastException.GetType().Name);
-            
-            // Log job failed
-            _sharpTickerInstrumentation.LogJobFailed(context.TickerId, context.FunctionName, lastException, context.RetryCount);
-            _sharpTickerInstrumentation.LogJobCompleted(context.TickerId, context.FunctionName, totalStopWatch.ElapsedMilliseconds, false);
-
-            await _internalTickerManager.UpdateTickerAsync(context, CancellationToken.None);
+            await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
+            context.ResetUpdateProps();
         }
-
-
-        // Clean up: RemoveTickerCancellationToken handles disposal of the CTS
-        TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            Logger?.LogDebug(ex, "Recording attempt {Attempt} of {FunctionName} ({TickerId}) was cancelled.",
+                context.RetryCount, context.FunctionName, context.TickerId);
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning(ex,
+                "Recording attempt {Attempt} of {FunctionName} ({TickerId}) failed; the job goes on, and its final outcome is written as usual.",
+                context.RetryCount, context.FunctionName, context.TickerId);
+        }
     }
 
     private async Task<bool> WaitForRetry(InternalFunctionContext context, CancellationToken cancellationToken,
@@ -483,9 +616,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
 
         context.SetProperty(x => x.RetryCount, attempt);
 
-        await _internalTickerManager.UpdateTickerAsync(context, cancellationToken);
-
-        context.ResetUpdateProps();
+        await StoreAttemptAsync(context, cancellationToken);
 
         var retryInterval = (context.RetryIntervals?.Length > 0)
             ? (attempt - 1 < context.RetryIntervals.Length
@@ -546,10 +677,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
     // ever run, nor the rest of the chain. Its final status is written as usual.
     private async Task RecordChildInProgressAsync(InternalFunctionContext child, CancellationToken cancellationToken)
     {
-        child.SetProperty(x => x.Status, TickerStatus.InProgress);
         try
         {
-            await _internalTickerManager.UpdateTickerAsync(child, cancellationToken);
+            await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken);
         }
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
         {
@@ -557,7 +687,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway.",
+            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway, and its writes are by Id, not fenced.",
                 child.FunctionName, child.TickerId);
         }
         finally

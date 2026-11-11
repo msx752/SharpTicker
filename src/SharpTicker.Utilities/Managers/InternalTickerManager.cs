@@ -23,6 +23,7 @@ namespace SharpTicker.Utilities.Managers
         private readonly ITickerClock _clock;
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
         private readonly ILogger _logger;
+        private readonly ClaimPutBackRetryList _putBackRetry;
 
         public InternalTickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -37,11 +38,24 @@ namespace SharpTicker.Utilities.Managers
             ITickerClock clock,
             ISharpTickerNotificationHubSender notificationHubSender,
             ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger)
+            : this(persistenceProvider, clock, notificationHubSender, logger, null)
+        {
+        }
+
+        // putBackRetry: registered only when the background services run; null keeps the rows of a failed put-back InProgress
+        // until the store releases the rows of this node.
+        public InternalTickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger,
+            ClaimPutBackRetryList putBackRetry)
         {
             _persistenceProvider = persistenceProvider;
             _clock = clock ?? throw new ArgumentNullException(nameof(clock));
             _notificationHubSender = notificationHubSender;
             _logger = logger;
+            _putBackRetry = putBackRetry;
         }
         
         public async Task<(TimeSpan TimeRemaining, InternalFunctionContext[] Functions)> GetNextTickers(CancellationToken cancellationToken = default)
@@ -318,7 +332,11 @@ namespace SharpTicker.Utilities.Managers
                 : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
 
             if (won)
+            {
                 function.Status = TickerStatus.InProgress;
+                // The run's writes are fenced by the marker this claim wrote, as on the other claim paths.
+                function.ClaimMarker = claimMarker;
+            }
 
             return won;
         }
@@ -378,18 +396,99 @@ namespace SharpTicker.Utilities.Managers
                 await _persistenceProvider.ReleaseAcquiredTimeTickers(timeTickerIds, cancellationToken).ConfigureAwait(false);
         }
         
-        public async Task UpdateTickerAsync(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
+        public async Task<bool> UpdateTickerAsync(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
-            if (functionContext.Type == TickerType.CronTickerOccurrence)
+            var stored = await WriteAsync(functionContext, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false);
+            await NotifyUpdatedAsync(functionContext).ConfigureAwait(false);
+            return stored;
+        }
+
+        public bool FencesRuns => _persistenceProvider is IFencedRunWriter;
+
+        public async Task<bool> StoreLostOutcomeAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+        {
+            if (context.RunMarker is null || _persistenceProvider is not IFencedRunWriter)
+                throw new InvalidOperationException(
+                    $"The outcome of {context.FunctionName} ({context.TickerId}) is not written again: only a run fenced by its marker is, and a write by Id could land on a later run.");
+
+            if (!await WriteAsync(context, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false))
+                return false;
+
+            // The outcome is stored. A notification that fails must not make it look lost, which would write it again forever.
+            try
+            {
+                await NotifyUpdatedAsync(context).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "The {Status} outcome of {FunctionName} ({TickerId}) was stored, but the dashboard could not be notified.",
+                    context.Status, context.FunctionName, context.TickerId);
+            }
+            return true;
+        }
+
+        public async Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+        {
+            var written = await WriteAsync(context, onlyWhileRunning: true, cancellationToken).ConfigureAwait(false);
+            if (!written)
+                return false;
+
+            // Written: a failing notification must not make the stop log it as not recorded.
+            try
+            {
+                await NotifyUpdatedAsync(context).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Job {FunctionName} ({TickerId}) was recorded as Cancelled, but the dashboard could not be notified.",
+                    context.FunctionName, context.TickerId);
+            }
+            return true;
+        }
+
+        // A fenced run writes only to the row it still holds (see IFencedRunWriter); any other write is by Id, as before.
+        private async Task<bool> WriteAsync(InternalFunctionContext functionContext, bool onlyWhileRunning, CancellationToken cancellationToken)
+        {
+            var isCron = functionContext.Type == TickerType.CronTickerOccurrence;
+
+            if (functionContext.RunMarker is { } runMarker && _persistenceProvider is IFencedRunWriter fenced)
+            {
+                var written = isCron
+                    ? await fenced.UpdateCronOccurrenceFencedAsync(functionContext, runMarker, onlyWhileRunning, cancellationToken).ConfigureAwait(false)
+                    : await fenced.UpdateTimeTickerFencedAsync(functionContext, runMarker, onlyWhileRunning, cancellationToken).ConfigureAwait(false);
+                return written > 0;
+            }
+
+            if (isCron)
             {
                 await _persistenceProvider.UpdateCronTickerOccurrence(functionContext, cancellationToken).ConfigureAwait(false);
-                await _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext).ConfigureAwait(false);
+                return true;
+            }
+
+            return await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false) > 0;
+        }
+
+        private Task NotifyUpdatedAsync(InternalFunctionContext functionContext)
+            => functionContext.Type == TickerType.CronTickerOccurrence
+                ? _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext)
+                : _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext);
+
+        public async Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default)
+        {
+            child.SetProperty(x => x.Status, TickerStatus.InProgress);
+
+            if (_persistenceProvider is IFencedRunWriter fenced)
+            {
+                var marker = _clock.NextClaimMarker();
+                if (await fenced.StartInlineChildAsync(child.TickerId, marker, cancellationToken).ConfigureAwait(false) > 0)
+                    child.RunMarker = marker;
             }
             else
             {
-                await _persistenceProvider.UpdateTimeTicker(functionContext, cancellationToken).ConfigureAwait(false);
-                await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext).ConfigureAwait(false);
+                await _persistenceProvider.UpdateTimeTicker(child, cancellationToken).ConfigureAwait(false);
             }
+
+            await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(child).ConfigureAwait(false);
         }
         
         public async Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
@@ -435,12 +534,15 @@ namespace SharpTicker.Utilities.Managers
             }
             catch (ClaimPutBackFailedException ex)
             {
+                // Not inside the log call: with no logger its arguments are not evaluated.
+                var retried = _putBackRetry?.AddFrom(ex) > 0;
                 _logger?.LogError(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed, and some of the rows it claimed could not be put back. " +
-                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                    "{WhatHappens}; the others run when the fallback picks them up.", string.Join(", ", ids), ClaimPutBackRetryList.WhatHappens(retried));
                 return [];
             }
             catch (Exception ex)
             {
+                _putBackRetry?.AddFrom(ex);
                 _logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} after their parent ended failed. They run when the fallback picks them up.",
                     string.Join(", ", ids));
                 return [];
@@ -479,7 +581,8 @@ namespace SharpTicker.Utilities.Managers
 
         // The stores claim the overdue rows one by one while they are enumerated, so a failure in the middle (a dropped
         // connection, a cancelled token) comes after some rows were claimed. Those rows are InProgress for this node; they are
-        // handed back with the failure so the fallback runs them, instead of being dropped with the list.
+        // handed back with the failure so the fallback runs them, instead of being dropped with the list. A row the store
+        // could not put back after such a failure goes to the retry list, so the scheduler loop puts it back later.
         public async Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default)
         {
             var results = new List<InternalFunctionContext>();
@@ -488,9 +591,12 @@ namespace SharpTicker.Utilities.Managers
             {
                 await ClaimTimedOutTickersAsync(results, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (results.Count > 0)
+            catch (Exception ex)
             {
-                throw new ClaimsInterruptedException(results.ToArray(), ex);
+                _putBackRetry?.AddFrom(ex);
+                if (results.Count > 0)
+                    throw new ClaimsInterruptedException(results.ToArray(), ex);
+                throw;
             }
 
             return results.ToArray();

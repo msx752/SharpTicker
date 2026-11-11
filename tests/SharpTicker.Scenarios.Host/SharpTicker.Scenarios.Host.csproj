@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- A test-only node for the container scenario tests. Not part of SharpTicker.slnx and not built in CI. -->
+  <PropertyGroup>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="$(EfCoreVersion)" />
+    <!-- dotnet ef generated the migrations of the migration scenarios (Migrations/Documented, Migrations/Unedited) -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="$(EfCoreVersion)" PrivateAssets="All" />
+    <!-- Pin patched versions of vulnerable transitive dependencies -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SharpTicker\SharpTicker.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.EntityFrameworkCore\SharpTicker.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.MongoDB\SharpTicker.MongoDB.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.Caching.StackExchangeRedis\SharpTicker.Caching.StackExchangeRedis.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.Dashboard\SharpTicker.Dashboard.csproj" />
+  </ItemGroup>
+
+</Project>

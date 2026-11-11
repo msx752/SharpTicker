@@ -18,7 +18,7 @@ namespace SharpTicker.Provider
 {
     internal class
         TickerInMemoryPersistenceProvider<TTimeTicker, TCronTicker> : ITickerPersistenceProvider<TTimeTicker,
-        TCronTicker>, IClaimFanOut, IChildSkipWriter
+        TCronTicker>, IClaimFanOut, IChildSkipWriter, IFencedRunWriter
         where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
         where TCronTicker : CronTickerEntity, new()
     {
@@ -468,43 +468,58 @@ namespace SharpTicker.Provider
                 ticker.ParentId = parentId.Value;
             }
             
-            // Update the ticker itself
-            if (TimeTickers.TryGetValue(ticker.Id, out var existing))
+            // Update the ticker itself. A running row keeps its run (RunStateOnEdit), checked against the very row the swap
+            // replaces: each attempt starts again from what the caller sent.
+            for (var attempt = 0; ; attempt++)
             {
-                if (TimeTickers.TryUpdate(ticker.Id, ticker, existing))
+                if (!TimeTickers.TryGetValue(ticker.Id, out var existing))
                 {
-                    // Maintain children index for parent changes
-                    if (existing.ParentId != ticker.ParentId)
+                    // If it doesn't exist, add it (this can happen for new children). A body that still shows a run does not
+                    // create a running row that nobody runs.
+                    if (ticker.Status == TickerStatus.InProgress)
                     {
-                        if (existing.ParentId.HasValue)
-                            RemoveChildIndex(existing.ParentId.Value, ticker.Id);
-                        if (ticker.ParentId.HasValue)
-                            AddChildIndex(ticker.ParentId.Value, ticker.Id);
+                        ticker.Status = TickerStatus.Idle;
+                        ticker.LockHolder = null;
+                        ticker.LockedAt = null;
                     }
+                    return count + AddTickerWithChildren(ticker, parentId);
+                }
 
-                    count++;
-                    
-                    // Recursively update all children
-                    if (ticker.Children != null && ticker.Children.Count > 0)
+                if (attempt == MaxSwapAttempts)
+                    throw new InvalidOperationException($"Time ticker {ticker.Id} kept changing while it was being updated; it was not updated.");
+
+                var updated = CloneTicker(ticker);
+                RunStateOnEdit.Apply(updated, existing);
+
+                if (!TimeTickers.TryUpdate(ticker.Id, updated, existing))
+                    continue;
+
+                // Maintain children index for parent changes
+                if (existing.ParentId != updated.ParentId)
+                {
+                    if (existing.ParentId.HasValue)
+                        RemoveChildIndex(existing.ParentId.Value, ticker.Id);
+                    if (updated.ParentId.HasValue)
+                        AddChildIndex(updated.ParentId.Value, ticker.Id);
+                }
+
+                count++;
+
+                // Recursively update all children
+                if (ticker.Children != null && ticker.Children.Count > 0)
+                {
+                    foreach (var child in ticker.Children)
                     {
-                        foreach (var child in ticker.Children)
+                        // Cast to TTimeTicker since Children is ICollection<TTimeTicker>
+                        if (child is TTimeTicker childTicker)
                         {
-                            // Cast to TTimeTicker since Children is ICollection<TTimeTicker>
-                            if (child is TTimeTicker childTicker)
-                            {
-                                count += UpdateTickerWithChildren(childTicker, ticker.Id);
-                            }
+                            count += UpdateTickerWithChildren(childTicker, ticker.Id);
                         }
                     }
                 }
+
+                return count;
             }
-            else
-            {
-                // If it doesn't exist, add it (this can happen for new children)
-                count += AddTickerWithChildren(ticker, parentId);
-            }
-            
-            return count;
         }
 
         public Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default)
@@ -859,16 +874,81 @@ namespace SharpTicker.Provider
 
         public Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
-            if (CronOccurrences.TryGetValue(functionContext.TickerId, out var occurrence))
-            {
-                var updatedOccurrence = CloneCronOccurrence(occurrence);
-                ApplyFunctionContextToCronOccurrence(updatedOccurrence, functionContext);
-                
-                CronOccurrences.TryUpdate(functionContext.TickerId, updatedOccurrence, occurrence);
-            }
-            
+            // A lost swap is tried again, so the write is not dropped when the row changed in between.
+            SwapCronOccurrence(functionContext.TickerId, _ => true, occurrence => ApplyFunctionContextToCronOccurrence(occurrence, functionContext));
             return Task.CompletedTask;
         }
+
+        #region IFencedRunWriter
+
+        private const int MaxSwapAttempts = 16;
+
+        // The fence of IFencedRunWriter: the row this node holds with the run's marker, and with onlyWhileRunning still InProgress.
+        private bool HoldsRun(string lockHolder, DateTime updatedAt, TickerStatus status, DateTime runMarker, bool onlyWhileRunning)
+            => lockHolder == _lockHolder && updatedAt == runMarker && (!onlyWhileRunning || status == TickerStatus.InProgress);
+
+        public Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+            => Task.FromResult(SwapTimeTicker(context.TickerId,
+                ticker => HoldsRun(ticker.LockHolder, ticker.UpdatedAt, ticker.Status, runMarker, onlyWhileRunning),
+                ticker => ApplyFunctionContextToTicker(ticker, context, runMarker)));
+
+        public Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+            => Task.FromResult(SwapCronOccurrence(context.TickerId,
+                occurrence => HoldsRun(occurrence.LockHolder, occurrence.UpdatedAt, occurrence.Status, runMarker, onlyWhileRunning),
+                occurrence => ApplyFunctionContextToCronOccurrence(occurrence, context, runMarker)));
+
+        public Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
+        {
+            var now = _clock.UtcNow;
+            return Task.FromResult(SwapTimeTicker(timeTickerId, _ => true, ticker =>
+            {
+                ticker.Status = TickerStatus.InProgress;
+                ticker.LockHolder = _lockHolder;
+                ticker.LockedAt = now;
+                ticker.UpdatedAt = runMarker;
+            }));
+        }
+
+        public Task<int> UpdateNotStartedCronOccurrenceAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+            => Task.FromResult(SwapCronOccurrence(context.TickerId,
+                occurrence => occurrence.Status is TickerStatus.Idle or TickerStatus.Queued,
+                occurrence => ApplyFunctionContextToCronOccurrence(occurrence, context)));
+
+        // Applies a change to a copy of the row and swaps it in when the row still matches; a row that changed in between is
+        // read and checked again. Returns 1 when written, 0 when the row is missing or does not match.
+        private int SwapTimeTicker(Guid id, Func<TTimeTicker, bool> matches, Action<TTimeTicker> change)
+        {
+            for (var attempt = 0; attempt < MaxSwapAttempts; attempt++)
+            {
+                if (!TimeTickers.TryGetValue(id, out var current) || !matches(current))
+                    return 0;
+
+                var updated = CloneTicker(current);
+                change(updated);
+                if (TimeTickers.TryUpdate(id, updated, current))
+                    return 1;
+            }
+
+            throw new InvalidOperationException($"Time ticker {id} kept changing while it was being written; it was not written.");
+        }
+
+        private int SwapCronOccurrence(Guid id, Func<CronTickerOccurrenceEntity<TCronTicker>, bool> matches, Action<CronTickerOccurrenceEntity<TCronTicker>> change)
+        {
+            for (var attempt = 0; attempt < MaxSwapAttempts; attempt++)
+            {
+                if (!CronOccurrences.TryGetValue(id, out var current) || !matches(current))
+                    return 0;
+
+                var updated = CloneCronOccurrence(current);
+                change(updated);
+                if (CronOccurrences.TryUpdate(id, updated, current))
+                    return 1;
+            }
+
+            throw new InvalidOperationException($"Cron occurrence {id} kept changing while it was being written; it was not written.");
+        }
+
+        #endregion
 
         public Task ReleaseAcquiredCronTickerOccurrences(Guid[] occurrenceIds, CancellationToken cancellationToken = default)
         {
@@ -1141,7 +1221,9 @@ namespace SharpTicker.Provider
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (!CronOccurrences.TryGetValue(occurrence.Id, out var current))
+                // The row read again may have been claimed in the meantime: only a row that has still not started is skipped.
+                if (!CronOccurrences.TryGetValue(occurrence.Id, out var current) ||
+                    current.Status is not (TickerStatus.Idle or TickerStatus.Queued))
                     continue;
 
                 var updated = CloneCronOccurrence(current);
@@ -1384,6 +1466,12 @@ namespace SharpTicker.Provider
 
 
         private void ApplyFunctionContextToTicker(TTimeTicker ticker, InternalFunctionContext context)
+            => ApplyFunctionContextToTicker(ticker, context, _clock.UtcNow);
+
+        private void ApplyFunctionContextToCronOccurrence(CronTickerOccurrenceEntity<TCronTicker> occurrence, InternalFunctionContext context)
+            => ApplyFunctionContextToCronOccurrence(occurrence, context, _clock.UtcNow);
+
+        private static void ApplyFunctionContextToTicker(TTimeTicker ticker, InternalFunctionContext context, DateTime updatedAt)
         {
             var propsToUpdate = context.GetPropsToUpdate();
 
@@ -1432,10 +1520,10 @@ namespace SharpTicker.Provider
             }
 
             // UPDATED_AT ALWAYS
-            ticker.UpdatedAt = _clock.UtcNow;
+            ticker.UpdatedAt = updatedAt;
         }
-        
-        private void ApplyFunctionContextToCronOccurrence(CronTickerOccurrenceEntity<TCronTicker> occurrence, InternalFunctionContext context)
+
+        private static void ApplyFunctionContextToCronOccurrence(CronTickerOccurrenceEntity<TCronTicker> occurrence, InternalFunctionContext context, DateTime updatedAt)
         {
             var propsToUpdate = context.GetPropsToUpdate();
 
@@ -1484,7 +1572,7 @@ namespace SharpTicker.Provider
             }
 
             // UPDATED_AT ALWAYS
-            occurrence.UpdatedAt = _clock.UtcNow;
+            occurrence.UpdatedAt = updatedAt;
         }
 
         #endregion

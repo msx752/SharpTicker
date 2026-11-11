@@ -1474,4 +1474,141 @@ public class InternalTickerManagerTests
         Assert.Equal("the store refused", failure.Message);
         await _persistence.Received(1).ReleaseDeadNodeTimeTickerResources("node-a", start, Arg.Any<CancellationToken>());
     }
+
+    #region A put-back that failed inside a claim call
+
+    private IInternalTickerManager ManagerWith(ClaimPutBackRetryList retry)
+    {
+        var managerType = typeof(IInternalTickerManager).Assembly
+            .GetType("SharpTicker.Utilities.Managers.InternalTickerManager`2")!
+            .MakeGenericType(typeof(FakeTimeTicker), typeof(FakeCronTicker));
+        return (IInternalTickerManager)Activator.CreateInstance(managerType,
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, binder: null,
+            args: new object?[] { _persistence, _clock, _notificationHub, null, retry }, culture: null)!;
+    }
+
+    private static ClaimPutBackFailedException PutBackFailed(NotPutBackClaim row)
+        => new(1, [new InvalidOperationException("store failed"), new TimeoutException("release failed")], [row]);
+
+    private static async IAsyncEnumerable<T> YieldThenThrow<T>(IEnumerable<T> items, Exception failure,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        foreach (var item in items)
+        {
+            yield return item;
+            await Task.Yield();
+        }
+        throw failure;
+    }
+
+    // The fallback's claim call failed and so did the put-back of a row it had claimed. That row is InProgress for this node
+    // with nothing to run it: it goes to the retry list, whether the failure came before any row was handed back (it is
+    // thrown as it is) or after one (it is wrapped with the rows handed back). The failure still reaches the fallback.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RunTimedOutTickers_APutBackFailed_HandsItsRowToTheRetryList(bool afterARowWasHandedBack)
+    {
+        var retry = new ClaimPutBackRetryList();
+        var manager = ManagerWith(retry);
+        var row = new NotPutBackClaim(Guid.NewGuid(), _now, TickerType.TimeTicker);
+        var handedBack = new TimeTickerEntity { Id = Guid.NewGuid(), Function = "fn", ExecutionTime = _now, UpdatedAt = _now };
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>())
+            .Returns(YieldThenThrow(afterARowWasHandedBack ? [handedBack] : Array.Empty<TimeTickerEntity>(), PutBackFailed(row)));
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(EmptyAsyncEnumerable<CronTickerOccurrenceEntity<FakeCronTicker>>());
+
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(() => manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Equal(afterARowWasHandedBack, thrown is ClaimsInterruptedException);
+        Assert.Equal([row], retry.TakeAll());
+    }
+
+    // The same for a cron occurrence: the row keeps its type, so its put-back uses the occurrence's release.
+    [Fact]
+    public async Task RunTimedOutTickers_APutBackOfAnOccurrenceFailed_HandsItsRowToTheRetryList()
+    {
+        var retry = new ClaimPutBackRetryList();
+        var manager = ManagerWith(retry);
+        var row = new NotPutBackClaim(Guid.NewGuid(), _now, TickerType.CronTickerOccurrence);
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>()).Returns(EmptyAsyncEnumerable<TimeTickerEntity>());
+        _persistence.QueueTimedOutCronTickerOccurrences(Arg.Any<CancellationToken>())
+            .Returns(YieldThenThrow(Array.Empty<CronTickerOccurrenceEntity<FakeCronTicker>>(), PutBackFailed(row)));
+
+        await Assert.ThrowsAnyAsync<Exception>(() => manager.RunTimedOutTickers(CancellationToken.None));
+
+        Assert.Equal([row], retry.TakeAll());
+    }
+
+    // The claim of delayed children after their parent ended failed, and so did a put-back: the row goes to the retry list.
+    [Fact]
+    public async Task AcquireDelayedChildren_APutBackFailed_HandsItsRowToTheRetryList()
+    {
+        var retry = new ClaimPutBackRetryList();
+        var manager = ManagerWith(retry);
+        var row = new NotPutBackClaim(Guid.NewGuid(), _now, TickerType.TimeTicker);
+        _persistence.AcquireImmediateTimeTickersAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<TimeTickerEntity[]>(_ => throw PutBackFailed(row));
+
+        var claimed = await manager.AcquireDelayedChildrenAsync([row.Id], CancellationToken.None);
+
+        Assert.Empty(claimed);
+        Assert.Equal([row], retry.TakeAll());
+    }
+
+    // Without a retry list (the background services do not run) the failure is only logged, as before.
+    [Fact]
+    public async Task RunTimedOutTickers_APutBackFailed_WithoutARetryList_StillThrows()
+    {
+        var row = new NotPutBackClaim(Guid.NewGuid(), _now, TickerType.TimeTicker);
+        _persistence.QueueTimedOutTimeTickers(Arg.Any<CancellationToken>())
+            .Returns(YieldThenThrow(Array.Empty<TimeTickerEntity>(), PutBackFailed(row)));
+
+        await Assert.ThrowsAsync<ClaimPutBackFailedException>(() => _manager.RunTimedOutTickers(CancellationToken.None));
+    }
+
+    #endregion
+
+    #region UpdateTickerAsync - stored or not
+
+    // The handler runs or skips chain children only on an outcome the store has, so the manager says whether it does: a time
+    // ticker store reports the rows it wrote.
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(0, false)]
+    public async Task UpdateTickerAsync_TimeTicker_IsStored_OnlyWhenTheStoreWroteARow(int rowsWritten, bool expected)
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker };
+        _persistence.UpdateTimeTicker(context, Arg.Any<CancellationToken>()).Returns(rowsWritten);
+
+        var stored = await _manager.UpdateTickerAsync(context, CancellationToken.None);
+
+        Assert.Equal(expected, stored);
+    }
+
+    // T7: a provider that does not fence (a custom one) keeps its write by Id, also for a run that has a marker.
+    [Fact]
+    public async Task UpdateTickerAsync_OnAProviderThatDoesNotFence_WritesById_AsBefore()
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker, RunMarker = _now };
+        _persistence.UpdateTimeTicker(context, Arg.Any<CancellationToken>()).Returns(1);
+
+        Assert.True(await _manager.UpdateTickerAsync(context, CancellationToken.None));
+        await _persistence.Received(1).UpdateTimeTicker(context, Arg.Any<CancellationToken>());
+    }
+
+    // A cron occurrence store reports no row count, so a write that did not throw counts as stored.
+    [Fact]
+    public async Task UpdateTickerAsync_CronOccurrence_IsStored_WhenTheWriteDoesNotThrow()
+    {
+        var context = new InternalFunctionContext { TickerId = Guid.NewGuid(), Type = TickerType.CronTickerOccurrence };
+        _persistence.UpdateCronTickerOccurrence(context, Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+
+        var stored = await _manager.UpdateTickerAsync(context, CancellationToken.None);
+
+        Assert.True(stored);
+        await _persistence.Received(1).UpdateCronTickerOccurrence(context, Arg.Any<CancellationToken>());
+    }
+
+    #endregion
 }

@@ -1,5 +1,10 @@
 using System;
+using System.Linq;
+using MongoDB.Bson;
+using MongoDB.Bson.IO;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
+using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Models;
@@ -131,6 +136,63 @@ namespace SharpTicker.MongoDB.Infrastructure
         {
             var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
             return fb.And(fb.Eq(x => x.Status, TickerStatus.Queued), fb.Eq(x => x.LockHolder, lockHolder));
+        }
+
+        /// <summary>
+        /// The edit of a running time ticker (a full-entity update of an InProgress row): a $set of every field of
+        /// <paramref name="body"/> but the run's state, which the run keeps (see <see cref="RunStateOnEdit"/>). The run state is
+        /// its status, lock, run marker (UpdatedAt) and the fields the run writes.
+        /// </summary>
+        public static UpdateDefinition<TTimeTicker> BuildEditOfRunningTimeTicker<TTimeTicker>(TTimeTicker body, IBsonSerializer<TTimeTicker> serializer)
+            where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        {
+            var fields = Serialize(body, serializer);
+            fields.Remove("_id");
+            foreach (var element in RunStateElements<TTimeTicker>.Names)
+                fields.Remove(element);
+            return new BsonDocumentUpdateDefinition<TTimeTicker>(new BsonDocument("$set", fields));
+        }
+
+        /// <summary>A copy of a time ticker's stored fields (its navigation properties are not mapped, so not copied).</summary>
+        public static TTimeTicker CopyOf<TTimeTicker>(TTimeTicker ticker, IBsonSerializer<TTimeTicker> serializer)
+            where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        {
+            var document = Serialize(ticker, serializer);
+            using var reader = new BsonDocumentReader(document);
+            return serializer.Deserialize(BsonDeserializationContext.CreateRoot(reader));
+        }
+
+        private static BsonDocument Serialize<T>(T value, IBsonSerializer<T> serializer)
+        {
+            var document = new BsonDocument();
+            using (var writer = new BsonDocumentWriter(document))
+                serializer.Serialize(BsonSerializationContext.CreateRoot(writer), value);
+            return document;
+        }
+
+        // The element names of the run state of a time ticker, from its class map.
+        private static class RunStateElements<TTimeTicker>
+            where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+        {
+            private static readonly string[] Members =
+            {
+                nameof(TimeTickerEntity.Status), nameof(TimeTickerEntity.LockHolder), nameof(TimeTickerEntity.LockedAt),
+                nameof(TimeTickerEntity.UpdatedAt), nameof(TimeTickerEntity.RetryCount), nameof(TimeTickerEntity.ExecutedAt),
+                nameof(TimeTickerEntity.ElapsedTime), nameof(TimeTickerEntity.ExceptionMessage), nameof(TimeTickerEntity.SkippedReason)
+            };
+
+            // Built on first use: the class map is registered before the first write.
+            private static readonly Lazy<string[]> Lazy = new(() =>
+            {
+                var classMap = BsonClassMap.LookupClassMap(typeof(TTimeTicker));
+                return Members
+                    .Select(member => classMap.AllMemberMaps.FirstOrDefault(m => m.MemberName == member)?.ElementName
+                                      ?? throw new InvalidOperationException(
+                                          $"The MongoDB class map of {typeof(TTimeTicker).FullName} does not map {member}, which SharpTicker needs to keep the run of an edited job."))
+                    .ToArray();
+            });
+
+            public static string[] Names => Lazy.Value;
         }
 
         private static UpdateDefinition<T> Combine<T>(UpdateDefinition<T> a, UpdateDefinition<T> b)

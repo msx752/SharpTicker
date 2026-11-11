@@ -14,7 +14,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 
-internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter
+internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter, IFencedRunWriter
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
@@ -40,6 +40,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
     private static readonly string ReleaseClaimScript = LuaScriptLoader.Load("ReleaseClaim");
     private static readonly string SkipNotStartedScript = LuaScriptLoader.Load("SkipNotStarted");
+    private static readonly string CompareAndSetScript = LuaScriptLoader.Load("CompareAndSet");
+
+    // Test seams, null in production: called between the read and the set of a compare-and-set, with the key, and after a
+    // fenced write landed, before its index update, with the row id. They let a test put a concurrent write into that gap.
+    internal Func<string, Task> BeforeCompareAndSetHook { get; set; }
+    internal Func<Guid, Task> AfterFencedWriteHook { get; set; }
 
     protected BaseRedisPersistenceProvider(
         IDatabase db,
@@ -81,7 +87,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
         catch (Exception failure)
         {
-            await ClaimPutBack.PutBackOrThrowAsync(id, claimMarker, failure, release).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(id, claimMarker,
+                typeof(T) == typeof(TTimeTicker) ? TickerType.TimeTicker : TickerType.CronTickerOccurrence, failure, release).ConfigureAwait(false);
             throw;
         }
     }
@@ -182,6 +189,52 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         // it meanwhile.
         return !result.IsNull;
     }
+
+    private const int MaxCompareAndSetRounds = 5;
+
+    // Every C# read-modify-write of a time ticker or occurrence row goes through here, so a write made between the read
+    // and the set is never lost. change gets the row as read (null when the stored JSON does not deserialize) and returns
+    // the row to write, or null to write nothing; its rules are checked in C# on the deserialized values, so dates are
+    // compared as DateTime, never as text. The set lands only while the key still holds the exact text that was read
+    // (CompareAndSet.lua); when it changed, the row is read and checked again. create gives the row to write when the key
+    // does not exist (SET NX); without it a missing key writes nothing.
+    // Returns the row as written, or null when nothing was written: the key is missing, or change refused the row. Rounds
+    // that keep conflicting throw: null means the row is gone or does not match, which a caller may act on.
+    protected async Task<T> CompareAndSetAsync<T>(string key, Func<T, T> change, Func<T> create = null) where T : class
+    {
+        for (var round = 0; round < MaxCompareAndSetRounds; round++)
+        {
+            var read = await Db.StringGetAsync(key).ConfigureAwait(false);
+            if (read.IsNull)
+            {
+                var created = create?.Invoke();
+                if (created == null) return null;
+                if (await Serializer.TryCreateAsync(key, created).ConfigureAwait(false)) return created;
+                continue;
+            }
+
+            var raw = (string)read;
+            var row = change(Serializer.DeserializeOrNull<T>(raw));
+            if (row == null) return null;
+            var payload = Serializer.Serialize(row);
+
+            if (BeforeCompareAndSetHook != null)
+                await BeforeCompareAndSetHook(key).ConfigureAwait(false);
+
+            var result = (int)await Db.ScriptEvaluateAsync(CompareAndSetScript, [(RedisKey)key], [(RedisValue)raw, (RedisValue)payload])
+                .ConfigureAwait(false);
+            if (result == 1) return row;
+            if (result == -1 && create == null) return null;
+
+            // Another writer changed the key in between: wait a short, random moment before reading it again, so writers
+            // that keep meeting each other spread out instead of using up their rounds together.
+            if (round + 1 < MaxCompareAndSetRounds)
+                await Task.Delay(Random.Shared.Next(1, 4 << round)).ConfigureAwait(false);
+        }
+
+        throw new InvalidOperationException(
+            $"Redis key '{key}' kept changing while it was being written ({MaxCompareAndSetRounds} rounds); it was not written.");
+    }
     #endregion
 
     #region FunctionContext mapping
@@ -194,7 +247,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         Action<long> setElapsedTime,
         Action<int> setRetryCount,
         Action releaseLock,
-        Action<DateTime> setUpdatedAt)
+        Action<DateTime> setUpdatedAt,
+        DateTime updatedAt)
     {
         var propsToUpdate = context.GetPropsToUpdate();
 
@@ -225,7 +279,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         if (propsToUpdate.Contains(nameof(InternalFunctionContext.ReleaseLock)))
             releaseLock();
 
-        setUpdatedAt(Clock.UtcNow);
+        setUpdatedAt(updatedAt);
     }
 
     // Mirrors what ApplyFunctionContext applies. A context with none of these (for example one that only carries
@@ -242,7 +296,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                props.Contains(nameof(InternalFunctionContext.ReleaseLock));
     }
 
-    protected void ApplyFunctionContextToTicker(TTimeTicker ticker, InternalFunctionContext context)
+    // updatedAt: the run marker for a fenced write of a run, which keeps it; now for any other write.
+    protected void ApplyFunctionContextToTicker(TTimeTicker ticker, InternalFunctionContext context, DateTime? updatedAt = null)
     {
         ApplyFunctionContext(context,
             status => ticker.Status = status,
@@ -252,10 +307,11 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             elapsed => ticker.ElapsedTime = elapsed,
             count => ticker.RetryCount = count,
             () => { ticker.LockHolder = null; ticker.LockedAt = null; },
-            at => ticker.UpdatedAt = at);
+            at => ticker.UpdatedAt = at,
+            updatedAt ?? Clock.UtcNow);
     }
 
-    protected void ApplyFunctionContextToCronOccurrence(CronTickerOccurrenceEntity<TCronTicker> occurrence, InternalFunctionContext context)
+    protected void ApplyFunctionContextToCronOccurrence(CronTickerOccurrenceEntity<TCronTicker> occurrence, InternalFunctionContext context, DateTime? updatedAt = null)
     {
         ApplyFunctionContext(context,
             status => occurrence.Status = status,
@@ -265,7 +321,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             elapsed => occurrence.ElapsedTime = elapsed,
             count => occurrence.RetryCount = count,
             () => { occurrence.LockHolder = null; occurrence.LockedAt = null; },
-            at => occurrence.UpdatedAt = at);
+            at => occurrence.UpdatedAt = at,
+            updatedAt ?? Clock.UtcNow);
     }
 
     #region Chain rows
@@ -569,7 +626,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         var parentStatuses = await LoadParentStatusesAsync([acquired], CancellationToken.None).ConfigureAwait(false);
         if (!claimedThisPass.Contains(acquired.ParentId.Value) && ChainGateOpen(acquired, parentStatuses)) return true;
 
-        await ClaimPutBack.PutBackOrThrowAsync(acquired.Id, acquired.UpdatedAt,
+        await ClaimPutBack.PutBackOrThrowAsync(acquired.Id, acquired.UpdatedAt, TickerType.TimeTicker,
             new InvalidOperationException("A chain child was claimed before its gate was checked."), TryReleaseTimeTickerClaim).ConfigureAwait(false);
         return false;
     }
@@ -665,11 +722,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     {
         if (!HasApplicableProps(functionContexts)) return 0;
 
-        var ticker = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(functionContexts.TickerId)).ConfigureAwait(false);
+        var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(functionContexts.TickerId), row =>
+        {
+            if (row != null) ApplyFunctionContextToTicker(row, functionContexts);
+            return row;
+        }).ConfigureAwait(false);
         if (ticker == null) return 0;
 
-        ApplyFunctionContextToTicker(ticker, functionContexts);
-        await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
         await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
         return 1;
     }
@@ -682,14 +741,16 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     public async Task UpdateTimeTickersWithUnifiedContext(Guid[] timeTickerIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
     {
-        var tickers = await Serializer.LoadByIdsAsync<TTimeTicker>(timeTickerIds, TimeTickerKey, cancellationToken).ConfigureAwait(false);
-
-        foreach (var ticker in tickers)
+        foreach (var id in timeTickerIds.Distinct())
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ApplyFunctionContextToTicker(ticker, functionContext);
-            await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
-            await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
+            var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(id), row =>
+            {
+                if (row != null) ApplyFunctionContextToTicker(row, functionContext);
+                return row;
+            }).ConfigureAwait(false);
+            if (ticker != null)
+                await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
         }
     }
 
@@ -732,7 +793,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
             throw;
         }
     }
@@ -752,13 +813,95 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             await IndexManager.AddTimeTickerIndexesAsync(recovered).ConfigureAwait(false);
         }
     }
+
+    // What an earlier run of that node left locked: only rows it locked before lockedBefore, so a row this run has claimed
+    // since keeps its lock. Without this override the interface's default body would ignore lockedBefore and release every
+    // row of the node, the running jobs of this run too.
+    public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+    {
+        var cutoff = EarlierRunCutoff(lockedBefore);
+        return ReleaseEarlierRunRowsAsync<TTimeTicker>(TimeTickerIdsKey, TimeTickerKey, row => row.Id,
+            row => IsLeftByEarlierRun(row.LockHolder, row.LockedAt, row.Status, instanceIdentifier, cutoff),
+            row =>
+            {
+                row.LockHolder = null;
+                row.LockedAt = null;
+                row.Status = TickerStatus.Idle;
+                row.UpdatedAt = Clock.UtcNow;
+            },
+            IndexManager.AddTimeTickerIndexesAsync, cancellationToken);
+    }
+
+    // The index entries of a row are written before the row itself, as in TryReleaseClaimAsync: the fallback and the loop
+    // find rows through the pending index, so a row set Idle whose index write then failed would be a row nothing looks
+    // at, and a later pass would no longer see it as held. Written first, a failure leaves the row held and the next pass
+    // does both again; an entry for a row that turns out to be claimed by this run is harmless, Acquire.lua rejects it.
+    // The row is then written through the compare-and-set, which checks the rule again on what the key holds at that
+    // moment, so a claim made since the read is kept.
+    // One row that fails does not keep the others held: it is logged, the pass goes on, and the pass fails at its end so
+    // the caller tries again. A store that cannot be reached fails the pass at once.
+    private async Task ReleaseEarlierRunRowsAsync<T>(string idsKey, Func<Guid, string> keyOf, Func<T, Guid> idOf,
+        Func<T, bool> isLeftByEarlierRun, Action<T> asIdle, Func<T, Task> indexAsIdle, CancellationToken cancellationToken) where T : class
+    {
+        var ids = ParseGuidSet(await Db.SetMembersAsync(idsKey).ConfigureAwait(false));
+        var failed = 0;
+        Exception firstFailure = null;
+
+        foreach (var page in ids.Chunk(FallbackPage))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var rows = await Serializer.LoadByIdsAsync<T>(page, keyOf, cancellationToken).ConfigureAwait(false);
+            foreach (var row in rows.Where(isLeftByEarlierRun))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var id = idOf(row);
+                try
+                {
+                    asIdle(row);
+                    await indexAsIdle(row).ConfigureAwait(false);
+
+                    await CompareAndSetAsync<T>(keyOf(id), current =>
+                    {
+                        if (current == null || !isLeftByEarlierRun(current))
+                            return null;
+
+                        asIdle(current);
+                        return current;
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or JsonException or NotSupportedException)
+                {
+                    // The row's own trouble (it kept changing, it does not serialize), not the store's.
+                    failed++;
+                    firstFailure ??= ex;
+                    _logger.LogWarning(ex, "Row {Id}, left locked by an earlier run of this node, could not be released.", id);
+                }
+            }
+        }
+
+        if (firstFailure != null)
+            throw new InvalidOperationException($"{failed} row(s) an earlier run of this node left locked could not be released; the first failure is attached.", firstFailure);
+    }
+
+    // A fallback or run-now claim stores its claim marker as LockedAt, and a marker is cut to the millisecond. Cut the
+    // start of the run the same way, or a claim made in the millisecond the run started would count as an earlier run's.
+    private static DateTime EarlierRunCutoff(DateTime runStartedAt)
+        => new(runStartedAt.Ticks - runStartedAt.Ticks % TimeSpan.TicksPerMillisecond, runStartedAt.Kind);
+
+    // The rows RecoverDeadNode.lua releases (held by the node; Idle, Queued or InProgress), narrowed to those locked before
+    // the cutoff. A row without LockedAt is left alone: nothing says it is older than this run.
+    private static bool IsLeftByEarlierRun(string lockHolder, DateTime? lockedAt, TickerStatus status, string node, DateTime cutoff)
+        => lockHolder == node
+           && status is TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress
+           && lockedAt is { } at && at < cutoff;
     #endregion
 
     #region Core_Cron_Ticker_Methods
     public async Task MigrateDefinedCronTickers((string Function, string Expression)[] cronTickers, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
-        const string seedPrefix = "MemoryTicker_Seeded_";
 
         var allRegisteredFunctions = TickerFunctionProvider.TickerFunctions.Keys
             .ToHashSet(StringComparer.Ordinal);
@@ -777,20 +920,30 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
 
         var orphanedSet = orphanedToDelete.ToHashSet();
+        // A function can have several crons (a user's next to the seeded one, or a seeded copy from two nodes starting
+        // together): grouped, not one per function, which threw and stopped the host on every start.
         var existingByFunction = existingList
             .Where(c => !orphanedSet.Contains(c.Id))
-            .ToDictionary(c => c.Function, c => c, StringComparer.Ordinal);
+            .GroupBy(c => c.Function, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList(), StringComparer.Ordinal);
 
         foreach (var (function, expression) in cronTickers)
         {
-            if (existingByFunction.TryGetValue(function, out var cron))
+            if (existingByFunction.TryGetValue(function, out var rows))
             {
-                if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
+                foreach (var cron in SeededCronTickers.Owned(rows))
                 {
-                    cron.Expression = expression;
-                    cron.UpdatedAt = now;
-                    await Serializer.SetAsync(CronKey(cron.Id), cron).ConfigureAwait(false);
+                    if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                    {
+                        cron.Expression = expression;
+                        cron.UpdatedAt = now;
+                        await Serializer.SetAsync(CronKey(cron.Id), cron).ConfigureAwait(false);
+                    }
                 }
+
+                if (SeededCronTickers.IsAmbiguous(rows))
+                    _logger.LogWarning(SeededCronTickers.AmbiguousWarning, function, expression, rows.Count);
             }
             else
             {
@@ -799,7 +952,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                     Id = Guid.NewGuid(),
                     Function = function,
                     Expression = expression,
-                    InitIdentifier = $"{seedPrefix}{function}",
+                    InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
                     CreatedAt = now,
                     UpdatedAt = now,
                     Request = []
@@ -976,11 +1129,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     {
         if (!HasApplicableProps(functionContext)) return;
 
-        var occurrence = await Serializer.GetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(functionContext.TickerId)).ConfigureAwait(false);
+        var occurrence = await CompareAndSetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(functionContext.TickerId), row =>
+        {
+            if (row != null) ApplyFunctionContextToCronOccurrence(row, functionContext);
+            return row;
+        }).ConfigureAwait(false);
         if (occurrence == null) return;
 
-        ApplyFunctionContextToCronOccurrence(occurrence, functionContext);
-        await Serializer.SetAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false);
         await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
     }
 
@@ -1009,16 +1164,105 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     public async Task UpdateCronTickerOccurrencesWithUnifiedContext(Guid[] cronOccurrenceIds, InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
     {
-        var occurrences = await Serializer.LoadByIdsAsync<CronTickerOccurrenceEntity<TCronTicker>>(cronOccurrenceIds, CronOccurrenceKey, cancellationToken).ConfigureAwait(false);
-
-        foreach (var occurrence in occurrences)
+        foreach (var id in cronOccurrenceIds.Distinct())
         {
             cancellationToken.ThrowIfCancellationRequested();
-            ApplyFunctionContextToCronOccurrence(occurrence, functionContext);
-            await Serializer.SetAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false);
-            await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
+            var occurrence = await CompareAndSetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id), row =>
+            {
+                if (row != null) ApplyFunctionContextToCronOccurrence(row, functionContext);
+                return row;
+            }).ConfigureAwait(false);
+            if (occurrence != null)
+                await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
         }
     }
+
+    #region IFencedRunWriter
+    // The fence of IFencedRunWriter: the row this node holds with the run's marker, compared as DateTime, and with
+    // onlyWhileRunning still InProgress. Checked here in C# on the row that was read; the compare-and-set then sets it only
+    // while the key still holds that text.
+    private bool HoldsRun(string lockHolder, DateTime updatedAt, TickerStatus status, DateTime runMarker, bool onlyWhileRunning)
+        => lockHolder == LockHolder && updatedAt == runMarker && (!onlyWhileRunning || status == TickerStatus.InProgress);
+
+    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+    {
+        var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(context.TickerId), row =>
+        {
+            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, row.Status, runMarker, onlyWhileRunning)) return null;
+            ApplyFunctionContextToTicker(row, context, runMarker);
+            return row;
+        }).ConfigureAwait(false);
+        if (ticker == null) return 0;
+
+        await UpdateIndexAfterFencedWriteAsync(ticker.Id, () => IndexManager.AddTimeTickerIndexesAddOnlyAsync(ticker)).ConfigureAwait(false);
+        return 1;
+    }
+
+    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+    {
+        var occurrence = await CompareAndSetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(context.TickerId), row =>
+        {
+            if (row == null || !HoldsRun(row.LockHolder, row.UpdatedAt, row.Status, runMarker, onlyWhileRunning)) return null;
+            ApplyFunctionContextToCronOccurrence(row, context, runMarker);
+            return row;
+        }).ConfigureAwait(false);
+        if (occurrence == null) return 0;
+
+        await UpdateIndexAfterFencedWriteAsync(occurrence.Id, () => IndexManager.AddCronOccurrenceIndexesAddOnlyAsync(occurrence)).ConfigureAwait(false);
+        return 1;
+    }
+
+    public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
+    {
+        var now = Clock.UtcNow;
+        var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(timeTickerId), row =>
+        {
+            if (row == null) return null;
+            row.Status = TickerStatus.InProgress;
+            row.LockHolder = LockHolder;
+            row.LockedAt = now;
+            row.UpdatedAt = runMarker;
+            return row;
+        }).ConfigureAwait(false);
+        if (ticker == null) return 0;
+
+        await UpdateIndexAfterFencedWriteAsync(ticker.Id, () => IndexManager.AddTimeTickerIndexesAddOnlyAsync(ticker)).ConfigureAwait(false);
+        return 1;
+    }
+
+    // The field logic of UpdateCronTickerOccurrence, only on an occurrence that has not started: a running one keeps its run.
+    public async Task<int> UpdateNotStartedCronOccurrenceAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+    {
+        if (!HasApplicableProps(context)) return 0;
+
+        var occurrence = await CompareAndSetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(context.TickerId), row =>
+        {
+            if (row == null || row.Status is not (TickerStatus.Idle or TickerStatus.Queued)) return null;
+            ApplyFunctionContextToCronOccurrence(row, context);
+            return row;
+        }).ConfigureAwait(false);
+        if (occurrence == null) return 0;
+
+        await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
+        return 1;
+    }
+
+    // The row is written: an index failure must not report the run's write as lost (the run would take its stored outcome
+    // for a lost one). The index of a running or ended row has nothing to add but its id, which the row already has.
+    private async Task UpdateIndexAfterFencedWriteAsync(Guid id, Func<Task> updateIndex)
+    {
+        try
+        {
+            if (AfterFencedWriteHook != null)
+                await AfterFencedWriteHook(id).ConfigureAwait(false);
+            await updateIndex().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Row {Id} was written by its run but its index entries could not be updated.", id);
+        }
+    }
+    #endregion
 
     public async Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, CancellationToken cancellationToken = default)
     {
@@ -1036,6 +1280,22 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
             await IndexManager.AddCronOccurrenceIndexesAsync(recovered).ConfigureAwait(false);
         }
+    }
+
+    // See ReleaseDeadNodeTimeTickerResources with lockedBefore.
+    public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+    {
+        var cutoff = EarlierRunCutoff(lockedBefore);
+        return ReleaseEarlierRunRowsAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceIdsKey, CronOccurrenceKey, row => row.Id,
+            row => IsLeftByEarlierRun(row.LockHolder, row.LockedAt, row.Status, instanceIdentifier, cutoff),
+            row =>
+            {
+                row.LockHolder = null;
+                row.LockedAt = null;
+                row.Status = TickerStatus.Idle;
+                row.UpdatedAt = Clock.UtcNow;
+            },
+            IndexManager.AddCronOccurrenceIndexesAsync, cancellationToken);
     }
     #endregion
 }

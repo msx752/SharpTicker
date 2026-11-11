@@ -38,6 +38,24 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return Task.WhenAll(t1, t2);
     }
 
+    // After a fenced write of a run (IFencedRunWriter): add-only. The row may have been released (and indexed as pending)
+    // right after the write; a removal decided on the written copy would race that add and drop the entry of a row that can
+    // be claimed. A pending entry left for a row that cannot be claimed is harmless: the claim scripts reject it, and the
+    // fallback drops the entry of an ended row.
+    internal Task AddTimeTickerIndexesAddOnlyAsync(TTimeTicker ticker)
+    {
+        var batch = _db.CreateBatch();
+        var idStr = (RedisValue)ticker.Id.ToString();
+
+        var t1 = batch.SetAddAsync(TimeTickerIdsKey, idStr);
+        var t2 = ticker.ExecutionTime.HasValue && CanAcquire(ticker.Status, ticker.LockHolder, _lockHolder)
+            ? batch.SortedSetAddAsync(TimeTickerPendingKey, idStr, ToScore(ticker.ExecutionTime.Value))
+            : Task.CompletedTask;
+
+        batch.Execute();
+        return Task.WhenAll(t1, t2);
+    }
+
     // Scored by the child's position in its chain, so children read back in the order the chain was built. A child
     // already linked keeps its place.
     internal Task AddTimeTickerChildAsync(Guid parentId, Guid childId, int position)
@@ -84,6 +102,22 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
             t3 = batch.SortedSetAddAsync(CronOccurrencePendingKey, idStr, ToScore(occurrence.ExecutionTime));
         else
             t3 = batch.SortedSetRemoveAsync(CronOccurrencePendingKey, idStr);
+
+        batch.Execute();
+        return Task.WhenAll(t1, t2, t3);
+    }
+
+    // After a fenced write of a run: add-only, as AddTimeTickerIndexesAddOnlyAsync.
+    internal Task AddCronOccurrenceIndexesAddOnlyAsync(CronTickerOccurrenceEntity<TCronTicker> occurrence)
+    {
+        var batch = _db.CreateBatch();
+        var idStr = (RedisValue)occurrence.Id.ToString();
+
+        var t1 = batch.SetAddAsync(CronOccurrenceIdsKey, idStr);
+        var t2 = batch.SetAddAsync(CronOccurrencesByCronKey(occurrence.CronTickerId), idStr);
+        var t3 = CanAcquire(occurrence.Status, occurrence.LockHolder, _lockHolder)
+            ? batch.SortedSetAddAsync(CronOccurrencePendingKey, idStr, ToScore(occurrence.ExecutionTime))
+            : Task.CompletedTask;
 
         batch.Execute();
         return Task.WhenAll(t1, t2, t3);

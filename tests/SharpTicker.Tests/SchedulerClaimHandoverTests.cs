@@ -86,6 +86,32 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         public Task<bool> WaitForRunningTasksAsync(TimeSpan? timeout = null) => Task.FromResult(true);
     }
 
+    /// <summary>
+    /// Starts the queued work on the calling thread with the job's token, so the work has reached its first wait when
+    /// <see cref="QueueAsync"/> returns.
+    /// </summary>
+    private sealed class InlineTaskScheduler : ISharpTickerTaskScheduler
+    {
+        private readonly ConcurrentQueue<Task> _running = new();
+        public bool IsFrozen => false;
+        public bool IsDisposed => false;
+        public int ActiveWorkers => 0;
+        public int TotalQueuedTasks => 0;
+
+        public ValueTask QueueAsync(Func<CancellationToken, Task> work, TickerTaskPriority priority, CancellationToken cancellationToken = default)
+        {
+            _running.Enqueue(work(cancellationToken));
+            return ValueTask.CompletedTask;
+        }
+
+        public Task WhenAllIdleAsync() => Task.WhenAll(_running.ToArray());
+
+        public void Freeze() { }
+        public void Resume() { }
+        public string GetDiagnostics() => string.Empty;
+        public Task<bool> WaitForRunningTasksAsync(TimeSpan? timeout = null) => Task.FromResult(true);
+    }
+
     private readonly List<Guid> _timeTickerIds = [];
     private readonly List<Guid> _occurrenceIds = [];
     private readonly List<Guid> _cronTickerIds = [];
@@ -395,7 +421,11 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
             Released.TrySetResult();
         }
 
-        public Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.UpdateTickerAsync(context, cancellationToken);
+        public Task<bool> UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.UpdateTickerAsync(context, cancellationToken);
+        public bool FencesRuns => inner.FencesRuns;
+        public Task<bool> StoreLostOutcomeAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.StoreLostOutcomeAsync(context, cancellationToken);
+        public Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default) => inner.RecordStoppedRunAsync(context, cancellationToken);
+        public Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default) => inner.RecordChildStartedAsync(child, cancellationToken);
         public Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default) => inner.GetRequestAsync<T>(tickerId, type, cancellationToken);
         public Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default) => inner.GetRequestAsync(tickerId, type, typeInfo, cancellationToken);
         public Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default) => inner.RunTimedOutTickers(cancellationToken);
@@ -606,6 +636,40 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
     }
 
+    // A claimed job waits for its function's only slot, and the application stops. The job that holds the slot ends on that
+    // stop and frees the slot before the stop reaches the waiting job, so its wait succeeds although the stop has begun. It
+    // must not start: it would run with a cancelled token and end Cancelled. Its claim stays pending and the stop puts it back.
+    [Fact]
+    public async Task ASlotFreedByTheStop_DoesNotStartTheWaitingJob_TheStopPutsItBack()
+    {
+        var manager = new HookedManager(CreateRealManager(CreateProvider("node-A")));
+        var gate = new TickerFunctionConcurrencyGate();
+        var function = Function("Handover.SlotFreedByTheStop");
+        function.CachedMaxConcurrency = 1;
+        var slot = gate.GetSemaphoreOrNull(function.FunctionName, 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        handler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>()).Returns(Task.CompletedTask);
+        var scheduler = new InlineTaskScheduler();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate);
+        using var stopping = new CancellationTokenSource();
+        var entry = work.Record(function, manager.NextClaimMarker());
+
+        await work.QueueWork(entry, isDue: false, stopping.Token);
+        // Registered after the waiting job's wait, so it runs first: the holder ends on the stop and frees the slot. This relies
+        // on cancellation callbacks running in reverse order of registration; if that changed, the wait would be cancelled, the
+        // job's task would end Canceled and WhenAllIdleAsync would throw, so the test fails instead of passing for no reason.
+        stopping.Token.Register(() => slot.Release());
+        stopping.Cancel();
+        await scheduler.WhenAllIdleAsync().WaitAsync(TimeSpan.FromSeconds(5));
+
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+        Assert.True(entry.IsPending);
+        Assert.Equal(1, slot.CurrentCount);
+        await work.PutBackUnstartedAsync();
+        Assert.Equal(1, manager.PutBackAttempts);
+    }
+
     // The fallback stops first (the host stops services in reverse order) and sweeps the shared ledger while the loop's claim
     // call is still in flight. The claim has no outcome yet, so the sweep must leave it to the loop: once it is won, the job
     // runs instead of the row staying InProgress with neither a worker nor a put-back.
@@ -678,6 +742,137 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("put back"));
         Assert.Equal(0, service.Claims.Count);
         await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+    }
+
+    // A claim call (the fallback, run-now) failed after it had claimed a row, and the store's own put-back of it failed too:
+    // the row is InProgress for this node with no worker, and it reached the retry list. The loop puts it back once the store
+    // answers, with the claim's marker, and the fallback then runs it. Without that the row stays InProgress for as long as
+    // the node lives (candidate row 50, scenario AFallbackPassThatFailsPartway_RunsEachOverdueRowOnce).
+    [Fact]
+    public async Task ARowWhosePutBackFailedInsideAClaimCall_IsPutBackByTheLoop_OnceTheStoreAnswers()
+    {
+        var (node, id, retry, manager, service, handler, _) = await RowWhosePutBackFailed(markerMatches: true);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Contains(id)), "the row was never put back");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.Null((await node.GetTimeTickerById(id, CancellationToken.None)).LockHolder);
+        Assert.True(manager.PutBackAttempts >= 2, "the first put-back was to fail like the store's own");
+        Assert.True(retry.IsEmpty);
+        Assert.Equal(0, service.Claims.Count);
+        await handler.DidNotReceiveWithAnyArgs().ExecuteTaskAsync(default!, default, default);
+    }
+
+    // The usual case: the loop has nothing to do and sleeps (up to a day) when the fallback's claim call fails and its row
+    // reaches the retry list. Adding it wakes the loop, so the row is put back at once and not at the next planned wake-up.
+    [Fact]
+    public async Task ARowAddedToTheRetryListWhileTheLoopSleeps_WakesItAndIsPutBack()
+    {
+        var (node, id, retry, manager, service, _, add) = await RowWhosePutBackFailed(markerMatches: true, addNow: false);
+        service.PutBackRetryInterval = TimeSpan.FromMinutes(10); // only a wake-up can put the row back within the wait below
+        manager.FailPutBacks = 0; // the store answers again by the time the row is added
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.Polls >= 1), "the loop never polled");
+            await Task.Delay(200); // the loop is asleep now: nothing is due
+            add();
+            Assert.True(await WaitUntilAsync(() => manager.PutBacks.Contains(id), seconds: 5), "adding the row did not wake the loop");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.True(retry.IsEmpty);
+    }
+
+    // At the stop: the fallback's sweep (with its owner) leaves such a row alone, since the scheduler may still try it; the
+    // scheduler's sweep, the last one, takes it from the retry list and puts it back.
+    [Fact]
+    public async Task AtTheStop_OnlyTheSchedulersSweep_PutsBackARowFromTheRetryList()
+    {
+        var (node, id, retry, manager, _, _, _) = await RowWhosePutBackFailed(markerMatches: true);
+        manager.FailPutBacks = 0;
+        var work = new ClaimedWorkQueue(manager, new RecordingTaskScheduler(), Substitute.For<ITickerExecutionTaskHandler>(),
+            new TickerFunctionConcurrencyGate(), null, retry);
+
+        await work.PutBackUnstartedAsync(owner: new object());
+        Assert.False(retry.IsEmpty);
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+
+        await work.PutBackUnstartedAsync();
+        Assert.True(retry.IsEmpty);
+        Assert.Equal(TickerStatus.Idle, await StatusOf(node, id));
+        Assert.Equal(0, work.Claims.Count);
+    }
+
+    // The row moved on before the retry (this node's fallback took it again, under a new marker): the fenced put-back leaves
+    // it alone, so a row that is running is never put back.
+    [Fact]
+    public async Task ARowWhosePutBackFailed_ThatMovedOnSince_IsLeftAlone()
+    {
+        var (node, id, _, manager, service, _, _) = await RowWhosePutBackFailed(markerMatches: false);
+
+        await service.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(await WaitUntilAsync(() => manager.PutBackAttempts >= 2), "the put-back was not tried again");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+        Assert.Empty(manager.PutBacks);
+        Assert.Equal(0, service.Claims.Count);
+    }
+
+    // The fallback of node-A claims a row; the store's put-back of it failed, so it is in the retry list with that claim's
+    // marker (or another one: the row moved on since). The first put-back by the loop fails as well, the next ones reach the store.
+    // With addNow false the row is added only when the test calls Add.
+    private async Task<(TickerInMemoryPersistenceProvider<TimeTickerEntity, CronTickerEntity> Node, Guid Id, ClaimPutBackRetryList Retry,
+        HookedManager Manager, SharpTickerSchedulerBackgroundService Service, ITickerExecutionTaskHandler Handler, Action Add)> RowWhosePutBackFailed(
+        bool markerMatches, bool addNow = true)
+    {
+        var node = CreateProvider("node-A");
+        var id = await SeedTimeTicker("PutBack.InsideAClaimCall");
+        _clock.Advance(TimeSpan.FromSeconds(2)); // past the fallback's threshold
+        var claimed = new List<TimeTickerEntity>();
+        await foreach (var row in node.QueueTimedOutTimeTickers(CancellationToken.None))
+            claimed.Add(row);
+        var marker = Assert.Single(claimed, x => x.Id == id).UpdatedAt;
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(node, id));
+
+        var retry = new ClaimPutBackRetryList();
+        Action add = () => retry.AddFrom(new ClaimPutBackFailedException(1, [new InvalidOperationException("store failed"), new TimeoutException("release failed")],
+            [new NotPutBackClaim(id, markerMatches ? marker : marker.AddTicks(-1), TickerType.TimeTicker)]));
+        if (addNow)
+            add();
+
+        var manager = new HookedManager(CreateRealManager(node)) { FailPutBacks = 1 };
+        var scheduler = new RecordingTaskScheduler();
+        var handler = Substitute.For<ITickerExecutionTaskHandler>();
+        var gate = new TickerFunctionConcurrencyGate();
+        var work = new ClaimedWorkQueue(manager, scheduler, handler, gate, null, retry);
+        var service = new SharpTickerSchedulerBackgroundService(new TickerExecutionContext(), handler, scheduler, manager,
+            new SchedulerOptionsBuilder { MinPollingInterval = TimeSpan.FromMilliseconds(10) }, gate, null, _clock, null, work)
+        {
+            // Nothing else to do, so the loop would sleep a day; a row to put back keeps its sleep short.
+            PutBackRetryInterval = TimeSpan.FromMilliseconds(50)
+        };
+        return (node, id, retry, manager, service, handler, add);
     }
 
     // The batch is claimed as many rows at once as the store takes, and the won rows are still handed over in priority order.

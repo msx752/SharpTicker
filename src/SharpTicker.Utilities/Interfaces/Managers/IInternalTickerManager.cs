@@ -23,7 +23,24 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         Task NotifyInProgress(InternalFunctionContext function);
         // Sends the function's current status to the dashboard.
         Task NotifyStatusChanged(InternalFunctionContext function);
-        Task UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // Writes the function's changed fields to its row. True when the store has them: a time ticker store reports the rows
+        // it wrote, so 0 rows (the row was deleted while the job ran) is false. A cron occurrence store reports nothing, so
+        // there a write that did not throw counts as stored.
+        // A run with a RunMarker on a fencing store writes only to the row it still holds (IFencedRunWriter); 0 rows is false.
+        Task<bool> UpdateTickerAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // Whether the store fences the writes of a run (IFencedRunWriter). A claimed job carries a RunMarker whatever the store,
+        // so only this says whether its writes are fenced; an unfenced write is by Id and could land on a later run.
+        bool FencesRuns { get; }
+        // Writes again a lost outcome (LostOutcomeRetryList), fenced only: throws InvalidOperationException when the store does
+        // not fence or the context has no RunMarker. True when stored, false when the fence did not hold (0 rows). A failing
+        // dashboard notification after a stored write is logged, not thrown, so a stored outcome never looks lost.
+        Task<bool> StoreLostOutcomeAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // The stop's write of a job still running (Cancelled, lock released). With a RunMarker on a fencing store it lands only
+        // while the row is still this run and still InProgress; otherwise by Id, as before. True when written.
+        Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
+        // Records an inline chain child as started (InProgress). On a fencing store it also takes this node's lock and a run
+        // marker, set on the child when the row was written; otherwise the child's writes stay by Id. Throws when the store fails.
+        Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);
         Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default);

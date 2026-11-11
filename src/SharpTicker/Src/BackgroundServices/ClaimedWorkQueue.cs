@@ -2,6 +2,8 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using SharpTicker.Utilities;
+using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Models;
@@ -22,14 +24,17 @@ internal sealed class ClaimedWorkQueue
     private readonly ITickerExecutionTaskHandler _taskHandler;
     private readonly ITickerFunctionConcurrencyGate _concurrencyGate;
     private readonly ILogger _logger;
+    private readonly ClaimPutBackRetryList _putBackRetry;
 
     public ClaimedWorkQueue(
         IInternalTickerManager internalTickerManager,
         ISharpTickerTaskScheduler taskScheduler,
         ITickerExecutionTaskHandler taskHandler,
         ITickerFunctionConcurrencyGate concurrencyGate,
-        ILogger logger = null)
+        ILogger logger = null,
+        ClaimPutBackRetryList putBackRetry = null)
     {
+        _putBackRetry = putBackRetry;
         _internalTickerManager = internalTickerManager ?? throw new ArgumentNullException(nameof(internalTickerManager));
         _taskScheduler = taskScheduler ?? throw new ArgumentNullException(nameof(taskScheduler));
         _taskHandler = taskHandler ?? throw new ArgumentNullException(nameof(taskHandler));
@@ -67,6 +72,16 @@ internal sealed class ClaimedWorkQueue
 
                 try
                 {
+                    // The wait can get the slot after the stop began: the job that held it ended on the stop and freed it
+                    // before the stop reached this wait. The job does not start then; its claim stays pending and the
+                    // stop's put-back moves the row back to Idle.
+                    if (ct.IsCancellationRequested)
+                    {
+                        _logger?.LogDebug("Job {FunctionName} ({TickerId}) got its slot as the application was stopping; it does not start and the stop puts its claim back.",
+                            function.FunctionName, function.TickerId);
+                        return;
+                    }
+
                     // A claim that is being put back, or whose put-back was tried, does not start.
                     if (!entry.TryStart())
                         return;
@@ -173,16 +188,55 @@ internal sealed class ClaimedWorkQueue
         return true;
     }
 
+    /// <summary>
+    /// Whether a put-back waits to be tried again: one that failed here, or one that failed inside a claim call and is still
+    /// in <see cref="ClaimPutBackRetryList"/>. The loop keeps its sleep short while there is one.
+    /// </summary>
+    /// <summary>Calls <paramref name="wake"/> whenever a claim call adds rows whose put-back failed; returns the unsubscribe.</summary>
+    internal Action WakeOnPutBacksToRetry(Action wake)
+    {
+        if (_putBackRetry == null)
+            return () => { };
+        _putBackRetry.Added += wake;
+        return () => _putBackRetry.Added -= wake;
+    }
+
+    internal bool HasPutBacksToRetry => !(_putBackRetry?.IsEmpty ?? true) || Claims.PendingPutBacks().Count > 0;
+
+    // The rows whose put-back failed inside a claim call become claims of the ledger that can never start, so the loop tries
+    // their put-back again like any other that failed. Only the id, the type and the marker are known: the put-back needs no
+    // more, and the logs name the job by its id.
+    private void AdoptFailedPutBacks()
+    {
+        if (_putBackRetry == null)
+            return;
+
+        foreach (var claim in _putBackRetry.TakeAll())
+        {
+            var function = new InternalFunctionContext
+            {
+                TickerId = claim.Id,
+                Type = claim.Type,
+                FunctionName = "(not read: its claim call failed)",
+                ClaimMarker = claim.ClaimMarker,
+                Status = TickerStatus.InProgress
+            };
+            Claims.RecordFailedPutBack(function, claim.ClaimMarker);
+        }
+    }
+
     /// <summary>How long one retried put-back may wait for the store before the loop goes on.</summary>
     internal TimeSpan PutBackAttemptLimit { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Tries the failed put-backs again, each for at most <see cref="PutBackAttemptLimit"/>. The first that fails again ends
-    /// the round: the store is still out of reach, and waiting for it once per row would hold the loop that long. The rest
-    /// are tried on the next pass.
+    /// Tries the failed put-backs again, each for at most <see cref="PutBackAttemptLimit"/>: those that failed here and those
+    /// that failed inside a claim call (<see cref="ClaimPutBackRetryList"/>). The first that fails again ends the round: the
+    /// store is still out of reach, and waiting for it once per row would hold the loop that long. The rest are tried on the
+    /// next pass.
     /// </summary>
     internal async Task RetryFailedPutBacksAsync()
     {
+        AdoptFailedPutBacks();
         foreach (var entry in Claims.PendingPutBacks())
         {
             using var limit = new CancellationTokenSource(PutBackAttemptLimit);
@@ -200,6 +254,9 @@ internal sealed class ClaimedWorkQueue
     /// </summary>
     internal async Task PutBackUnstartedAsync(object owner = null, CancellationToken cancellationToken = default)
     {
+        // The scheduler's sweep also takes the rows whose put-back failed inside a claim call: no one tries after it.
+        if (owner == null)
+            AdoptFailedPutBacks();
         foreach (var entry in Claims.Pending(owner))
             // The sweep of every claim is the scheduler's, which stops last: no one tries after it. While the scheduler still
             // runs, its loop retries what fails in the fallback's sweep.

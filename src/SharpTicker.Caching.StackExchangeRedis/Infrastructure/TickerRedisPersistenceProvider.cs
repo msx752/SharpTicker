@@ -122,15 +122,12 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         var children = depth < MaxChainDepth ? ticker.Children?.Where(c => c != null).ToList() ?? [] : [];
 
-        if (!adding)
+        if (!adding && children.Count == 0)
         {
+            // A row of an older version holds its children nested: an update that carries none splits those into rows.
             var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(ticker.Id)).ConfigureAwait(false);
-            if (stored != null)
-            {
-                KeepStoredChainState(ticker, stored);
-                if (children.Count == 0 && stored.Children is { Count: > 0 } nested)
-                    children = nested.Where(c => c != null).ToList();
-            }
+            if (stored?.Children is { Count: > 0 } nested)
+                children = nested.Where(c => c != null).ToList();
         }
 
         for (var position = 0; position < children.Count; position++)
@@ -147,20 +144,79 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         // The row is stored without its children; they are rows of their own. The caller's entity keeps them.
         var carried = ticker.Children;
         ticker.Children = new List<TTimeTicker>();
+        TTimeTicker written;
         try
         {
-            await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
+            if (adding)
+            {
+                await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
+                written = ticker;
+            }
+            else
+            {
+                written = await UpdateChainRowAsync(ticker).ConfigureAwait(false);
+                KeepStoredState(ticker, written);
+            }
         }
         finally
         {
             ticker.Children = carried;
         }
-        await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
+        await IndexManager.AddTimeTickerIndexesAsync(written).ConfigureAwait(false);
+    }
+
+    // Writes the update's row (without its children) over the stored one through the compare-and-set: each round starts
+    // again from a copy of what the caller sent and keeps the state the store owns of the row it replaces. A row that is
+    // not there yet (a new chain node) is created, with no run state of the body's.
+    private async Task<TTimeTicker> UpdateChainRowAsync(TTimeTicker ticker)
+    {
+        var body = Serializer.Serialize(ticker);
+        TTimeTicker Copy() => Serializer.DeserializeOrNull<TTimeTicker>(body);
+
+        return await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(ticker.Id),
+            stored =>
+            {
+                var row = Copy();
+                if (stored == null)
+                    RunStateOnEdit.Apply(row, NoStoredRow);
+                else
+                {
+                    KeepStoredChainState(row, stored);
+                    RunStateOnEdit.Apply(row, stored);
+                }
+                return row;
+            },
+            create: () =>
+            {
+                var row = Copy();
+                RunStateOnEdit.Apply(row, NoStoredRow);
+                return row;
+            }).ConfigureAwait(false);
+    }
+
+    // What a body is checked against when no row is stored (or it does not read): a run it shows is not brought in.
+    private static readonly TTimeTicker NoStoredRow = new() { Status = TickerStatus.Idle };
+
+    // The caller's entity reflects what was stored, as it did when the store's state was applied to it directly.
+    private static void KeepStoredState(TTimeTicker ticker, TTimeTicker written)
+    {
+        ticker.ParentId = written.ParentId;
+        ticker.RunCondition = written.RunCondition;
+        ticker.Status = written.Status;
+        ticker.LockHolder = written.LockHolder;
+        ticker.LockedAt = written.LockedAt;
+        ticker.ExecutedAt = written.ExecutedAt;
+        ticker.ExceptionMessage = written.ExceptionMessage;
+        ticker.SkippedReason = written.SkippedReason;
+        ticker.ElapsedTime = written.ElapsedTime;
+        ticker.RetryCount = written.RetryCount;
+        ticker.UpdatedAt = written.UpdatedAt;
     }
 
     // A chain child's link and run belong to the store: an update carries a copy read earlier, whose run state may be
     // stale, and the dashboard's edit form carries no ParentId or RunCondition. The update's definition is applied. A
-    // root keeps the update's run state, as before.
+    // root keeps the update's run state, as before, except the run of a row that is InProgress, or one the body still
+    // shows after it ended (RunStateOnEdit, applied after this to every row).
     private static void KeepStoredChainState(TTimeTicker ticker, TTimeTicker stored)
     {
         if (stored.ParentId == null) return;
@@ -346,7 +402,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
             throw;
         }
     }

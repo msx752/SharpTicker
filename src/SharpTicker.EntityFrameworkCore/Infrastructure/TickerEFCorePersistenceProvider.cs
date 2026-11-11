@@ -142,14 +142,63 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             return await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        // A full-entity update (UpdateAsync, the dashboard edit) keeps the run of every row it writes that is running
+        // (RunStateOnEdit), or the run's fenced writes would no longer land. The rows are locked first, in one transaction, so a
+        // claim cannot start a run between the read of the stored state and the write: a claim waits for the commit.
         public async Task<int> UpdateTimeTickers(TTimeTicker[] timeTickers, CancellationToken cancellationToken = default)
         {
             using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
             var dbContext = session.Context;
+            var rowsToWrite = WithDescendants(timeTickers);
+            var ids = rowsToWrite.Select(x => x.Id).Distinct().ToList(); // a List: see the note on Contains in TickerManager
+            // The rule below changes the rows; a retried attempt starts again from what the caller sent.
+            var sent = rowsToWrite.Select(RunStateOnEdit.Snapshot).ToArray();
 
-            dbContext.Set<TTimeTicker>().UpdateRange(timeTickers);
-             
-            return await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return await dbContext.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+            {
+                for (var i = 0; i < rowsToWrite.Count; i++)
+                    RunStateOnEdit.Restore(rowsToWrite[i], sent[i]);
+                dbContext.ChangeTracker.Clear();
+                await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+                await dbContext.Set<TTimeTicker>()
+                    .Where(x => ids.Contains(x.Id))
+                    .ExecuteUpdateAsync(setter => setter.SetProperty(x => x.UpdatedAt, x => x.UpdatedAt), cancellationToken).ConfigureAwait(false);
+
+                var stored = await dbContext.Set<TTimeTicker>()
+                    .AsNoTracking()
+                    .Where(x => ids.Contains(x.Id))
+                    .ToDictionaryAsync(x => x.Id, cancellationToken).ConfigureAwait(false);
+                foreach (var row in rowsToWrite)
+                {
+                    if (stored.TryGetValue(row.Id, out var storedRow))
+                        RunStateOnEdit.Apply(row, storedRow);
+                }
+
+                dbContext.Set<TTimeTicker>().UpdateRange(timeTickers);
+                var written = await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return written;
+            }).ConfigureAwait(false);
+        }
+
+        // The rows an update of these tickers writes: each ticker and its children, at any depth.
+        private static List<TTimeTicker> WithDescendants(IEnumerable<TTimeTicker> tickers)
+        {
+            var rows = new List<TTimeTicker>();
+            var pending = new Stack<TTimeTicker>(tickers);
+            var seen = new HashSet<TTimeTicker>(ReferenceEqualityComparer.Instance);
+            while (pending.Count > 0)
+            {
+                var row = pending.Pop();
+                if (row == null || !seen.Add(row))
+                    continue;
+                rows.Add(row);
+                foreach (var child in row.Children ?? [])
+                    pending.Push(child);
+            }
+
+            return rows;
         }
 
         public async Task<int> RemoveTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken)
@@ -404,7 +453,7 @@ namespace SharpTicker.EntityFrameworkCore.Infrastructure
             catch (Exception failure) when (won.Count > 0)
             {
                 // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-                await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
                 throw;
             }
         }

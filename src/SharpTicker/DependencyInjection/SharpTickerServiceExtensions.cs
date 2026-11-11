@@ -63,13 +63,21 @@ namespace SharpTicker.DependencyInjection
             if (optionInstance.RegisterBackgroundServices)
             {
                 // One queue of claimed work for the loop, the fallback and run-now, so every claim whose job does not
-                // start is put back and a failed put-back is tried again by the loop.
+                // start is put back and a failed put-back is tried again by the loop. The rows whose put-back failed inside a
+                // claim call reach it through ClaimPutBackRetryList, which the managers write to.
+                services.AddSingleton<ClaimPutBackRetryList>();
+                // The outcomes whose final write threw, written again by the scheduler loop. Registered only here: without
+                // the loop nothing would write them, and the handler then logs the lost write as before.
+                services.AddSingleton<LostOutcomeRetryList>();
+                services.AddSingleton<ILateOutcomeFollowUp>(sp => sp.GetRequiredService<ITickerExecutionTaskHandler>() as ILateOutcomeFollowUp);
+                services.AddSingleton<LostOutcomeDrain>();
                 services.AddSingleton(sp => new ClaimedWorkQueue(
                     sp.GetRequiredService<IInternalTickerManager>(),
                     sp.GetRequiredService<ISharpTickerTaskScheduler>(),
                     sp.GetRequiredService<ITickerExecutionTaskHandler>(),
                     sp.GetRequiredService<ITickerFunctionConcurrencyGate>(),
-                    sp.GetService<ILoggerFactory>()?.CreateLogger<ClaimedWorkQueue>()));
+                    sp.GetService<ILoggerFactory>()?.CreateLogger<ClaimedWorkQueue>(),
+                    sp.GetRequiredService<ClaimPutBackRetryList>()));
                 services.AddSingleton<SharpTickerSchedulerBackgroundService>();
                 services.AddSingleton<ISharpTickerHostScheduler>(provider =>
                     provider.GetRequiredService<SharpTickerSchedulerBackgroundService>());

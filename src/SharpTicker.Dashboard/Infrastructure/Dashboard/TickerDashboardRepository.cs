@@ -27,6 +27,7 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
         private readonly TickerExecutionContext _executionContext;
         private readonly DashboardOptionsBuilder _dashboardOptions;
+        private readonly ClaimPutBackRetryList _putBackRetry;
         public TickerDashboardRepository(
             TickerExecutionContext executionContext,
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -34,7 +35,21 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
             ISharpTickerNotificationHubSender notificationHubSender, 
             DashboardOptionsBuilder dashboardOptions,
             ISharpTickerDispatcher dispatcher)
+            : this(executionContext, persistenceProvider, sharpTickerHostScheduler, notificationHubSender, dashboardOptions, dispatcher, null)
         {
+        }
+
+        // putBackRetry: registered only when the background services run; see InternalTickerManager.
+        public TickerDashboardRepository(
+            TickerExecutionContext executionContext,
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ISharpTickerHostScheduler sharpTickerHostScheduler,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            DashboardOptionsBuilder dashboardOptions,
+            ISharpTickerDispatcher dispatcher,
+            ClaimPutBackRetryList putBackRetry)
+        {
+            _putBackRetry = putBackRetry;
             _persistenceProvider = persistenceProvider ?? throw new ArgumentNullException(nameof(persistenceProvider));
             _sharpTickerHostScheduler = sharpTickerHostScheduler ?? throw new ArgumentNullException(nameof(sharpTickerHostScheduler));
             _notificationHubSender = notificationHubSender ?? throw new ArgumentNullException(nameof(notificationHubSender));
@@ -464,10 +479,20 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
             await _persistenceProvider.InsertCronTickerOccurrences([onDemandOccurrence], cancellationToken);
 
-            // Acquire and run immediately
-            var acquired = await _persistenceProvider
-                .AcquireImmediateCronOccurrencesAsync([onDemandOccurrence.Id], cancellationToken)
-                .ConfigureAwait(false);
+            // Acquire and run immediately. When the claim fails, the store has put back what it claimed; a row it could not
+            // put back goes to the retry list, so the scheduler loop puts it back later. The request still fails.
+            CronTickerOccurrenceEntity<TCronTicker>[] acquired;
+            try
+            {
+                acquired = await _persistenceProvider
+                    .AcquireImmediateCronOccurrencesAsync([onDemandOccurrence.Id], cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _putBackRetry?.AddFrom(ex);
+                throw;
+            }
 
             CronTickerOccurrenceEntity<TCronTicker>? acquiredOccurrence = null;
 

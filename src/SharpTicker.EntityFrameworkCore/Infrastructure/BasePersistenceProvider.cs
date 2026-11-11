@@ -19,7 +19,7 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
-internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter
+internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter, IFencedRunWriter
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
@@ -62,7 +62,75 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
     protected DbContextLease<TDbContext> CreateDbContext()
         => DbContextLease<TDbContext>.Create(_serviceProvider);
-    
+
+    #region IFencedRunWriter
+
+    // The writes of a run land only on the row this node holds with the run's marker (and, with onlyWhileRunning, that is still
+    // InProgress), and keep the marker in UpdatedAt.
+    public async Task<int> UpdateTimeTickerFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = session.Context.Set<TTimeTicker>();
+        var id = context.TickerId;
+
+        var written = await rows
+            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress))
+            .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(context, runMarker), cancellationToken).ConfigureAwait(false);
+
+        // A provider that counts only the rows it changed (MySQL with UseAffectedRows) reports 0 for a write sent again with
+        // the same values; the row that still matches the fence has the write. The same fence, status included: a Done row
+        // with the marker was not written by a write that needed InProgress.
+        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                                                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress), cancellationToken).ConfigureAwait(false)
+            ? 1
+            : 0;
+    }
+
+    public async Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var rows = session.Context.Set<CronTickerOccurrenceEntity<TCronTicker>>();
+        var id = context.TickerId;
+
+        var written = await rows
+            .Where(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress))
+            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(context, runMarker), cancellationToken).ConfigureAwait(false);
+
+        return written > 0 || await rows.AnyAsync(x => x.Id == id && x.LockHolder == _lockHolder && x.UpdatedAt == runMarker
+                                                        && (!onlyWhileRunning || x.Status == TickerStatus.InProgress), cancellationToken).ConfigureAwait(false)
+            ? 1
+            : 0;
+    }
+
+    public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var now = _clock.UtcNow;
+
+        return await session.Context.Set<TTimeTicker>()
+            .Where(x => x.Id == timeTickerId)
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.InProgress)
+                .SetProperty(x => x.LockHolder, _lockHolder)
+                .SetProperty(x => x.LockedAt, now)
+                .SetProperty(x => x.UpdatedAt, runMarker), cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<int> UpdateNotStartedCronOccurrenceAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var id = context.TickerId;
+        var now = _clock.UtcNow;
+
+        return await session.Context.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.Id == id && (x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued))
+            .ExecuteUpdateAsync(setter => setter.UpdateCronTickerOccurrence<TCronTicker>(context, now), cancellationToken).ConfigureAwait(false);
+    }
+
+    #endregion
+
     #region Core_Time_Ticker_Methods
     public async IAsyncEnumerable<TimeTickerEntity> QueueTimeTickers(TimeTickerEntity[] timeTickers, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -147,7 +215,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             }
             catch (Exception failure)
             {
-                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(timeTicker.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
                 throw;
             }
 
@@ -453,7 +521,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         catch (Exception failure) when (won.Count > 0)
         {
             // The caller gets no rows to run, so the rows won so far would stay InProgress until this node restarts.
-            await ClaimPutBack.PutBackOrThrowAsync(won, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+            await ClaimPutBack.PutBackOrThrowAsync(won, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
             throw;
         }
     }
@@ -513,18 +581,24 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
         var existingByFunction = existing
             .GroupBy(c => c.Function)
-            .ToDictionary(g => g.Key, g => g.First());
+            .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList());
 
         foreach (var (function, expression) in cronTickers)
         {
-            if (existingByFunction.TryGetValue(function, out var cron))
+            if (existingByFunction.TryGetValue(function, out var rows))
             {
-                // Update expression if it changed
-                if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
+                foreach (var cron in SeededCronTickers.Owned(rows))
                 {
-                    cron.Expression = expression;
-                    cron.UpdatedAt = now;
+                    if (!string.Equals(cron.Expression, expression, StringComparison.Ordinal))
+                    {
+                        cron.Expression = expression;
+                        cron.UpdatedAt = now;
+                    }
                 }
+
+                if (SeededCronTickers.IsAmbiguous(rows))
+                    _logger.LogWarning(SeededCronTickers.AmbiguousWarning, function, expression, rows.Count);
             }
             else
             {
@@ -534,7 +608,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                     Id = Guid.NewGuid(),
                     Function = function,
                     Expression = expression,
-                    InitIdentifier = $"MemoryTicker_Seeded_{function}",
+                    InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
                     CreatedAt = now,
                     UpdatedAt = now,
                     Request = Array.Empty<byte>()
@@ -625,7 +699,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             }
             catch (Exception failure)
             {
-                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
+                await ClaimPutBack.PutBackOrThrowAsync(cronTickerOccurrence.Id, claimMarker, TickerType.CronTickerOccurrence, failure, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
                 throw;
             }
 

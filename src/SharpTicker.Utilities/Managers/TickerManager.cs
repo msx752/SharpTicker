@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Exceptions;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
@@ -28,6 +29,7 @@ namespace SharpTicker.Utilities.Managers
         private readonly ISharpTickerDispatcher _dispatcher;
         private readonly TickerExecutionContext _executionContext;
         private readonly ILogger _logger;
+        private readonly ClaimPutBackRetryList _putBackRetry;
 
         public TickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -50,8 +52,24 @@ namespace SharpTicker.Utilities.Managers
             ISharpTickerDispatcher dispatcher,
             ILogger<TickerManager<TTimeTicker, TCronTicker>> logger
             )
+            : this(persistenceProvider, sharpTickerHostScheduler, clock, notificationHubSender, executionContext, dispatcher, logger, null)
+        {
+        }
+
+        // putBackRetry: registered only when the background services run; see InternalTickerManager.
+        public TickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ISharpTickerHostScheduler sharpTickerHostScheduler,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            TickerExecutionContext executionContext,
+            ISharpTickerDispatcher dispatcher,
+            ILogger<TickerManager<TTimeTicker, TCronTicker>> logger,
+            ClaimPutBackRetryList putBackRetry
+            )
         {
             _logger = logger;
+            _putBackRetry = putBackRetry;
             _persistenceProvider = persistenceProvider;
             _sharpTickerHostScheduler = sharpTickerHostScheduler ?? throw new ArgumentNullException(nameof(sharpTickerHostScheduler));
             _clock = clock;
@@ -71,12 +89,15 @@ namespace SharpTicker.Utilities.Managers
             }
             catch (ClaimPutBackFailedException ex)
             {
+                // Not inside the log call: with no logger its arguments are not evaluated.
+                var retried = _putBackRetry?.AddFrom(ex) > 0;
                 _logger?.LogError(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed and some of the rows it claimed could not be put back. " +
-                    "Those stay InProgress until the store releases the rows of this node; the others run when the fallback picks them up.", string.Join(", ", ids));
+                    "{WhatHappens}; the others run when the fallback picks them up.", string.Join(", ", ids), ClaimPutBackRetryList.WhatHappens(retried));
                 return [];
             }
             catch (Exception ex)
             {
+                _putBackRetry?.AddFrom(ex);
                 _logger?.LogWarning(ex, "Tickers {TickerIds} were stored, but the claim to run them now failed. They run when the fallback picks them up.",
                     string.Join(", ", ids));
                 return [];
@@ -302,11 +323,8 @@ namespace SharpTicker.Utilities.Managers
 
                 if (_executionContext.Functions.FirstOrDefault(x => x.ParentId == cronTicker.Id) is { } internalFunction)
                 {
-                    internalFunction.ResetUpdateProps()
-                        .SetProperty(x => x.ExecutionTime, nextOccurrence);
-                    
-                    await _persistenceProvider.UpdateCronTickerOccurrence(internalFunction, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    
+                    await MovePlannedOccurrenceAsync(internalFunction.TickerId, nextOccurrence, cancellationToken).ConfigureAwait(false);
+
                     _sharpTickerHostScheduler.Restart();
                 }
                 
@@ -318,6 +336,20 @@ namespace SharpTicker.Utilities.Managers
             {
                 return new TickerResult<TCronTicker>(e);
             }
+        }
+
+        // Moves the occurrence the scheduler planned for an edited cron to the cron's next time. A new context, not the
+        // scheduler's: that one may already run (its claim won), and its writes carry the run. Only an occurrence that has not
+        // started is moved; a running one keeps its run, and the next occurrence follows the new expression.
+        private async Task MovePlannedOccurrenceAsync(Guid occurrenceId, DateTime nextOccurrence, CancellationToken cancellationToken)
+        {
+            var move = new InternalFunctionContext { TickerId = occurrenceId, Type = TickerType.CronTickerOccurrence }
+                .SetProperty(x => x.ExecutionTime, nextOccurrence);
+
+            if (_persistenceProvider is IFencedRunWriter fenced)
+                await fenced.UpdateNotStartedCronOccurrenceAsync(move, cancellationToken).ConfigureAwait(false);
+            else
+                await _persistenceProvider.UpdateCronTickerOccurrence(move, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         private async Task<TickerResult<TCronTicker>> DeleteCronTickerAsync(Guid id, CancellationToken cancellationToken = default)
@@ -567,7 +599,7 @@ namespace SharpTicker.Utilities.Managers
             var errors = new List<Exception>();
             var nextOccurrences = new List<DateTime>();
             var needsRestart = false;
-            var internalFunctionsToUpdate = new List<InternalFunctionContext>();
+            var plannedOccurrencesToMove = new List<(Guid OccurrenceId, DateTime NextOccurrence)>();
             
             foreach (var cronTicker in cronTickers)
             {
@@ -599,9 +631,7 @@ namespace SharpTicker.Utilities.Managers
                 
                 if (_executionContext.Functions.FirstOrDefault(x => x.ParentId == cronTicker.Id) is { } internalFunction)
                 {
-                    internalFunction.ResetUpdateProps()
-                        .SetProperty(x => x.ExecutionTime, nextOccurrence);
-                    internalFunctionsToUpdate.Add(internalFunction);
+                    plannedOccurrencesToMove.Add((internalFunction.TickerId, nextOccurrence));
                     needsRestart = true;
                 }
                 
@@ -623,10 +653,10 @@ namespace SharpTicker.Utilities.Managers
 
                 var affectedRows = await _persistenceProvider.UpdateCronTickers(validTickers.ToArray(), cancellationToken: cancellationToken);
 
-                // Update internal functions for those that need it
-                foreach (var internalFunction in internalFunctionsToUpdate)
+                // Move the occurrences the scheduler planned for these crons
+                foreach (var (occurrenceId, nextOccurrence) in plannedOccurrencesToMove)
                 {
-                    await _persistenceProvider.UpdateCronTickerOccurrence(internalFunction, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    await MovePlannedOccurrenceAsync(occurrenceId, nextOccurrence, cancellationToken).ConfigureAwait(false);
                 }
                 
                 if (needsRestart)

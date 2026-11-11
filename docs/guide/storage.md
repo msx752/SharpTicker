@@ -83,7 +83,7 @@ options.AddStackExchangeRedis(redis =>
 
 - Set one of `Configuration`, `ConfigurationOptions`, `ConnectionMultiplexer` or `ConnectionMultiplexerFactory`; startup fails otherwise.
 - `InstanceName` (default `sharpticker:`) is the prefix under which nodes report that they are alive. Job data uses its own `tq:*` keys.
-- Each node sends a heartbeat every `NodeHeartbeatInterval` (default one minute). Jobs held by a node that stopped sending heartbeats are released for others.
+- Each node sends a heartbeat every `NodeHeartbeatInterval` (default one minute). Jobs held by a node that stopped sending heartbeats are released by another running instance, about two heartbeat TTLs (each `NodeHeartbeatInterval` plus 20 seconds) after its last heartbeat; an outage of Redis itself does not release the nodes that are still running. With Redis as the job store, a node that starts again under the same name releases the jobs its earlier run left locked (see [Operations](operations.md)).
 - Each child and grandchild of a chain is a record of its own, linked to its parent. Upgrade all nodes together: an older version reads only chains that hold their children inside the parent's record (see [Delayed children](scheduling.md#delayed-children)).
 - For trimmed or AOT applications, set `JsonSerializerContext`.
 - A custom entity can add properties, but Redis rewrites the stored record when a job is claimed, and an empty collection comes back readable only for `Children` and `RetryIntervals`, and only under those exact (PascalCase) names. A custom entity with another collection property, or a camelCase JSON context, can leave a record that cannot be read after a claim, so avoid both with Redis.
@@ -105,6 +105,8 @@ Every claim writes a marker into `UpdatedAt`: the instance's clock in whole mill
 | `ReleaseDeadNodeTimeTickerResources(node, lockedBefore)`, `ReleaseDeadNodeOccurrenceResources(node, lockedBefore)` | Calls the overload without `lockedBefore`, which also releases the jobs this run has claimed since it started, so such a job can run twice. | Only rows locked before `lockedBefore` are released. |
 
 `AcquireImmediateTimeTickersAsync` and `AcquireImmediateCronOccurrencesAsync` have no default, but the same contract: return each row this call claimed with the marker it wrote as `UpdatedAt`, and when the call fails after it claimed rows, put them back before it throws. Choose a row's marker before its write, so that a write that fails (it may have landed) is put back too. `QueueTimedOutTimeTickers` and `QueueTimedOutCronTickerOccurrences` hand back each row with the marker of its claim, and put back the row whose claim write fails before they throw.
+
+The built-in stores also fence the writes of a running job by its claim marker and keep the run of a running row on a whole-object update (see [What is guaranteed](operations.md#what-is-guaranteed)). That goes through an internal interface, so a custom provider keeps writing by id: a late write of a run whose row was claimed again overwrites the new run, and an update of a running row can put its old state back.
 
 A class that wraps a built-in provider must forward all of these methods, or it gets the defaults without any error. For the same reason, upgrade all SharpTicker packages together: a store package from an earlier version keeps the defaults.
 

@@ -96,4 +96,28 @@ public class DashboardRunNowCronTests
         await provider.Received(1).RemoveCronTickerOccurrences(
             Arg.Is<Guid[]>(ids => ids.Length == 1 && ids[0] == claimed.Id), Arg.Any<CancellationToken>());
     }
+
+    // The claim of the stored occurrence failed, and so did the put-back of the row: it is InProgress for this node with
+    // nothing to run it. It goes to the retry list, so the scheduler loop puts it back once the store answers; the request
+    // still fails, as before.
+    [Fact]
+    public async Task TheClaimFailsAndItsPutBackToo_TheRowGoesToTheRetryList_AndTheRequestFails()
+    {
+        var cronId = Guid.NewGuid();
+        var (provider, _) = ProviderReturningAClaimWithoutItsCron(cronId, storedCron: null);
+        var row = new NotPutBackClaim(Guid.NewGuid(), Marker, TickerType.CronTickerOccurrence);
+        provider.AcquireImmediateCronOccurrencesAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
+            .Returns<CronTickerOccurrenceEntity<CronTickerEntity>[]>(_ => throw new ClaimPutBackFailedException(1,
+                [new InvalidOperationException("store failed"), new TimeoutException("release failed")], [row]));
+        var (dispatcher, dispatched) = RecordingDispatcher();
+        var retry = new ClaimPutBackRetryList();
+        var repository = new TickerDashboardRepository<TimeTickerEntity, CronTickerEntity>(new TickerExecutionContext(), provider,
+            Substitute.For<ISharpTickerHostScheduler>(), Substitute.For<ISharpTickerNotificationHubSender>(),
+            new SharpTicker.Dashboard.DashboardOptionsBuilder(), dispatcher, retry);
+
+        await Assert.ThrowsAsync<ClaimPutBackFailedException>(() => repository.AddOnDemandCronTickerOccurrenceAsync(cronId, CancellationToken.None));
+
+        Assert.Empty(dispatched);
+        Assert.Equal([row], retry.TakeAll());
+    }
 }
