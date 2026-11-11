@@ -813,6 +813,89 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             await IndexManager.AddTimeTickerIndexesAsync(recovered).ConfigureAwait(false);
         }
     }
+
+    // What an earlier run of that node left locked: only rows it locked before lockedBefore, so a row this run has claimed
+    // since keeps its lock. Without this override the interface's default body would ignore lockedBefore and release every
+    // row of the node, the running jobs of this run too.
+    public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+    {
+        var cutoff = EarlierRunCutoff(lockedBefore);
+        return ReleaseEarlierRunRowsAsync<TTimeTicker>(TimeTickerIdsKey, TimeTickerKey, row => row.Id,
+            row => IsLeftByEarlierRun(row.LockHolder, row.LockedAt, row.Status, instanceIdentifier, cutoff),
+            row =>
+            {
+                row.LockHolder = null;
+                row.LockedAt = null;
+                row.Status = TickerStatus.Idle;
+                row.UpdatedAt = Clock.UtcNow;
+            },
+            IndexManager.AddTimeTickerIndexesAsync, cancellationToken);
+    }
+
+    // The index entries of a row are written before the row itself, as in TryReleaseClaimAsync: the fallback and the loop
+    // find rows through the pending index, so a row set Idle whose index write then failed would be a row nothing looks
+    // at, and a later pass would no longer see it as held. Written first, a failure leaves the row held and the next pass
+    // does both again; an entry for a row that turns out to be claimed by this run is harmless, Acquire.lua rejects it.
+    // The row is then written through the compare-and-set, which checks the rule again on what the key holds at that
+    // moment, so a claim made since the read is kept.
+    // One row that fails does not keep the others held: it is logged, the pass goes on, and the pass fails at its end so
+    // the caller tries again. A store that cannot be reached fails the pass at once.
+    private async Task ReleaseEarlierRunRowsAsync<T>(string idsKey, Func<Guid, string> keyOf, Func<T, Guid> idOf,
+        Func<T, bool> isLeftByEarlierRun, Action<T> asIdle, Func<T, Task> indexAsIdle, CancellationToken cancellationToken) where T : class
+    {
+        var ids = ParseGuidSet(await Db.SetMembersAsync(idsKey).ConfigureAwait(false));
+        var failed = 0;
+        Exception firstFailure = null;
+
+        foreach (var page in ids.Chunk(FallbackPage))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var rows = await Serializer.LoadByIdsAsync<T>(page, keyOf, cancellationToken).ConfigureAwait(false);
+            foreach (var row in rows.Where(isLeftByEarlierRun))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var id = idOf(row);
+                try
+                {
+                    asIdle(row);
+                    await indexAsIdle(row).ConfigureAwait(false);
+
+                    await CompareAndSetAsync<T>(keyOf(id), current =>
+                    {
+                        if (current == null || !isLeftByEarlierRun(current))
+                            return null;
+
+                        asIdle(current);
+                        return current;
+                    }).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or JsonException or NotSupportedException)
+                {
+                    // The row's own trouble (it kept changing, it does not serialize), not the store's.
+                    failed++;
+                    firstFailure ??= ex;
+                    _logger.LogWarning(ex, "Row {Id}, left locked by an earlier run of this node, could not be released.", id);
+                }
+            }
+        }
+
+        if (firstFailure != null)
+            throw new InvalidOperationException($"{failed} row(s) an earlier run of this node left locked could not be released; the first failure is attached.", firstFailure);
+    }
+
+    // A fallback or run-now claim stores its claim marker as LockedAt, and a marker is cut to the millisecond. Cut the
+    // start of the run the same way, or a claim made in the millisecond the run started would count as an earlier run's.
+    private static DateTime EarlierRunCutoff(DateTime runStartedAt)
+        => new(runStartedAt.Ticks - runStartedAt.Ticks % TimeSpan.TicksPerMillisecond, runStartedAt.Kind);
+
+    // The rows RecoverDeadNode.lua releases (held by the node; Idle, Queued or InProgress), narrowed to those locked before
+    // the cutoff. A row without LockedAt is left alone: nothing says it is older than this run.
+    private static bool IsLeftByEarlierRun(string lockHolder, DateTime? lockedAt, TickerStatus status, string node, DateTime cutoff)
+        => lockHolder == node
+           && status is TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress
+           && lockedAt is { } at && at < cutoff;
     #endregion
 
     #region Core_Cron_Ticker_Methods
@@ -1197,6 +1280,22 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
             await IndexManager.AddCronOccurrenceIndexesAsync(recovered).ConfigureAwait(false);
         }
+    }
+
+    // See ReleaseDeadNodeTimeTickerResources with lockedBefore.
+    public Task ReleaseDeadNodeOccurrenceResources(string instanceIdentifier, DateTime lockedBefore, CancellationToken cancellationToken = default)
+    {
+        var cutoff = EarlierRunCutoff(lockedBefore);
+        return ReleaseEarlierRunRowsAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceIdsKey, CronOccurrenceKey, row => row.Id,
+            row => IsLeftByEarlierRun(row.LockHolder, row.LockedAt, row.Status, instanceIdentifier, cutoff),
+            row =>
+            {
+                row.LockHolder = null;
+                row.LockedAt = null;
+                row.Status = TickerStatus.Idle;
+                row.UpdatedAt = Clock.UtcNow;
+            },
+            IndexManager.AddCronOccurrenceIndexesAsync, cancellationToken);
     }
     #endregion
 }

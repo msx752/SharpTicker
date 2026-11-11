@@ -147,12 +147,10 @@ public static class Invariants
         bool Hit(params string[] types) => faults.Any(f => types.Contains(f.Type) && f.NodeIdentifier == node
                                                          && (taken == null || f.At >= taken.Value - Slack));
 
-        // docs/guide/operations.md, "What is guaranteed": MongoDB has no release step for an instance that stopped; with Redis a restart under
-        // the same name inside the heartbeat TTL is not seen as a stop (the harness restarts a killed node within seconds).
+        // docs/guide/operations.md, "What is guaranteed": MongoDB has no release step for an instance that stopped. A Redis
+        // node that is killed and started again releases what its earlier run left, so a kill explains nothing there.
         if (store == Store.MongoDb && Hit("kill"))
             return "MongoDB kill";
-        if (store == Store.Redis && Hit("kill"))
-            return "Redis restart inside the heartbeat TTL";
 
         var isInlineChild = ticker.ParentId != null && ticker.ExecutionTime == null;
         if (isInlineChild && Hit("stop", "kill"))

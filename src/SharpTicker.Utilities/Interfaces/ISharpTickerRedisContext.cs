@@ -14,8 +14,4 @@ internal interface ISharpTickerRedisContext
         Func<CancellationToken, Task<TResult[]>> factory,
         TimeSpan? expiration = null,
         CancellationToken cancellationToken = default) where TResult : class;
-
-    Task<string[]>GetDeadNodesAsync();
-
-    Task NotifyNodeAliveAsync();
 }
