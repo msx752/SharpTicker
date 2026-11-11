@@ -23,6 +23,8 @@ public class OutcomeNotStoredChainTests : IAsyncLifetime
     private static readonly DateTime Now = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
     private readonly TickerInMemoryPersistenceProvider<ChainTimeTicker, ChainCronTicker> _store;
     private readonly TickerExecutionTaskHandler _handler;
+    private readonly ISharpTickerDispatcher _dispatcher = Substitute.For<ISharpTickerDispatcher>();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, int> _runs = new();
     private readonly List<Guid> _rows = [];
     private long _marker;
 
@@ -42,6 +44,7 @@ public class OutcomeNotStoredChainTests : IAsyncLifetime
         var handlerServices = new ServiceCollection();
         handlerServices.AddSingleton<IInternalTickerManager>(internalManager);
         handlerServices.AddSingleton(instrumentation);
+        handlerServices.AddSingleton(_dispatcher); // not enabled unless a test says so
         _handler = new TickerExecutionTaskHandler(handlerServices.BuildServiceProvider(), clock, instrumentation, internalManager);
     }
 
@@ -104,5 +107,93 @@ public class OutcomeNotStoredChainTests : IAsyncLifetime
         Assert.Null(await _store.GetTimeTickerById(parent.Id, CancellationToken.None)); // the outcome write saved nothing
         Assert.Equal(TickerStatus.Done, parentContext.Status);
         Assert.False(childRan, "the inline child ran although its parent's outcome was never stored");
+    }
+
+    // A parent whose outcome was stored late, with an OnSuccess inline child that carries an inline grandchild. The contexts
+    // are the ones the parent's run carried.
+    private async Task<(InternalFunctionContext Outcome, ChainTimeTicker Child, ChainTimeTicker Grandchild)> AParentStoredLate()
+    {
+        var grandchild = Row(null, TickerStatus.Idle, RunCondition.OnSuccess, "grandchild");
+        var child = Row(null, TickerStatus.Idle, RunCondition.OnSuccess, "child");
+        child.Children = [grandchild];
+        var parent = Row(Now.AddMinutes(-1), TickerStatus.Done);
+        parent.Children = [child];
+        await _store.AddTimeTickers([parent], CancellationToken.None);
+
+        var outcome = Context(parent.Id, (_, _, _) => Task.CompletedTask);
+        outcome.Status = TickerStatus.Done;
+        var childContext = Context(child.Id, (_, _, _) => Task.CompletedTask, RunCondition.OnSuccess);
+        childContext.TimeTickerChildren.Add(Context(grandchild.Id, (_, _, _) => Task.CompletedTask, RunCondition.OnSuccess));
+        outcome.TimeTickerChildren.Add(childContext);
+        return (outcome, child, grandchild);
+    }
+
+    // The dispatcher runs what the handler claimed, as a claimed job: the functions are not registered in a test, so each
+    // context gets one that counts its runs.
+    private void TheDispatcherRunsWhatIsClaimed()
+    {
+        void Count(InternalFunctionContext context)
+        {
+            context.CachedDelegate = (_, _, _) => { _runs.AddOrUpdate(context.TickerId, 1, (_, n) => n + 1); return Task.CompletedTask; };
+            foreach (var child in context.TimeTickerChildren) Count(child);
+        }
+
+        _dispatcher.IsEnabled.Returns(true);
+        _dispatcher.DispatchAsync(Arg.Any<InternalFunctionContext[]>(), Arg.Any<CancellationToken>()).Returns(async call =>
+        {
+            foreach (var context in call.Arg<InternalFunctionContext[]>())
+            {
+                Count(context);
+                await _handler.ExecuteTaskAsync(context, isDue: false);
+            }
+        });
+    }
+
+    private async Task<TickerStatus> StatusOf(Guid id) => (await _store.GetTimeTickerById(id, CancellationToken.None)).Status;
+
+    // After the late store the inline child is claimed from the store and runs as a claimed job, and its own inline child
+    // runs after it: each once, also when the follow-up comes a second time.
+    [Fact]
+    public async Task AnInlineChildAndItsChild_RunOnce_AfterTheirParentsOutcomeWasStoredLate()
+    {
+        var (outcome, child, grandchild) = await AParentStoredLate();
+        TheDispatcherRunsWhatIsClaimed();
+
+        await _handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+        await _handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+
+        Assert.Equal(1, _runs.GetValueOrDefault(child.Id));
+        Assert.Equal(1, _runs.GetValueOrDefault(grandchild.Id));
+        Assert.Equal(TickerStatus.Done, await StatusOf(child.Id));
+        Assert.Equal(TickerStatus.Done, await StatusOf(grandchild.Id));
+    }
+
+    // The store decides who starts the child: when another claim has taken its row meanwhile (it was given a time and the
+    // fallback claimed it), the late follow-up starts nothing.
+    [Fact]
+    public async Task AnInlineChildAnotherClaimTookMeanwhile_IsNotStartedByTheLateFollowUp()
+    {
+        var (outcome, child, _) = await AParentStoredLate();
+        TheDispatcherRunsWhatIsClaimed();
+        Assert.Single(await _store.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
+
+        await _handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+
+        Assert.Equal(0, _runs.GetValueOrDefault(child.Id));
+        Assert.Equal(TickerStatus.InProgress, await StatusOf(child.Id));
+    }
+
+    // At the stop nothing is claimed: the child keeps its row as it is.
+    [Fact]
+    public async Task AnInlineChild_IsNotStarted_WhenItsParentsOutcomeWasStoredAtTheStop()
+    {
+        var (outcome, child, grandchild) = await AParentStoredLate();
+        TheDispatcherRunsWhatIsClaimed();
+
+        await _handler.AfterLateStoreAsync(outcome, claimChildren: false, CancellationToken.None);
+
+        Assert.Empty(_runs);
+        Assert.Equal(TickerStatus.Idle, await StatusOf(child.Id));
+        Assert.Equal(TickerStatus.Idle, await StatusOf(grandchild.Id));
     }
 }

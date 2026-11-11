@@ -167,14 +167,23 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     // A delayed child whose time has come is claimed and started now, instead of waiting for the next fallback pass; one due
     // later wakes the scheduler loop, which did not plan it while it waited for its parent. Never before its own time: the
     // claim does not look at the time. Best effort: the fallback still runs what this misses, so nothing here fails the run.
-    private async Task HandOffDelayedChildrenAsync(IEnumerable<InternalFunctionContext> children, CancellationToken cancellationToken)
+    // After an outcome stored late (lateParent) the children can also be inline ones, which have no time of their own and
+    // are claimed at once. The fallback does not run those: one that was not claimed is named in a warning.
+    private async Task HandOffDelayedChildrenAsync(IEnumerable<InternalFunctionContext> children, CancellationToken cancellationToken,
+        InternalFunctionContext lateParent = null)
     {
         var now = _clock.UtcNow;
         List<Guid> due = null;
+        List<InternalFunctionContext> inline = null;
         DateTime? nextTime = null;
         foreach (var child in children)
         {
-            if (child.ExecutionTime <= now)
+            if (!child.IsDelayed)
+            {
+                (inline ??= []).Add(child);
+                (due ??= []).Add(child.TickerId);
+            }
+            else if (child.ExecutionTime <= now)
                 (due ??= []).Add(child.TickerId);
             else if (nextTime == null || child.ExecutionTime < nextTime)
                 nextTime = child.ExecutionTime;
@@ -195,7 +204,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         // Without a running dispatcher (background services off) a claimed row would never start.
         var dispatcher = due == null ? null : Dispatcher;
         if (dispatcher is not { IsEnabled: true })
+        {
+            WarnOfInlineChildrenNotClaimed(inline, [], lateParent);
             return;
+        }
 
         InternalFunctionContext[] claimed;
         try
@@ -205,13 +217,15 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
         {
             Logger?.LogDebug(ex, "Claiming delayed chain children was cancelled; the fallback runs them.");
-            return;
+            claimed = [];
         }
         catch (Exception ex)
         {
             Logger?.LogWarning(ex, "Claiming delayed chain children {TickerIds} failed; the fallback runs them.", string.Join(", ", due));
-            return;
+            claimed = [];
         }
+
+        WarnOfInlineChildrenNotClaimed(inline, claimed, lateParent);
 
         if (claimed.Length == 0)
             return;
@@ -226,6 +240,25 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             // node now, and the fallback does not take them.
             Logger?.LogError(ex, "Delayed chain children {TickerIds} were claimed but could not be dispatched. They stay InProgress until the store releases the rows of this node.",
                 string.Join(", ", claimed.Select(c => c.TickerId)));
+        }
+    }
+
+    // An inline child that was not claimed after its parent's outcome was stored late: another claim holds its row (it was
+    // given a time meanwhile, or it already ran), or the claim failed. Which of the two is not known here, and the fallback
+    // does not take a row without a time, so the warning says what to check.
+    private void WarnOfInlineChildrenNotClaimed(List<InternalFunctionContext> inline, InternalFunctionContext[] claimed, InternalFunctionContext lateParent)
+    {
+        if (inline == null)
+            return;
+
+        foreach (var child in inline)
+        {
+            if (Array.Exists(claimed, c => c.TickerId == child.TickerId))
+                continue;
+
+            Logger?.LogWarning(
+                "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not claimed after its parent's outcome was stored late: its row was taken or changed meanwhile, or the claim failed. If its row is still Idle and has no execution time, nothing runs it; add a new job to run it.",
+                child.FunctionName, child.TickerId, lateParent?.FunctionName, lateParent?.TickerId);
         }
     }
 
@@ -513,12 +546,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             {
                 case LostOutcomeListing.Listed when isChild:
                     Logger?.LogError(ex,
-                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        "The {Status} outcome of chain child {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node. Its chain children follow once it is written; those without a time of their own only when that happens before the scheduler stops.",
                         context.Status, context.FunctionName, context.TickerId);
                     break;
                 case LostOutcomeListing.Listed:
                     Logger?.LogError(ex,
-                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node, and the job can then run again. Its delayed chain children follow once it is written; its inline chain children are neither run nor skipped.",
+                        "The {Status} outcome of {FunctionName} ({TickerId}) could not be stored. The scheduler writes it again while it runs; if it stops first, the row stays InProgress until the store releases the rows of this node, and the job can then run again. Its chain children follow once it is written; those without a time of their own only when that happens before the scheduler stops.",
                         context.Status, context.FunctionName, context.TickerId);
                     break;
                 // An inline chain child that was not fenced was never claimed by this node's lock, so nothing releases it.
@@ -558,19 +591,40 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     private static string StoppingNote(LostOutcomeListing listing)
         => listing == LostOutcomeListing.Closed ? " The scheduler is stopping, so it is not written again." : string.Empty;
 
+    // A child without a time of its own that the parent's run starts after the parent has ended: it has a function, and it is
+    // not an InProgress child, which started with the parent.
+    private static bool RunsInlineAfterItsParent(InternalFunctionContext child)
+        => !child.IsDelayed && child.CachedDelegate != null && child.RunCondition != RunCondition.InProgress;
+
     public async Task AfterLateStoreAsync(InternalFunctionContext outcome, bool claimChildren, CancellationToken cancellationToken)
     {
-        var delayedChildren = outcome.TimeTickerChildren?.Where(c => c.IsDelayed).ToList();
-        if (delayedChildren is not { Count: > 0 })
+        // The run returned before these children when its outcome could not be stored (ExecuteTaskAsync), so nothing has
+        // run or skipped them. The inline ones are not started from here, in the scheduler loop: the store hands them out
+        // as it does the delayed ones (a claim by id), and each then runs as a claimed job.
+        var children = outcome.TimeTickerChildren?.Where(c => c.IsDelayed || RunsInlineAfterItsParent(c)).ToList();
+        if (children is not { Count: > 0 })
             return;
 
-        // As after an outcome stored at once (ExecuteTaskAsync): the store now hands out the delayed children the outcome
-        // lets run, and those it does not let run never will, so they are skipped with what they carry.
-        if (claimChildren && ChainRunGate.IsFinal(outcome.Status))
-            await HandOffDelayedChildrenAsync(delayedChildren.Where(c => ShouldRunChild(c, outcome.Status)), cancellationToken).ConfigureAwait(false);
+        // As after an outcome stored at once (ExecuteTaskAsync): the store now hands out the children the outcome lets run,
+        // and those it does not let run never will, so they are skipped with what they carry.
+        if (ChainRunGate.IsFinal(outcome.Status))
+        {
+            var allowed = children.Where(c => ShouldRunChild(c, outcome.Status));
+            if (claimChildren)
+                await HandOffDelayedChildrenAsync(allowed, cancellationToken, outcome).ConfigureAwait(false);
+            else
+            {
+                // The scheduler is stopping. A delayed child is run by the fallback at the next start; nothing claims a row
+                // without a time, and writing it Skipped would record an outcome it did not have.
+                foreach (var child in allowed.Where(c => !c.IsDelayed))
+                    Logger?.LogError(
+                        "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not started: its parent's {Status} outcome was stored only while the scheduler stopped. Its row stays Idle and nothing runs it; add a new job to run it.",
+                        child.FunctionName, child.TickerId, outcome.FunctionName, outcome.TickerId, outcome.Status);
+            }
+        }
 
         var childrenToSkip = new List<InternalFunctionContext>();
-        foreach (var child in delayedChildren)
+        foreach (var child in children)
         {
             if (!ShouldRunChild(child, outcome.Status))
                 SkipWithDescendants(child, outcome, childrenToSkip);

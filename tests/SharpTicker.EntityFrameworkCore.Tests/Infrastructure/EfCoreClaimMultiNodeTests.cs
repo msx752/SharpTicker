@@ -1258,6 +1258,37 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(ChainRunGate.Allows(condition, parentStatus), claimed.Any(x => x.Id == childId));
     }
 
+    // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
+    // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
+    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task AChildWithoutATime_IsHandedOutByRunNow_OnlyOnceItsParentEndedWithAMatchingOutcome(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "inline-child-fn";
+        child.RunCondition = condition;
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(1)); // not due, so no claim below takes the parent itself
+        parent.Children = [child];
+        await using (var context = CreateContext())
+        {
+            context.Set<TimeTickerEntity>().Add(parent);
+            await context.SaveChangesAsync();
+        }
+        var nodeA = CreateProvider("node-A");
+
+        Assert.DoesNotContain(await nodeA.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == child.Id);
+        Assert.DoesNotContain(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == child.Id);
+
+        var claimed = await nodeA.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None);
+
+        var expected = condition != RunCondition.InProgress && ChainRunGate.Allows(condition, parentStatus);
+        Assert.Equal(expected, claimed.Any(x => x.Id == child.Id));
+        Assert.Equal(expected ? TickerStatus.InProgress : TickerStatus.Idle, (await ReadRow(child.Id)).Status);
+        Assert.Empty(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
+    }
+
     // The fallback's skip query is the negation of the gate; both must agree with ChainRunGate everywhere: an overdue
     // delayed child is claimed when its parent's status lets it run, skipped when its parent ended without a match, and
     // left waiting otherwise.

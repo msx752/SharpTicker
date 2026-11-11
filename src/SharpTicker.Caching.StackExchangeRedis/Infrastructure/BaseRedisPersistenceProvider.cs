@@ -423,6 +423,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                && parentStatuses.TryGetValue(row.ParentId.Value, out var status)
                && ChainRunGate.Allows(row.RunCondition, status));
 
+    // The gate of a claim by id (ChainRunGate.AllowsRunNow): unlike the window and the fallback, it also hands out a child
+    // without a time of its own, once its parent has ended with an outcome it runs on.
+    protected static bool RunNowGateOpen(TTimeTicker row, Dictionary<Guid, TickerStatus> parentStatuses)
+        => row.ParentId == null
+           || (parentStatuses.TryGetValue(row.ParentId.Value, out var status)
+               && ChainRunGate.AllowsRunNow(row.RunCondition, status, row.ExecutionTime.HasValue));
+
     // A delayed child whose parent ended with an outcome it does not run on never will.
     protected static bool ParentEndedWithoutMatch(TTimeTicker row, Dictionary<Guid, TickerStatus> parentStatuses)
         => row.ParentId != null
@@ -768,12 +775,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // dispatched, the rows not written yet stay Idle for the fallback.
                 if (cancellationToken.IsCancellationRequested) break;
 
-                // A chain child is handed out on its own only when it is a delayed child whose parent's status lets it run
-                // (ChainGateOpen); a finished status never changes back, so the gate read here holds at the claim. A row
-                // that does not deserialize still goes to the claim script, which rewrites it in a readable form.
+                // A chain child is handed out by id only when its parent's status lets it run (RunNowGateOpen); a finished
+                // status never changes back, so the gate read here holds at the claim. A row that does not deserialize
+                // still goes to the claim script, which rewrites it in a readable form.
                 var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
                 if (stored?.ParentId != null
-                    && !ChainGateOpen(stored, await LoadParentStatusesAsync([stored], CancellationToken.None).ConfigureAwait(false)))
+                    && !RunNowGateOpen(stored, await LoadParentStatusesAsync([stored], CancellationToken.None).ConfigureAwait(false)))
                     continue;
 
                 // Not cancelled by the caller's token: a cancel here must not turn the rows already won into a failure.

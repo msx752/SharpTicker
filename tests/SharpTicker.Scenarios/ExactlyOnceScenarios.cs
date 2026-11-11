@@ -81,7 +81,16 @@ public class ExactlyOnceScenarios
         var late = env.Nodes.Single(n => n.Identifier == held!.LockHolder);
         var other = env.Nodes.Single(n => n != late);
 
-        await env.PauseNodeAsync(late.Index, due - DateTime.UtcNow + TimeSpan.FromSeconds(6));
+        // The late node stays frozen until 6 s past the due time. With Redis the other node's fallback does not take a row
+        // another node holds Queued: it takes it once the frozen node's rows were released, which is when its heartbeat
+        // entry has been missing for one more TTL (25 s here). As in APausedNodesLateWrite: the entry expires 20 to 25 s
+        // into the pause, the check that first misses it comes up to 5 s later, the release one TTL and up to one check
+        // (5 s) after that, and the fallback takes the row within 2 s, so 45 to 62 s into the pause. The pause is 70 s
+        // there, or longer when the due time is further away.
+        var pause = due - DateTime.UtcNow + TimeSpan.FromSeconds(6);
+        if (store == Store.Redis && pause < TimeSpan.FromSeconds(70))
+            pause = TimeSpan.FromSeconds(70);
+        await env.PauseNodeAsync(late.Index, pause);
 
         await env.UntilAsync(async () =>
         {
