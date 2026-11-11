@@ -152,7 +152,6 @@ public class InvariantTests
     // A claim of the killed node whose job never started: no start line, the row is held by that node.
     [Theory]
     [InlineData(Store.MongoDb)]
-    [InlineData(Store.Redis)]
     public void InProgress_ClaimNeverStarted_OnAKilledNode_IsAKnownLimit(Store store)
     {
         var claimed = new TickerView { Id = A, Status = TickerStatus.InProgress, LockHolder = "n1" };
@@ -169,6 +168,21 @@ public class InvariantTests
 
         Assert.ThrowsAny<XunitException>(() => Invariants.AssertNothingInProgressExceptKnownLimits(
             [claimed], new RunLog(), [new FaultEvent("kill", "n1")], store));
+    }
+
+    // A Redis node that is killed and started again releases what its earlier run left (and another node releases a node
+    // that stays down), so a kill does not explain a row left InProgress there.
+    [Fact]
+    public void InProgress_OnRedisAfterAKill_Fails()
+    {
+        var log = new RunLog();
+        Line(log, "start", A, "n1", 0);
+        var claimed = new TickerView { Id = B, Status = TickerStatus.InProgress, LockHolder = "n1" };
+
+        Assert.ThrowsAny<XunitException>(() => Invariants.AssertNothingInProgressExceptKnownLimits(
+            [View(A, TickerStatus.InProgress)], log, [new FaultEvent("kill", "n1") { At = T0.AddSeconds(5) }], Store.Redis));
+        Assert.ThrowsAny<XunitException>(() => Invariants.AssertNothingInProgressExceptKnownLimits(
+            [claimed], new RunLog(), [new FaultEvent("kill", "n1")], Store.Redis));
     }
 
     [Fact]
@@ -208,7 +222,6 @@ public class InvariantTests
     // In a chaos run most nodes are killed at some point; only a fault after the row was taken explains it.
     [Theory]
     [InlineData(Store.MongoDb)]
-    [InlineData(Store.Redis)]
     public void InProgress_AfterAKillBeforeItsStart_Fails(Store store)
     {
         var log = new RunLog();
@@ -222,7 +235,6 @@ public class InvariantTests
 
     [Theory]
     [InlineData(Store.MongoDb)]
-    [InlineData(Store.Redis)]
     public void InProgress_ClaimNeverStarted_KilledLongBeforeItWasDue_Fails(Store store)
     {
         var claimed = new TickerView { Id = A, Status = TickerStatus.InProgress, LockHolder = "n1", ExecutionTime = T0.AddMinutes(5).UtcDateTime };
