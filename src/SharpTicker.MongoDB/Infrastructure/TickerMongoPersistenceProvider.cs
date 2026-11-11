@@ -348,11 +348,11 @@ namespace SharpTicker.MongoDB.Infrastructure
             // by the loop below (it stops before claiming), not by a throw here.
             var requested = await coll
                 .Find(fb.In(x => x.Id, ids))
-                .Project(x => new { x.Id, x.ParentId, x.RunCondition })
+                .Project(x => new { x.Id, x.ParentId, x.RunCondition, x.ExecutionTime })
                 .ToListAsync(CancellationToken.None).ConfigureAwait(false);
             var parentStatuses = await LoadParentStatuses(requested.Select(r => r.ParentId), CancellationToken.None).ConfigureAwait(false);
             var gateOpen = requested
-                .Where(r => ChainGateOpen(r.ParentId, r.RunCondition, parentStatuses))
+                .Where(r => RunNowGateOpen(r.ParentId, r.RunCondition, r.ExecutionTime.HasValue, parentStatuses))
                 .Select(r => r.Id)
                 .ToHashSet();
             if (gateOpen.Count == 0) return Array.Empty<TimeTickerEntity>();
@@ -1384,6 +1384,12 @@ namespace SharpTicker.MongoDB.Infrastructure
         private static bool ChainGateOpen(Guid? parentId, RunCondition? condition, Dictionary<Guid, TickerStatus> parentStatuses)
             => parentId == null
                || (parentStatuses.TryGetValue(parentId.Value, out var status) && ChainRunGate.Allows(condition, status));
+
+        // The gate of a claim by id (ChainRunGate.AllowsRunNow): an InProgress child without a time of its own is left out.
+        // It starts with its parent and is never handed out on its own.
+        private static bool RunNowGateOpen(Guid? parentId, RunCondition? condition, bool hasOwnTime, Dictionary<Guid, TickerStatus> parentStatuses)
+            => parentId == null
+               || (parentStatuses.TryGetValue(parentId.Value, out var status) && ChainRunGate.AllowsRunNow(condition, status, hasOwnTime));
 
         // A delayed child whose parent ended with an outcome it does not run on never will, as a finished status does not
         // change.

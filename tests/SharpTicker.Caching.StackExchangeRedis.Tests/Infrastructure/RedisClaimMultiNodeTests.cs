@@ -985,21 +985,29 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(ids.OrderBy(x => x), fallback.Select(x => x.Id).OrderBy(x => x));
     }
 
-    // A child without a time of its own runs only inside its parent's run, also once its parent has ended.
-    [Fact]
-    public async Task AChildWithoutATimeOfItsOwn_IsNeverHandedOutOnItsOwn()
+    // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
+    // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
+    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task AChildWithoutATime_IsHandedOutByRunNow_OnlyOnceItsParentEndedWithAMatchingOutcome(RunCondition? condition, TickerStatus parentStatus)
     {
         var child = NewTimeTicker();
         child.ExecutionTime = null;
-        child.RunCondition = RunCondition.OnSuccess;
-        var parent = NewTimeTicker(TickerStatus.Done, executionTime: T0.AddHours(-1));
+        child.RunCondition = condition;
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(-1));
         parent.Children = [child];
         var nodeA = CreateProvider("node-A");
         await nodeA.AddTimeTickers([parent], CancellationToken.None);
 
-        Assert.Empty(await nodeA.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
-        Assert.Empty(await nodeA.GetEarliestTimeTickers(CancellationToken.None));
-        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(nodeA, child.Id)).Status);
+        Assert.DoesNotContain(await nodeA.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == child.Id);
+
+        var claimed = await nodeA.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None);
+
+        var expected = condition != RunCondition.InProgress && ChainRunGate.Allows(condition, parentStatus);
+        Assert.Equal(expected, claimed.Any(x => x.Id == child.Id));
+        Assert.Equal(expected ? TickerStatus.InProgress : TickerStatus.Idle, (await ReadTimeTicker(nodeA, child.Id)).Status);
+        Assert.Empty(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
     }
 
     // The handler skips a child its parent's outcome does not let run; only a row that has not started is written, so a

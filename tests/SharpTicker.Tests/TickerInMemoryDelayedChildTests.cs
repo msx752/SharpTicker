@@ -119,6 +119,36 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
         Assert.Empty(await ClaimedByAnyPath(child.Id));
     }
 
+    // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
+    // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
+    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    public static IEnumerable<object?[]> EveryConditionAndParentStatus()
+        => from condition in Enum.GetValues<RunCondition>().Select(c => (RunCondition?)c).Append(null)
+           from status in Enum.GetValues<TickerStatus>()
+           select new object?[] { condition, status };
+
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task AChildWithoutATime_IsHandedOutByRunNow_OnlyOnceItsParentEndedWithAMatchingOutcome(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var child = Row(null, condition: condition, function: "inline-child");
+        var parent = Row(Now.AddHours(1), parentStatus); // not due, so no claim below takes the parent itself
+        parent.Children = [child];
+        await _provider.AddTimeTickers([parent], CancellationToken.None);
+
+        var window = await _provider.GetEarliestTimeTickers(CancellationToken.None);
+        var fallback = new List<TimeTickerEntity>();
+        await foreach (var row in _provider.QueueTimedOutTimeTickers(CancellationToken.None)) fallback.Add(row);
+        Assert.DoesNotContain(window.Concat(fallback), x => x.Id == child.Id);
+
+        var claimed = await _provider.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None);
+
+        var expected = condition != RunCondition.InProgress && ChainRunGate.Allows(condition, parentStatus);
+        Assert.Equal(expected, claimed.Any(x => x.Id == child.Id));
+        Assert.Equal(expected ? TickerStatus.InProgress : TickerStatus.Idle, await StatusOf(child.Id));
+        Assert.Empty(await _provider.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
+    }
+
     [Fact]
     public async Task TheWindow_HandsOutADelayedChildAtItsTime_OnceItsParentSucceeded()
     {

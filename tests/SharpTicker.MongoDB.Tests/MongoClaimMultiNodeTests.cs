@@ -1267,6 +1267,32 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
             Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
     }
 
+    // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
+    // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
+    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    [Theory]
+    [MemberData(nameof(EveryConditionAndParentStatus))]
+    public async Task AChildWithoutATime_IsHandedOutByRunNow_OnlyOnceItsParentEndedWithAMatchingOutcome(RunCondition? condition, TickerStatus parentStatus)
+    {
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.Function = "inline-child-fn";
+        child.RunCondition = condition;
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(-1));
+        parent.Children = [child];
+        var nodeA = CreateProvider("node-A");
+        await nodeA.AddTimeTickers([parent], CancellationToken.None);
+
+        Assert.DoesNotContain(await nodeA.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == child.Id);
+
+        var claimed = await nodeA.AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None);
+
+        var expected = condition != RunCondition.InProgress && ChainRunGate.Allows(condition, parentStatus);
+        Assert.Equal(expected, claimed.Any(x => x.Id == child.Id));
+        Assert.Equal(expected ? TickerStatus.InProgress : TickerStatus.Idle, (await ReadTimeTicker(child.Id)).Status);
+        Assert.Empty(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
+    }
+
     // Run-now with several rows claims each row whose gate is open and leaves the others waiting.
     [Fact]
     public async Task RunNow_ClaimsTheRowsWhoseGateIsOpen_AndLeavesAWaitingDelayedChild()

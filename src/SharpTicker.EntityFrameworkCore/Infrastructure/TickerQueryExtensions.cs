@@ -38,6 +38,12 @@ public static class TickerQueryExtensions
         return q.Where(Expression.Lambda<Func<TTimeTicker, bool>>(Expression.OrElse(noParent, allowed.Body), e));
     }
 
+    // The gate of a claim by id (ChainRunGate.AllowsRunNow): as WhereChainGateOpen, but an InProgress child without a time
+    // of its own is left out. It starts with its parent and is never handed out on its own.
+    internal static IQueryable<TTimeTicker> WhereRunNowGateOpen<TTimeTicker>(this IQueryable<TTimeTicker> q) where TTimeTicker : TimeTickerEntity<TTimeTicker>
+        => q.WhereChainGateOpen()
+            .Where(e => e.ParentId == null || e.ExecutionTime != null || e.RunCondition != RunCondition.InProgress);
+
     // A delayed child whose parent has ended with an outcome it does not run on: it never will, as a finished status does
     // not change.
     internal static IQueryable<TTimeTicker> WhereParentEndedWithoutMatch<TTimeTicker>(this IQueryable<TTimeTicker> q) where TTimeTicker : TimeTickerEntity<TTimeTicker>
