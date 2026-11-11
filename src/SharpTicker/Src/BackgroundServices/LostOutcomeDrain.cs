@@ -13,9 +13,9 @@ namespace SharpTicker.BackgroundServices;
 /// <summary>
 /// Writes again the outcomes whose final write threw (<see cref="LostOutcomeRetryList"/>), for the scheduler loop and its stop.
 /// Each write is fenced by the run's marker (<see cref="IInternalTickerManager.StoreLostOutcomeAsync"/>): it lands only while the
-/// row is still this run's, so it never replaces another run. A stored outcome is followed up for its delayed chain children
+/// row is still this run's, so it never replaces another run. A stored outcome is followed up for its chain children
 /// (<see cref="ILateOutcomeFollowUp"/>); a row that is no longer this run's is dropped. A write that fails again stays listed.
-/// Starts no job.
+/// Runs no job itself: the children that follow are claimed from the store and dispatched.
 /// </summary>
 internal sealed class LostOutcomeDrain
 {
@@ -195,7 +195,7 @@ internal sealed class LostOutcomeDrain
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "The delayed chain children of {FunctionName} ({TickerId}) could not be followed up after its outcome was stored late; the fallback runs those the outcome lets run.",
+            _logger?.LogWarning(ex, "The chain children of {FunctionName} ({TickerId}) could not be followed up after its outcome was stored late. The fallback runs the delayed ones the outcome lets run; one without a time of its own that is still Idle is not run, add a new job to run it.",
                 context.FunctionName, context.TickerId);
         }
     }

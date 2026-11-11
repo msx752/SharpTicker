@@ -1184,21 +1184,94 @@ public class TickerExecutionTaskHandlerTests : IDisposable
             Arg.Any<CancellationToken>());
     }
 
-    // Inline children are not run or skipped after a late store (that is for a later change); only the delayed ones follow.
-    [Fact]
-    public async Task AfterALateStore_InlineChildrenAreLeftAlone()
+    private static InternalFunctionContext InlineChild(RunCondition condition, Action? onRun = null)
     {
-        var (handler, _, _) = HandlerWithLostOutcomes();
-        var ran = false;
+        var child = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { onRun?.Invoke(); return Task.CompletedTask; });
+        child.RunCondition = condition;
+        return child;
+    }
+
+    // After a late store the inline children (no time of their own) follow the outcome through the store: one it lets run is
+    // claimed by id, whatever the time its context carries, and is never run here; one it does not let run is skipped with
+    // its descendants. An InProgress child started with its parent, and a child without a function is never run: neither is
+    // claimed or skipped.
+    [Fact]
+    public async Task AfterALateStore_AnInlineChildTheOutcomeLetsRunIsClaimed_AndOneItDoesNotLetRunIsSkipped()
+    {
+        var dispatcher = Substitute.For<ISharpTickerDispatcher>();
+        dispatcher.IsEnabled.Returns(true);
+        var (handler, _, _) = HandlerWithLostOutcomes(dispatcher);
+        var ran = 0;
         var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Done);
-        var inline = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => { ran = true; return Task.CompletedTask; });
-        inline.RunCondition = RunCondition.OnFailure;
-        outcome.TimeTickerChildren.Add(inline);
+        var onSuccess = InlineChild(RunCondition.OnSuccess, () => ran++);
+        onSuccess.ExecutionTime = DateTime.UtcNow.AddHours(1); // a context always carries a time; an inline child's is not its own
+        var onFailure = InlineChild(RunCondition.OnFailure, () => ran++);
+        var grandchild = InlineChild(RunCondition.OnSuccess, () => ran++);
+        onFailure.TimeTickerChildren.Add(grandchild);
+        var withParent = InlineChild(RunCondition.InProgress, () => ran++);
+        var withoutFunction = CreateContext(type: TickerType.TimeTicker);
+        withoutFunction.RunCondition = RunCondition.OnSuccess;
+        outcome.TimeTickerChildren.AddRange([onSuccess, onFailure, withParent, withoutFunction]);
+        _internalManager.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns([]);
 
         await handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
 
-        Assert.False(ran);
-        await _internalManager.DidNotReceiveWithAnyArgs().UpdateSkipTimeTickersWithUnifiedContextAsync(default!, default);
+        Assert.Equal(0, ran);
+        await _internalManager.Received(1).AcquireDelayedChildrenAsync(
+            Arg.Is<Guid[]>(ids => ids.SequenceEqual(new[] { onSuccess.TickerId })), Arg.Any<CancellationToken>());
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { onFailure.TickerId, grandchild.TickerId })),
+            Arg.Any<CancellationToken>());
+    }
+
+    // An inline child the claim did not return is not started, and a warning names it: nothing else runs a row without a time.
+    [Fact]
+    public async Task AfterALateStore_AnInlineChildThatWasNotClaimed_IsNamedInAWarning()
+    {
+        var dispatcher = Substitute.For<ISharpTickerDispatcher>();
+        dispatcher.IsEnabled.Returns(true);
+        var (handler, _, logs) = HandlerWithLostOutcomes(dispatcher);
+        var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Done);
+        var inline = InlineChild(RunCondition.OnSuccess);
+        var delayed = DelayedChild(RunCondition.OnSuccess, DateTime.UtcNow.AddMinutes(-1));
+        outcome.TimeTickerChildren.AddRange([inline, delayed]);
+        _internalManager.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>()).Returns([]);
+
+        await handler.AfterLateStoreAsync(outcome, claimChildren: true, CancellationToken.None);
+
+        var warning = Assert.Single(logs.Entries, e => e.Level == LogLevel.Warning);
+        Assert.Contains(inline.TickerId.ToString(), warning.Message);
+        Assert.Contains(outcome.TickerId.ToString(), warning.Message);
+        Assert.DoesNotContain(delayed.TickerId.ToString(), warning.Message);
+        await dispatcher.DidNotReceiveWithAnyArgs().DispatchAsync(default!, default);
+    }
+
+    // At the stop nothing is claimed. An inline child the outcome lets run then stays Idle, and nothing claims a row without a
+    // time later: one error per child names it and its parent. It is not skipped, which would record an outcome it did not have.
+    [Fact]
+    public async Task AfterALateStore_WithoutClaims_AnInlineChildTheOutcomeLetsRunStaysAsItIs_AndAnErrorNamesIt()
+    {
+        var dispatcher = Substitute.For<ISharpTickerDispatcher>();
+        dispatcher.IsEnabled.Returns(true);
+        var (handler, _, logs) = HandlerWithLostOutcomes(dispatcher);
+        var outcome = CreateContext(type: TickerType.TimeTicker).SetProperty(x => x.Status, TickerStatus.Done);
+        var first = InlineChild(RunCondition.OnSuccess);
+        var second = InlineChild(RunCondition.OnAnyCompletedStatus);
+        var notAllowed = InlineChild(RunCondition.OnFailure);
+        var delayed = DelayedChild(RunCondition.OnSuccess, DateTime.UtcNow.AddMinutes(-1));
+        outcome.TimeTickerChildren.AddRange([first, second, notAllowed, delayed]);
+
+        await handler.AfterLateStoreAsync(outcome, claimChildren: false, CancellationToken.None);
+
+        await _internalManager.DidNotReceiveWithAnyArgs().AcquireDelayedChildrenAsync(default!, default);
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { notAllowed.TickerId })),
+            Arg.Any<CancellationToken>());
+        var errors = logs.Entries.Where(e => e.Level == LogLevel.Error).ToList();
+        Assert.Equal(2, errors.Count);
+        Assert.Contains(first.TickerId.ToString(), errors[0].Message);
+        Assert.Contains(outcome.TickerId.ToString(), errors[0].Message);
+        Assert.Contains(second.TickerId.ToString(), errors[1].Message);
     }
 
     #endregion
