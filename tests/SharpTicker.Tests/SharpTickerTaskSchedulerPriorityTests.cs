@@ -13,8 +13,10 @@ namespace SharpTicker.Tests;
 /// <summary>
 /// The order in which a saturated pool takes its waiting jobs: High before Normal before Low, first in first out within
 /// one priority, and a Low job is not held back for ever by a steady stream of High ones.
-/// With one worker the order is exact, so the tests use one: the worker is held by a job that waits on a gate, the jobs
-/// queue up behind it, and the order they run in after the gate opens is recorded.
+/// With one worker the order is exact, so the tests use one: the worker is held by a job that blocks on a gate, the jobs
+/// queue up behind it, and the order they run in after the gate opens is recorded. The job blocks instead of awaiting:
+/// a worker runs a job only up to its first await, so an awaiting job would free the worker and a job queued meanwhile
+/// would start at once.
 /// </summary>
 [Collection(SharedStaticStateCollection.Name)]
 public class SharpTickerTaskSchedulerPriorityTests
@@ -25,16 +27,17 @@ public class SharpTickerTaskSchedulerPriorityTests
     {
         public SharpTickerTaskScheduler Scheduler { get; } = new(1);
         public ConcurrentQueue<string> Order { get; } = new();
-        private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ManualResetEventSlim _gate = new(false);
         private readonly TaskCompletionSource _holding = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         /// <summary>Holds the only worker until <see cref="Open"/> is called, and returns once it holds it.</summary>
         public async Task HoldTheWorkerAsync()
         {
-            await Scheduler.QueueAsync(async _ =>
+            await Scheduler.QueueAsync(_ =>
             {
                 _holding.SetResult();
-                await _gate.Task;
+                _gate.Wait(Wait);
+                return Task.CompletedTask;
             }, TickerTaskPriority.Normal);
             await _holding.Task.WaitAsync(Wait);
         }
@@ -42,7 +45,7 @@ public class SharpTickerTaskSchedulerPriorityTests
         public ValueTask Queue(string name, TickerTaskPriority priority)
             => Scheduler.QueueAsync(_ => { Order.Enqueue(name); return Task.CompletedTask; }, priority);
 
-        public void Open() => _gate.SetResult();
+        public void Open() => _gate.Set();
 
         public async Task WaitForAsync(int count)
         {
@@ -52,7 +55,12 @@ public class SharpTickerTaskSchedulerPriorityTests
             Assert.True(Order.Count >= count, $"only {Order.Count} of {count} jobs ran: {string.Join(",", Order)}");
         }
 
-        public ValueTask DisposeAsync() => Scheduler.DisposeAsync();
+        // The gate is opened first, so a test that failed before Open does not leave the worker blocked
+        public async ValueTask DisposeAsync()
+        {
+            _gate.Set();
+            await Scheduler.DisposeAsync();
+        }
     }
 
     [Fact]
