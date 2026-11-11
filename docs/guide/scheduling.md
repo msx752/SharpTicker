@@ -149,7 +149,7 @@ When the application stops while a parent runs, the parent is recorded as `Cance
 
 A child or grandchild can have an execution time of its own (`SetExecutionTime` on the child or grandchild builder). Such a **delayed child** follows the same rules as any other child, and in addition does not start before its own time:
 
-- It runs only when its parent has ended with a status its `RunCondition` accepts, and not before its own execution time. If that time has already passed when the parent ends, it runs right after the parent. Known limit: the scheduler plans by the second, so a job can start up to one second before its time when a cron occurrence is due in that same second.
+- It runs only when its parent has ended with a status its `RunCondition` accepts, and not before its own execution time. If that time has already passed when the parent ends, it runs right after the parent.
 - When the parent ends with a status its condition does not accept, it is skipped with everything below it.
 - An `InProgress` delayed child runs at its time once its parent has started, whatever the parent's outcome. It is skipped only when the parent was skipped.
 - A delayed grandchild depends on its own parent (the child), not on the root of the chain.
