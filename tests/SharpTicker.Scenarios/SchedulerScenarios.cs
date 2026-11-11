@@ -160,6 +160,42 @@ public class SchedulerScenarios(ITestOutputHelper output)
         Assert.Equal(0, restarts);
     }
 
+    // #117: the store hands the loop every job of the earliest job's second as one batch, and the loop started the whole
+    // batch at the earliest time, so a job due later in that second started before its own time (up to a second). Two jobs
+    // in one second, added together so that the loop plans them together; times and starts are both read on the node's
+    // clock.
+    [Theory]
+    [InlineData(Store.EfCorePostgres)]
+    [InlineData(Store.MongoDb)]
+    [InlineData(Store.Redis)]
+    public async Task AJobLaterInTheSameSecondAsAnotherJob_DoesNotStartBeforeItsTime(Store store)
+    {
+        await using var env = await ScenarioEnvironment.StartAsync("same-second", store, nodes: 1);
+        var node = env.Nodes[0];
+
+        var now = DateTime.UtcNow;
+        var second = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second, DateTimeKind.Utc).AddSeconds(6);
+        var times = new[] { second.AddMilliseconds(100), second.AddMilliseconds(500) };
+        var ids = await node.Api.AddTimeTickersAsync(times.Select(t => new TickerSeed { Function = Functions.Record, ExecutionTime = t }).ToArray());
+
+        await env.UntilAsync(() => Task.FromResult(ids.All(id => env.Runs.Starts(id) == 1)),
+            () => $"starts: {string.Join(", ", ids.Select(id => env.Runs.Starts(id)))}");
+
+        var late = new TimeSpan[ids.Count];
+        for (var i = 0; i < ids.Count; i++)
+        {
+            var started = env.Runs.For(ids[i]).Single(e => e.IsStart).At;
+            var own = new DateTimeOffset(times[i]);
+            Assert.True(started >= own, $"job {i} started {(own - started).TotalMilliseconds:F0} ms before its time ({started:HH:mm:ss.fff} for {own:HH:mm:ss.fff})");
+            late[i] = started - own;
+        }
+
+        // Planned in two passes, the second job starts a polling interval after the first, 600 ms or more after its time,
+        // and the check above would pass without the two having shared a batch.
+        Assert.True(late[1] < TimeSpan.FromMilliseconds(400),
+            $"the second job was not planned together with the first (started {late[1].TotalMilliseconds:F0} ms after its time), so this run shows nothing");
+    }
+
     /// <summary>"H H H L N" -> "H*3 L N".</summary>
     private static string Compress(IEnumerable<string> letters)
     {
