@@ -19,6 +19,9 @@ using MongoStore = SharpTicker.MongoDB.DependencyInjection.ServiceExtension;
 //   SCENARIO_NODE            the node identifier (also written in every run-log line)
 //   SCENARIO_REDIS_INSTANCE  the Redis InstanceName (key prefix), unique per scenario
 //   SCENARIO_CREATE_SCHEMA   1 = create the EF Core schema before starting (one node per scenario)
+//   SCENARIO_HEARTBEAT_REDIS optional, with a store other than Redis (run with EF Core only so far): a Redis connection
+//                            string; the node then uses Redis next to its store (node heartbeat, release of nodes whose
+//                            heartbeat stopped)
 //   SCENARIO_MAX_CONCURRENCY      optional: the scheduler's MaxConcurrency
 //   SCENARIO_IDLE_WORKER_TIMEOUT  optional: the scheduler's IdleWorkerTimeOut, in seconds
 //   SCENARIO_MIGRATIONS      optional, EF Core: documented | unedited = use that context and its migrations (the migration scenarios);
@@ -77,16 +80,22 @@ builder.Services.AddSharpTicker(options =>
                 mongo.UseSharpTickerMongoClient(connection, Required("SCENARIO_DATABASE")));
             break;
         case "redis":
-            options.AddStackExchangeRedis(redis =>
-            {
-                redis.Configuration = connection;
-                redis.InstanceName = Required("SCENARIO_REDIS_INSTANCE");
-                redis.NodeHeartbeatInterval = TimeSpan.FromSeconds(5);
-            });
+            AddRedis(connection);
             break;
         default:
             throw new InvalidOperationException($"Unknown SCENARIO_STORE '{store}'.");
     }
+
+    // Redis next to another store: it is the job store only when no other store is registered.
+    if (store != "redis" && Environment.GetEnvironmentVariable("SCENARIO_HEARTBEAT_REDIS") is { Length: > 0 } heartbeatRedis)
+        AddRedis(heartbeatRedis);
+
+    void AddRedis(string redisConnection) => options.AddStackExchangeRedis(redis =>
+    {
+        redis.Configuration = redisConnection;
+        redis.InstanceName = Required("SCENARIO_REDIS_INSTANCE");
+        redis.NodeHeartbeatInterval = TimeSpan.FromSeconds(5);
+    });
 
     options.AddDashboard(dashboard => dashboard.WithNoAuth());
 });

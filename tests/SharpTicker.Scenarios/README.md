@@ -13,6 +13,8 @@ These tests are local only: they are not part of `SharpTicker.slnx` and do not r
   add jobs; the dashboard API is used to read them. Every job start and end writes one `SCENARIO_RUN {...}` JSON line.
 - `tests/SharpTicker.Scenarios`: the xUnit tests. Each scenario starts a Docker network, a store (PostgreSQL 16,
   MongoDB 7 or Redis 7), a Toxiproxy in front of the store, and the nodes. Faults go through Docker and Toxiproxy.
+  A scenario can give a node a store proxy of its own (the store is then cut for some nodes and not for others), and can
+  add a Redis next to an EF Core store for the node heartbeat.
 
 ## Prerequisites
 
@@ -79,7 +81,7 @@ scenario's log folder; `SCENARIO_SEED=<seed>` repeats the same sequence.
 ## Logs and the summary
 
 Each scenario writes to `artifacts/scenarios/<scenario>-<store>/`: one log per container (`node-0.log`, a restarted node
-as `node-0-r1.log`, `store.log`, `proxy.log`), `run.json` (the test, the counts of jobs, starts and ends), and for
+as `node-0-r1.log`, `store.log`, `proxy.log`, `heartbeat.log` for a heartbeat Redis), `run.json` (the test, the counts of jobs, starts and ends), and for
 some scenarios `faults.txt` or `memory.csv`. A failing wait names the containers' state and this folder.
 
 The summary (`artifacts/scenarios/summary.md`, one row per test, failures first) is written in a second step from the
