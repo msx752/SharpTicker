@@ -143,9 +143,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
             if (_executionContext.Functions.Length != 0)
             {
-
-                var batch = _executionContext.Functions.OrderBy(x => x.CachedPriority).ToArray();
-                await HandOverBatchAsync(batch, stoppingToken);
+                await HandOverWhenDueAsync(_executionContext.Functions, stoppingToken, cancellationToken);
 
                 _executionContext.SetFunctions(null);
             }
@@ -208,6 +206,30 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
 
     private bool CanHandOver(CancellationToken stoppingToken)
         => !stoppingToken.IsCancellationRequested && !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
+
+    // The rows of one second are planned together and the loop wakes at the earliest of them. A row whose time is later in
+    // that second waits here for its own time, so no job starts before it. The rows that are due go on together, in
+    // priority order. The wait follows the loop's token: a restart or a stop ends it, and the rows not handed over yet are
+    // still Queued and are released with the rest of the plan.
+    private async Task HandOverWhenDueAsync(InternalFunctionContext[] planned, CancellationToken stoppingToken, CancellationToken cancellationToken)
+    {
+        var waiting = planned.OrderBy(x => x.ExecutionTime).ToList();
+
+        while (waiting.Count > 0)
+        {
+            var now = Now;
+            var due = waiting.TakeWhile(x => x.ExecutionTime <= now).OrderBy(x => x.CachedPriority).ToArray();
+            if (due.Length == 0)
+            {
+                // Rounded up to the next millisecond: the timer drops the fraction and would otherwise fire just before the time.
+                await Task.Delay(waiting[0].ExecutionTime - now + TimeSpan.FromMilliseconds(1), cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            waiting.RemoveRange(0, due.Length);
+            await HandOverBatchAsync(due, stoppingToken).ConfigureAwait(false);
+        }
+    }
 
     // The batch is claimed first, as many rows at once as the store takes, and the won rows are then handed to the workers in
     // priority order. A job goes to a worker only when this node won the claim on its row: the fallback or a cancel may have
