@@ -455,7 +455,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var gateOpen = await set
             .AsNoTracking()
             .Where(x => idList.Contains(x.Id))
-            .WhereChainGateOpen()
+            .WhereRunNowGateOpen()
             .Select(x => x.Id)
             // A cancelled caller is answered by the loop below (it stops before claiming), not by a throw here.
             .ToListAsync(CancellationToken.None).ConfigureAwait(false);

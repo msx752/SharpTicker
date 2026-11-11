@@ -323,7 +323,7 @@ namespace SharpTicker.Provider
                 if (!TimeTickers.TryGetValue(id, out var ticker))
                     continue;
 
-                if (!CanAcquire(ticker) || !ChainGateOpen(ticker))
+                if (!CanAcquire(ticker) || !RunNowGateOpen(ticker))
                     continue;
 
                 var updatedTicker = CloneTicker(ticker);
@@ -1372,6 +1372,13 @@ namespace SharpTicker.Provider
         private static bool ChainGateOpen(TTimeTicker ticker)
             => ticker.ParentId == null
                || (TimeTickers.TryGetValue(ticker.ParentId.Value, out var parent) && ChainRunGate.Allows(ticker.RunCondition, parent.Status));
+
+        // The gate of a claim by id (ChainRunGate.AllowsRunNow): also a child without a time of its own, once its parent
+        // has ended with an outcome it runs on.
+        private static bool RunNowGateOpen(TTimeTicker ticker)
+            => ticker.ParentId == null
+               || (TimeTickers.TryGetValue(ticker.ParentId.Value, out var parent)
+                   && ChainRunGate.AllowsRunNow(ticker.RunCondition, parent.Status, ticker.ExecutionTime.HasValue));
 
         // Skips a delayed child whose parent has ended with an outcome it does not run on; true when it did.
         private bool SkipIfParentOutcomeDoesNotMatch(TTimeTicker snapshot, DateTime now)
