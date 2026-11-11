@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using SharpTicker.Scenarios.Harness;
 using Xunit.Abstractions;
 
@@ -94,16 +95,102 @@ public class StoreFaultScenarios(ITestOutputHelper output)
         await AssertEveryJobRanOnceAndEnded(env, ids, finalOk: null, window, reader: 1);
     }
 
+    // #74: the store is cut while jobs run, so the final status write of each fails at its end. The node writes the outcome
+    // again once the store is back, with no restart. Before the fix the row stayed InProgress for as long as the node lived;
+    // a later release (a restart on EF Core) freed it and the finished job ran again.
+    [Theory]
+    [InlineData(Store.EfCorePostgres)]
+    [InlineData(Store.MongoDb)]
+    [InlineData(Store.Redis)]
+    public async Task AStoreCutAtTheEndOfJobs_TheirOutcomesAreStoredOnceTheStoreIsBack(Store store)
+    {
+        await using var env = await ScenarioEnvironment.StartAsync("outcome-cut", store, nodes: 2);
+
+        var start = DateTime.UtcNow;
+        var ids = await env.Nodes[0].Api.AddTimeTickersAsync(Enumerable.Range(0, 5)
+            .Select(_ => new TickerSeed { Function = Functions.Slow, ExecutionTime = start.AddSeconds(3), Request = new WaitRequest { Seconds = 6 } })
+            .ToArray());
+
+        // All five run 6 s. They are seen started at most a fallback pass (2 s) after the first start, so the earliest end is
+        // at least 4 s away; the cut starts 2 s from here and lasts past the latest end. MongoDB 40 s: longer than its
+        // driver's server selection wait (30 s), which otherwise waits out the cut and writes late on its own, so no final
+        // write fails there. Redis 10 s: well inside its heartbeat TTL (25 s), counting the last heartbeat (up to 5 s before
+        // the cut) and the 5 s retry delay after a failed one; a longer outage can make the nodes release their own running
+        // rows when Redis returns (a known Redis behaviour, not fixed yet), which is not what this scenario checks. The
+        // jobs end at most 6 s into the cut, so 10 s still fails their final writes.
+        await env.UntilAsync(() => Task.FromResult(ids.All(id => env.Runs.Starts(id) == 1)),
+            () => $"{ids.Count(id => env.Runs.Starts(id) == 1)} of {ids.Count} started", TimeSpan.FromSeconds(30));
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        var cut = TimeSpan.FromSeconds(store switch { Store.MongoDb => 40, Store.Redis => 10, _ => 15 });
+        var window = new FaultEvent("cut") { At = DateTimeOffset.UtcNow, Until = DateTimeOffset.UtcNow + cut };
+        await env.CutStoreAsync(cut);
+
+        // DueDone when a node's fallback took the job.
+        await AssertEveryJobRanOnceAndEnded(env, ids, finalOk: [TickerStatus.Done, TickerStatus.DueDone], window);
+
+        // The fault reached the final writes: without this the scenario would pass on code that never meets a failed write
+        // (a store client that waits out the cut and writes late on its own).
+        var lost = env.CountNodeLogLines("could not be stored");
+        Assert.True(lost >= ids.Count, $"{lost} lost final writes logged, expected one per job ({ids.Count}); see {env.LogFolder}");
+    }
+
+    // #74 (#104): a node frozen past its heartbeat is taken for dead; the other node releases its rows and runs its job again
+    // (the documented at-least-once of a node taken for dead). When the frozen node goes on, its job ends and writes its
+    // outcome late. That write must not land on the row the other node now runs: before the fix it was by Id, so the row
+    // became Done and unlocked while the other node still ran the job. Redis only: it is the store whose nodes release the
+    // rows of a dead node while they run.
+    [Fact]
+    public async Task APausedNodesLateWrite_DoesNotOverwriteTheRunThatTookItsRow()
+    {
+        await using var env = await ScenarioEnvironment.StartAsync("late-write", Store.Redis, nodes: 2, startedNodes: 1);
+        string frozen = env.Nodes[0].Identifier, taker = env.Nodes[1].Identifier;
+
+        // 30 s: node 0's run outlasts nothing it needs to (its wait has passed when it is let go), and node 1's run, which
+        // starts at least 20 s into the pause (heartbeat ttl 25 s minus one 5 s interval), is still going 10 s after it.
+        var id = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed
+            { Function = Functions.Slow, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 30 } });
+        await env.UntilAsync(() => Task.FromResult(env.Runs.Starts(id) == 1), () => "node 0 did not start the job", TimeSpan.FromSeconds(30));
+        await env.StartNodeAsync(1);
+
+        await env.PauseNodeAsync(0, TimeSpan.FromSeconds(40));
+        Assert.True(env.Runs.For(id).Any(e => e.IsStart && e.Node == taker),
+            $"node 1 did not take the job while node 0 was frozen: {Describe(env, id)}");
+
+        // Node 0's job ends as soon as it runs again, and writes its outcome.
+        await env.UntilAsync(() => Task.FromResult(env.Runs.For(id).Any(e => e.IsEnd && e.Node == frozen)),
+            () => $"node 0's job did not end after the pause: {Describe(env, id)}", TimeSpan.FromSeconds(20));
+
+        // The row is read once node 0's write is done: with the fence it logs the refusal; without it there is no such
+        // line, so the wait ends after 10 s and the row shows what the write did.
+        var refusalWait = Stopwatch.StartNew();
+        while (env.CountNodeLogLines("was not stored", node: 0) == 0 && refusalWait.Elapsed < TimeSpan.FromSeconds(10))
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+
+        var row = (await env.Nodes[1].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id);
+        Assert.False(env.Runs.For(id).Any(e => e.IsEnd && e.Node == taker), $"inconclusive: node 1's run ended already: {Describe(env, id)}");
+        Assert.True(row.Status == TickerStatus.InProgress && row.LockHolder == taker,
+            $"node 0's late write changed the row node 1 runs: {row.Status}, lock {row.LockHolder ?? "none"}; {Describe(env, id)}");
+
+        // Node 1's run ends it: DueDone, as node 1's fallback took the overdue row.
+        var final = TickerStatus.InProgress;
+        await env.UntilAsync(async () => (final = (await env.Nodes[1].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id).Status) is TickerStatus.Done or TickerStatus.DueDone,
+            () => $"node 1's run did not end the row: {final}; {Describe(env, id)}", TimeSpan.FromSeconds(60));
+        Assert.True(env.CountNodeLogLines("was not stored", node: 0) >= 1, $"node 0 logged no refused late write; see {env.LogFolder}");
+        output.WriteLine($"starts: {env.Runs.Starts(id)} (node 0, then node 1 after it was taken for dead)");
+    }
+
+    private static string Describe(ScenarioEnvironment env, Guid id)
+        => string.Join("; ", env.Runs.For(id).Select(e => $"{e.Event} {e.Node} {e.At:HH:mm:ss.fff} {e.Status}"));
+
     /// <summary>
-    /// Waits until every job is settled, then checks each started exactly once with attempt 0. A row that stays InProgress
-    /// although its job logged its end is the open issue #74 (the final status write failed and nothing retries it); it is
-    /// tolerated, and reported, only when the job ended inside the scenario's fault <paramref name="window"/>. Any other row
-    /// left InProgress fails: without an end line it is a claim left without a worker.
+    /// Waits until every job has a final status, then checks each started exactly once with attempt 0. A row left
+    /// InProgress fails: either a claim without a worker, or a final status write that failed and was not written again
+    /// (#74). <paramref name="window"/> is kept for the failure message.
     /// </summary>
     private async Task AssertEveryJobRanOnceAndEnded(ScenarioEnvironment env, IReadOnlyList<Guid> ids, TickerStatus[]? finalOk, FaultEvent window, int reader = 0)
     {
         IReadOnlyList<TickerView> tickers = [];
-        bool Settled(Guid id) => tickers.Any(t => t.Id == id && (IsFinal(t.Status) || (t.Status == TickerStatus.InProgress && env.Runs.Ends(id) == 1)));
+        bool Settled(Guid id) => tickers.Any(t => t.Id == id && IsFinal(t.Status));
         await env.UntilAsync(async () =>
         {
             tickers = await env.Nodes[reader].Dashboard.GetAllTimeTickersAsync();
@@ -113,33 +200,20 @@ public class StoreFaultScenarios(ITestOutputHelper output)
             var open = tickers.Where(t => ids.Contains(t.Id) && !Settled(t.Id)).ToList();
             var missing = ids.Count(id => tickers.All(t => t.Id != id));
             return $"{open.Count + missing} of {ids.Count} not settled ({missing} not listed by the dashboard; " +
-                   $"{string.Join(", ", open.Select(t => $"{t.Id} {t.Status}, starts {env.Runs.Starts(t.Id)}"))})";
+                   $"{string.Join(", ", open.Select(t => $"{t.Id} {t.Status}, starts {env.Runs.Starts(t.Id)}, ends {env.Runs.Ends(t.Id)}"))}; " +
+                   $"fault {window.Type} {window.At:O} to {window.Until:O})";
         }, Recovery);
 
         // Let anything that would start a second time do so before counting.
         await Task.Delay(TimeSpan.FromSeconds(5));
         tickers = await env.Nodes[reader].Dashboard.GetAllTimeTickersAsync();
-        var known74 = new List<Guid>();
         foreach (var id in ids)
         {
             Assert.True(env.Runs.Starts(id, 0) == 1, $"ticker {id}: {env.Runs.Starts(id, 0)} starts with attempt 0");
-            var status = tickers.Single(t => t.Id == id).Status;
-            if (status == TickerStatus.InProgress)
-            {
-                Assert.True(env.Runs.Ends(id) == 1, $"ticker {id} is InProgress and its job never ended: a claim without a worker");
-                var end = env.Runs.For(id).Single(e => e.IsEnd);
-                Assert.True(Invariants.FinalWriteCouldFail(end, [window]),
-                    $"ticker {id} is InProgress although its job ended at {end.At:O}, outside the fault ({window.At:O} to {window.Until:O})");
-                known74.Add(id);
-            }
-            else if (finalOk != null)
-            {
-                Assert.Contains(status, finalOk);
-            }
+            if (finalOk != null)
+                Assert.Contains(tickers.Single(t => t.Id == id).Status, finalOk);
         }
-
-        if (known74.Count > 0)
-            output.WriteLine($"Tolerated open issue #74: {known74.Count} job(s) ended during the fault but stay InProgress (final status write failed): {string.Join(", ", known74)}");
+        output.WriteLine($"{ids.Count} jobs, each started once and ended {string.Join("/", finalOk ?? [])}");
     }
 
     private static bool IsFinal(TickerStatus status)

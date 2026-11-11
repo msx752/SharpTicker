@@ -63,6 +63,8 @@ public static class Functions
     public const string Blocker = "Scenario.Blocker";
     /// <summary>Holds its worker with Thread.Sleep for 200 ms.</summary>
     public const string Wave = "Scenario.Wave";
+    /// <summary>A cron defined in code; registered only when the node gets SCENARIO_SEEDED_CRON.</summary>
+    public const string Seeded = "Scenario.Seeded";
 }
 
 /// <summary>Cron expressions the scenarios use.</summary>
@@ -100,6 +102,13 @@ public sealed class TickerView
 
     public IEnumerable<TickerView> SelfAndDescendants()
         => new[] { this }.Concat(Children.SelectMany(c => c.SelfAndDescendants()));
+}
+
+public sealed class CronView
+{
+    public Guid Id { get; set; }
+    public string? Function { get; set; }
+    public string? Expression { get; set; }
 }
 
 public sealed class OccurrenceView
@@ -199,6 +208,9 @@ public sealed class DashboardClient(Func<HttpClient> http)
     /// <summary>Every time ticker, roots and children, in one flat list.</summary>
     public async Task<IReadOnlyList<TickerView>> GetAllTimeTickersAsync()
         => (await GetTimeTickersAsync()).SelectMany(t => t.SelfAndDescendants()).ToList();
+
+    public async Task<IReadOnlyList<CronView>> GetCronsAsync()
+        => (await http().GetFromJsonAsync<List<CronView>>($"{Api}/cron-tickers", Json.Options))!;
 
     public async Task<IReadOnlyList<OccurrenceView>> GetOccurrencesAsync(Guid cronId)
         => (await http().GetFromJsonAsync<List<OccurrenceView>>($"{Api}/cron-ticker-occurrences/{cronId}", Json.Options))!;

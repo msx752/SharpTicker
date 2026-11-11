@@ -228,7 +228,8 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
     private string NodeConnection() => Store switch
     {
         Store.EfCorePostgres => $"Host=proxy;Port={ProxyListenPort};Database={DatabaseName};Username=postgres;Password=postgres",
-        Store.MongoDb => $"mongodb://mongo:mongo@proxy:{ProxyListenPort}/?authSource=admin&directConnection=true",
+        // The driver's default server selection wait, pinned: the store-cut scenarios are timed against it.
+        Store.MongoDb => $"mongodb://mongo:mongo@proxy:{ProxyListenPort}/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=30000",
         Store.Redis => $"proxy:{ProxyListenPort},abortConnect=false",
         _ => throw new ArgumentOutOfRangeException(nameof(Store)),
     };
@@ -347,13 +348,14 @@ public sealed class ScenarioEnvironment : IScenarioState, IAsyncDisposable
 
     /// <summary>
     /// The number of lines in all node logs so far that contain <paramref name="text"/> (e.g. "fail:", the prefix of an
-    /// error-level log line). Lets a scenario check that the fault it injected was seen by a node.
+    /// error-level log line). Lets a scenario check that the fault it injected was seen by a node. With
+    /// <paramref name="node"/>, only that node's log is read.
     /// </summary>
-    public int CountNodeLogLines(string text)
+    public int CountNodeLogLines(string text, int? node = null)
     {
         lock (_fileGate)
         {
-            return Directory.GetFiles(LogFolder, "node-*.log").Sum(path =>
+            return Directory.GetFiles(LogFolder, node is { } n ? $"node-{n}.log" : "node-*.log").Sum(path =>
             {
                 using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var reader = new StreamReader(stream);

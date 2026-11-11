@@ -28,6 +28,7 @@ public static class ScenarioJobs
     public const string Low = "Scenario.Low";
     public const string Blocker = "Scenario.Blocker";
     public const string Wave = "Scenario.Wave";
+    public const string Seeded = "Scenario.Seeded";
 
     private static readonly HttpClient TimingOutClient = new() { Timeout = TimeSpan.FromSeconds(1) };
 
@@ -95,6 +96,12 @@ public static class ScenarioJobs
         services.MapTicker(Blocker, (context, ct) => Logged(context, ct, _ => Sleep(TimeSpan.FromSeconds(8))));
 
         services.MapTicker(Wave, (context, ct) => Logged(context, ct, _ => Sleep(TimeSpan.FromMilliseconds(200))));
+
+        // A cron defined in code, seeded into the store at every start: only when SCENARIO_SEEDED_CRON gives its expression,
+        // so the other scenarios see no cron of their own.
+        if (Environment.GetEnvironmentVariable("SCENARIO_SEEDED_CRON") is { Length: > 0 } seeded)
+            services.MapTicker(Seeded, (context, ct) => Logged(context, ct, _ => Task.CompletedTask))
+                .WithCron(SharpTicker.Utilities.CronExpression.Parse(seeded));
     }
 
     private static Task Sleep(TimeSpan duration)
