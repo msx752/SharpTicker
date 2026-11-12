@@ -413,6 +413,59 @@ public class TickerManagerBatchTests : IAsyncLifetime
         Assert.Equal("later", Assert.Single(await Store.GetTimeTickers(null, default)).Description);
     }
 
+    private async Task<(TimeTickerEntity Parent, TimeTickerEntity Child)> AddChainAsync(DateTime? childTime)
+    {
+        var parent = Time();
+        parent.Children.Add(new TimeTickerEntity { Function = TimeFunction, ExecutionTime = childTime, RunCondition = SharpTicker.Utilities.Enums.RunCondition.OnSuccess, Description = "child" });
+        var added = (await Times.AddAsync(parent)).Result;
+        return (added, Assert.Single(added.Children));
+    }
+
+    // A child without a time of its own runs right after its parent. The update refused a body without a time, so the
+    // child could only be edited by giving it a time, which makes it a delayed child.
+    [Fact]
+    public async Task UpdatingAChildWithoutATime_WithABodyWithoutATime_KeepsItWithoutATime()
+    {
+        var (parent, child) = await AddChainAsync(childTime: null);
+
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = child.Id, Function = TimeFunction, Description = "edited" });
+
+        Assert.True(result.IsSucceeded, result.Exception?.Message);
+        var stored = await Store.GetTimeTickerById(child.Id, default);
+        Assert.Equal("edited", stored.Description);
+        Assert.Null(stored.ExecutionTime);
+        Assert.Equal(parent.Id, stored.ParentId);
+        Assert.Equal(SharpTicker.Utilities.Enums.RunCondition.OnSuccess, stored.RunCondition);
+    }
+
+    // Taking the time from a delayed child is refused: when its parent has already ended, nothing would start it.
+    [Fact]
+    public async Task UpdatingAChildWithATime_WithABodyWithoutATime_IsRefused()
+    {
+        var at = DateTime.UtcNow.AddHours(3);
+        var (_, child) = await AddChainAsync(childTime: at);
+
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = child.Id, Function = TimeFunction, Description = "edited" });
+
+        Assert.False(result.IsSucceeded);
+        Assert.Contains("ExecutionTime", result.Exception.Message);
+        var stored = await Store.GetTimeTickerById(child.Id, default);
+        Assert.Equal("child", stored.Description);
+        Assert.NotNull(stored.ExecutionTime);
+    }
+
+    [Fact]
+    public async Task UpdatingATickerThatIsNotAChild_WithABodyWithoutATime_IsRefused()
+    {
+        var added = (await Times.AddAsync(Time())).Result;
+
+        var result = await Times.UpdateAsync(new TimeTickerEntity { Id = added.Id, Function = TimeFunction, Description = "edited" });
+
+        Assert.False(result.IsSucceeded);
+        Assert.Contains("ExecutionTime", result.Exception.Message);
+        Assert.NotEqual("edited", (await Store.GetTimeTickerById(added.Id, default)).Description);
+    }
+
     #endregion
 
     #region Backwards cron ranges
