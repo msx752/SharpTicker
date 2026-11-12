@@ -10,12 +10,18 @@ namespace SharpTicker.Utilities;
 /// run's fenced writes would no longer match and its outcome would be lost, leaving the row InProgress or running the job
 /// again. A body that still shows a run the store no longer has (read while the job ran, sent after it ended) does not bring
 /// that run back. The stores apply this to every row an update writes, the root and its chain rows.
+/// <para>
+/// The link of a chain child is the store's too (<see cref="KeepChainLink{TTicker}"/>): an update does not take a stored
+/// child out of its chain or move it to another parent. To do that, delete the child and add a new job.
+/// </para>
 /// </summary>
 internal static class RunStateOnEdit
 {
     /// <summary>Changes <paramref name="body"/>, the row to be written, against <paramref name="stored"/>, the row in the store.</summary>
     internal static void Apply<TTicker>(TTicker body, TTicker stored) where TTicker : TimeTickerEntity<TTicker>
     {
+        KeepChainLink(body, stored.ParentId, stored.RunCondition);
+
         if (stored.Status == TickerStatus.InProgress)
         {
             KeepRunOf(body, stored);
@@ -37,6 +43,20 @@ internal static class RunStateOnEdit
             body.LockHolder = stored.LockHolder;
             body.LockedAt = stored.LockedAt;
         }
+    }
+
+    /// <summary>
+    /// A stored chain child keeps its parent, and its run condition when <paramref name="body"/> has none: the dashboard's
+    /// edit form sends neither, and a child written without them would leave its chain and run as a job of its own.
+    /// </summary>
+    internal static void KeepChainLink<TTicker>(TTicker body, Guid? storedParentId, RunCondition? storedRunCondition)
+        where TTicker : TimeTickerEntity<TTicker>
+    {
+        if (storedParentId == null)
+            return;
+
+        body.ParentId = storedParentId;
+        body.RunCondition ??= storedRunCondition;
     }
 
     /// <summary>The run fields of a row as the caller sent it, so an update that is tried again starts from them.</summary>

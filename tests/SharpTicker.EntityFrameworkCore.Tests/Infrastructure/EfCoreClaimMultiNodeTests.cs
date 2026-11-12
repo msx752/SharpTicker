@@ -1656,6 +1656,35 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.True(await a.Manager.UpdateTickerAsync(Ended(childRun, TickerStatus.Done, T0.AddMinutes(1))));
     }
 
+    // The dashboard's edit form sends a child on its own, with no ParentId and no RunCondition. The link is the store's: the
+    // child stays in its chain and keeps its condition, whether it has started or not.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Fence_EditingAChildWithABodyWithoutItsLink_KeepsItInItsChain(bool running)
+    {
+        var a = Node("node-A");
+        var childId = Guid.NewGuid();
+        var parentId = await SeedChain(childId);
+        var condition = (await ReadTimeTicker(childId)).RunCondition;
+        Assert.NotNull(condition);
+        if (running)
+            await a.Manager.RecordChildStartedAsync(new InternalFunctionContext { TickerId = childId, Type = TickerType.TimeTicker });
+        var edit = NewTimeTicker(executionTime: T0.AddHours(1));
+        edit.Id = childId;
+        edit.Function = "claim-child";
+        edit.Description = "child edited";
+        edit.ParentId = null;
+        edit.RunCondition = null;
+
+        await a.Store.UpdateTimeTickers([edit], CancellationToken.None);
+
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal("child edited", row.Description);
+        Assert.Equal(parentId, row.ParentId);
+        Assert.Equal(condition, row.RunCondition);
+    }
+
     // A body read before the job ran (a dialog opened before, saved after) must not write the ended job back as not started:
     // the row stays Done and is not handed out again.
     [Fact]

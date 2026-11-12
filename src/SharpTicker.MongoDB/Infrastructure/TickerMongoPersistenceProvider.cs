@@ -1029,6 +1029,18 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
             var byId = fb.Eq(x => x.Id, ticker.Id);
+
+            // A stored chain child keeps its link (RunStateOnEdit.KeepChainLink). Read before the write: an update never
+            // changes a stored ParentId, so it is the same when the write lands. The caller's entity is left as it was sent.
+            var link = await coll.Find(byId)
+                .Project(x => new { x.ParentId, x.RunCondition })
+                .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+            if (link?.ParentId != null && (ticker.ParentId != link.ParentId || ticker.RunCondition == null))
+            {
+                ticker = MongoUpdateBuilders.CopyOf(ticker, coll.DocumentSerializer);
+                RunStateOnEdit.KeepChainLink(ticker, link.ParentId, link.RunCondition);
+            }
+
             // A row that runs or has ended keeps its run (RunStateOnEdit): an ended job written back as not started would run
             // again. Only a row that has not started (Idle, Queued) is replaced.
             TickerStatus[] notStartedStatuses = [TickerStatus.Idle, TickerStatus.Queued];
