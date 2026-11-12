@@ -900,7 +900,7 @@ namespace SharpTicker.Provider
         public Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
         {
             var now = _clock.UtcNow;
-            return Task.FromResult(SwapTimeTicker(timeTickerId, _ => true, ticker =>
+            return Task.FromResult(SwapTimeTicker(timeTickerId, WaitsForItsInlineStart, ticker =>
             {
                 ticker.Status = TickerStatus.InProgress;
                 ticker.LockHolder = _lockHolder;
@@ -908,6 +908,10 @@ namespace SharpTicker.Provider
                 ticker.UpdatedAt = runMarker;
             }));
         }
+
+        // The row an inline start may claim (IFencedRunWriter.StartInlineChildAsync).
+        private static bool WaitsForItsInlineStart(TTimeTicker ticker)
+            => ticker.Status == TickerStatus.Idle && string.IsNullOrEmpty(ticker.LockHolder) && ticker.ExecutionTime == null;
 
         public Task<int> UpdateNotStartedCronOccurrenceAsync(InternalFunctionContext context, CancellationToken cancellationToken = default)
             => Task.FromResult(SwapCronOccurrence(context.TickerId,

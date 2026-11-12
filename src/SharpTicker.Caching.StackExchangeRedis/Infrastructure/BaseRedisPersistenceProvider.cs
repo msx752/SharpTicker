@@ -1251,9 +1251,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
+        // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync). The check runs
+        // again on every round of the compare-and-set, so a start that lost the row to another one is refused.
         var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(timeTickerId), row =>
         {
             if (row == null) return null;
+            if (row.Status != TickerStatus.Idle || !string.IsNullOrEmpty(row.LockHolder) || row.ExecutionTime != null) return null;
             row.Status = TickerStatus.InProgress;
             row.LockHolder = LockHolder;
             row.LockedAt = now;

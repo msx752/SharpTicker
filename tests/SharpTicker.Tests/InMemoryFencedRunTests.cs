@@ -265,10 +265,10 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         Assert.Equal(run.ClaimMarker, row.UpdatedAt);
     }
 
-    // T3: an inline child started by two runs of its parent (node A's run was released and node B ran the parent again).
-    // The child's row belongs to the last start: A's late write changes nothing.
+    // T3: the row of an inline child belongs to the run that started it. A second start of the same child (another run of
+    // its parent) is refused, and the first run's outcome is still stored.
     [Fact]
-    public async Task ALateWriteOfAnInlineChildThatAnotherRunStartedAgain_ChangesNothing()
+    public async Task ASecondStartOfAnInlineChild_IsRefused_AndTheFirstRunKeepsTheRow()
     {
         var a = CreateNode("node-A");
         var b = CreateNode("node-B");
@@ -279,13 +279,92 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         await a.Manager.RecordChildStartedAsync(childOfA);
         await b.Manager.RecordChildStartedAsync(childOfB);
         Assert.NotNull(childOfA.RunMarker);
+        Assert.Null(childOfB.RunMarker);
 
         var stored = await a.Manager.UpdateTickerAsync(Outcome(childOfA, TickerStatus.Done, T0.AddMinutes(1)));
 
-        Assert.False(stored);
+        Assert.True(stored);
+        var row = await Row(child.Id);
+        Assert.Equal(TickerStatus.Done, row.Status);
+        Assert.Equal(childOfA.RunMarker, row.UpdatedAt);
+    }
+
+    // An inline child is started by a claim (#83, #84): its row moves to InProgress only while it is Idle, unlocked and
+    // without a time of its own. The stored row decides, so two starts of the same child cannot both win.
+    [Fact]
+    public async Task StartingAnInlineChildThatWaits_ClaimsItForThisNode()
+    {
+        var a = CreateNode("node-A");
+        var child = InlineChild();
+        await SeedTimeTicker(T0, child);
+        var marker = a.Manager.NextClaimMarker();
+
+        var started = await a.Store.StartInlineChildAsync(child.Id, marker, CancellationToken.None);
+
+        Assert.Equal(1, started);
         var row = await Row(child.Id);
         Assert.Equal(TickerStatus.InProgress, row.Status);
-        Assert.Equal("node-B", row.LockHolder);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(marker, row.UpdatedAt);
+    }
+
+    // Each case differs from a waiting child in one field only.
+    [Theory]
+    [InlineData(TickerStatus.Queued, null, false)]
+    [InlineData(TickerStatus.InProgress, null, false)]
+    [InlineData(TickerStatus.Done, null, false)]
+    [InlineData(TickerStatus.Idle, "node-B", false)]
+    [InlineData(TickerStatus.Idle, null, true)]
+    public async Task StartingAnInlineChildThatDoesNotWait_ChangesNothing(TickerStatus status, string? lockHolder, bool hasTime)
+    {
+        var a = CreateNode("node-A");
+        var child = InlineChild();
+        child.Status = status;
+        child.LockHolder = lockHolder;
+        child.ExecutionTime = hasTime ? T0.AddHours(1) : null;
+        await SeedTimeTicker(T0, child);
+        var before = await Row(child.Id);
+        Assert.Equal(status, before.Status);
+        Assert.Equal(lockHolder, before.LockHolder);
+        Assert.Equal(hasTime, before.ExecutionTime.HasValue);
+
+        var started = await a.Store.StartInlineChildAsync(child.Id, a.Manager.NextClaimMarker(), CancellationToken.None);
+
+        Assert.Equal(0, started);
+        var row = await Row(child.Id);
+        Assert.Equal(status, row.Status);
+        Assert.Equal(lockHolder, row.LockHolder);
+        Assert.Equal(before.UpdatedAt, row.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task StartingAnInlineChildThatIsNotStored_ChangesNothing()
+    {
+        var a = CreateNode("node-A");
+
+        Assert.Equal(0, await a.Store.StartInlineChildAsync(Guid.NewGuid(), a.Manager.NextClaimMarker(), CancellationToken.None));
+    }
+
+    // Not pinned to one interleaving: the two starts are released together, many times. It can only fail when both win.
+    [Fact]
+    public async Task TwoStartsOfTheSameInlineChildAtOnce_OneWins()
+    {
+        var a = CreateNode("node-A");
+        var b = CreateNode("node-B");
+        for (var round = 0; round < 200; round++)
+        {
+            var child = InlineChild();
+            await SeedTimeTicker(T0, child);
+            using var go = new ManualResetEventSlim();
+            var starts = new[] { a, b }.Select(node => Task.Run(() =>
+            {
+                go.Wait();
+                return node.Store.StartInlineChildAsync(child.Id, node.Manager.NextClaimMarker(), CancellationToken.None);
+            })).ToArray();
+            go.Set();
+
+            Assert.Equal(1, (await Task.WhenAll(starts)).Sum());
+        }
     }
 
     // T9: an inline child carries this node's lock while it runs, so the release of a dead node's rows ends it (this store
