@@ -93,6 +93,34 @@ public class RestartThrottleManagerTests
         Assert.Null(exception);
     }
 
+    // Timer.Dispose does not take back a callback the timer has already queued: it runs after the dispose.
+    [Fact]
+    public void ACallbackAlreadyQueuedWhenTheManagerIsDisposed_DoesNothing()
+    {
+        var triggerCount = 0;
+        var manager = new RestartThrottleManager(() => Interlocked.Increment(ref triggerCount), Window);
+        manager.RequestRestart();
+        manager.Dispose();
+
+        var thrown = Record.Exception(() => manager.OnTimerCallback(null));
+
+        Assert.Null(thrown);
+        Assert.Equal(0, Volatile.Read(ref triggerCount));
+    }
+
+    [Fact]
+    public async Task ARequestAfterDispose_DoesNotTriggerARestart()
+    {
+        var triggerCount = 0;
+        var manager = new RestartThrottleManager(() => Interlocked.Increment(ref triggerCount), TimeSpan.FromMilliseconds(50));
+        manager.Dispose();
+
+        manager.RequestRestart();
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+        Assert.Equal(0, Volatile.Read(ref triggerCount));
+    }
+
     private static async Task<bool> WaitUntilAsync(Func<bool> condition)
     {
         var deadline = DateTime.UtcNow + WaitLimit;
