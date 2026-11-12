@@ -32,7 +32,7 @@ Existing jobs keep firing, history stays visible in the dashboard, and crons def
 
 ## Rolling deployment
 
-Old (TickerQ) and new (SharpTicker) instances can run against the same store at the same time, so you can roll the switch out one instance at a time without downtime. They read and write the same tables, documents and keys, but they do not guard each other's jobs: an old instance can overwrite a claim a new one made, an old Redis instance creates cron occurrences the new ones do not see as the same slot, and the old Redis scripts can write rows with empty collections the new code cannot read. A job can run twice for as long as any old instance is still running; the guarantee in [Running in production](docs/guide/operations.md) starts when the last one is gone.
+Old (TickerQ) and new (SharpTicker) instances can run against the same store at the same time, so you can roll the switch out one instance at a time without downtime. They read and write the same tables, documents and keys, but they do not guard each other's jobs: an old instance can overwrite a claim a new one made, an old Redis instance creates cron occurrences the new ones do not see as the same slot, and the old Redis scripts can write rows with empty collections the new code cannot read. A job can run twice for as long as any old instance is still running; what [Running in production](docs/guide/operations.md#several-instances) describes applies once the last one is gone.
 
 **If you use the Redis provider**, also keep the old coordination prefix for the rollout. Redis tracks which instances are alive under this prefix, and that is how jobs held by a crashed instance are released. With different prefixes, old and new instances cannot see each other:
 
