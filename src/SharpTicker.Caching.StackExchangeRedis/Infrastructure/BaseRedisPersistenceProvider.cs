@@ -938,6 +938,21 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             if (existingByFunction.TryGetValue(function, out var rows))
             {
+                // Copies of the seeded cron, left by nodes that started together before the seeded id was fixed.
+                var copies = SeededCronTickers.Copies(rows);
+                if (copies.Count > 0)
+                {
+                    foreach (var copy in copies)
+                    {
+                        await IndexManager.RemoveCronIndexesAsync(copy.Id).ConfigureAwait(false);
+                        await IndexManager.RemoveCronOccurrencesByParentAsync(copy.Id).ConfigureAwait(false);
+                        await Db.KeyDeleteAsync(CronKey(copy.Id)).ConfigureAwait(false);
+                    }
+
+                    rows = rows.Except(copies).ToList();
+                    _logger.LogWarning(SeededCronTickers.CopiesRemovedWarning, copies.Count, function);
+                }
+
                 // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
                 foreach (var cron in SeededCronTickers.Owned(rows))
                 {
