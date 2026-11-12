@@ -109,8 +109,9 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var now = _clock.UtcNow;
 
+        // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync).
         return await session.Context.Set<TTimeTicker>()
-            .Where(x => x.Id == timeTickerId)
+            .Where(x => x.Id == timeTickerId && x.Status == TickerStatus.Idle && x.LockHolder == null && x.ExecutionTime == null)
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.InProgress)
                 .SetProperty(x => x.LockHolder, _lockHolder)

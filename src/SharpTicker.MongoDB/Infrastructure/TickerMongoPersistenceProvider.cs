@@ -835,9 +835,15 @@ namespace SharpTicker.MongoDB.Infrastructure
 
         public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
         {
+            // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync).
+            var fb = Builders<TTimeTicker>.Filter;
             var result = await _context.TimeTickers
                 .UpdateOneAsync(
-                    Builders<TTimeTicker>.Filter.Eq(x => x.Id, timeTickerId),
+                    fb.And(
+                        fb.Eq(x => x.Id, timeTickerId),
+                        fb.Eq(x => x.Status, TickerStatus.Idle),
+                        fb.Eq(x => x.LockHolder, (string)null),
+                        fb.Eq(x => x.ExecutionTime, (DateTime?)null)),
                     Builders<TTimeTicker>.Update
                         .Set(x => x.Status, TickerStatus.InProgress)
                         .Set(x => x.LockHolder, _lockHolder)

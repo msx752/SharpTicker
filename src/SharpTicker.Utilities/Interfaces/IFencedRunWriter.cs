@@ -26,9 +26,10 @@ internal interface IFencedRunWriter
     Task<int> UpdateCronOccurrenceFencedAsync(InternalFunctionContext context, DateTime runMarker, bool onlyWhileRunning, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Records an inline chain child (one without a time of its own, never claimed) as started by this node: InProgress, this
-    /// node's lock and the run marker. By Id, as the child's write was before: the last run that starts it holds it.
-    /// Returns the rows written, 0 when the row does not exist.
+    /// Starts an inline chain child (one without a time of its own) for this node: InProgress, this node's lock and the run
+    /// marker. A claim: the row is written only while it is Idle, unlocked and still without a time, so of several starts
+    /// of the same child one wins. Returns 1 when this call started it, 0 when the row is missing or does not wait for its
+    /// start (it runs or ran elsewhere, another node holds it, or it was given a time and is a delayed child now).
     /// </summary>
     Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default);
 

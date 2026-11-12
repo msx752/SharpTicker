@@ -1445,7 +1445,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         return run;
     }
 
-    private async Task<Guid> SeedChain(Guid childId)
+    protected async Task<Guid> SeedChain(Guid childId, Action<TimeTickerEntity>? shapeChild = null)
     {
         var parent = NewTimeTicker(executionTime: T0.AddHours(1));
         var child = NewTimeTicker(executionTime: null);
@@ -1453,6 +1453,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         child.Function = "claim-child";
         child.ExecutionTime = null;
         child.RunCondition = RunCondition.OnSuccess;
+        shapeChild?.Invoke(child);
         parent.Children = [child];
         await using var context = CreateContext();
         context.Set<TimeTickerEntity>().Add(parent);
@@ -1581,11 +1582,11 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(run.ClaimMarker, row.UpdatedAt);
     }
 
-    // T3 and T9: an inline child carries the lock of the node that started it and a marker of its own. Started again by
-    // another run of its parent, the first run's late write changes nothing; left by a node, the release frees it, and with
-    // no time of its own no claim path hands it out again.
+    // T3 and T9: an inline child carries the lock of the node that started it and a marker of its own, and its row belongs
+    // to that run: a second start (another run of its parent) is refused. Left by a node, the release frees it; started
+    // again after that, the first run's late write changes nothing. With no time of its own no other claim path hands it out.
     [Fact]
-    public async Task Fence_AnInlineChild_IsHeldByTheRunThatStartedItLast_AndFreedWithItsNodesRows()
+    public async Task Fence_AnInlineChild_IsHeldByTheRunThatStartedIt_AndFreedWithItsNodesRows()
     {
         var a = Node("node-A");
         var b = Node("node-B");
@@ -1595,16 +1596,79 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         var childOfB = new InternalFunctionContext { TickerId = childId, Type = TickerType.TimeTicker };
         await a.Manager.RecordChildStartedAsync(childOfA);
         await b.Manager.RecordChildStartedAsync(childOfB);
+        Assert.NotNull(childOfA.RunMarker);
+        Assert.Null(childOfB.RunMarker);
+        Assert.Equal("node-A", (await ReadTimeTicker(childId)).LockHolder);
 
-        Assert.False(await a.Manager.UpdateTickerAsync(Ended(childOfA, TickerStatus.Done, T0.AddMinutes(1))));
-        Assert.Equal("node-B", (await ReadTimeTicker(childId)).LockHolder);
-
-        await b.Store.ReleaseDeadNodeTimeTickerResources("node-B", CancellationToken.None);
+        await b.Store.ReleaseDeadNodeTimeTickerResources("node-A", CancellationToken.None);
         var freed = await ReadTimeTicker(childId);
         Assert.Equal(TickerStatus.Idle, freed.Status);
         Assert.Null(freed.LockHolder);
         Assert.DoesNotContain(await a.Store.GetEarliestTimeTickers(CancellationToken.None), x => x.Id == childId);
         Assert.DoesNotContain(await Drain(a.Store.QueueTimedOutTimeTickers(CancellationToken.None)), x => x.Id == childId);
+
+        await b.Manager.RecordChildStartedAsync(childOfB);
+        Assert.NotNull(childOfB.RunMarker);
+        Assert.False(await a.Manager.UpdateTickerAsync(Ended(childOfA, TickerStatus.Done, T0.AddMinutes(1))));
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-B", row.LockHolder);
+        Assert.Equal(childOfB.RunMarker, row.UpdatedAt);
+    }
+
+    // An inline child is started by a claim (#83, #84): its row moves to InProgress only while it is Idle, unlocked and
+    // without a time of its own. The stored row decides, so two starts of the same child cannot both win.
+    [Fact]
+    public async Task InlineStart_OfAChildThatWaits_ClaimsItForThisNode()
+    {
+        var a = Node("node-A");
+        var childId = Guid.NewGuid();
+        await SeedChain(childId);
+        var marker = Clock.NextClaimMarker();
+
+        var started = await ((IFencedRunWriter)a.Store).StartInlineChildAsync(childId, marker, CancellationToken.None);
+
+        Assert.Equal(1, started);
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(marker, row.UpdatedAt);
+    }
+
+    // Each case differs from a waiting child in one field only.
+    [Theory]
+    [InlineData(TickerStatus.Queued, null, false)]
+    [InlineData(TickerStatus.InProgress, null, false)]
+    [InlineData(TickerStatus.Done, null, false)]
+    [InlineData(TickerStatus.Idle, "node-B", false)]
+    [InlineData(TickerStatus.Idle, null, true)]
+    public async Task InlineStart_OfAChildThatDoesNotWait_ChangesNothing(TickerStatus status, string? lockHolder, bool hasTime)
+    {
+        var a = Node("node-A");
+        var childId = Guid.NewGuid();
+        await SeedChain(childId, child =>
+        {
+            child.Status = status;
+            child.LockHolder = lockHolder;
+            child.ExecutionTime = hasTime ? T0.AddHours(2) : null;
+        });
+        var before = await ReadTimeTicker(childId);
+
+        var started = await ((IFencedRunWriter)a.Store).StartInlineChildAsync(childId, Clock.NextClaimMarker(), CancellationToken.None);
+
+        Assert.Equal(0, started);
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(status, row.Status);
+        Assert.Equal(lockHolder, row.LockHolder);
+        Assert.Equal(before.UpdatedAt, row.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task InlineStart_OfAChildThatIsNotStored_ChangesNothing()
+    {
+        var a = Node("node-A");
+
+        Assert.Equal(0, await ((IFencedRunWriter)a.Store).StartInlineChildAsync(Guid.NewGuid(), Clock.NextClaimMarker(), CancellationToken.None));
     }
 
     // T10: an edit of a running job (a full-entity update with no run state, as UpdateAsync and the dashboard send it) writes
@@ -1842,6 +1906,36 @@ public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITes
         Assert.All(perRow, pair => Assert.Equal(1, pair.Value));
         await using var verify = CreateContext();
         Assert.Equal(rowCount, await verify.Set<TimeTickerEntity>().CountAsync(x => x.Status == TickerStatus.InProgress));
+    }
+
+    // Two nodes start the same inline children at once: each child has one winner. Not pinned to one interleaving; it can
+    // only fail when both starts of a child win.
+    [Fact]
+    public async Task InlineStart_TwoNodesAtOnce_EachChildHasOneWinner()
+    {
+        const int childCount = 100;
+        var nodes = new[] { CreateProvider("node-A"), CreateProvider("node-B") };
+        var childIds = Enumerable.Range(0, childCount).Select(_ => Guid.NewGuid()).ToArray();
+        foreach (var childId in childIds)
+            await SeedChain(childId);
+        using var start = new ManualResetEventSlim(false);
+
+        async Task<int[]> StartAll(ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> node)
+        {
+            start.Wait();
+            var results = new int[childCount];
+            for (var i = 0; i < childCount; i++)
+                results[i] = await ((IFencedRunWriter)node).StartInlineChildAsync(childIds[i], Clock.NextClaimMarker(), CancellationToken.None);
+            return results;
+        }
+
+        var tasks = nodes.Select(node => Task.Run(() => StartAll(node))).ToArray();
+        start.Set();
+        var won = await Task.WhenAll(tasks);
+
+        Assert.All(Enumerable.Range(0, childCount), i => Assert.Equal(1, won[0][i] + won[1][i]));
+        await using var verify = CreateContext();
+        Assert.Equal(childCount, await verify.Set<TimeTickerEntity>().CountAsync(x => childIds.Contains(x.Id) && x.Status == TickerStatus.InProgress));
     }
 
     // The scheduler path for one second with 1000 rows: window read, one queue write per row, one fenced claim per row.
