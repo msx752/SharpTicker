@@ -586,7 +586,114 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 yield return ForQueue(acquired, children);
             }
         }
+
+        // A child without a time of its own is started by its parent's run. One that still waits some time after its
+        // parent ended was never started (the node stopped, or its start claim failed): it is claimed here when the
+        // parent's outcome lets it run, and skipped when not. Its claim is the one of the inline start, so one of them wins.
+        await IndexWaitingChildrenOnceAsync(cancellationToken).ConfigureAwait(false);
+        var waitingByParent = (await IndexManager.GetWaitingChildrenAsync().ConfigureAwait(false)).ToLookup(x => x.ParentId, x => x.ChildId);
+
+        foreach (var page in waitingByParent.Select(x => x.Key).Chunk(FallbackPage))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var endedParents = (await Serializer.LoadByIdsAsync<TTimeTicker>(page, TimeTickerKey, cancellationToken).ConfigureAwait(false))
+                .Where(parent => ChainRunGate.FallbackMayDecideChildWithoutTime(parent.Status, parent.ExecutedAt, now))
+                .ToDictionary(parent => parent.Id, parent => parent.Status);
+            if (endedParents.Count == 0) continue;
+
+            var entries = endedParents.Keys.SelectMany(parentId => waitingByParent[parentId]).ToArray();
+            var leftWaiting = await Serializer.LoadByIdsAsync<TTimeTicker>(entries, TimeTickerKey, cancellationToken).ConfigureAwait(false);
+
+            foreach (var child in leftWaiting)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // The index is written after the row and may be behind it: the row decides, and its entry is corrected.
+                if (!RedisIndexManager<TTimeTicker, TCronTicker>.WaitsForItsInlineStart(child) || !endedParents.TryGetValue(child.ParentId.Value, out var parentStatus))
+                {
+                    await TryUpdateIndexAfterClaim(child.Id, () => IndexManager.AddTimeTickerIndexesAsync(child)).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!ChainRunGate.AllowsRunNow(child.RunCondition, parentStatus, hasOwnTime: false))
+                {
+                    try
+                    {
+                        await SkipNotStartedAsync(child.Id, ChainRunGate.NotMatchedReason, now, now).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(ex, "Skipping chain child {Id} without a time whose ended parent does not let it run failed; the next fallback pass tries again.", child.Id);
+                    }
+
+                    continue;
+                }
+
+                var claimMarker = Clock.NextClaimMarker();
+                TTimeTicker acquired;
+                try
+                {
+                    acquired = await ClaimWaitingChildAsync(child.Id, claimMarker, now).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(child.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                    throw;
+                }
+
+                if (acquired == null) continue;
+
+                await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
+                yield return ForQueue(acquired, await LoadChildrenAsync(acquired.Id, cancellationToken).ConfigureAwait(false));
+            }
+        }
     }
+
+    private bool _waitingChildrenIndexed;
+
+    // Once per process, on its first fallback pass: every child that waits for its inline start gets its entry in the
+    // waiting-children index. Rows stored by a version before 1.4.0 have none, and an index write can fail after its row
+    // was written. A failure does not stop the pass; the next pass tries again.
+    private async Task IndexWaitingChildrenOnceAsync(CancellationToken cancellationToken)
+    {
+        if (_waitingChildrenIndexed) return;
+
+        try
+        {
+            var ids = ParseGuidSet(await Db.SetMembersAsync(TimeTickerIdsKey).ConfigureAwait(false));
+            foreach (var page in ids.Chunk(FallbackPage))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var rows = await Serializer.LoadByIdsAsync<TTimeTicker>(page, TimeTickerKey, cancellationToken).ConfigureAwait(false);
+                await IndexManager.AddWaitingChildrenAsync(rows
+                    .Where(RedisIndexManager<TTimeTicker, TCronTicker>.WaitsForItsInlineStart)
+                    .Select(row => new HashEntry(row.Id.ToString(), row.ParentId.Value.ToString()))
+                    .ToArray()).ConfigureAwait(false);
+            }
+
+            _waitingChildrenIndexed = true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Indexing the chain children that wait for their start failed; the next fallback pass tries again.");
+        }
+    }
+
+    // The claim of a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync); null when refused.
+    // The check runs again on every round of the compare-and-set, so a claim that lost the row to another one is refused.
+    private Task<TTimeTicker> ClaimWaitingChildAsync(Guid timeTickerId, DateTime claimMarker, DateTime now)
+        => CompareAndSetAsync<TTimeTicker>(TimeTickerKey(timeTickerId), row =>
+        {
+            if (row == null) return null;
+            if (row.Status != TickerStatus.Idle || !string.IsNullOrEmpty(row.LockHolder) || row.ExecutionTime != null) return null;
+            row.Status = TickerStatus.InProgress;
+            row.LockHolder = LockHolder;
+            row.LockedAt = now;
+            row.UpdatedAt = claimMarker;
+            return row;
+        });
 
     private const int FallbackPage = 256;
 
@@ -1249,19 +1356,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
     {
-        var now = Clock.UtcNow;
-        // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync). The check runs
-        // again on every round of the compare-and-set, so a start that lost the row to another one is refused.
-        var ticker = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(timeTickerId), row =>
-        {
-            if (row == null) return null;
-            if (row.Status != TickerStatus.Idle || !string.IsNullOrEmpty(row.LockHolder) || row.ExecutionTime != null) return null;
-            row.Status = TickerStatus.InProgress;
-            row.LockHolder = LockHolder;
-            row.LockedAt = now;
-            row.UpdatedAt = runMarker;
-            return row;
-        }).ConfigureAwait(false);
+        var ticker = await ClaimWaitingChildAsync(timeTickerId, runMarker, Clock.UtcNow).ConfigureAwait(false);
         if (ticker == null) return 0;
 
         await UpdateIndexAfterFencedWriteAsync(ticker.Id, () => IndexManager.AddTimeTickerIndexesAddOnlyAsync(ticker)).ConfigureAwait(false);

@@ -1260,7 +1260,8 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
     // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
-    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    // late. Never an InProgress child, which starts with its parent, and never by the window. The fallback leaves it too
+    // while its parent has not ended at least the grace time ago.
     [Theory]
     [MemberData(nameof(EveryConditionAndParentStatus))]
     public async Task AChildWithoutATime_IsHandedOutByRunNow_OnlyOnceItsParentEndedWithAMatchingOutcome(RunCondition? condition, TickerStatus parentStatus)
@@ -1270,6 +1271,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         child.Function = "inline-child-fn";
         child.RunCondition = condition;
         var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(1)); // not due, so no claim below takes the parent itself
+        parent.ExecutedAt = T0;
         parent.Children = [child];
         await using (var context = CreateContext())
         {
@@ -1387,6 +1389,194 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(ChainRunGate.NotMatchedReason, skipped.SkippedReason);
         Assert.Equal(TickerStatus.Skipped, (await ReadRow(grandchild.Id)).Status);
     }
+
+    #region The fallback and a child without a time of its own (#84)
+
+    // A parent (not due, so the fallback never takes the parent itself) with a child without a time that was never started.
+    protected async Task<Guid> SeedLeftWaiting(TickerStatus parentStatus, DateTime? parentEndedAt, RunCondition? condition = RunCondition.OnSuccess,
+        Action<TimeTickerEntity>? shapeChild = null)
+    {
+        var childId = Guid.NewGuid();
+        var parentId = await SeedChain(childId, child =>
+        {
+            child.RunCondition = condition;
+            shapeChild?.Invoke(child);
+        });
+        await using var context = CreateContext();
+        await context.Set<TimeTickerEntity>().Where(x => x.Id == parentId)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, parentStatus).SetProperty(x => x.ExecutedAt, parentEndedAt));
+        return childId;
+    }
+
+    private Task<List<TimeTickerEntity>> Fallback(string node = "node-A") => Drain(CreateProvider(node).QueueTimedOutTimeTickers(CancellationToken.None));
+
+    // The parent's run starts such a child right after the parent ends. One that still waits 30 s later was never
+    // started: the fallback claims it as a job of its own, with what it carries.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_ThatStillWaits30SecondsAfterItsParentEnded()
+    {
+        var grandchild = NewTimeTicker();
+        grandchild.ExecutionTime = null;
+        grandchild.RunCondition = RunCondition.OnSuccess;
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddSeconds(-30), shapeChild: c => c.Children = [grandchild]);
+
+        var taken = Assert.Single(await Fallback());
+
+        Assert.Equal(childId, taken.Id);
+        Assert.Equal([grandchild.Id], taken.Children.Select(x => x.Id));
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(T0, row.LockedAt);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(row.UpdatedAt, taken.UpdatedAt);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(grandchild.Id)).Status);
+        Assert.Empty(await Fallback("node-B"));
+    }
+
+    // A final parent without an end time counts as ended long ago: its child must not wait forever.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_WhoseEndedParentHasNoEndTime()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, null);
+
+        Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
+    }
+
+    // Within the grace time the parent's run may still be about to start the child; a parent that has not ended starts
+    // it itself.
+    [Theory]
+    [InlineData(TickerStatus.Done, 29)]
+    [InlineData(TickerStatus.Failed, 29)]
+    [InlineData(TickerStatus.Idle, 3600)]
+    [InlineData(TickerStatus.Queued, 3600)]
+    [InlineData(TickerStatus.InProgress, 3600)]
+    public async Task TheFallback_LeavesAChildWithoutATime_WhoseParentHasNotEndedLongEnoughAgo(TickerStatus parentStatus, int endedSecondsAgo)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-endedSecondsAgo));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
+    }
+
+    // A row another start holds, or one that has run, is not a child left waiting.
+    [Theory]
+    [InlineData(TickerStatus.Idle, "node-B")]
+    [InlineData(TickerStatus.InProgress, "node-B")]
+    [InlineData(TickerStatus.Queued, null)]
+    [InlineData(TickerStatus.Done, null)]
+    public async Task TheFallback_LeavesAChildWithoutATime_ThatDoesNotWaitForItsStart(TickerStatus childStatus, string? lockHolder)
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-5), shapeChild: c =>
+        {
+            c.Status = childStatus;
+            c.LockHolder = lockHolder;
+        });
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(childStatus, (await ReadTimeTicker(childId)).Status);
+    }
+
+    // The outcome does not let the child run, or the child was to start with its parent (InProgress) and the parent is
+    // over: it never runs. What it carries follows on a later pass, as for a delayed child.
+    [Theory]
+    [InlineData(TickerStatus.Failed, RunCondition.OnSuccess)]
+    [InlineData(TickerStatus.Skipped, RunCondition.OnAnyCompletedStatus)]
+    [InlineData(TickerStatus.Skipped, null)]
+    [InlineData(TickerStatus.Done, RunCondition.InProgress)]
+    public async Task TheFallback_SkipsAChildWithoutATime_ThatItsEndedParentDoesNotLetRun(TickerStatus parentStatus, RunCondition? condition)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), condition);
+
+        Assert.Empty(await Fallback());
+
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.Skipped, row.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, row.SkippedReason);
+        Assert.Equal(T0, row.ExecutedAt);
+    }
+
+    // Only a child that waits is decided: one another path holds is not skipped either.
+    [Fact]
+    public async Task TheFallback_DoesNotSkipAChildWithoutATime_ThatIsQueued()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Failed, T0.AddMinutes(-5), shapeChild: c => c.Status = TickerStatus.Queued);
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Queued, (await ReadTimeTicker(childId)).Status);
+    }
+
+    [Fact]
+    public async Task TheFallback_DoesNotSkipAChildWithoutATime_WithinTheGraceTime()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Failed, T0.AddSeconds(-29));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(childId)).Status);
+    }
+
+    // One start per child: the inline start of the parent's run and the fallback are claims on the same row.
+    [Fact]
+    public async Task AChildTheFallbackTook_IsRefusedToAnInlineStart_AndOneAnInlineStartTook_IsNotTakenByTheFallback()
+    {
+        var takenByFallback = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var startedInline = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var b = (IFencedRunWriter)CreateProvider("node-B");
+        Assert.Equal(1, await b.StartInlineChildAsync(startedInline, Clock.NextClaimMarker(), CancellationToken.None));
+
+        Assert.Equal([takenByFallback], (await Fallback()).Select(x => x.Id));
+
+        Assert.Equal(0, await b.StartInlineChildAsync(takenByFallback, Clock.NextClaimMarker(), CancellationToken.None));
+    }
+
+    // A child that is started, given a time or skipped after the fallback read it is not claimed by the fallback's write. The
+    // other write does not carry a later UpdatedAt than the pass read (a clock that is behind; an edit): the row's state is
+    // what refuses the claim.
+    [Theory]
+    [InlineData("started", TickerStatus.InProgress)]
+    [InlineData("given a time", TickerStatus.Idle)]
+    [InlineData("skipped", TickerStatus.Skipped)]
+    public async Task TheFallbacksClaim_IsRefused_WhenTheChildStoppedWaitingAfterItWasRead(string change, TickerStatus expected)
+    {
+        var first = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var second = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var behind = CreateProvider("node-behind", new FakeTickerClock(T0.AddHours(-2)));
+        var taken = new List<Guid>();
+
+        // The pass has read both children when it hands out the first; the other changes before its claim is written.
+        await foreach (var row in CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None))
+        {
+            taken.Add(row.Id);
+            var other = row.Id == first ? second : first;
+            if (change == "skipped")
+            {
+                var skip = new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.Skipped).SetProperty(x => x.ExceptionDetails, "skipped elsewhere");
+                await ((IChildSkipWriter)behind).SkipNotStartedTimeTickersAsync([other], skip, CancellationToken.None);
+            }
+            else if (change == "given a time")
+            {
+                var edit = await ReadTimeTicker(other);
+                edit.ExecutionTime = T0.AddHours(3);
+                await behind.UpdateTimeTickers([edit], CancellationToken.None);
+            }
+            else
+            {
+                Assert.Equal(1, await ((IFencedRunWriter)behind).StartInlineChildAsync(other, T0.AddHours(-2), CancellationToken.None));
+            }
+        }
+
+        Assert.Single(taken);
+        var changed = await ReadTimeTicker(taken[0] == first ? second : first);
+        Assert.True(changed.UpdatedAt <= T0.AddHours(-1), "the other write must not carry a later UpdatedAt than the pass read, or this test shows nothing");
+        Assert.NotEqual("node-A", changed.LockHolder);
+        Assert.Equal(expected, changed.Status);
+    }
+
+    #endregion
 
     // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
     [Theory]

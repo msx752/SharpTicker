@@ -132,7 +132,37 @@ namespace SharpTicker.Provider
                     }
                 }
             }
-            
+
+            // A child without a time of its own is started by its parent's run. One that still waits some time after its
+            // parent ended was never started (the node stopped, or its start claim failed): it is claimed here when the
+            // parent's outcome lets it run, and skipped when not.
+            var childrenLeftWaiting = TimeTickers.Values.Where(x => x.ParentId != null && WaitsForItsInlineStart(x)).ToArray();
+
+            foreach (var child in childrenLeftWaiting)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!TimeTickers.TryGetValue(child.ParentId.Value, out var parent)
+                    || !ChainRunGate.FallbackMayDecideChildWithoutTime(parent.Status, parent.ExecutedAt, now))
+                    continue;
+
+                if (!ChainRunGate.AllowsRunNow(child.RunCondition, parent.Status, hasOwnTime: false))
+                {
+                    SkipNotStarted(child, now);
+                    continue;
+                }
+
+                var claimedChild = CloneTicker(child);
+                claimedChild.LockHolder = _lockHolder;
+                claimedChild.LockedAt = now;
+                claimedChild.UpdatedAt = _clock.NextClaimMarker();
+                claimedChild.Status = TickerStatus.InProgress;
+
+                // Every write replaces the stored row, so the swap fails when the row was written since it was read.
+                if (TimeTickers.TryUpdate(child.Id, claimedChild, child))
+                    yield return ForQueueTimeTickers(claimedChild);
+            }
+
             await Task.CompletedTask;
         }
 
@@ -1393,6 +1423,12 @@ namespace SharpTicker.Provider
                 || ChainRunGate.Allows(snapshot.RunCondition, parent.Status))
                 return false;
 
+            return SkipNotStarted(snapshot, now);
+        }
+
+        // Skips a row that has not started since it was read; true when it did.
+        private bool SkipNotStarted(TTimeTicker snapshot, DateTime now)
+        {
             if (!TimeTickers.TryGetValue(snapshot.Id, out var current)
                 || (current.Status != TickerStatus.Idle && current.Status != TickerStatus.Queued)
                 || current.UpdatedAt > snapshot.UpdatedAt)

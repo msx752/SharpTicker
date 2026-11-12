@@ -18,7 +18,7 @@ internal interface ILateOutcomeFollowUp
     /// are handed off through the store: a delayed child as after a stored outcome (claimed when due, the scheduler woken
     /// for a later one), an inline child claimed at once, to run as a claimed job. None is run by this call. Without
     /// <paramref name="claimChildren"/> nothing is claimed: the scheduler is stopping. The fallback runs the delayed ones at
-    /// the next start; an inline one stays Idle and is named in an error. Throws when the store fails.
+    /// the next start; an inline one stays Idle, is named in an error, and is taken by the fallback later. Throws when the store fails.
     /// </summary>
     Task AfterLateStoreAsync(InternalFunctionContext outcome, bool claimChildren, CancellationToken cancellationToken);
 }
