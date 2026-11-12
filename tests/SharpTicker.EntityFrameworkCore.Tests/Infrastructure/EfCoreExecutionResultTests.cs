@@ -422,6 +422,86 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.Equal(Now, seeded.CreatedAt);
     }
 
+    // Two nodes that start together both read "no such cron" and both insert it. Node A has read; node B's whole seed runs
+    // just before node A writes (an interceptor, no timing). The seeded row's id comes from the function name, so node A's
+    // insert meets node B's row and the cron exists once. Node A still adds the cron node B did not have.
+    [Fact]
+    public async Task TwoNodesStartingTogether_SeedEachCronOnce()
+    {
+        var nodeB = _provider;
+        var nodeA = NodeThatRunsBeforeItsFirstWrite(() => nodeB.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default));
+
+        await nodeA.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *"), ("KnownFunction", "0 0 5 * * *") }, default);
+
+        await using var db = Verify();
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined"));
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
+    }
+
+    // The id a seeded cron gets is stored, so it must never change: this pins it.
+    [Fact]
+    public async Task ASeededCron_GetsTheIdOfItsFunctionName()
+    {
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await using var db = Verify();
+        var seeded = await db.Set<CronTickerEntity>().SingleAsync(x => x.Function == "NewlyDefined");
+        Assert.Equal(Guid.Parse("71afc3b1-efa3-e3ec-442c-e920c2e60612"), seeded.Id);
+    }
+
+    // The id of the function's name is taken by a cron of another function (a seeded cron whose function was changed on the
+    // dashboard): the seed still adds the cron, under another id, and does not fail the start.
+    [Fact]
+    public async Task TheIdOfTheFunctionNameIsTakenByACronOfAnotherFunction_TheCronIsStillSeeded()
+    {
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+        await using (var edit = Verify())
+        {
+            var moved = await edit.Set<CronTickerEntity>().SingleAsync(x => x.Function == "NewlyDefined");
+            moved.Function = "KnownFunction";
+            moved.InitIdentifier = null;
+            await edit.SaveChangesAsync();
+        }
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await using var db = Verify();
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined"));
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
+    }
+
+    private TestableProvider NodeThatRunsBeforeItsFirstWrite(Func<Task> other)
+    {
+        var options = new DbContextOptionsBuilder<TestSharpTickerDbContext>()
+            .UseSqlite(_connection)
+            .AddInterceptors(new RunOnceBeforeSave(other))
+            .Options;
+        var services = new ServiceCollection();
+        services.AddSingleton<IDbContextFactory<TestSharpTickerDbContext>>(new PooledDbContextFactory<TestSharpTickerDbContext>(options));
+        var clock = Substitute.For<ITickerClock>();
+        clock.UtcNow.Returns(Now);
+        return new TestableProvider(services.BuildServiceProvider(), clock, new SchedulerOptionsBuilder { NodeIdentifier = "node-2" },
+            Substitute.For<ISharpTickerRedisContext>());
+    }
+
+    private sealed class RunOnceBeforeSave(Func<Task> other) : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        private bool _ran;
+
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (!_ran)
+            {
+                _ran = true;
+                await other();
+            }
+
+            return result;
+        }
+    }
+
     [Fact]
     public async Task SeedingTwice_DoesNotAddTheCronAgain()
     {

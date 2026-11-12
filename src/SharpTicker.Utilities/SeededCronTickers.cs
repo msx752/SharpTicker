@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using SharpTicker.Utilities.Entities;
 
 namespace SharpTicker.Utilities;
@@ -16,6 +18,18 @@ internal static class SeededCronTickers
     internal const string InitIdentifierPrefix = "MemoryTicker_Seeded_";
 
     internal static string InitIdentifierFor(string function) => InitIdentifierPrefix + function;
+
+    /// <summary>
+    /// The id of the row the seed inserts for a function: always the same for one function name, on every node. Two nodes
+    /// that start together and both find the cron missing then insert the same key, and the store keeps one row. The id is
+    /// stored, so how it is made must never change: the first 16 bytes of the SHA-256 of the prefix and the name. Rows that
+    /// exist keep the id they have; the seed finds them by function.
+    /// </summary>
+    internal static Guid IdFor(string function)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes("SharpTicker.SeededCron:" + function));
+        return new Guid(hash.AsSpan(0, 16), bigEndian: true);
+    }
 
     /// <summary>The warning when <see cref="IsAmbiguous"/>: logged on every start until one of the crons is kept.</summary>
     internal const string AmbiguousWarning =
