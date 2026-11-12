@@ -501,7 +501,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 {
                     var entity = new TCronTicker
                     {
-                        Id = Guid.NewGuid(),
+                        Id = SeededCronTickers.IdFor(function),
                         Function = function,
                         Expression = expression,
                         InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
@@ -509,7 +509,27 @@ namespace SharpTicker.MongoDB.Infrastructure
                         UpdatedAt = now,
                         Request = Array.Empty<byte>()
                     };
-                    await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                    try
+                    {
+                        await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        // The id is taken. By a cron of this function: another node that started together seeded it, and
+                        // nothing is left to do. By a cron of another function (a seeded cron whose function was changed
+                        // keeps its id): this cron is seeded under a random id, as before.
+                        var seededByAnotherNode = await cronSet
+                            .Find(fb.Eq(x => x.Function, function))
+                            .AnyAsync(cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (!seededByAnotherNode)
+                        {
+                            entity.Id = Guid.NewGuid();
+                            await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }
+                    }
                 }
             }
         }
