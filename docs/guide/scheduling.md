@@ -153,7 +153,7 @@ A child or grandchild can have an execution time of its own (`SetExecutionTime` 
 - When the parent ends with a status its condition does not accept, it is skipped with everything below it.
 - An `InProgress` delayed child runs at its time once its parent has started, whatever the parent's outcome. It is skipped only when the parent was skipped.
 - A delayed grandchild depends on its own parent (the child), not on the root of the chain.
-- One node claims it, also with several nodes, and a restart does not run it a second time once it has ended. The limits in [What is guaranteed](operations.md#what-is-guaranteed) apply to it as to any job. A child that is given a time while its parent runs becomes a delayed child: the parent's run does not start it any more. A child that has already started keeps the status of its own run.
+- It is claimed like any other job, also with several nodes, and once it has ended a restart does not start it again. The cases in [When a job can run more than once](operations.md#when-a-job-can-run-more-than-once) apply to it as to any job. A child that is given a time while its parent runs becomes a delayed child: the parent's run does not start it any more. A child that has already started keeps the status of its own run.
 
 Pass the child's time in UTC.
 
