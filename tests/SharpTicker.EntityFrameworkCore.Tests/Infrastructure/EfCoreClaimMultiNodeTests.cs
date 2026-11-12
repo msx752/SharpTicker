@@ -1671,6 +1671,27 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(0, await ((IFencedRunWriter)a.Store).StartInlineChildAsync(Guid.NewGuid(), Clock.NextClaimMarker(), CancellationToken.None));
     }
 
+    // A start whose write landed while its call failed is put back by its marker (the manager does that): the child waits
+    // again and can be started.
+    [Fact]
+    public async Task InlineStart_ThatIsPutBack_LeavesTheChildWaitingAgain()
+    {
+        var a = Node("node-A");
+        var b = Node("node-B");
+        var childId = Guid.NewGuid();
+        await SeedChain(childId);
+        var marker = Clock.NextClaimMarker();
+        Assert.Equal(1, await ((IFencedRunWriter)a.Store).StartInlineChildAsync(childId, marker, CancellationToken.None));
+
+        Assert.True(await a.Store.TryReleaseTimeTickerClaim(childId, marker, CancellationToken.None));
+
+        var row = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(1, await ((IFencedRunWriter)b.Store).StartInlineChildAsync(childId, Clock.NextClaimMarker(), CancellationToken.None));
+    }
+
     // T10: an edit of a running job (a full-entity update with no run state, as UpdateAsync and the dashboard send it) writes
     // its fields and keeps the run, so the run's outcome is still stored and the job does not run again.
     [Fact]
