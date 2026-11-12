@@ -1,5 +1,8 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using SharpTicker.Caching.StackExchangeRedis.Helpers;
+using SharpTicker.Utilities;
+using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceExtension;
 using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
@@ -182,6 +185,28 @@ public class RedisUnreadableRowsTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal(1, await Provider().UpdateTimeTicker(StatusContext(id, TickerStatus.Done), CancellationToken.None));
 
         Assert.Equal((int)TickerStatus.Done, (await StoredTimeTickerAsync(id)).Status);
+    }
+
+    // A row that is not readable for another reason is still reported, and the warning names that row's key, in the reads
+    // that load many rows at once.
+    [Fact]
+    public async Task ARowBrokenForAnotherReason_IsReportedWithItsOwnKey_WhenManyRowsAreLoaded()
+    {
+        var readable = await SeedRowLeftInProgressAsync("[]");
+        var repaired = await SeedRowLeftInProgressAsync("{}");
+        var broken = await SeedRowLeftInProgressAsync("{\"a\":1}");
+        var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        var provider = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(fixture.Database, _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = Node }, new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);
+
+        var listed = await provider.GetTimeTickers(null!, CancellationToken.None);
+        await provider.ReleaseDeadNodeTimeTickerResources(Node, T0, CancellationToken.None);
+
+        Assert.Equal(new[] { readable, repaired }.Order(), listed.Select(x => x.Id).Order());
+        var warnings = log.Entries.Where(e => e.Level == LogLevel.Warning).ToList();
+        Assert.Equal(2, warnings.Count);
+        Assert.All(warnings, w => Assert.Contains(RedisKeyBuilder.TimeTickerKey(broken), w.Message));
+        Assert.Equal(((int)TickerStatus.InProgress, Node), await StoredTimeTickerAsync(broken));
     }
 
     // Another node that finds the holder dead releases the same row through the script, which reads any shape.

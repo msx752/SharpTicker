@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 using StackExchange.Redis;
@@ -9,6 +10,38 @@ using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceE
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 
 /// <summary>
+/// An application's own time ticker type: a list of its own, and a property whose converter fails.
+/// </summary>
+public sealed class OwnTimeTicker : TimeTickerEntity<OwnTimeTicker>
+{
+    public List<string> Tags { get; set; } = [];
+
+    [JsonConverter(typeof(FailingConverter))]
+    public int Boom { get; set; }
+
+    public sealed class FailingConverter : JsonConverter<int>
+    {
+        public override int Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => throw new InvalidCastException("the converter fails");
+
+        public override void Write(Utf8JsonWriter writer, int value, JsonSerializerOptions options) => writer.WriteNumberValue(value);
+    }
+}
+
+[JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
+[JsonSerializable(typeof(OwnTimeTicker))]
+internal partial class OwnJsonSerializerContext : JsonSerializerContext;
+
+internal sealed class ListLogger<T> : ILogger<T>
+{
+    public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        => Entries.Add((logLevel, formatter(state, exception), exception));
+}
+
+/// <summary>
 /// The read of a row whose empty collections were written as objects (what cjson does to an empty array), through
 /// RedisSerializer with the source-generated contexts the store uses. No Redis is needed: the text is given as it is stored.
 /// </summary>
@@ -17,16 +50,7 @@ public class EmptyCollectionRepairTests
     private const string Key = "tq:tt:the-key";
     private const string Id = "44944170-cb7b-46ce-b381-476f567ca54b";
 
-    private sealed class ListLogger : ILogger
-    {
-        public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-        public bool IsEnabled(LogLevel logLevel) => true;
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-            => Entries.Add((logLevel, formatter(state, exception), exception));
-    }
-
-    private readonly ListLogger _log = new();
+    private readonly ListLogger<EmptyCollectionRepairTests> _log = new();
     private readonly RedisSerializer _serializer;
 
     public EmptyCollectionRepairTests()
@@ -35,7 +59,7 @@ public class EmptyCollectionRepairTests
         {
             PropertyNameCaseInsensitive = true,
             WriteIndented = false,
-            TypeInfoResolverChain = { TestJsonSerializerContext.Default, RedisContextJsonSerializerContext.Default }
+            TypeInfoResolverChain = { OwnJsonSerializerContext.Default, TestJsonSerializerContext.Default, RedisContextJsonSerializerContext.Default }
         };
         _serializer = new RedisSerializer(Substitute.For<IDatabase>(), options, _log);
     }
@@ -160,16 +184,35 @@ public class EmptyCollectionRepairTests
             Assert.Equal(firstFailurePath, failure.Path);
     }
 
-    // A key twice in one object: whatever the runtime makes of it, the read does not throw.
     [Fact]
-    public void AKeyTwiceInOneObject_DoesNotThrow()
+    public void AKeyTwiceInOneObject_IsNotRead_AndIsReported()
     {
-        var row = Read<TimeTickerEntity>($$$"""{"Id":"{{{Id}}}","Children":{},"Children":{}}""");
+        Assert.Null(Read<TimeTickerEntity>($$$"""{"Id":"{{{Id}}}","Children":{},"Children":{}}"""));
 
-        if (row == null)
-            Assert.Equal(LogLevel.Warning, Assert.Single(_log.Entries).Level);
-        else
-            Assert.Empty(row.Children);
+        Assert.Equal(LogLevel.Warning, Assert.Single(_log.Entries).Level);
+    }
+
+    // Only the two collections of a row are read this way. An empty list of an application's own type stays unread here.
+    [Fact]
+    public void AnEmptyListOfAnApplicationsOwnType_IsNotRead_AndIsReported()
+    {
+        Assert.Null(Read<OwnTimeTicker>($$$"""{"Id":"{{{Id}}}","Tags":{},"Children":[]}"""));
+
+        var entry = Assert.Single(_log.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("$.Tags", Assert.IsAssignableFrom<JsonException>(entry.Exception).Path);
+    }
+
+    // The second read can fail in a way that is not a JsonException (here a converter of the application's own type).
+    // The row is then reported like any row that does not deserialize; the read does not throw.
+    [Fact]
+    public void WhenTheSecondReadFailsInAnotherWay_TheRowIsNotRead_AndIsReported()
+    {
+        Assert.Null(Read<OwnTimeTicker>($$$"""{"Id":"{{{Id}}}","Children":{},"Boom":1}"""));
+
+        var entry = Assert.Single(_log.Entries);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("$.Children", Assert.IsAssignableFrom<JsonException>(entry.Exception).Path);
     }
 
     [Fact]

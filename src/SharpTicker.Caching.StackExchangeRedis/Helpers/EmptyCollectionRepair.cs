@@ -38,9 +38,10 @@ internal static class EmptyCollectionRepair
                 }
             }
         }
-        catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException or FormatException or NotSupportedException)
+        catch (Exception)
         {
-            // The text is not something this can work on (not JSON, a key twice in one object).
+            // The text is not something this can work on (not JSON, a key twice in one object), or reading it again failed
+            // in another way. The row stays unread and the caller reports the first failure, as it did before.
             return null;
         }
     }
