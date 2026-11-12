@@ -266,15 +266,21 @@ namespace SharpTicker.Utilities.Managers
                 return new TickerResult<TTimeTicker>(
                     new TickerValidatorException($"Ticker must not be null!"));
             
-            if(timeTicker.ExecutionTime == null)
-                return new TickerResult<TTimeTicker>(
-                    new TickerValidatorException($"Ticker ExecutionTime must not be null!"));
-            
             timeTicker.UpdatedAt = _clock.UtcNow;
-            timeTicker.ExecutionTime = ConvertToUtcIfNeeded(timeTicker.ExecutionTime.Value);
-            
+            if (timeTicker.ExecutionTime is { } executionTime)
+                timeTicker.ExecutionTime = ConvertToUtcIfNeeded(executionTime);
+
             try {
-                if (await _persistenceProvider.GetTimeTickerById(timeTicker.Id, cancellationToken).ConfigureAwait(false) is null)
+                var stored = await _persistenceProvider.GetTimeTickerById(timeTicker.Id, cancellationToken).ConfigureAwait(false);
+
+                // Only a chain child that has no time of its own may be updated without one: it stays a child that runs
+                // right after its parent. A time is not taken from a ticker that has one: a child whose parent has
+                // already ended would then never start.
+                if (timeTicker.ExecutionTime == null && !(stored is { ParentId: not null, ExecutionTime: null }))
+                    return new TickerResult<TTimeTicker>(
+                        new TickerValidatorException($"Ticker ExecutionTime must not be null!"));
+
+                if (stored is null)
                     return new TickerResult<TTimeTicker>(
                         new TickerValidatorException($"Cannot find time ticker with id {timeTicker.Id}"));
 

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using SharpTicker.Utilities.Entities;
 
 namespace SharpTicker.Utilities;
@@ -16,6 +18,18 @@ internal static class SeededCronTickers
     internal const string InitIdentifierPrefix = "MemoryTicker_Seeded_";
 
     internal static string InitIdentifierFor(string function) => InitIdentifierPrefix + function;
+
+    /// <summary>
+    /// The id of the row the seed inserts for a function: always the same for one function name, on every node. Two nodes
+    /// that start together and both find the cron missing then insert the same key, and the store keeps one row. The id is
+    /// stored, so how it is made must never change: the first 16 bytes of the SHA-256 of the prefix and the name. Rows that
+    /// exist keep the id they have; the seed finds them by function.
+    /// </summary>
+    internal static Guid IdFor(string function)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes("SharpTicker.SeededCron:" + function));
+        return new Guid(hash.AsSpan(0, 16), bigEndian: true);
+    }
 
     /// <summary>The warning when <see cref="IsAmbiguous"/>: logged on every start until one of the crons is kept.</summary>
     internal const string AmbiguousWarning =
@@ -41,6 +55,28 @@ internal static class SeededCronTickers
             return marked;
 
         return rowsOfFunction.Count == 1 ? rowsOfFunction.ToList() : [];
+    }
+
+    /// <summary>The warning when <see cref="Copies"/> were removed.</summary>
+    internal const string CopiesRemovedWarning =
+        "Removed {Count} copies of the code-defined cron of {Function}, with their occurrences. They were made when several nodes started at the same time; the oldest one is kept.";
+
+    /// <summary>
+    /// The rows of one function to remove because they are copies of its seeded cron: of the rows that carry the seed's
+    /// marker for this function, all but the oldest. Every one of them runs the job on every tick. The order (creation
+    /// time, then id) is the same on every node, so nodes that start together keep the same row. Rows without the marker
+    /// (a user's cron, or a seeded cron edited on the dashboard) are never among them.
+    /// </summary>
+    internal static IReadOnlyList<TCronTicker> Copies<TCronTicker>(IReadOnlyCollection<TCronTicker> rowsOfFunction)
+        where TCronTicker : CronTickerEntity
+    {
+        var seeded = rowsOfFunction
+            .Where(c => string.Equals(c.InitIdentifier, InitIdentifierFor(c.Function), StringComparison.Ordinal))
+            .OrderBy(c => c.CreatedAt)
+            .ThenBy(c => c.Id)
+            .ToList();
+
+        return seeded.Count > 1 ? seeded.GetRange(1, seeded.Count - 1) : [];
     }
 
     /// <summary>True when the function has several stored crons and none of them is marked as seeded.</summary>

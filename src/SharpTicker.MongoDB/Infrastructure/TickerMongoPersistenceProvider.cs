@@ -480,6 +480,20 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 if (existingByFunction.TryGetValue(function, out var rows))
                 {
+                    // Copies of the seeded cron, left by nodes that started together before the seeded id was fixed.
+                    var copies = SeededCronTickers.Copies(rows);
+                    if (copies.Count > 0)
+                    {
+                        var copyIds = copies.Select(c => c.Id).ToArray();
+                        await occSet.DeleteManyAsync(
+                            Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.In(x => x.CronTickerId, copyIds),
+                            cancellationToken).ConfigureAwait(false);
+                        await cronSet.DeleteManyAsync(fb.In(x => x.Id, copyIds), cancellationToken).ConfigureAwait(false);
+
+                        rows = rows.Except(copies).ToList();
+                        _logger.LogWarning(SeededCronTickers.CopiesRemovedWarning, copies.Count, function);
+                    }
+
                     // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
                     foreach (var cron in SeededCronTickers.Owned(rows))
                     {
@@ -501,7 +515,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 {
                     var entity = new TCronTicker
                     {
-                        Id = Guid.NewGuid(),
+                        Id = SeededCronTickers.IdFor(function),
                         Function = function,
                         Expression = expression,
                         InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
@@ -509,7 +523,27 @@ namespace SharpTicker.MongoDB.Infrastructure
                         UpdatedAt = now,
                         Request = Array.Empty<byte>()
                     };
-                    await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                    try
+                    {
+                        await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
+                    {
+                        // The id is taken. By a cron of this function: another node that started together seeded it, and
+                        // nothing is left to do. By a cron of another function (a seeded cron whose function was changed
+                        // keeps its id): this cron is seeded under a random id, as before.
+                        var seededByAnotherNode = await cronSet
+                            .Find(fb.Eq(x => x.Function, function))
+                            .AnyAsync(cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (!seededByAnotherNode)
+                        {
+                            entity.Id = Guid.NewGuid();
+                            await cronSet.InsertOneAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }
+                    }
                 }
             }
         }
@@ -1029,6 +1063,18 @@ namespace SharpTicker.MongoDB.Infrastructure
             var coll = _context.TimeTickers;
             var fb = Builders<TTimeTicker>.Filter;
             var byId = fb.Eq(x => x.Id, ticker.Id);
+
+            // A stored chain child keeps its link (RunStateOnEdit.KeepChainLink). Read before the write: an update never
+            // changes a stored ParentId, so it is the same when the write lands. The caller's entity is left as it was sent.
+            var link = await coll.Find(byId)
+                .Project(x => new { x.ParentId, x.RunCondition })
+                .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+            if (link?.ParentId != null && (ticker.ParentId != link.ParentId || ticker.RunCondition == null))
+            {
+                ticker = MongoUpdateBuilders.CopyOf(ticker, coll.DocumentSerializer);
+                RunStateOnEdit.KeepChainLink(ticker, link.ParentId, link.RunCondition);
+            }
+
             // A row that runs or has ended keeps its run (RunStateOnEdit): an ended job written back as not started would run
             // again. Only a row that has not started (Idle, Queued) is replaced.
             TickerStatus[] notStartedStatuses = [TickerStatus.Idle, TickerStatus.Queued];

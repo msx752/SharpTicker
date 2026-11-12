@@ -88,12 +88,13 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
     }
 
     private async Task<CronTickerEntity> AddCronTickerAsync(
-        string function = "KnownFunction", string expression = "0 0 * * * *", bool enabled = true, string? initIdentifier = null, string? request = null)
+        string function = "KnownFunction", string expression = "0 0 * * * *", bool enabled = true, string? initIdentifier = null, string? request = null,
+        DateTime? createdAt = null)
     {
         var cron = new CronTickerEntity
         {
             Id = Guid.NewGuid(), Function = function, Expression = expression, IsEnabled = enabled,
-            InitIdentifier = initIdentifier, CreatedAt = Earlier, UpdatedAt = Earlier,
+            InitIdentifier = initIdentifier, CreatedAt = createdAt ?? Earlier, UpdatedAt = Earlier,
             Request = request == null ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(request),
         };
         _seed.Set<CronTickerEntity>().Add(cron);
@@ -422,6 +423,86 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.Equal(Now, seeded.CreatedAt);
     }
 
+    // Two nodes that start together both read "no such cron" and both insert it. Node A has read; node B's whole seed runs
+    // just before node A writes (an interceptor, no timing). The seeded row's id comes from the function name, so node A's
+    // insert meets node B's row and the cron exists once. Node A still adds the cron node B did not have.
+    [Fact]
+    public async Task TwoNodesStartingTogether_SeedEachCronOnce()
+    {
+        var nodeB = _provider;
+        var nodeA = NodeThatRunsBeforeItsFirstWrite(() => nodeB.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default));
+
+        await nodeA.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *"), ("KnownFunction", "0 0 5 * * *") }, default);
+
+        await using var db = Verify();
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined"));
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
+    }
+
+    // The id a seeded cron gets is stored, so it must never change: this pins it.
+    [Fact]
+    public async Task ASeededCron_GetsTheIdOfItsFunctionName()
+    {
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await using var db = Verify();
+        var seeded = await db.Set<CronTickerEntity>().SingleAsync(x => x.Function == "NewlyDefined");
+        Assert.Equal(Guid.Parse("71afc3b1-efa3-e3ec-442c-e920c2e60612"), seeded.Id);
+    }
+
+    // The id of the function's name is taken by a cron of another function (a seeded cron whose function was changed on the
+    // dashboard): the seed still adds the cron, under another id, and does not fail the start.
+    [Fact]
+    public async Task TheIdOfTheFunctionNameIsTakenByACronOfAnotherFunction_TheCronIsStillSeeded()
+    {
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+        await using (var edit = Verify())
+        {
+            var moved = await edit.Set<CronTickerEntity>().SingleAsync(x => x.Function == "NewlyDefined");
+            moved.Function = "KnownFunction";
+            moved.InitIdentifier = null;
+            await edit.SaveChangesAsync();
+        }
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await using var db = Verify();
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined"));
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
+    }
+
+    private TestableProvider NodeThatRunsBeforeItsFirstWrite(Func<Task> other)
+    {
+        var options = new DbContextOptionsBuilder<TestSharpTickerDbContext>()
+            .UseSqlite(_connection)
+            .AddInterceptors(new RunOnceBeforeSave(other))
+            .Options;
+        var services = new ServiceCollection();
+        services.AddSingleton<IDbContextFactory<TestSharpTickerDbContext>>(new PooledDbContextFactory<TestSharpTickerDbContext>(options));
+        var clock = Substitute.For<ITickerClock>();
+        clock.UtcNow.Returns(Now);
+        return new TestableProvider(services.BuildServiceProvider(), clock, new SchedulerOptionsBuilder { NodeIdentifier = "node-2" },
+            Substitute.For<ISharpTickerRedisContext>());
+    }
+
+    private sealed class RunOnceBeforeSave(Func<Task> other) : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        private bool _ran;
+
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (!_ran)
+            {
+                _ran = true;
+                await other();
+            }
+
+            return result;
+        }
+    }
+
     [Fact]
     public async Task SeedingTwice_DoesNotAddTheCronAgain()
     {
@@ -499,19 +580,68 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.Equal("0 0 4 * * *", stored[seeded.Id].Expression);
     }
 
-    // Two seeded copies of one cron (two nodes that seeded it at the same time): neither keeps the old schedule.
-    [Fact]
-    public async Task TwoSeededCopiesOfOneCron_BothTakeTheExpressionInCode()
+    // Seeded copies of one cron (nodes that seeded it at the same time) each run the job on every tick: the oldest is
+    // kept and takes the expression in code, the others go with their occurrences. Both insertion orders.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SeededCopiesOfOneCron_TheOldestIsKept_TheOthersAreRemovedWithTheirOccurrences(bool oldestFirst)
     {
-        await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
-        await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+        const string seeded = "MemoryTicker_Seeded_NewlyDefined";
+        CronTickerEntity oldest, copy;
+        if (oldestFirst)
+        {
+            oldest = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: seeded, createdAt: Earlier.AddSeconds(-1));
+            copy = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: seeded);
+        }
+        else
+        {
+            copy = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: seeded);
+            oldest = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: seeded, createdAt: Earlier.AddSeconds(-1));
+        }
+        var third = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: seeded);
+        var keptOccurrence = await AddOccurrenceAsync(oldest.Id, TickerStatus.Done, locked: false);
+        var removedOccurrence = await AddOccurrenceAsync(copy.Id, TickerStatus.Done, locked: false);
 
         await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
 
         await using var db = Verify();
-        var stored = await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").ToListAsync();
-        Assert.Equal(2, stored.Count);
-        Assert.All(stored, c => Assert.Equal("0 0 4 * * *", c.Expression));
+        var stored = Assert.Single(await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").ToListAsync());
+        Assert.Equal(oldest.Id, stored.Id);
+        Assert.Equal("0 0 4 * * *", stored.Expression);
+        Assert.False(await db.Set<CronTickerEntity>().AnyAsync(x => x.Id == copy.Id || x.Id == third.Id));
+        var occurrences = await db.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().Select(x => x.Id).ToListAsync();
+        Assert.Contains(keptOccurrence.Id, occurrences);
+        Assert.DoesNotContain(removedOccurrence.Id, occurrences);
+    }
+
+    // Created in the same instant: every node must keep the same row, so the id decides.
+    [Fact]
+    public async Task SeededCopiesCreatedAtTheSameTime_TheOneWithTheLowestIdIsKept()
+    {
+        var a = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+        var b = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var stored = Assert.Single(await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").ToListAsync());
+        Assert.Equal(a.Id.CompareTo(b.Id) < 0 ? a.Id : b.Id, stored.Id);
+    }
+
+    // A user's cron and a seeded cron edited on the dashboard carry no marker: they are not copies, whatever their number.
+    [Fact]
+    public async Task CronsWithoutTheSeedMarker_AreNotRemovedAsCopies()
+    {
+        var seededCron = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_NewlyDefined");
+        var user1 = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *");
+        var user2 = await AddCronTickerAsync("NewlyDefined", "0 0 3 * * *", initIdentifier: "MemoryTicker_Seeded_AnotherFunction");
+
+        await _provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 4 * * *") }, default);
+
+        await using var db = Verify();
+        var ids = await db.Set<CronTickerEntity>().AsNoTracking().Where(x => x.Function == "NewlyDefined").Select(x => x.Id).ToListAsync();
+        Assert.Equal(new[] { seededCron.Id, user1.Id, user2.Id }.OrderBy(x => x), ids.OrderBy(x => x));
     }
 
     // Several crons of the function and none marked as seeded (a dashboard edit clears the mark): any choice could

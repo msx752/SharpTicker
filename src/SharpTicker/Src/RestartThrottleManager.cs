@@ -9,6 +9,7 @@ public sealed class RestartThrottleManager : IDisposable
     private readonly object _lock = new();
     private Timer _debounceTimer;
     private volatile bool _restartPending;
+    private bool _disposed;
 
     private static readonly TimeSpan DefaultDebounceWindow = TimeSpan.FromMilliseconds(50);
 
@@ -30,6 +31,10 @@ public sealed class RestartThrottleManager : IDisposable
     {
         lock (_lock)
         {
+            // After the dispose nothing restarts: a new timer would never be disposed and would call a stopped scheduler.
+            if (_disposed)
+                return;
+
             _restartPending = true;
 
             // Create timer only when first needed
@@ -46,10 +51,15 @@ public sealed class RestartThrottleManager : IDisposable
         }
     }
 
-    private void OnTimerCallback(object state)
+    // Internal so a test can run it as the timer would run a callback it had already queued
+    internal void OnTimerCallback(object state)
     {
         lock (_lock)
         {
+            // Timer.Dispose does not take back a callback that was already queued; it runs here after the dispose.
+            if (_disposed)
+                return;
+
             if (_restartPending)
             {
                 _restartPending = false;
@@ -63,6 +73,7 @@ public sealed class RestartThrottleManager : IDisposable
     {
         lock (_lock)
         {
+            _disposed = true;
             _debounceTimer?.Dispose();
             _debounceTimer = null;
         }

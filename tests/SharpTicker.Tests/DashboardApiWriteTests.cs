@@ -105,6 +105,32 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
         Assert.Equal(5, queued.GetProperty("retries").GetInt32());
     }
 
+    // The edit dialog sends no time for a child that has none. The update used to refuse that, so such a child could only
+    // be saved with a time, which turns it into a child that also waits for that time.
+    [Fact]
+    public async Task UpdateTimeTicker_OfAChildWithoutATime_WithABodyWithoutATime_KeepsItWithoutATimeInItsChain()
+    {
+        var parentId = await AddTimeTickerAsync(
+            $$"""{"function":"WriteJob","executionTime":"{{InTwoDays}}","retries":0,"description":"chain parent","children":[{"function":"OtherJob","retries":0,"description":"child","runCondition":1}]}""");
+        var child = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == parentId).GetProperty("children")[0];
+        Assert.Equal(JsonValueKind.Null, child.GetProperty("executionTime").ValueKind);
+        var childId = child.GetProperty("id").GetGuid();
+
+        var (status, body) = await _api.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={childId}",
+            """{"function":"OtherJob","request":"","retries":2,"description":"edited child","retryIntervals":[]}""");
+
+        Assert.Equal(200, status);
+        Assert.True(body!.Value.GetProperty("success").GetBoolean(), body.ToString());
+        var parent = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == parentId);
+        var edited = Assert.Single(parent.GetProperty("children").EnumerateArray());
+        Assert.Equal(childId, edited.GetProperty("id").GetGuid());
+        Assert.Equal("edited child", edited.GetProperty("description").GetString());
+        Assert.Equal(2, edited.GetProperty("retries").GetInt32());
+        Assert.Equal(JsonValueKind.Null, edited.GetProperty("executionTime").ValueKind);
+        Assert.Equal(parentId, edited.GetProperty("parentId").GetGuid());
+        Assert.Equal(1, edited.GetProperty("runCondition").GetInt32());
+    }
+
     /// <summary>Updating a ticker that does not exist is a failure and creates nothing, whichever store is used.</summary>
     [Fact]
     public async Task UpdateTimeTicker_ReportsFailureAndCreatesNothing_ForATickerThatDoesNotExist()

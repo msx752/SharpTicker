@@ -84,15 +84,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                     continue;
                 }
 
-                if (child.CachedDelegate != null)
-                {
-                    if (child.RunCondition == RunCondition.InProgress)
-                        tasksToRunNow[tasksToRunNowCount++] = SafeRecursiveExecution(child, isDue, cancellationToken);
-                    else
-                    {
-                        childrenToRunAfter[childrenToRunAfterCount++] = child;
-                    }
-                }
+                // A child whose function is not registered here is not left out: nothing else runs a row without a time,
+                // so it would stay Idle for ever. It goes on like the others and its run ends Failed ("not found").
+                if (child.RunCondition == RunCondition.InProgress)
+                    tasksToRunNow[tasksToRunNowCount++] = SafeRecursiveExecution(child, isDue, cancellationToken);
+                else
+                    childrenToRunAfter[childrenToRunAfterCount++] = child;
             }
         }
         
@@ -129,17 +126,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             {
                 var child = childrenToRunAfter[i];
 
-                if (child.CachedDelegate != null)
-                {
-                    if (ShouldRunChild(child, context.Status))
-                    {
-                        childrenToRunAfterTask[taskCount++] = SafeRecursiveExecution(child, isDue, cancellationToken);
-                    }
-                    else
-                    {
-                        SkipWithDescendants(child, context, childrenToSkip);
-                    }
-                }
+                if (ShouldRunChild(child, context.Status))
+                    childrenToRunAfterTask[taskCount++] = SafeRecursiveExecution(child, isDue, cancellationToken);
+                else
+                    SkipWithDescendants(child, context, childrenToSkip);
             }
 
             // A delayed child the parent's outcome lets run is left to the store; one it does not let run never will, as
@@ -591,10 +581,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     private static string StoppingNote(LostOutcomeListing listing)
         => listing == LostOutcomeListing.Closed ? " The scheduler is stopping, so it is not written again." : string.Empty;
 
-    // A child without a time of its own that the parent's run starts after the parent has ended: it has a function, and it is
-    // not an InProgress child, which started with the parent.
+    // A child without a time of its own that the parent's run starts after the parent has ended: it is not an InProgress
+    // child, which started with the parent.
     private static bool RunsInlineAfterItsParent(InternalFunctionContext child)
-        => !child.IsDelayed && child.CachedDelegate != null && child.RunCondition != RunCondition.InProgress;
+        => !child.IsDelayed && child.RunCondition != RunCondition.InProgress;
 
     public async Task AfterLateStoreAsync(InternalFunctionContext outcome, bool claimChildren, CancellationToken cancellationToken)
     {
