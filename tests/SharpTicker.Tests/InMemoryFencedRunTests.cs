@@ -354,6 +354,30 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         Assert.True(await a.Manager.UpdateTickerAsync(Outcome(childRun, TickerStatus.Done, T0.AddMinutes(1))));
     }
 
+    // The dashboard's edit form sends a child on its own, with no ParentId and no RunCondition. The link is the store's: the
+    // child stays in its chain and keeps its condition, whether it has started or not.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EditingAChildWithABodyWithoutItsLink_KeepsItInItsChain(bool running)
+    {
+        var a = CreateNode("node-A");
+        var child = InlineChild();
+        var parent = await SeedTimeTicker(T0, child);
+        var condition = (await Row(child.Id)).RunCondition;
+        Assert.NotNull(condition);
+        if (running)
+            await a.Manager.RecordChildStartedAsync(new InternalFunctionContext { TickerId = child.Id, Type = TickerType.TimeTicker });
+        var edit = new TimeTickerEntity { Id = child.Id, Function = child.Function, Description = "child edited", ExecutionTime = T0.AddHours(1), Request = [] };
+
+        await a.Store.UpdateTimeTickers([edit], CancellationToken.None);
+
+        var row = await Row(child.Id);
+        Assert.Equal("child edited", row.Description);
+        Assert.Equal(parent.Id, row.ParentId);
+        Assert.Equal(condition, row.RunCondition);
+    }
+
     // A body read before the job ran (a dialog opened before, saved after) must not write the ended job back as not started:
     // the row stays Done and is not handed out again.
     [Fact]
