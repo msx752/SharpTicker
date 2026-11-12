@@ -109,7 +109,7 @@ SharpTicker follows [Semantic Versioning](https://semver.org), with one version 
 - **Minor** (`1.1.0`): new features and new target frameworks. APIs are marked `[Obsolete]` before they are removed in a later major version.
 - **Patch** (`1.0.1`): bug and security fixes.
 
-**Supported .NET versions.** Every 1.x release targets .NET 8, 9 and 10. Microsoft ends support for .NET 8 and .NET 9 on November 10, 2026, but SharpTicker keeps building for them throughout 1.x, so updating SharpTicker never forces you to upgrade .NET within a major version. They will be dropped no earlier than 2.0.0.
+**Supported .NET versions.** Every 1.x release targets .NET 8, 9 and 10. Microsoft ended support for .NET 8 and .NET 9 on November 10, 2026. SharpTicker keeps building for them throughout 1.x, so updating SharpTicker within 1.x does not require a newer .NET. They will be dropped no earlier than 2.0.0.
 
 ## Building from source
 
@@ -146,11 +146,11 @@ The fork is where SharpTicker starts, not what it intends to stay. Version 1.0.0
 
 In practice this means:
 
-- **Divergence is expected.** APIs, behavior and storage will evolve on their own terms after 1.0.0. Breaking changes follow [Semantic Versioning](https://semver.org) and are announced in the release notes.
+- **Divergence is expected.** APIs, behavior and storage will evolve on their own terms after 1.0.0. Breaking changes follow [Semantic Versioning](https://semver.org) and are announced in the [release notes](https://github.com/msx752/SharpTicker/releases); [Upgrading](https://msx752.github.io/SharpTicker/guide/upgrading.html) lists what to check per release.
 - **No tracking of the original project.** Changes made there are not followed, mirrored or ported, and SharpTicker makes no compatibility promise beyond 1.0.0.
 - **No affiliation.** SharpTicker is not affiliated with, endorsed by or supported by the original authors. Please report SharpTicker issues here, not upstream.
 
-### Migrating to 1.0.0
+### Migrating
 
 Moving from TickerQ? Follow the **[migration guide](MIGRATING.md)**.
 

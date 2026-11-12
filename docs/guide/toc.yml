@@ -14,5 +14,7 @@
   items:
   - name: Running in production
     href: operations.md
+- name: Upgrading
+  href: upgrading.md
 - name: Migration guide
   href: migrating.md
