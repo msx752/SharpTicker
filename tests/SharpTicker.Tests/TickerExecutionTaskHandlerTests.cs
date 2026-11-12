@@ -638,26 +638,70 @@ public class TickerExecutionTaskHandlerTests : IDisposable
             Arg.Any<CancellationToken>());
     }
 
-    [Fact]
-    public async Task ExecuteTaskAsync_ChildWithNullDelegate_IsSkipped()
+    // A child whose function is not registered on this node is a job like any other with an unknown function: when its
+    // condition lets it run it ends Failed with the "not found" message, and it is not left Idle with no status written.
+    [Theory]
+    [InlineData(RunCondition.OnSuccess)]
+    [InlineData(RunCondition.OnAnyCompletedStatus)]
+    [InlineData(RunCondition.InProgress)]
+    public async Task AnInlineChildWithoutAFunction_ThatItsConditionLetsRun_EndsFailed(RunCondition condition)
     {
-        var parentContext = CreateContext(
-            type: TickerType.TimeTicker,
-            ct: (_, _, _) => Task.CompletedTask);
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        var child = CreateContext(type: TickerType.TimeTicker);
+        child.FunctionName = "GoneFunction";
+        child.RunCondition = condition;
+        parent.TimeTickerChildren.Add(child);
 
-        var nullDelegateChild = new InternalFunctionContext
-        {
-            TickerId = Guid.NewGuid(),
-            FunctionName = "NullChild",
-            Type = TickerType.TimeTicker,
-            CachedDelegate = null,
-            RunCondition = RunCondition.OnSuccess,
-            TimeTickerChildren = []
-        };
-        parentContext.TimeTickerChildren.Add(nullDelegateChild);
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
 
-        // Should not throw
-        await _handler.ExecuteTaskAsync(parentContext, isDue: false);
+        Assert.Equal(TickerStatus.Done, parent.Status);
+        Assert.Equal(TickerStatus.Failed, child.Status);
+        // The message is stored as JSON, which escapes the quotes around the name.
+        Assert.Contains("GoneFunction", child.ExceptionDetails);
+        Assert.Contains("was not found in the registered functions", child.ExceptionDetails);
+        await _internalManager.Received().UpdateTickerAsync(
+            Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId && c.Status == TickerStatus.Failed), Arg.Any<CancellationToken>());
+    }
+
+    // Its own children follow that outcome: the one that runs on a failure runs, the one that runs on a success is skipped.
+    [Fact]
+    public async Task TheChildrenOfAChildWithoutAFunction_FollowItsFailedOutcome()
+    {
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        var child = CreateContext(type: TickerType.TimeTicker);
+        child.RunCondition = RunCondition.OnSuccess;
+        var ran = 0;
+        var onFailure = InlineChild(RunCondition.OnFailure, () => ran++);
+        var onSuccess = InlineChild(RunCondition.OnSuccess, () => ran++);
+        child.TimeTickerChildren.AddRange([onFailure, onSuccess]);
+        parent.TimeTickerChildren.Add(child);
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(1, ran);
+        Assert.Equal(TickerStatus.Done, onFailure.Status);
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { onSuccess.TickerId })),
+            Arg.Any<CancellationToken>());
+    }
+
+    // One its condition does not let run is skipped with its descendants, like a child that has a function.
+    [Fact]
+    public async Task AnInlineChildWithoutAFunction_ThatItsConditionDoesNotLetRun_IsSkippedWithItsDescendants()
+    {
+        var parent = CreateContext(type: TickerType.TimeTicker, ct: (_, _, _) => Task.CompletedTask);
+        var child = CreateContext(type: TickerType.TimeTicker);
+        child.RunCondition = RunCondition.OnFailure;
+        var grandchild = InlineChild(RunCondition.OnSuccess);
+        child.TimeTickerChildren.Add(grandchild);
+        parent.TimeTickerChildren.Add(child);
+
+        await _handler.ExecuteTaskAsync(parent, isDue: false);
+
+        Assert.Equal(TickerStatus.Idle, child.Status);
+        await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
+            Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { child.TickerId, grandchild.TickerId })),
+            Arg.Any<CancellationToken>());
     }
 
     #endregion
@@ -1193,8 +1237,8 @@ public class TickerExecutionTaskHandlerTests : IDisposable
 
     // After a late store the inline children (no time of their own) follow the outcome through the store: one it lets run is
     // claimed by id, whatever the time its context carries, and is never run here; one it does not let run is skipped with
-    // its descendants. An InProgress child started with its parent, and a child without a function is never run: neither is
-    // claimed or skipped.
+    // its descendants. A child without a function is claimed like the others and ends Failed as a claimed job. An InProgress
+    // child started with its parent: it is neither claimed nor skipped.
     [Fact]
     public async Task AfterALateStore_AnInlineChildTheOutcomeLetsRunIsClaimed_AndOneItDoesNotLetRunIsSkipped()
     {
@@ -1218,7 +1262,7 @@ public class TickerExecutionTaskHandlerTests : IDisposable
 
         Assert.Equal(0, ran);
         await _internalManager.Received(1).AcquireDelayedChildrenAsync(
-            Arg.Is<Guid[]>(ids => ids.SequenceEqual(new[] { onSuccess.TickerId })), Arg.Any<CancellationToken>());
+            Arg.Is<Guid[]>(ids => ids.SequenceEqual(new[] { onSuccess.TickerId, withoutFunction.TickerId })), Arg.Any<CancellationToken>());
         await _internalManager.Received(1).UpdateSkipTimeTickersWithUnifiedContextAsync(
             Arg.Is<InternalFunctionContext[]>(skipped => skipped.Select(s => s.TickerId).SequenceEqual(new[] { onFailure.TickerId, grandchild.TickerId })),
             Arg.Any<CancellationToken>());
