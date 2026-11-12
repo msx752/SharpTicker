@@ -359,6 +359,50 @@ public class RedisFencedRunTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal(markerOfB, row.UpdatedAt);
     }
 
+    // A start whose write landed while its call failed is put back by its marker (the manager does that): the child waits
+    // again and can be started.
+    [Fact]
+    public async Task AnInlineStartThatIsPutBack_LeavesTheChildWaitingAgain()
+    {
+        var a = CreateNode("node-A");
+        var b = CreateNode("node-B");
+        var child = InlineChild();
+        await SeedTimeTicker(T0, child);
+        var marker = a.Manager.NextClaimMarker();
+        Assert.Equal(1, await StartInline(a, child.Id, marker));
+
+        Assert.True(await a.Store.TryReleaseTimeTickerClaim(child.Id, marker, CancellationToken.None));
+
+        var row = await Row(child.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(1, await StartInline(b, child.Id, b.Manager.NextClaimMarker()));
+    }
+
+    // A claim's marker is written by a script in one text form; a later write of the row from C# (an edit while it is
+    // claimed) stores the same date in another. The put-back compares the marker as a date, so it still finds its claim.
+    [Fact]
+    public async Task AClaimedRowThatWasWrittenAgainMeanwhile_CanStillBePutBack()
+    {
+        var a = CreateNode("node-A");
+        var ticker = await SeedTimeTicker(T0);
+        var run = await ClaimTimeTicker(a, ticker.Id);
+        var edit = new TimeTickerEntity
+        {
+            Id = ticker.Id, Function = ticker.Function, ExecutionTime = T0, Description = "edited", CreatedAt = ticker.CreatedAt, Request = []
+        };
+        await a.Provider.UpdateTimeTickers([edit], CancellationToken.None);
+        Assert.Equal(run.ClaimMarker, (await Row(ticker.Id)).UpdatedAt);
+
+        Assert.True(await a.Provider.TryReleaseTimeTickerClaim(ticker.Id, run.ClaimMarker!.Value, CancellationToken.None));
+
+        var row = await Row(ticker.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Equal("edited", row.Description);
+    }
+
     // T9: an inline child carries this node's lock while it runs, so the heartbeat's release of a dead node's rows frees it
     // to Idle (this store releases running rows too) instead of leaving it InProgress for good; it has no time of its own,
     // so no claim path hands it out again.

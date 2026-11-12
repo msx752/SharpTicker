@@ -38,7 +38,6 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     private static readonly string ReleaseScript = LuaScriptLoader.Load("Release");
     private static readonly string RecoverDeadNodeScript = LuaScriptLoader.Load("RecoverDeadNode");
     private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
-    private static readonly string ReleaseClaimScript = LuaScriptLoader.Load("ReleaseClaim");
     private static readonly string SkipNotStartedScript = LuaScriptLoader.Load("SkipNotStarted");
     private static readonly string CompareAndSetScript = LuaScriptLoader.Load("CompareAndSet");
 
@@ -167,10 +166,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // rejects it. Written after the put-back, a failed index write would leave an Idle row that nothing looks at; this way a
     // failure leaves the row InProgress and the caller tries again, and a put-back whose reply was lost is already indexed.
     // The row key and the index keys live in different hash slots, so they cannot share one script.
-    protected async Task<bool> TryReleaseClaimAsync<T>(string key, DateTime claimMarker, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle)
+    protected async Task<bool> TryReleaseClaimAsync<T>(string key, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle)
         where T : class
     {
-        // A row that is not this claim is left alone without any write; the script below checks again atomically.
+        // A row that is not this claim is left alone without any write; the compare-and-set below checks again.
         var row = await Serializer.GetAsync<T>(key).ConfigureAwait(false);
         if (row == null || !isThisClaim(row))
             return false;
@@ -178,16 +177,18 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         asIdle(row);
         await indexAsIdle(row).ConfigureAwait(false);
 
-        var result = await Db.ScriptEvaluateAsync(
-            ReleaseClaimScript,
-            [(RedisKey)key],
-            [(RedisValue)LockHolder, (RedisValue)claimMarker.ToString("O"), (RedisValue)Clock.UtcNow.ToString("O"),
-             LuaStatusInProgress, LuaStatusIdle]
-        ).ConfigureAwait(false);
+        // The marker is compared as a date on the deserialized row, not as text: a claim script writes it in one text form
+        // and a later write of the row from C# (an inline child's start, an edit while it is claimed) in another.
+        var released = await CompareAndSetAsync<T>(key, stored =>
+        {
+            if (stored == null || !isThisClaim(stored)) return null;
+            asIdle(stored);
+            return stored;
+        }).ConfigureAwait(false);
 
         // A row that moved on keeps the extra pending entry until its next write updates its index; Acquire.lua rejects
         // it meanwhile.
-        return !result.IsNull;
+        return released != null;
     }
 
     private const int MaxCompareAndSetRounds = 5;
@@ -668,9 +669,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     public Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         => TryReleaseClaimAsync<TTimeTicker>(
             TimeTickerKey(id),
-            claimMarker,
             row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
-            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; },
+            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; row.UpdatedAt = Clock.UtcNow; },
             row => IndexManager.AddTimeTickerIndexesAsync(row));
 
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken = default)
@@ -1156,9 +1156,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     public Task<bool> TryReleaseCronOccurrenceClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         => TryReleaseClaimAsync<CronTickerOccurrenceEntity<TCronTicker>>(
             CronOccurrenceKey(id),
-            claimMarker,
             row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
-            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; },
+            row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; row.UpdatedAt = Clock.UtcNow; },
             row => IndexManager.AddCronOccurrenceIndexesAsync(row));
 
     public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)

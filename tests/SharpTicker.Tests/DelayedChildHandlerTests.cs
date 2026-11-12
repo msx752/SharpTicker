@@ -28,6 +28,8 @@ public class DelayedChildHandlerTests : IDisposable
         _dispatcher.IsEnabled.Returns(true);
         // The store has every write, unless a test says otherwise.
         _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        // An inline child's start claim is won, unless a test says otherwise.
+        _internalManager.RecordChildStartedAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         _internalManager.AcquireDelayedChildrenAsync(Arg.Any<Guid[]>(), Arg.Any<CancellationToken>())
             .Returns(call => ((Guid[])call[0]).Select(id => new InternalFunctionContext { TickerId = id, FunctionName = "fn", ClaimMarker = _now }).ToArray());
         var services = new ServiceCollection();
@@ -439,30 +441,57 @@ public class DelayedChildHandlerTests : IDisposable
         await run;
     }
 
-    // A failed start write does not stop the child, nothing else would run it; its outcome is still written, by Id, as the
-    // start gave the child no run marker to fence its writes with.
-    [Fact]
-    public async Task AnInlineChild_StillRuns_WhenItCannotBeRecordedInProgress()
+    public enum StartClaim { Refused, Failed, Cancelled }
+
+    // The start of an inline child is a claim on its row (#83). A child whose claim was refused (another start holds the row,
+    // or the row has a time now and the store hands it out), failed or was cancelled is not run here: nothing is written
+    // for it, and what it carries is neither run, handed off nor skipped. Its sibling and its parent are not affected.
+    [Theory]
+    [InlineData(StartClaim.Refused)]
+    [InlineData(StartClaim.Failed)]
+    [InlineData(StartClaim.Cancelled)]
+    public async Task AnInlineChildWhoseStartClaimIsNotWon_IsNotRun_AndNeitherIsWhatItCarries(StartClaim claim)
     {
-        var ran = false;
+        var ran = new List<string>();
+        using var stop = new CancellationTokenSource();
         var parent = Job(Succeeds);
-        var child = Job((_, _, _) => { ran = true; return Task.CompletedTask; }, RunCondition.OnSuccess);
+        var child = Job((_, _, _) => { lock (ran) ran.Add("child"); return Task.CompletedTask; }, RunCondition.OnSuccess);
+        var inlineGrandchild = Job((_, _, _) => { lock (ran) ran.Add("grandchild"); return Task.CompletedTask; }, RunCondition.OnAnyCompletedStatus);
+        var delayedGrandchild = DelayedChild(TimeSpan.FromMinutes(-1), RunCondition.InProgress);
+        var sibling = Job((_, _, _) => { lock (ran) ran.Add("sibling"); return Task.CompletedTask; }, RunCondition.OnSuccess);
+        child.TimeTickerChildren.Add(inlineGrandchild);
+        child.TimeTickerChildren.Add(delayedGrandchild);
         parent.TimeTickerChildren.Add(child);
+        parent.TimeTickerChildren.Add(sibling);
         _internalManager.RecordChildStartedAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
-            .Returns<Task>(_ => throw new InvalidOperationException("store failed"));
-        var finalWrites = new List<(TickerStatus Status, DateTime? RunMarker)>();
-        _internalManager.UpdateTickerAsync(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId), Arg.Any<CancellationToken>())
-            .Returns(c =>
+            .Returns(_ =>
             {
-                var written = (InternalFunctionContext)c[0];
-                finalWrites.Add((written.Status, written.RunMarker));
-                return Task.FromResult(true);
+                switch (claim)
+                {
+                    case StartClaim.Failed:
+                        throw new InvalidOperationException("store failed");
+                    case StartClaim.Cancelled:
+                        stop.Cancel();
+                        throw new OperationCanceledException(stop.Token);
+                    default:
+                        return Task.FromResult(false);
+                }
             });
 
-        await _handler.ExecuteTaskAsync(parent, isDue: false);
+        await _handler.ExecuteTaskAsync(parent, isDue: false, stop.Token);
 
-        Assert.True(ran);
-        Assert.Equal([(TickerStatus.Done, (DateTime?)null)], finalWrites);
+        Assert.DoesNotContain("child", ran);
+        Assert.DoesNotContain("grandchild", ran);
+        await _internalManager.DidNotReceive().UpdateTickerAsync(
+            Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId || c.TickerId == inlineGrandchild.TickerId), Arg.Any<CancellationToken>());
+        await _internalManager.DidNotReceive().RecordChildStartedAsync(
+            Arg.Is<InternalFunctionContext>(c => c.TickerId == inlineGrandchild.TickerId), Arg.Any<CancellationToken>());
+        Assert.Empty(HandedOffIds());
+        Assert.Empty(SkippedIds());
+        Assert.Equal(TickerStatus.Done, parent.Status);
+        // The sibling's own claim comes after: it is still started, unless the run itself was cancelled.
+        if (claim != StartClaim.Cancelled)
+            Assert.Contains("sibling", ran);
     }
 
     // With the background services off nothing would start a claimed row, so nothing is claimed.
