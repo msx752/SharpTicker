@@ -956,7 +956,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             {
                 var entity = new TCronTicker
                 {
-                    Id = Guid.NewGuid(),
+                    Id = SeededCronTickers.IdFor(function),
                     Function = function,
                     Expression = expression,
                     InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
@@ -964,7 +964,21 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                     UpdatedAt = now,
                     Request = []
                 };
-                await Serializer.SetAsync(CronKey(entity.Id), entity).ConfigureAwait(false);
+
+                // Written only when the key is free: it can be held by a cron of another function, which must not be overwritten.
+                if (!await Serializer.TryCreateAsync(CronKey(entity.Id), entity).ConfigureAwait(false))
+                {
+                    var holder = await Serializer.GetAsync<TCronTicker>(CronKey(entity.Id)).ConfigureAwait(false);
+                    if (holder != null && !string.Equals(holder.Function, function, StringComparison.Ordinal))
+                    {
+                        // A seeded cron whose function was changed keeps its id: this cron is seeded under a random id, as before.
+                        entity.Id = Guid.NewGuid();
+                        await Serializer.SetAsync(CronKey(entity.Id), entity).ConfigureAwait(false);
+                    }
+                }
+
+                // Also for a row another node created: a node that stopped between the row and its index would leave a
+                // cron no node sees and, with the id fixed, no later start could add.
                 await IndexManager.AddCronIndexesAsync(entity).ConfigureAwait(false);
             }
         }
