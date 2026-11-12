@@ -195,7 +195,7 @@ internal sealed class LostOutcomeDrain
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning(ex, "The chain children of {FunctionName} ({TickerId}) could not be followed up after its outcome was stored late. The fallback runs the delayed ones the outcome lets run; one without a time of its own that is still Idle is not run, add a new job to run it.",
+            _logger?.LogWarning(ex, "The chain children of {FunctionName} ({TickerId}) could not be followed up after its outcome was stored late. The fallback runs the ones the outcome lets run: a delayed one at its time, one without a time of its own that is still Idle once its parent ended 30 seconds ago.",
                 context.FunctionName, context.TickerId);
         }
     }

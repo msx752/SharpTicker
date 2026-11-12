@@ -248,7 +248,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 continue;
 
             Logger?.LogWarning(
-                "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not claimed after its parent's outcome was stored late: its row was taken or changed meanwhile, or the claim failed. If its row is still Idle and has no execution time, nothing runs it; add a new job to run it.",
+                "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not claimed after its parent's outcome was stored late: its row was taken or changed meanwhile, or the claim failed. If its row is still Idle and has no execution time, the fallback takes it once its parent ended 30 seconds ago.",
                 child.FunctionName, child.TickerId, lateParent?.FunctionName, lateParent?.TickerId);
         }
     }
@@ -609,7 +609,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 // without a time, and writing it Skipped would record an outcome it did not have.
                 foreach (var child in allowed.Where(c => !c.IsDelayed))
                     Logger?.LogError(
-                        "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not started: its parent's {Status} outcome was stored only while the scheduler stopped. Its row stays Idle and nothing runs it; add a new job to run it.",
+                        "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not started: its parent's {Status} outcome was stored only while the scheduler stopped. Its row stays Idle; the fallback takes it once its parent ended 30 seconds ago.",
                         child.FunctionName, child.TickerId, outcome.FunctionName, outcome.TickerId, outcome.Status);
             }
         }

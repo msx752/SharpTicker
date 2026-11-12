@@ -121,7 +121,8 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
 
     // A child without a time of its own normally runs inside its parent's run. Run-now (a claim by id) hands it out only once
     // its parent has ended with an outcome its condition accepts: that is how it follows a parent outcome that was stored
-    // late. Never an InProgress child, which starts with its parent, and never by the window or the fallback.
+    // late. Never an InProgress child, which starts with its parent, and never by the window. The fallback leaves it too
+    // while its parent has not ended at least the grace time ago.
     public static IEnumerable<object?[]> EveryConditionAndParentStatus()
         => from condition in Enum.GetValues<RunCondition>().Select(c => (RunCondition?)c).Append(null)
            from status in Enum.GetValues<TickerStatus>()
@@ -133,6 +134,7 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
     {
         var child = Row(null, condition: condition, function: "inline-child");
         var parent = Row(Now.AddHours(1), parentStatus); // not due, so no claim below takes the parent itself
+        parent.ExecutedAt = Now;
         parent.Children = [child];
         await _provider.AddTimeTickers([parent], CancellationToken.None);
 
@@ -264,4 +266,158 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
         Assert.Equal(Now.AddHours(3), Assert.Single(carried.Children, x => x.Id == delayedGrandchild.Id).ExecutionTime);
         Assert.Null(Assert.Single(carried.Children, x => x.Id == grandchild.Id).ExecutionTime);
     }
+
+    #region The fallback and a child without a time of its own (#84)
+
+    // A parent with a child without a time that was never started.
+    private async Task<(FakeTimeTicker Parent, FakeTimeTicker Child)> SeedLeftWaiting(TickerStatus parentStatus, DateTime? parentEndedAt,
+        RunCondition? condition = RunCondition.OnSuccess, Action<FakeTimeTicker>? shapeChild = null)
+    {
+        var child = Row(null, condition: condition, function: "inline-child");
+        shapeChild?.Invoke(child);
+        var parent = Row(Now.AddHours(1), parentStatus); // not due, so the fallback does not take the parent itself
+        parent.ExecutedAt = parentEndedAt;
+        parent.Children = [child];
+        await _provider.AddTimeTickers([parent], CancellationToken.None);
+        return (parent, child);
+    }
+
+    private async Task<List<TimeTickerEntity>> Fallback()
+    {
+        var taken = new List<TimeTickerEntity>();
+        await foreach (var row in _provider.QueueTimedOutTimeTickers(CancellationToken.None)) taken.Add(row);
+        return taken;
+    }
+
+    // The parent's run starts such a child right after the parent ends. One that still waits 30 s later was never
+    // started: the fallback claims it as a job of its own, with what it carries.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_ThatStillWaits30SecondsAfterItsParentEnded()
+    {
+        var grandchild = Row(null, condition: RunCondition.OnSuccess, function: "inline-grandchild");
+        var (_, child) = await SeedLeftWaiting(TickerStatus.Done, Now.AddSeconds(-30), shapeChild: c => c.Children = [grandchild]);
+
+        var taken = Assert.Single(await Fallback());
+
+        Assert.Equal(child.Id, taken.Id);
+        Assert.Equal([grandchild.Id], taken.Children.Select(x => x.Id));
+        var row = await _provider.GetTimeTickerById(child.Id, CancellationToken.None);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.NotNull(row.LockedAt);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(row.UpdatedAt, taken.UpdatedAt);
+        Assert.Equal(TickerStatus.Idle, await StatusOf(grandchild.Id));
+        Assert.Empty(await Fallback());
+    }
+
+    // A final parent without an end time counts as ended long ago: its child must not wait forever.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_WhoseEndedParentHasNoEndTime()
+    {
+        var (_, child) = await SeedLeftWaiting(TickerStatus.Done, null);
+
+        Assert.Equal([child.Id], (await Fallback()).Select(x => x.Id));
+    }
+
+    // Within the grace time the parent's run may still be about to start the child; a parent that has not ended starts
+    // it itself.
+    [Theory]
+    [InlineData(TickerStatus.Done, 29)]
+    [InlineData(TickerStatus.Failed, 29)]
+    [InlineData(TickerStatus.Idle, 3600)]
+    [InlineData(TickerStatus.Queued, 3600)]
+    [InlineData(TickerStatus.InProgress, 3600)]
+    public async Task TheFallback_LeavesAChildWithoutATime_WhoseParentHasNotEndedLongEnoughAgo(TickerStatus parentStatus, int endedSecondsAgo)
+    {
+        var (_, child) = await SeedLeftWaiting(parentStatus, Now.AddSeconds(-endedSecondsAgo));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(child.Id));
+    }
+
+    // A row another start holds, or one that has run, is not a child left waiting.
+    [Theory]
+    [InlineData(TickerStatus.Idle, "node-B")]
+    [InlineData(TickerStatus.InProgress, "node-B")]
+    [InlineData(TickerStatus.Queued, null)]
+    [InlineData(TickerStatus.Done, null)]
+    public async Task TheFallback_LeavesAChildWithoutATime_ThatDoesNotWaitForItsStart(TickerStatus childStatus, string? lockHolder)
+    {
+        var (_, child) = await SeedLeftWaiting(TickerStatus.Done, Now.AddMinutes(-5), shapeChild: c =>
+        {
+            c.Status = childStatus;
+            c.LockHolder = lockHolder;
+        });
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(childStatus, await StatusOf(child.Id));
+    }
+
+    // The outcome does not let the child run, or the child was to start with its parent (InProgress) and the parent is
+    // over: it never runs. What it carries follows on a later pass, as for a delayed child.
+    [Theory]
+    [InlineData(TickerStatus.Failed, RunCondition.OnSuccess)]
+    [InlineData(TickerStatus.Skipped, RunCondition.OnAnyCompletedStatus)]
+    [InlineData(TickerStatus.Skipped, null)]
+    [InlineData(TickerStatus.Done, RunCondition.InProgress)]
+    public async Task TheFallback_SkipsAChildWithoutATime_ThatItsEndedParentDoesNotLetRun(TickerStatus parentStatus, RunCondition? condition)
+    {
+        var (_, child) = await SeedLeftWaiting(parentStatus, Now.AddSeconds(-30), condition);
+
+        Assert.Empty(await Fallback());
+
+        var row = await _provider.GetTimeTickerById(child.Id, CancellationToken.None);
+        Assert.Equal(TickerStatus.Skipped, row.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, row.SkippedReason);
+        Assert.NotNull(row.ExecutedAt);
+    }
+
+    [Fact]
+    public async Task TheFallback_DoesNotSkipAChildWithoutATime_WithinTheGraceTime()
+    {
+        var (_, child) = await SeedLeftWaiting(TickerStatus.Failed, Now.AddSeconds(-29));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, await StatusOf(child.Id));
+    }
+
+    // One start per child: the inline start of the parent's run and the fallback are claims on the same row.
+    [Fact]
+    public async Task AChildTheFallbackTook_IsRefusedToAnInlineStart_AndOneAnInlineStartTook_IsNotTakenByTheFallback()
+    {
+        var (_, takenByFallback) = await SeedLeftWaiting(TickerStatus.Done, Now.AddMinutes(-1));
+        var (_, startedInline) = await SeedLeftWaiting(TickerStatus.Done, Now.AddMinutes(-1));
+        Assert.Equal(1, await _provider.StartInlineChildAsync(startedInline.Id, Now.AddMilliseconds(500), CancellationToken.None));
+
+        Assert.Equal([takenByFallback.Id], (await Fallback()).Select(x => x.Id));
+
+        Assert.Equal(0, await _provider.StartInlineChildAsync(takenByFallback.Id, Now.AddMilliseconds(501), CancellationToken.None));
+    }
+
+    // A child that is started after the fallback read it is not claimed by the fallback's write.
+    [Fact]
+    public async Task TheFallbacksClaim_IsRefused_WhenTheChildWasStartedAfterItWasRead()
+    {
+        var (_, first) = await SeedLeftWaiting(TickerStatus.Done, Now.AddMinutes(-1));
+        var (_, second) = await SeedLeftWaiting(TickerStatus.Done, Now.AddMinutes(-1));
+        var taken = new List<Guid>();
+
+        // The pass has read both children when it hands out the first; the other is started before its claim is written.
+        await foreach (var row in _provider.QueueTimedOutTimeTickers(CancellationToken.None))
+        {
+            taken.Add(row.Id);
+            var other = row.Id == first.Id ? second.Id : first.Id;
+            Assert.Equal(1, await _provider.StartInlineChildAsync(other, Now.AddHours(-2), CancellationToken.None));
+        }
+
+        Assert.Single(taken);
+        var started = await _provider.GetTimeTickerById(taken[0] == first.Id ? second.Id : first.Id, CancellationToken.None);
+        Assert.Equal(Now.AddHours(-2), started.UpdatedAt);
+    }
+
+    #endregion
 }

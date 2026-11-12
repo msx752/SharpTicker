@@ -34,8 +34,38 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         else
             t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
 
+        var t3 = WaitsForItsInlineStart(ticker)
+            ? batch.HashSetAsync(TimeTickerWaitingChildrenKey, idStr, ticker.ParentId.Value.ToString())
+            : batch.HashDeleteAsync(TimeTickerWaitingChildrenKey, idStr);
+
         batch.Execute();
-        return Task.WhenAll(t1, t2);
+        return Task.WhenAll(t1, t2, t3);
+    }
+
+    // A chain child without a time of its own that no start has claimed yet (the condition of the inline start's claim).
+    internal static bool WaitsForItsInlineStart(TTimeTicker ticker)
+        => ticker.ParentId.HasValue && !ticker.ExecutionTime.HasValue && ticker.Status == TickerStatus.Idle && string.IsNullOrEmpty(ticker.LockHolder);
+
+    // For rows stored before the waiting-children index existed, and for an index write that never landed.
+    internal Task AddWaitingChildrenAsync(HashEntry[] childAndParentIds)
+        => childAndParentIds.Length == 0 ? Task.CompletedTask : _db.HashSetAsync(TimeTickerWaitingChildrenKey, childAndParentIds);
+
+    // An entry whose row no longer waits (it was started, skipped or given a time, and that index write did not land or
+    // was add-only).
+    internal Task RemoveWaitingChildAsync(Guid id)
+        => _db.HashDeleteAsync(TimeTickerWaitingChildrenKey, id.ToString());
+
+    // Child id and parent id of every entry.
+    internal async Task<(Guid ChildId, Guid ParentId)[]> GetWaitingChildrenAsync()
+    {
+        var entries = await _db.HashGetAllAsync(TimeTickerWaitingChildrenKey).ConfigureAwait(false);
+        var result = new System.Collections.Generic.List<(Guid, Guid)>(entries.Length);
+        foreach (var entry in entries)
+        {
+            if (Guid.TryParse(entry.Name.ToString(), out var childId) && Guid.TryParse(entry.Value.ToString(), out var parentId))
+                result.Add((childId, parentId));
+        }
+        return result.ToArray();
     }
 
     // After a fenced write of a run (IFencedRunWriter): add-only. The row may have been released (and indexed as pending)
@@ -75,9 +105,10 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         var t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
         var t3 = batch.KeyDeleteAsync(TimeTickerChildrenKey(id));
         var t4 = parentId.HasValue ? batch.SortedSetRemoveAsync(TimeTickerChildrenKey(parentId.Value), idStr) : Task.CompletedTask;
+        var t5 = batch.HashDeleteAsync(TimeTickerWaitingChildrenKey, idStr);
 
         batch.Execute();
-        return Task.WhenAll(t1, t2, t3, t4);
+        return Task.WhenAll(t1, t2, t3, t4, t5);
     }
 
     internal Task AddCronIndexesAsync(TCronTicker ticker)

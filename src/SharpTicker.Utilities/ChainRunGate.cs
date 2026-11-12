@@ -56,6 +56,21 @@ namespace SharpTicker.Utilities
         internal static bool AllowsRunNow(RunCondition? condition, TickerStatus parentStatus, bool hasOwnTime)
             => Allows(condition, parentStatus) && (hasOwnTime || condition != RunCondition.InProgress);
 
+        /// <summary>
+        /// How long a parent must have ended before the fallback takes a child without a time of its own that is still
+        /// waiting. Such a child is started by its parent's run right after the parent ends; the fallback is only for a
+        /// start that never came (the node stopped, or the store could not be reached).
+        /// </summary>
+        internal static readonly TimeSpan FallbackGraceForChildWithoutTime = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Whether the fallback may look at a waiting child without a time of its own: its parent has a final status and
+        /// ended at least <see cref="FallbackGraceForChildWithoutTime"/> ago. A final parent without an end time counts as
+        /// ended long ago. The child is then claimed when <see cref="AllowsRunNow"/> lets it run, and skipped otherwise.
+        /// </summary>
+        internal static bool FallbackMayDecideChildWithoutTime(TickerStatus parentStatus, DateTime? parentEndedAt, DateTime now)
+            => IsFinal(parentStatus) && (parentEndedAt == null || parentEndedAt <= now - FallbackGraceForChildWithoutTime);
+
         /// <summary>Whether <paramref name="status"/> is final: a row with it never runs again.</summary>
         internal static bool IsFinal(TickerStatus status)
             => status is TickerStatus.Done or TickerStatus.DueDone or TickerStatus.Failed or TickerStatus.Cancelled or TickerStatus.Skipped;
