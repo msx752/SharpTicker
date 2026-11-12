@@ -480,6 +480,20 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 if (existingByFunction.TryGetValue(function, out var rows))
                 {
+                    // Copies of the seeded cron, left by nodes that started together before the seeded id was fixed.
+                    var copies = SeededCronTickers.Copies(rows);
+                    if (copies.Count > 0)
+                    {
+                        var copyIds = copies.Select(c => c.Id).ToArray();
+                        await occSet.DeleteManyAsync(
+                            Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter.In(x => x.CronTickerId, copyIds),
+                            cancellationToken).ConfigureAwait(false);
+                        await cronSet.DeleteManyAsync(fb.In(x => x.Id, copyIds), cancellationToken).ConfigureAwait(false);
+
+                        rows = rows.Except(copies).ToList();
+                        _logger.LogWarning(SeededCronTickers.CopiesRemovedWarning, copies.Count, function);
+                    }
+
                     // Only the rows the seed owns take the expression in code; a user's cron of the same function keeps its own.
                     foreach (var cron in SeededCronTickers.Owned(rows))
                     {

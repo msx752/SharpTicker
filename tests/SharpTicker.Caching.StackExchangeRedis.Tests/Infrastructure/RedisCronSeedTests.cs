@@ -70,18 +70,6 @@ public class RedisCronSeedTests(RedisTestFixture fixture) : IAsyncLifetime
     }
 
     [Fact]
-    public async Task TwoSeededCopiesOfOneCron_TheNodeStarts_AndBothTakeTheExpressionInCode()
-    {
-        await Provider().InsertCronTickers([Cron("0 0 3 * * *", Seeded), Cron("0 0 3 * * *", Seeded)], CancellationToken.None);
-
-        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
-
-        var stored = await StoredAsync();
-        Assert.Equal(2, stored.Count);
-        Assert.All(stored.Values, c => Assert.Equal("0 0 4 * * *", c.Expression));
-    }
-
-    [Fact]
     public async Task SeveralCronsOfOneFunction_NoneMarkedAsSeeded_TheNodeStarts_AndNoneIsChanged()
     {
         await Provider().InsertCronTickers([Cron("0 0 1 * * *"), Cron("0 0 2 * * *")], CancellationToken.None);
@@ -171,5 +159,67 @@ public class RedisCronSeedTests(RedisTestFixture fixture) : IAsyncLifetime
         await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
 
         Assert.Equal(IdOfFunction, Assert.Single(await StoredAsync()).Key);
+    }
+
+    private static CronTickerOccurrenceEntity<CronTickerEntity> OccurrenceOf(CronTickerEntity cron, DateTime at)
+        => new()
+        {
+            Id = Guid.NewGuid(), CronTickerId = cron.Id, Status = TickerStatus.Done, ExecutionTime = at, CreatedAt = at, UpdatedAt = at,
+            CronTicker = cron,
+        };
+
+    // Seeded copies of one cron (nodes that seeded it at the same time) each run the job on every tick: the oldest is
+    // kept and takes the expression in code, the others go with their occurrences. Both insertion orders.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SeededCopiesOfOneCron_TheOldestIsKept_TheOthersAreRemovedWithTheirOccurrences(bool oldestFirst)
+    {
+        var oldest = Cron("0 0 3 * * *", Seeded);
+        oldest.CreatedAt = T0.AddHours(-2);
+        var copy = Cron("0 0 3 * * *", Seeded);
+        var third = Cron("0 0 3 * * *", Seeded);
+        await Provider().InsertCronTickers(oldestFirst ? [oldest, copy, third] : [copy, third, oldest], CancellationToken.None);
+        var kept = OccurrenceOf(oldest, T0.AddMinutes(-10));
+        var removed = OccurrenceOf(copy, T0.AddMinutes(-20));
+        await Provider().InsertCronTickerOccurrences([kept, removed], CancellationToken.None);
+
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        var stored = Assert.Single(await StoredAsync());
+        Assert.Equal(oldest.Id, stored.Key);
+        Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+        var occurrences = await Provider().GetAllCronTickerOccurrences(_ => true, CancellationToken.None);
+        Assert.Equal([kept.Id], occurrences.Select(o => o.Id));
+        // Nothing of the copies is left in the store: the rows, their index entries and their occurrences.
+        Assert.Equal(1, await fixture.Database.SetLengthAsync(RedisKeyBuilder.CronIdsKey));
+        Assert.False(await fixture.Database.KeyExistsAsync(RedisKeyBuilder.CronKey(copy.Id)));
+        Assert.False(await fixture.Database.KeyExistsAsync(RedisKeyBuilder.CronKey(third.Id)));
+        Assert.False(await fixture.Database.KeyExistsAsync(RedisKeyBuilder.CronOccurrenceKey(removed.Id)));
+    }
+
+    // Created in the same instant: every node must keep the same row, so the id decides.
+    [Fact]
+    public async Task SeededCopiesCreatedAtTheSameTime_TheOneWithTheLowestIdIsKept()
+    {
+        var a = Cron("0 0 3 * * *", Seeded);
+        var b = Cron("0 0 3 * * *", Seeded);
+        await Provider().InsertCronTickers([a, b], CancellationToken.None);
+
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        Assert.Equal(a.Id.CompareTo(b.Id) < 0 ? a.Id : b.Id, Assert.Single(await StoredAsync()).Key);
+    }
+
+    // A user's cron and a row with the marker of another function are not copies, whatever their number.
+    [Fact]
+    public async Task CronsWithoutTheSeedMarker_AreNotRemovedAsCopies()
+    {
+        CronTickerEntity[] rows = [Cron("0 0 3 * * *", Seeded), Cron("0 0 3 * * *"), Cron("0 0 3 * * *", "MemoryTicker_Seeded_another-fn")];
+        await Provider().InsertCronTickers(rows, CancellationToken.None);
+
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        Assert.Equal(rows.Select(r => r.Id).OrderBy(x => x), (await StoredAsync()).Keys.OrderBy(x => x));
     }
 }
