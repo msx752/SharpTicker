@@ -73,7 +73,10 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
                 return new ValueTask(Task.FromException(new InvalidOperationException("Scheduler is frozen")));
 
             Priorities.Enqueue(priority);
-            _running.Enqueue(Task.Run(() => work(CancellationToken.None)));
+            // On the calling thread, up to the work's first wait: a job with a free slot has started when the caller goes on.
+            // With Task.Run it started some time later, and a stop or a freeze right after the hand-over could put its claim
+            // back first, so the row was Idle where the test expects the started job's InProgress.
+            _running.Enqueue(work(CancellationToken.None));
             OnQueued?.Invoke(Priorities.Count);
             return ValueTask.CompletedTask;
         }
