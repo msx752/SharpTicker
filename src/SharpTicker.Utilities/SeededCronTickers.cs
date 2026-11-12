@@ -57,6 +57,28 @@ internal static class SeededCronTickers
         return rowsOfFunction.Count == 1 ? rowsOfFunction.ToList() : [];
     }
 
+    /// <summary>The warning when <see cref="Copies"/> were removed.</summary>
+    internal const string CopiesRemovedWarning =
+        "Removed {Count} copies of the code-defined cron of {Function}, with their occurrences. They were made when several nodes started at the same time; the oldest one is kept.";
+
+    /// <summary>
+    /// The rows of one function to remove because they are copies of its seeded cron: of the rows that carry the seed's
+    /// marker for this function, all but the oldest. Every one of them runs the job on every tick. The order (creation
+    /// time, then id) is the same on every node, so nodes that start together keep the same row. Rows without the marker
+    /// (a user's cron, or a seeded cron edited on the dashboard) are never among them.
+    /// </summary>
+    internal static IReadOnlyList<TCronTicker> Copies<TCronTicker>(IReadOnlyCollection<TCronTicker> rowsOfFunction)
+        where TCronTicker : CronTickerEntity
+    {
+        var seeded = rowsOfFunction
+            .Where(c => string.Equals(c.InitIdentifier, InitIdentifierFor(c.Function), StringComparison.Ordinal))
+            .OrderBy(c => c.CreatedAt)
+            .ThenBy(c => c.Id)
+            .ToList();
+
+        return seeded.Count > 1 ? seeded.GetRange(1, seeded.Count - 1) : [];
+    }
+
     /// <summary>True when the function has several stored crons and none of them is marked as seeded.</summary>
     internal static bool IsAmbiguous<TCronTicker>(IReadOnlyCollection<TCronTicker> rowsOfFunction)
         where TCronTicker : CronTickerEntity
