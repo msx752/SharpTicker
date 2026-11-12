@@ -1,4 +1,7 @@
+using System.Reflection;
+using SharpTicker.Caching.StackExchangeRedis.Helpers;
 using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
+using StackExchange.Redis;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
@@ -15,6 +18,11 @@ public class RedisCronSeedTests(RedisTestFixture fixture) : IAsyncLifetime
 {
     private const string Function = "cron-seed-fn";
     private const string Seeded = "MemoryTicker_Seeded_" + Function;
+    private const string AnotherFunction = "cron-seed-another-fn";
+
+    // The first 16 bytes of SHA-256("SharpTicker.SeededCron:cron-seed-fn"), computed outside .NET. The id is stored, so
+    // how it is made is a contract.
+    private static readonly Guid IdOfFunction = Guid.Parse("1810d369-8a39-7c24-16ee-042e48d95bdc");
     private static readonly DateTime T0 = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
 
     public Task InitializeAsync()
@@ -23,7 +31,8 @@ public class RedisCronSeedTests(RedisTestFixture fixture) : IAsyncLifetime
         TickerFunctionProvider.RegisterFunctions(
             new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)>
             {
-                [Function] = ("", TickerTaskPriority.Normal, (_, _, _) => Task.CompletedTask, 0)
+                [Function] = ("", TickerTaskPriority.Normal, (_, _, _) => Task.CompletedTask, 0),
+                [AnotherFunction] = ("", TickerTaskPriority.Normal, (_, _, _) => Task.CompletedTask, 0)
             });
         TickerFunctionProvider.Build();
         return fixture.ResetAsync();
@@ -96,5 +105,71 @@ public class RedisCronSeedTests(RedisTestFixture fixture) : IAsyncLifetime
         var stored = Assert.Single(await StoredAsync());
         Assert.Equal(only.Id, stored.Key);
         Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+    }
+
+    // Two replicas of a new deployment: both read that the cron is missing, then both add it.
+    [Fact]
+    public async Task TwoNodesStartingTogether_SeedTheCronOnce()
+    {
+        (string, string)[] defined = [(Function, "0 0 4 * * *")];
+        var hooked = DispatchProxy.Create<IDatabase, RedisClaimMultiNodeTests.HookedDatabase>();
+        var hook = (RedisClaimMultiNodeTests.HookedDatabase)hooked;
+        hook.Inner = fixture.Database;
+        hook.HookOn = nameof(IDatabase.SetMembersAsync);
+        var nodeBSeeded = false;
+        // Node A has read which crons exist (none); node B's whole seed runs before node A goes on.
+        hook.AfterNextCall = async () =>
+        {
+            await fixture.CreateProvider("node-B", new FakeTickerClock(T0)).MigrateDefinedCronTickers(defined, CancellationToken.None);
+            nodeBSeeded = true;
+        };
+
+        await fixture.CreateProvider("node-A", new FakeTickerClock(T0), hooked).MigrateDefinedCronTickers(defined, CancellationToken.None);
+
+        Assert.True(nodeBSeeded, "the other node did not seed between this node's read and its write");
+        var stored = Assert.Single(await StoredAsync());
+        Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+        Assert.Equal(1, await fixture.Database.SetLengthAsync(RedisKeyBuilder.CronIdsKey));
+    }
+
+    [Fact]
+    public async Task ASeededCron_GetsTheIdOfItsFunctionName()
+    {
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        Assert.Equal(IdOfFunction, Assert.Single(await StoredAsync()).Key);
+    }
+
+    // A seeded cron whose function was changed keeps its id, the id of the old function name.
+    [Fact]
+    public async Task TheIdOfTheFunctionNameIsTakenByACronOfAnotherFunction_TheCronIsStillSeeded()
+    {
+        var holder = Cron("0 0 1 * * *");
+        holder.Id = IdOfFunction;
+        holder.Function = AnotherFunction;
+        await Provider().InsertCronTickers([holder], CancellationToken.None);
+
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        var stored = Assert.Single(await StoredAsync());
+        Assert.NotEqual(IdOfFunction, stored.Key);
+        Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+        var kept = Assert.Single(await Provider().GetCronTickers(c => c.Id == IdOfFunction, CancellationToken.None));
+        Assert.Equal(AnotherFunction, kept.Function);
+        Assert.Equal("0 0 1 * * *", kept.Expression);
+    }
+
+    // The node that created the row stopped before it added the row to the index of crons: no node sees the cron. With a
+    // fixed id no later start could create it again, so the start that finds the row adds it to the index.
+    [Fact]
+    public async Task ASeededCronThatIsMissingFromTheIndex_IsSeenAgainAfterTheNextStart()
+    {
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+        Assert.True(await fixture.Database.SetRemoveAsync(RedisKeyBuilder.CronIdsKey, IdOfFunction.ToString()));
+        Assert.Empty(await StoredAsync());
+
+        await Provider().MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        Assert.Equal(IdOfFunction, Assert.Single(await StoredAsync()).Key);
     }
 }
