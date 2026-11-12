@@ -1,4 +1,6 @@
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Events;
+using SharpTicker.MongoDB.Infrastructure;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
@@ -92,5 +94,73 @@ public class MongoCronSeedTests(MongoTestFixture fixture) : IClassFixture<MongoT
         var stored = Assert.Single(await StoredAsync());
         Assert.Equal(only.Id, stored.Key);
         Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+    }
+
+    /// <summary>
+    /// A node of its own connection whose first insert of a cron is held until <paramref name="beforeFirstInsert"/> has
+    /// run: what another node does between this node's read of the stored crons and its write.
+    /// </summary>
+    private TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity> NodeThatIsOvertaken(Func<Task> beforeFirstInsert)
+    {
+        var overtaken = 0;
+        var settings = MongoClientSettings.FromConnectionString(fixture.Container.GetConnectionString());
+        settings.ClusterConfigurator = cluster => cluster.Subscribe<CommandStartedEvent>(started =>
+        {
+            if (started.CommandName == "insert" && Interlocked.Exchange(ref overtaken, 1) == 0)
+                Task.Run(beforeFirstInsert).GetAwaiter().GetResult();
+        });
+
+        var context = new TickerMongoContext<TimeTickerEntity, CronTickerEntity>(
+            new MongoClient(settings).GetDatabase(fixture.Database.DatabaseNamespace.DatabaseName), "ticker_");
+        return new TickerMongoPersistenceProvider<TimeTickerEntity, CronTickerEntity>(
+            context, fixture.Clock, new SchedulerOptionsBuilder { NodeIdentifier = "node-a" });
+    }
+
+    // Two replicas of a new deployment: both read that the cron is missing, then both insert it.
+    [Fact]
+    public async Task TwoNodesStartingTogether_SeedTheCronOnce()
+    {
+        (string, string)[] defined = [(Function, "0 0 4 * * *")];
+        var nodeBSeeded = false;
+        var nodeA = NodeThatIsOvertaken(async () =>
+        {
+            await fixture.Provider.MigrateDefinedCronTickers(defined, CancellationToken.None);
+            nodeBSeeded = true;
+        });
+
+        await nodeA.MigrateDefinedCronTickers(defined, CancellationToken.None);
+
+        Assert.True(nodeBSeeded, "the other node did not seed between this node's read and its write");
+        var stored = Assert.Single(await StoredAsync());
+        Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+        Assert.Equal(Seeded, stored.Value.InitIdentifier);
+    }
+
+    // The id is stored, so how it is made is a contract. The expected value was computed outside .NET: the first 16
+    // bytes of SHA-256("SharpTicker.SeededCron:cron-seed-fn").
+    [Fact]
+    public async Task ASeededCron_GetsTheIdOfItsFunctionName()
+    {
+        await fixture.Provider.MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        var stored = Assert.Single(await StoredAsync());
+        Assert.Equal(Guid.Parse("1810d369-8a39-7c24-16ee-042e48d95bdc"), stored.Key);
+    }
+
+    // A seeded cron whose function was changed keeps its id, the id of the old function name.
+    [Fact]
+    public async Task TheIdOfTheFunctionNameIsTakenByACronOfAnotherFunction_TheCronIsStillSeeded()
+    {
+        var holder = Cron("0 0 1 * * *");
+        holder.Id = Guid.Parse("1810d369-8a39-7c24-16ee-042e48d95bdc");
+        holder.Function = "another-fn";
+        await fixture.CronTickers.InsertOneAsync(holder);
+
+        await fixture.Provider.MigrateDefinedCronTickers([(Function, "0 0 4 * * *")], CancellationToken.None);
+
+        var stored = Assert.Single(await StoredAsync());
+        Assert.NotEqual(holder.Id, stored.Key);
+        Assert.Equal("0 0 4 * * *", stored.Value.Expression);
+        Assert.Equal("another-fn", (await fixture.CronTickers.Find(c => c.Id == holder.Id).SingleAsync()).Function);
     }
 }
