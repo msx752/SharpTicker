@@ -1610,5 +1610,115 @@ public class InternalTickerManagerTests
         await _persistence.Received(1).UpdateCronTickerOccurrence(context, Arg.Any<CancellationToken>());
     }
 
+    #region The start claim of an inline chain child (#83)
+
+    private (ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker> Store, IInternalTickerManager Manager) FencedManager(ClaimPutBackRetryList retry = null)
+    {
+        var store = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IFencedRunWriter>();
+        return (store, new InternalTickerManager<FakeTimeTicker, FakeCronTicker>(store, _clock, _notificationHub, null, retry));
+    }
+
+    private static InternalFunctionContext InlineChild() => new() { TickerId = Guid.NewGuid(), FunctionName = "child-fn", Type = TickerType.TimeTicker };
+
+    [Fact]
+    public async Task RecordChildStarted_AWonClaim_GivesTheChildItsMarker_AndIsTrue()
+    {
+        var (store, manager) = FencedManager();
+        var child = InlineChild();
+        DateTime? written = null;
+        ((IFencedRunWriter)store).StartInlineChildAsync(child.TickerId, Arg.Do<DateTime>(m => written = m), Arg.Any<CancellationToken>()).Returns(1);
+
+        Assert.True(await manager.RecordChildStartedAsync(child));
+
+        Assert.NotNull(written);
+        Assert.Equal(written, child.RunMarker);
+        await _notificationHub.Received(1).UpdateTimeTickerFromInternalFunctionContext<FakeTimeTicker>(child);
+    }
+
+    // The row did not wait for its start: the caller must not run the child, and nothing says it is running.
+    [Fact]
+    public async Task RecordChildStarted_ARefusedClaim_IsFalse_AndNothingIsReported()
+    {
+        var (store, manager) = FencedManager();
+        var child = InlineChild();
+        ((IFencedRunWriter)store).StartInlineChildAsync(child.TickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(0);
+
+        Assert.False(await manager.RecordChildStartedAsync(child));
+
+        Assert.Null(child.RunMarker);
+        Assert.NotEqual(TickerStatus.InProgress, child.Status);
+        await _notificationHub.DidNotReceiveWithAnyArgs().UpdateTimeTickerFromInternalFunctionContext<FakeTimeTicker>(default);
+        await store.DidNotReceiveWithAnyArgs().TryReleaseTimeTickerClaim(default, default, default);
+    }
+
+    // The claim's write may have landed before the call failed. The caller does not run the child then, so the row is put
+    // back by the marker of that claim, and the failure still reaches the caller.
+    [Fact]
+    public async Task RecordChildStarted_AClaimThatFails_IsPutBackByItsMarker_AndTheFailureIsThrown()
+    {
+        var (store, manager) = FencedManager();
+        var child = InlineChild();
+        DateTime? written = null;
+        ((IFencedRunWriter)store).StartInlineChildAsync(child.TickerId, Arg.Do<DateTime>(m => written = m), Arg.Any<CancellationToken>())
+            .Returns<int>(_ => throw new InvalidOperationException("reply lost"));
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => manager.RecordChildStartedAsync(child));
+
+        Assert.Equal("reply lost", thrown.Message);
+        Assert.NotNull(written);
+        await store.Received(1).TryReleaseTimeTickerClaim(child.TickerId, written.Value, Arg.Any<CancellationToken>());
+        Assert.Null(child.RunMarker);
+    }
+
+    // The put-back failed too (the store is still down): the row goes to the retry list, so it does not stay InProgress
+    // with nothing running it until this node restarts.
+    [Fact]
+    public async Task RecordChildStarted_AClaimThatFailsAndCannotBePutBack_GoesToTheRetryList()
+    {
+        var retry = new ClaimPutBackRetryList();
+        var (store, manager) = FencedManager(retry);
+        var child = InlineChild();
+        DateTime? written = null;
+        ((IFencedRunWriter)store).StartInlineChildAsync(child.TickerId, Arg.Do<DateTime>(m => written = m), Arg.Any<CancellationToken>())
+            .Returns<int>(_ => throw new InvalidOperationException("store down"));
+        store.TryReleaseTimeTickerClaim(child.TickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>())
+            .Returns<bool>(_ => throw new InvalidOperationException("store still down"));
+
+        await Assert.ThrowsAsync<ClaimPutBackFailedException>(() => manager.RecordChildStartedAsync(child));
+
+        Assert.Equal([new NotPutBackClaim(child.TickerId, written!.Value, TickerType.TimeTicker)], retry.TakeAll());
+    }
+
+    // The child is started once its claim is won: a dashboard that cannot be notified must not make the caller drop it.
+    [Fact]
+    public async Task RecordChildStarted_AFailedNotificationAfterAWonClaim_IsStillTrue()
+    {
+        var (store, manager) = FencedManager();
+        var child = InlineChild();
+        ((IFencedRunWriter)store).StartInlineChildAsync(child.TickerId, Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(1);
+        _notificationHub.UpdateTimeTickerFromInternalFunctionContext<FakeTimeTicker>(child)
+            .Returns<Task>(_ => throw new InvalidOperationException("hub down"));
+
+        Assert.True(await manager.RecordChildStartedAsync(child));
+
+        Assert.NotNull(child.RunMarker);
+        await store.DidNotReceiveWithAnyArgs().TryReleaseTimeTickerClaim(default, default, default);
+    }
+
+    // A custom provider that does not fence runs: the start is written by Id, as before, and the child runs.
+    [Fact]
+    public async Task RecordChildStarted_OnAStoreThatDoesNotFenceRuns_WritesByIdAndIsTrue()
+    {
+        var manager = new InternalTickerManager<FakeTimeTicker, FakeCronTicker>(_persistence, _clock, _notificationHub);
+        var child = InlineChild();
+
+        Assert.True(await manager.RecordChildStartedAsync(child));
+
+        Assert.Null(child.RunMarker);
+        await _persistence.Received(1).UpdateTimeTicker(Arg.Is<InternalFunctionContext>(c => c.TickerId == child.TickerId && c.Status == TickerStatus.InProgress), Arg.Any<CancellationToken>());
+    }
+
+    #endregion
+
     #endregion
 }

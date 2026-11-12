@@ -350,6 +350,27 @@ public class MongoFencedRunTests : IClassFixture<MongoTestFixture>, IAsyncLifeti
         }
     }
 
+    // A start whose write landed while its call failed is put back by its marker (the manager does that): the child waits
+    // again and can be started.
+    [Fact]
+    public async Task AnInlineStartThatIsPutBack_LeavesTheChildWaitingAgain()
+    {
+        var a = CreateNode("node-A");
+        var b = CreateNode("node-B");
+        var child = InlineChild();
+        await SeedTimeTicker(T0, child);
+        var marker = a.Manager.NextClaimMarker();
+        Assert.Equal(1, await StartInline(a, child.Id, marker));
+
+        Assert.True(await a.Store.TryReleaseTimeTickerClaim(child.Id, marker, CancellationToken.None));
+
+        var row = await Row(child.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(1, await StartInline(b, child.Id, b.Manager.NextClaimMarker()));
+    }
+
     // T9: an inline child carries this node's lock while it runs, so the release of the node's rows frees it (this store
     // releases a running row of the node to Idle) instead of leaving it InProgress for good. It has no time of its own, so
     // no claim path hands it out again.

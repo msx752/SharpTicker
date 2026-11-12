@@ -38,9 +38,11 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         // The stop's write of a job still running (Cancelled, lock released). With a RunMarker on a fencing store it lands only
         // while the row is still this run and still InProgress; otherwise by Id, as before. True when written.
         Task<bool> RecordStoppedRunAsync(InternalFunctionContext context, CancellationToken cancellationToken = default);
-        // Records an inline chain child as started (InProgress). On a fencing store it also takes this node's lock and a run
-        // marker, set on the child when the row was written; otherwise the child's writes stay by Id. Throws when the store fails.
-        Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default);
+        // Starts an inline chain child: its row goes to InProgress. On a fencing store this is a claim (the row must still wait
+        // for its start) that takes this node's lock and a run marker, set on the child; false when the claim was refused, and
+        // the child must then not run here. On another store the write is by Id and the result is always true. Throws when the
+        // store fails; a claim that may have landed before it failed is put back first.
+        Task<bool> RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, CancellationToken cancellationToken = default);
         Task<T> GetRequestAsync<T>(Guid tickerId, TickerType type, JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken = default);
         Task<InternalFunctionContext[]> RunTimedOutTickers(CancellationToken cancellationToken = default);

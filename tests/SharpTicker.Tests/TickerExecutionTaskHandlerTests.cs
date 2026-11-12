@@ -32,6 +32,8 @@ public class TickerExecutionTaskHandlerTests : IDisposable
         _internalManager = Substitute.For<IInternalTickerManager>();
         // The store has every write, unless a test says otherwise.
         _internalManager.UpdateTickerAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
+        // An inline child's start claim is won, unless a test says otherwise.
+        _internalManager.RecordChildStartedAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>()).Returns(true);
         _instrumentation = Substitute.For<ISharpTickerInstrumentation>();
 
         var services = new ServiceCollection();

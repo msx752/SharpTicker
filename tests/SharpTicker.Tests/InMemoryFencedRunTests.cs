@@ -367,6 +367,27 @@ public class InMemoryFencedRunTests : IAsyncLifetime
         }
     }
 
+    // A start whose write landed while its call failed is put back by its marker (the manager does that): the child waits
+    // again and can be started.
+    [Fact]
+    public async Task AnInlineStartThatIsPutBack_LeavesTheChildWaitingAgain()
+    {
+        var a = CreateNode("node-A");
+        var b = CreateNode("node-B");
+        var child = InlineChild();
+        await SeedTimeTicker(T0, child);
+        var marker = a.Manager.NextClaimMarker();
+        Assert.Equal(1, await a.Store.StartInlineChildAsync(child.Id, marker, CancellationToken.None));
+
+        Assert.True(await a.Store.TryReleaseTimeTickerClaim(child.Id, marker, CancellationToken.None));
+
+        var row = await Row(child.Id);
+        Assert.Equal(TickerStatus.Idle, row.Status);
+        Assert.Null(row.LockHolder);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(1, await b.Store.StartInlineChildAsync(child.Id, b.Manager.NextClaimMarker(), CancellationToken.None));
+    }
+
     // T9: an inline child carries this node's lock while it runs, so the release of a dead node's rows ends it (this store
     // records a running row of a dead node as Skipped) instead of leaving it InProgress for good; it has no time of its own,
     // so no claim path hands it out again.
