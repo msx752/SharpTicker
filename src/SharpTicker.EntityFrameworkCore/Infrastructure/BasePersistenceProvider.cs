@@ -533,7 +533,6 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var dbContext = session.Context;
         var now = _clock.UtcNow;
 
-        var functions = cronTickers.Select(x => x.Function).ToList();
         var cronSet = dbContext.Set<TCronTicker>();
 
         // Build the complete list of registered function names to detect orphaned tickers.
@@ -571,7 +570,25 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .ConfigureAwait(false);
         }
 
-        var newFunctionSet = functions.ToHashSet(StringComparer.Ordinal);
+        try
+        {
+            await SeedDefinedCronTickersAsync(dbContext, cronTickers, now, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DbUpdateException)
+        {
+            // Another node that started at the same time inserted a seeded cron first: its row has the same id (the id of
+            // the function name), so this insert met the key. Read again and add only what is still missing. A second
+            // failure is not that race and is thrown.
+            dbContext.ChangeTracker.Clear();
+            await SeedDefinedCronTickersAsync(dbContext, cronTickers, now, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task SeedDefinedCronTickersAsync(TDbContext dbContext, (string Function, string Expression)[] cronTickers, DateTime now,
+        CancellationToken cancellationToken)
+    {
+        var functions = cronTickers.Select(x => x.Function).ToList();
+        var cronSet = dbContext.Set<TCronTicker>();
 
         // Load existing (remaining) cron tickers for the current function set
         var existing = await cronSet
@@ -582,6 +599,13 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         var existingByFunction = existing
             .GroupBy(c => c.Function)
             .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList());
+
+        // The id of a function name can be held by a cron of another function (a seeded cron whose function was changed on
+        // the dashboard). The cron is then seeded under another id; that one start has no guard against a second node.
+        var seedIds = cronTickers.Where(x => !existingByFunction.ContainsKey(x.Function)).Select(x => SeededCronTickers.IdFor(x.Function)).ToList();
+        var takenIds = seedIds.Count == 0
+            ? []
+            : await cronSet.Where(c => seedIds.Contains(c.Id)).Select(c => c.Id).ToListAsync(cancellationToken).ConfigureAwait(false);
 
         foreach (var (function, expression) in cronTickers)
         {
@@ -603,9 +627,10 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             else
             {
                 // Insert new seeded cron ticker
+                var seedId = SeededCronTickers.IdFor(function);
                 var entity = new TCronTicker
                 {
-                    Id = Guid.NewGuid(),
+                    Id = takenIds.Contains(seedId) ? Guid.NewGuid() : seedId,
                     Function = function,
                     Expression = expression,
                     InitIdentifier = SeededCronTickers.InitIdentifierFor(function),
