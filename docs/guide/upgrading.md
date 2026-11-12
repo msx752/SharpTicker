@@ -12,10 +12,10 @@ This page points to those notes and names what needs a decision or a step from y
 - Upgrade all instances together where you can. An instance of an earlier version behaves as that version did, so what a newer release changed does not apply to the jobs it runs.
 - Coming from a version before 1.3.0: upgrade all instances together, and do not go back below 1.3.0 once chains were added on the new version.
 - Coming from a version before 1.3.0 with Redis as the job store, two kinds of stored jobs did not carry over in a run that went from 1.2.3 to 1.4.0:
-  - Time jobs that 1.2.3 had picked up were `InProgress` without having run, and stayed so on 1.4.0 under the same `NodeIdentifier`. Its log has `Failed to deserialize JSON payload as TimeTickerEntity` for them.
+  - Time jobs that 1.2.3 had picked up were `InProgress` without having run, and stayed so on 1.4.0 under the same `NodeIdentifier`. Its log has `Failed to deserialize JSON payload as TimeTickerEntity` for them. A build with the fix for [#144](https://github.com/msx752/SharpTicker/issues/144), which comes after 1.4.0, read these rows in a run from 1.2.3: started under the same `NodeIdentifier`, it released them, and each ran once, late.
   - A chain stored by that version keeps its children inside the parent's record. On 1.4.0 the parent ran, and its children were not started.
 
-  Look for both before the upgrade, and delete such jobs and add them again afterwards. See [Scheduling](scheduling.md#delayed-children).
+  Look for both before the upgrade. On 1.4.0, delete such jobs and add them again afterwards. With the fix for #144, the `InProgress` time jobs run after the upgrade, so delete the ones that should not run any more; the chains still have to be deleted and added again. See [Scheduling](scheduling.md#delayed-children).
 
 ## Release by release
 

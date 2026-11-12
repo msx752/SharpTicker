@@ -217,8 +217,8 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal("node-A", read.LockHolder);
     }
 
-    // A row written by the old scripts has "Children":{} and is unreadable; the next script run writes it back as an
-    // array, so rows already stored in that state heal.
+    // A row written by the old scripts has "Children":{}. It is read with no children (see EmptyCollectionRepair), and the
+    // next script run writes it back as an array, so rows already stored in that state heal.
     [Fact]
     public async Task StoredRowWithBrokenChildren_HealsOnNextAcquire()
     {
@@ -229,7 +229,7 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         var key = RedisKeyBuilder.TimeTickerKey(ticker.Id);
         var broken = (await RawJson(ticker.Id)).Replace("\"Children\":[]", "\"Children\":{}").Replace("\"RetryIntervals\":[]", "\"RetryIntervals\":{}");
         await fixture.Database.StringSetAsync(key, broken);
-        Assert.Null(await node.GetTimeTickerById(ticker.Id, CancellationToken.None));
+        Assert.Empty((await node.GetTimeTickerById(ticker.Id, CancellationToken.None))!.Children);
 
         var acquired = await node.AcquireImmediateTimeTickersAsync([ticker.Id], CancellationToken.None);
 
@@ -237,6 +237,7 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         var read = await node.GetTimeTickerById(ticker.Id, CancellationToken.None);
         Assert.NotNull(read);
         Assert.Equal(TickerStatus.InProgress, read!.Status);
+        Assert.Contains("\"Children\":[]", await RawJson(ticker.Id));
     }
 
     // The rewrite is keyed on the property name. Inside a string value the quotes are escaped, so the same text in a
