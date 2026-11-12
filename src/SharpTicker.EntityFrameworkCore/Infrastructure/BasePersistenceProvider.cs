@@ -596,6 +596,29 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
+        // Copies of a seeded cron, left by nodes that started together before the seeded id was fixed, are removed.
+        foreach (var rowsOfFunction in existing.GroupBy(c => c.Function).ToList())
+        {
+            var copies = SeededCronTickers.Copies(rowsOfFunction.ToList());
+            if (copies.Count == 0)
+                continue;
+
+            // Their occurrences go with them: the model deletes the occurrences of a deleted cron.
+            var copyIds = copies.Select(c => c.Id).ToList();
+            await cronSet
+                .Where(c => copyIds.Contains(c.Id))
+                .ExecuteDeleteAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (var copy in copies)
+            {
+                dbContext.Entry(copy).State = EntityState.Detached;
+                existing.Remove(copy);
+            }
+
+            _logger.LogWarning(SeededCronTickers.CopiesRemovedWarning, copies.Count, rowsOfFunction.Key);
+        }
+
         var existingByFunction = existing
             .GroupBy(c => c.Function)
             .ToDictionary(g => g.Key, g => (IReadOnlyCollection<TCronTicker>)g.ToList());
