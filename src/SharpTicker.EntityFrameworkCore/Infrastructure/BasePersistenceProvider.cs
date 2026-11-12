@@ -109,8 +109,9 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var now = _clock.UtcNow;
 
+        // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync).
         return await session.Context.Set<TTimeTicker>()
-            .Where(x => x.Id == timeTickerId)
+            .Where(x => x.Id == timeTickerId && x.Status == TickerStatus.Idle && x.LockHolder == null && x.ExecutionTime == null)
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.InProgress)
                 .SetProperty(x => x.LockHolder, _lockHolder)
@@ -226,6 +227,68 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             timeTicker.UpdatedAt = claimMarker;
             yield return timeTicker;
         }
+
+        // A child without a time of its own is started by its parent's run. One that still waits some time after its
+        // parent ended was never started (the node stopped, or its start claim failed): it is claimed here when the
+        // parent's outcome lets it run, and skipped when not. Its claim is the one of the inline start, so one of them wins.
+        var leftWaiting = await context
+            .AsNoTracking()
+            .WhereChildLeftWaiting(now - ChainRunGate.FallbackGraceForChildWithoutTime)
+            .Select(x => new { x.Id, x.RunCondition, ParentStatus = x.Parent.Status })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        var neverRuns = leftWaiting.Where(x => !ChainRunGate.AllowsRunNow(x.RunCondition, x.ParentStatus, hasOwnTime: false)).Select(x => x.Id).ToList();
+        if (neverRuns.Count > 0)
+        {
+            try
+            {
+                await SkipNotStartedAsync(context, neverRuns, now, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "Skipping chain children without a time whose ended parent does not let them run failed; the next fallback pass tries again.");
+            }
+        }
+
+        var runs = leftWaiting.Select(x => x.Id).Except(neverRuns).ToList();
+        if (runs.Count == 0)
+            yield break;
+
+        var childrenToClaim = await context
+            .AsNoTracking()
+            .Where(x => runs.Contains(x.Id))
+            .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .ToArrayAsync(cancellationToken).ConfigureAwait(false);
+
+        foreach (var child in childrenToClaim)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var claimMarker = _clock.NextClaimMarker();
+            int affected;
+            try
+            {
+                affected = await context
+                    .Where(x => x.Id == child.Id && x.UpdatedAt <= child.UpdatedAt)
+                    .Where(x => x.Status == TickerStatus.Idle && x.ExecutionTime == null)
+                    .ExecuteUpdateAsync(setter => setter
+                        .SetProperty(x => x.LockHolder, _lockHolder)
+                        .SetProperty(x => x.LockedAt, now)
+                        .SetProperty(x => x.UpdatedAt, claimMarker)
+                        .SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                await ClaimPutBack.PutBackOrThrowAsync(child.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                throw;
+            }
+
+            if (affected <= 0)
+                continue;
+
+            child.UpdatedAt = claimMarker;
+            yield return child;
+        }
     }
 
     // A delayed child whose parent ended with an outcome it does not run on never will. The parent's run skips it; this
@@ -245,8 +308,12 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         if (outcomeDoesNotMatch.Count == 0)
             return;
 
-        await context
-            .Where(x => outcomeDoesNotMatch.Contains(x.Id))
+        await SkipNotStartedAsync(context, outcomeDoesNotMatch, now, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static Task SkipNotStartedAsync(DbSet<TTimeTicker> context, List<Guid> ids, DateTime now, CancellationToken cancellationToken)
+        => context
+            .Where(x => ids.Contains(x.Id))
             .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
             .ExecuteUpdateAsync(setter => setter
                 .SetProperty(x => x.Status, TickerStatus.Skipped)
@@ -254,8 +321,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .SetProperty(x => x.SkippedReason, ChainRunGate.NotMatchedReason)
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
-                .SetProperty(x => x.UpdatedAt, now), cancellationToken).ConfigureAwait(false);
-    }
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken);
 
     public async Task ReleaseAcquiredTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken)
     {

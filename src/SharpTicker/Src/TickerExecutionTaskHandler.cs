@@ -49,11 +49,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             return;
         }
 
-        // A chain child without a time of its own runs inside its parent's run and was never claimed: its row is recorded
-        // InProgress here, before it starts and before its InProgress delayed children are handed off (the store lets them
-        // run once this row is InProgress).
-        if (isChild)
-            await RecordChildInProgressAsync(context, cancellationToken);
+        // A chain child without a time of its own runs inside its parent's run. It is claimed here, before it starts and
+        // before its InProgress delayed children are handed off (the store lets them run once this row is InProgress). A
+        // child whose claim was refused or failed is not run here, and neither is anything below it: whoever holds its row
+        // carries its children.
+        if (isChild && !await TryStartInlineChildAsync(context, cancellationToken))
+            return;
 
         var childCount = context.TimeTickerChildren.Count;
         var childrenToRunAfter = new InternalFunctionContext[childCount];
@@ -247,7 +248,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 continue;
 
             Logger?.LogWarning(
-                "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not claimed after its parent's outcome was stored late: its row was taken or changed meanwhile, or the claim failed. If its row is still Idle and has no execution time, nothing runs it; add a new job to run it.",
+                "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not claimed after its parent's outcome was stored late: its row was taken or changed meanwhile, or the claim failed. If its row is still Idle and has no execution time, the fallback takes it once its parent ended 30 seconds ago.",
                 child.FunctionName, child.TickerId, lateParent?.FunctionName, lateParent?.TickerId);
         }
     }
@@ -305,8 +306,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         
         context.SetProperty(x => x.Status, TickerStatus.InProgress);
 
-        // A claimed job's writes are fenced by the marker its claim wrote. An inline chain child got its marker when its start
-        // was recorded (RecordChildInProgressAsync), or none when that failed.
+        // A claimed job's writes are fenced by the marker its claim wrote. An inline chain child got its marker when it was
+        // started (TryStartInlineChildAsync); it has none with a store that does not fence runs.
         if (!isChild)
             context.RunMarker = context.ClaimMarker;
 
@@ -608,7 +609,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 // without a time, and writing it Skipped would record an outcome it did not have.
                 foreach (var child in allowed.Where(c => !c.IsDelayed))
                     Logger?.LogError(
-                        "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not started: its parent's {Status} outcome was stored only while the scheduler stopped. Its row stays Idle and nothing runs it; add a new job to run it.",
+                        "Chain child {FunctionName} ({TickerId}) of {ParentFunctionName} ({ParentId}) was not started: its parent's {Status} outcome was stored only while the scheduler stopped. Its row stays Idle; the fallback takes it once its parent ended 30 seconds ago.",
                         child.FunctionName, child.TickerId, outcome.FunctionName, outcome.TickerId, outcome.Status);
             }
         }
@@ -717,22 +718,31 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         }
     }
 
-    // The status is for the dashboard and the chain gate; a failed write must not stop the child, which nothing else would
-    // ever run, nor the rest of the chain. Its final status is written as usual.
-    private async Task RecordChildInProgressAsync(InternalFunctionContext child, CancellationToken cancellationToken)
+    // The start of an inline child is a claim on its stored row, so of the parent's run, a second run of the parent and the
+    // store's own hand-out of a child that was given a time, one starts it. False: the child must not run here. A refused
+    // claim means another start holds the row or already ran it. A failed claim leaves the row waiting (the manager puts
+    // back a write that may have landed), and running the child without its row would be a run nothing fences.
+    private async Task<bool> TryStartInlineChildAsync(InternalFunctionContext child, CancellationToken cancellationToken)
     {
         try
         {
-            await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken);
+            if (await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken))
+                return true;
+
+            Logger?.LogDebug("Chain child {FunctionName} ({TickerId}) is not started here: its row no longer waits for its start (it runs or ran elsewhere, or it has a time of its own now).",
+                child.FunctionName, child.TickerId);
+            return false;
         }
         catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
         {
-            Logger?.LogDebug(ex, "Recording chain child {FunctionName} ({TickerId}) as InProgress was cancelled.", child.FunctionName, child.TickerId);
+            Logger?.LogDebug(ex, "Starting chain child {FunctionName} ({TickerId}) was cancelled; it is not run here.", child.FunctionName, child.TickerId);
+            return false;
         }
         catch (Exception ex)
         {
-            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be recorded as InProgress; it runs anyway, and its writes are by Id, not fenced.",
+            Logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) could not be started because its claim failed; it is not run here and its row keeps waiting.",
                 child.FunctionName, child.TickerId);
+            return false;
         }
         finally
         {

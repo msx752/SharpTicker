@@ -56,6 +56,15 @@ public static class TickerQueryExtensions
             .Where(Expression.Lambda<Func<TTimeTicker, bool>>(Expression.Not(allowed.Body), allowed.Parameters[0]));
     }
 
+    // A child without a time of its own that still waits for its start although its parent ended on or before
+    // parentEndedBy (ChainRunGate.FallbackMayDecideChildWithoutTime): the parent's run never started it. A final parent
+    // without an end time counts as ended long ago.
+    internal static IQueryable<TTimeTicker> WhereChildLeftWaiting<TTimeTicker>(this IQueryable<TTimeTicker> q, DateTime parentEndedBy) where TTimeTicker : TimeTickerEntity<TTimeTicker>
+        => q.Where(e => e.ParentId != null && e.ExecutionTime == null && e.Status == TickerStatus.Idle && e.LockHolder == null)
+            .Where(e => e.Parent.Status == TickerStatus.Done || e.Parent.Status == TickerStatus.DueDone || e.Parent.Status == TickerStatus.Failed
+                        || e.Parent.Status == TickerStatus.Cancelled || e.Parent.Status == TickerStatus.Skipped)
+            .Where(e => e.Parent.ExecutedAt == null || e.Parent.ExecutedAt <= parentEndedBy);
+
     // Whether the parent's status lets the row run, by the row's RunCondition (null = OnAnyCompletedStatus).
     private static Expression<Func<TTimeTicker, bool>> ParentStatusAllows<TTimeTicker>() where TTimeTicker : TimeTickerEntity<TTimeTicker>
         => e => (

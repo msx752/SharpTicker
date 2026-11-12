@@ -1010,6 +1010,221 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Empty(await CreateProvider("node-B").AcquireImmediateTimeTickersAsync([child.Id], CancellationToken.None));
     }
 
+    #region The fallback and a child without a time of its own (#84)
+
+    // A parent (not due, so the fallback never takes the parent itself) with a child without a time that was never started.
+    private async Task<Guid> SeedLeftWaiting(TickerStatus parentStatus, DateTime? parentEndedAt, RunCondition? condition = RunCondition.OnSuccess,
+        Action<TimeTickerEntity>? shapeChild = null)
+    {
+        var child = NewTimeTicker();
+        child.ExecutionTime = null;
+        child.RunCondition = condition;
+        shapeChild?.Invoke(child);
+        var parent = NewTimeTicker(parentStatus, executionTime: T0.AddHours(1));
+        parent.ExecutedAt = parentEndedAt;
+        parent.Children = [child];
+        await CreateProvider("seed").AddTimeTickers([parent], CancellationToken.None);
+        return child.Id;
+    }
+
+    private Task<List<TimeTickerEntity>> Fallback(string node = "node-A") => Drain(CreateProvider(node).QueueTimedOutTimeTickers(CancellationToken.None));
+
+    private Task<bool> HasWaitingEntry(Guid childId) => fixture.Database.HashExistsAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey, childId.ToString());
+
+    // The parent's run starts such a child right after the parent ends. One that still waits 30 s later was never
+    // started: the fallback claims it as a job of its own, with what it carries.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_ThatStillWaits30SecondsAfterItsParentEnded()
+    {
+        var grandchild = NewTimeTicker();
+        grandchild.ExecutionTime = null;
+        grandchild.RunCondition = RunCondition.OnSuccess;
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddSeconds(-30), shapeChild: c => c.Children = [grandchild]);
+        var reader = CreateProvider("reader");
+
+        var taken = Assert.Single(await Fallback());
+
+        Assert.Equal(childId, taken.Id);
+        Assert.Equal([grandchild.Id], taken.Children.Select(x => x.Id));
+        var row = await ReadTimeTicker(reader, childId);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
+        Assert.Equal(T0, row.LockedAt);
+        Assert.Null(row.ExecutionTime);
+        Assert.Equal(row.UpdatedAt, taken.UpdatedAt);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(reader, grandchild.Id)).Status);
+        Assert.False(await HasWaitingEntry(childId));
+        Assert.True(await HasWaitingEntry(grandchild.Id));
+        Assert.Empty(await Fallback("node-B"));
+    }
+
+    // A final parent without an end time counts as ended long ago: its child must not wait forever.
+    [Fact]
+    public async Task TheFallback_TakesAChildWithoutATime_WhoseEndedParentHasNoEndTime()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, null);
+
+        Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
+    }
+
+    // Within the grace time the parent's run may still be about to start the child; a parent that has not ended starts
+    // it itself.
+    [Theory]
+    [InlineData(TickerStatus.Done, 29)]
+    [InlineData(TickerStatus.Failed, 29)]
+    [InlineData(TickerStatus.Idle, 3600)]
+    [InlineData(TickerStatus.Queued, 3600)]
+    [InlineData(TickerStatus.InProgress, 3600)]
+    public async Task TheFallback_LeavesAChildWithoutATime_WhoseParentHasNotEndedLongEnoughAgo(TickerStatus parentStatus, int endedSecondsAgo)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-endedSecondsAgo));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(CreateProvider("reader"), childId)).Status);
+        Assert.True(await HasWaitingEntry(childId));
+    }
+
+    // A row another start holds, or one that has run, is not a child left waiting.
+    [Theory]
+    [InlineData(TickerStatus.Idle, "node-B")]
+    [InlineData(TickerStatus.InProgress, "node-B")]
+    [InlineData(TickerStatus.Queued, null)]
+    [InlineData(TickerStatus.Done, null)]
+    public async Task TheFallback_LeavesAChildWithoutATime_ThatDoesNotWaitForItsStart(TickerStatus childStatus, string? lockHolder)
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-5), shapeChild: c =>
+        {
+            c.Status = childStatus;
+            c.LockHolder = lockHolder;
+        });
+        // Also with an index entry that is behind its row: the row decides.
+        await fixture.Database.HashSetAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey, childId.ToString(), Guid.NewGuid().ToString());
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(childStatus, (await ReadTimeTicker(CreateProvider("reader"), childId)).Status);
+    }
+
+    // The outcome does not let the child run, or the child was to start with its parent (InProgress) and the parent is
+    // over: it never runs. What it carries follows on a later pass, as for a delayed child.
+    [Theory]
+    [InlineData(TickerStatus.Failed, RunCondition.OnSuccess)]
+    [InlineData(TickerStatus.Skipped, RunCondition.OnAnyCompletedStatus)]
+    [InlineData(TickerStatus.Skipped, null)]
+    [InlineData(TickerStatus.Done, RunCondition.InProgress)]
+    public async Task TheFallback_SkipsAChildWithoutATime_ThatItsEndedParentDoesNotLetRun(TickerStatus parentStatus, RunCondition? condition)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), condition);
+
+        Assert.Empty(await Fallback());
+
+        var row = await ReadTimeTicker(CreateProvider("reader"), childId);
+        Assert.Equal(TickerStatus.Skipped, row.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, row.SkippedReason);
+        Assert.Equal(T0, row.ExecutedAt);
+        Assert.False(await HasWaitingEntry(childId));
+    }
+
+    [Fact]
+    public async Task TheFallback_DoesNotSkipAChildWithoutATime_WithinTheGraceTime()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Failed, T0.AddSeconds(-29));
+
+        Assert.Empty(await Fallback());
+
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(CreateProvider("reader"), childId)).Status);
+    }
+
+    // One start per child: the inline start of the parent's run and the fallback are claims on the same row. The entry of
+    // a child an inline start took stays until a fallback pass sees its row.
+    [Fact]
+    public async Task AChildTheFallbackTook_IsRefusedToAnInlineStart_AndOneAnInlineStartTook_IsNotTakenByTheFallback()
+    {
+        var takenByFallback = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var startedInline = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var b = (IFencedRunWriter)CreateProvider("node-B");
+        Assert.Equal(1, await b.StartInlineChildAsync(startedInline, T0.AddMilliseconds(500), CancellationToken.None));
+
+        Assert.Equal([takenByFallback], (await Fallback()).Select(x => x.Id));
+
+        Assert.Equal(0, await b.StartInlineChildAsync(takenByFallback, T0.AddMilliseconds(501), CancellationToken.None));
+        Assert.False(await HasWaitingEntry(startedInline));
+    }
+
+    // A child that is started after the fallback read it is not claimed by the fallback's write.
+    [Fact]
+    public async Task TheFallbacksClaim_IsRefused_WhenTheChildWasStartedAfterItWasRead()
+    {
+        var first = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        var second = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        // Both parents are on one page, so both children are read before the first is handed out.
+        var reader = CreateProvider("reader");
+        var b = (IFencedRunWriter)CreateProvider("node-B");
+        var taken = new List<Guid>();
+
+        await foreach (var row in CreateProvider("node-A").QueueTimedOutTimeTickers(CancellationToken.None))
+        {
+            taken.Add(row.Id);
+            var other = row.Id == first ? second : first;
+            Assert.Equal(1, await b.StartInlineChildAsync(other, T0.AddMilliseconds(500), CancellationToken.None));
+        }
+
+        Assert.Single(taken);
+        var startedByB = taken[0] == first ? second : first;
+        Assert.Equal("node-B", (await ReadTimeTicker(reader, startedByB)).LockHolder);
+    }
+
+    // The fallback finds such children through the waiting-children index. A row stored by a version before 1.4.0 has no
+    // entry (and an index write can fail): the first fallback pass of a process gives every waiting child its entry.
+    [Fact]
+    public async Task AChildStoredWithoutAnIndexEntry_IsIndexedByTheFirstFallbackPassOfAProcess_AndOnlyByThat()
+    {
+        var before = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        Assert.True(await fixture.Database.HashDeleteAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey, before.ToString()));
+        var process = CreateProvider("node-A");
+
+        Assert.Equal([before], (await Drain(process.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
+
+        var after = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+        Assert.True(await fixture.Database.HashDeleteAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey, after.ToString()));
+        Assert.Empty(await Drain(process.QueueTimedOutTimeTickers(CancellationToken.None)));
+        Assert.Equal([after], (await Fallback("node-B")).Select(x => x.Id));
+    }
+
+    // A chain added while the process runs is indexed by the write that stores it, not by the first pass.
+    [Fact]
+    public async Task AChildStoredAfterAProcessesFirstFallbackPass_IsFoundThroughTheIndexItsWriteMade()
+    {
+        var process = CreateProvider("node-A");
+        Assert.Empty(await Drain(process.QueueTimedOutTimeTickers(CancellationToken.None)));
+
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1));
+
+        Assert.Equal([childId], (await Drain(process.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
+    }
+
+    // The index holds a child only while it waits: not once it has a time, and not after its chain is removed.
+    [Fact]
+    public async Task TheWaitingEntryOfAChild_IsDropped_WhenItIsGivenATime_AndWhenItsChainIsRemoved()
+    {
+        var givenATime = await SeedLeftWaiting(TickerStatus.Idle, null);
+        var removed = await SeedLeftWaiting(TickerStatus.Idle, null);
+        var node = CreateProvider("node-A");
+        Assert.True(await HasWaitingEntry(givenATime));
+        Assert.True(await HasWaitingEntry(removed));
+
+        var edit = await ReadTimeTicker(node, givenATime);
+        edit.ExecutionTime = T0.AddHours(2);
+        await node.UpdateTimeTickers([edit], CancellationToken.None);
+        await node.RemoveTimeTickers([(await ReadTimeTicker(node, removed)).ParentId!.Value], CancellationToken.None);
+
+        Assert.False(await HasWaitingEntry(givenATime));
+        Assert.False(await HasWaitingEntry(removed));
+    }
+
+    #endregion
+
     // The handler skips a child its parent's outcome does not let run; only a row that has not started is written, so a
     // delayed child the store already handed out keeps the status of its run.
     [Fact]

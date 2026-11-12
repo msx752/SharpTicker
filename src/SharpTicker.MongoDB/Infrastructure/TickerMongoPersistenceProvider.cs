@@ -162,6 +162,103 @@ namespace SharpTicker.MongoDB.Infrastructure
                 candidate.UpdatedAt = claimMarker;
                 yield return BuildQueuedEntity(candidate, byParent);
             }
+
+            // A child without a time of its own is started by its parent's run. One that still waits some time after its
+            // parent ended was never started (the node stopped, or its start claim failed): it is claimed here when the
+            // parent's outcome lets it run, and skipped when not. Its claim is the one of the inline start, so one of
+            // them wins.
+            var waitsForItsInlineStart = fb.And(
+                fb.Eq(x => x.Status, TickerStatus.Idle),
+                fb.Eq(x => x.ExecutionTime, null),
+                fb.Eq(x => x.LockHolder, (string)null));
+
+            var waiting = await coll.Find(fb.And(waitsForItsInlineStart, fb.Ne(x => x.ParentId, null)))
+                .Project(x => new { x.Id, x.ParentId, x.RunCondition })
+                .ToListAsync(cancellationToken).ConfigureAwait(false);
+            if (waiting.Count == 0)
+                yield break;
+
+            var parentEnds = await LoadParentEnds(waiting.Select(c => c.ParentId.Value), cancellationToken).ConfigureAwait(false);
+            var leftWaiting = waiting
+                .Where(c => parentEnds.TryGetValue(c.ParentId.Value, out var parent)
+                            && ChainRunGate.FallbackMayDecideChildWithoutTime(parent.Status, parent.ExecutedAt, now))
+                .ToList();
+
+            var neverRuns = leftWaiting
+                .Where(c => !ChainRunGate.AllowsRunNow(c.RunCondition, parentEnds[c.ParentId.Value].Status, hasOwnTime: false))
+                .Select(c => c.Id)
+                .ToArray();
+            if (neverRuns.Length > 0)
+            {
+                try
+                {
+                    await SkipDelayedChildrenAsync(neverRuns, now, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(ex, "Skipping chain children without a time whose ended parent does not let them run failed; the next fallback pass tries again.");
+                }
+            }
+
+            var runs = leftWaiting.Select(c => c.Id).Except(neverRuns).ToArray();
+            if (runs.Length == 0)
+                yield break;
+
+            var children = await coll.Find(fb.In(x => x.Id, runs)).ToListAsync(cancellationToken).ConfigureAwait(false);
+            var carried = await LoadChildrenLookup(runs, cancellationToken).ConfigureAwait(false);
+
+            foreach (var child in children)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var claimMarker = _clock.NextClaimMarker();
+                var update = Builders<TTimeTicker>.Update
+                    .Set(x => x.LockHolder, _lockHolder)
+                    .Set(x => x.LockedAt, now)
+                    .Set(x => x.UpdatedAt, claimMarker)
+                    .Set(x => x.Status, TickerStatus.InProgress);
+
+                UpdateResult result;
+                try
+                {
+                    result = await coll.UpdateOneAsync(
+                        fb.And(fb.Eq(x => x.Id, child.Id), fb.Lte(x => x.UpdatedAt, child.UpdatedAt), waitsForItsInlineStart),
+                        update, cancellationToken: cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(child.Id, claimMarker, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim).ConfigureAwait(false);
+                    throw;
+                }
+
+                if (result.ModifiedCount <= 0)
+                    continue;
+
+                child.UpdatedAt = claimMarker;
+                child.LockHolder = _lockHolder;
+                child.LockedAt = now;
+                child.Status = TickerStatus.InProgress;
+                yield return BuildQueuedEntity(child, carried);
+            }
+        }
+
+        // The status and end time of each given parent, for the fallback's children without a time. A parent that is not
+        // found is left out, so its children wait.
+        private async Task<Dictionary<Guid, (TickerStatus Status, DateTime? ExecutedAt)>> LoadParentEnds(IEnumerable<Guid> parentIds, CancellationToken ct)
+        {
+            var ends = new Dictionary<Guid, (TickerStatus, DateTime?)>();
+            foreach (var page in parentIds.Distinct().Chunk(1000))
+            {
+                var parents = await _context.TimeTickers
+                    .Find(Builders<TTimeTicker>.Filter.In(x => x.Id, page))
+                    .Project(x => new { x.Id, x.Status, x.ExecutedAt })
+                    .ToListAsync(ct)
+                    .ConfigureAwait(false);
+                foreach (var parent in parents)
+                    ends[parent.Id] = (parent.Status, parent.ExecutedAt);
+            }
+
+            return ends;
         }
 
         public async Task ReleaseAcquiredTimeTickers(Guid[] timeTickerIds, CancellationToken cancellationToken = default)
@@ -835,9 +932,15 @@ namespace SharpTicker.MongoDB.Infrastructure
 
         public async Task<int> StartInlineChildAsync(Guid timeTickerId, DateTime runMarker, CancellationToken cancellationToken = default)
         {
+            // A claim: only a child that still waits for its start (see IFencedRunWriter.StartInlineChildAsync).
+            var fb = Builders<TTimeTicker>.Filter;
             var result = await _context.TimeTickers
                 .UpdateOneAsync(
-                    Builders<TTimeTicker>.Filter.Eq(x => x.Id, timeTickerId),
+                    fb.And(
+                        fb.Eq(x => x.Id, timeTickerId),
+                        fb.Eq(x => x.Status, TickerStatus.Idle),
+                        fb.Eq(x => x.LockHolder, (string)null),
+                        fb.Eq(x => x.ExecutionTime, (DateTime?)null)),
                     Builders<TTimeTicker>.Update
                         .Set(x => x.Status, TickerStatus.InProgress)
                         .Set(x => x.LockHolder, _lockHolder)

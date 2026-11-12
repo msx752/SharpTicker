@@ -218,6 +218,21 @@ public sealed class DashboardClient(Func<HttpClient> http)
     public async Task RunCronNowAsync(Guid id)
         => await ScenarioClient.EnsureSuccess(await http().PostAsync($"{Api}/cron-ticker/run?id={id}", null));
 
+    /// <summary>
+    /// The dashboard's edit of a time ticker, with the fields its dialog sends. <paramref name="requestJson"/> is the job's
+    /// request as JSON text. Throws when the dashboard answers that the update failed.
+    /// </summary>
+    public async Task UpdateTimeTickerAsync(Guid id, string function, string? requestJson, DateTime executionTime)
+    {
+        var body = new { function, request = requestJson, retries = 0, description = "", executionTime = executionTime.ToUniversalTime().ToString("O") };
+        var response = await http().PutAsJsonAsync($"{Api}/time-ticker/update?id={id}", body, Json.Options);
+        await ScenarioClient.EnsureSuccess(response);
+        var answer = await response.Content.ReadFromJsonAsync<JsonElement>(Json.Options);
+        var success = answer.EnumerateObject().FirstOrDefault(p => p.NameEquals("success") || p.NameEquals("Success")).Value;
+        if (success.ValueKind != JsonValueKind.True)
+            throw new HttpRequestException($"The dashboard did not update time ticker {id}: {answer}");
+    }
+
     public async Task<(HttpStatusCode Status, string Body)> CancelAsync(Guid id)
     {
         var response = await http().PostAsync($"{Api}/ticker/cancel?id={id}", null);

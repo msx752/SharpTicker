@@ -13,6 +13,9 @@ internal static class RedisKeyBuilder
     internal const string Prefix = "tq";
     internal const string TimeTickerIdsKey = $"{Prefix}:tt:ids";
     internal const string TimeTickerPendingKey = $"{Prefix}:tt:pending";
+    // A hash: the id of each chain child without a time of its own that waits for its start, with its parent's id. The
+    // fallback finds through it the children whose parent ended without starting them. New in 1.4.0.
+    internal const string TimeTickerWaitingChildrenKey = $"{Prefix}:tt:waiting-children";
     internal const string CronIdsKey = $"{Prefix}:cron:ids";
     internal const string CronOccurrenceIdsKey = $"{Prefix}:co:ids";
     internal const string CronOccurrencePendingKey = $"{Prefix}:co:pending";

@@ -473,22 +473,62 @@ namespace SharpTicker.Utilities.Managers
                 ? _notificationHubSender.UpdateCronOccurrenceFromInternalFunctionContext<TCronTicker>(functionContext)
                 : _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(functionContext);
 
-        public async Task RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default)
+        public async Task<bool> RecordChildStartedAsync(InternalFunctionContext child, CancellationToken cancellationToken = default)
         {
-            child.SetProperty(x => x.Status, TickerStatus.InProgress);
-
             if (_persistenceProvider is IFencedRunWriter fenced)
             {
                 var marker = _clock.NextClaimMarker();
-                if (await fenced.StartInlineChildAsync(child.TickerId, marker, cancellationToken).ConfigureAwait(false) > 0)
-                    child.RunMarker = marker;
+                if (await StartInlineChildOrPutBackAsync(fenced, child.TickerId, marker, cancellationToken).ConfigureAwait(false) <= 0)
+                    return false;
+
+                child.SetProperty(x => x.Status, TickerStatus.InProgress);
+                child.RunMarker = marker;
             }
             else
             {
+                child.SetProperty(x => x.Status, TickerStatus.InProgress);
                 await _persistenceProvider.UpdateTimeTicker(child, cancellationToken).ConfigureAwait(false);
             }
 
-            await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(child).ConfigureAwait(false);
+            // The child is started now: a failed notification must not look like a failed start, which would leave the row
+            // InProgress with nothing running it.
+            try
+            {
+                await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(child).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Chain child {FunctionName} ({TickerId}) was started, but the dashboard could not be notified.",
+                    child.FunctionName, child.TickerId);
+            }
+
+            return true;
+        }
+
+        // The claim's write may have landed before the call failed (its reply was lost, or a stop cancelled it). The caller does
+        // not run the child then, so the row is put back like any other claim that was won and not handed over; a put-back
+        // that fails too goes to the retry list.
+        private async Task<int> StartInlineChildOrPutBackAsync(IFencedRunWriter fenced, Guid childId, DateTime marker, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await fenced.StartInlineChildAsync(childId, marker, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception failure)
+            {
+                try
+                {
+                    await ClaimPutBack.PutBackOrThrowAsync(childId, marker, TickerType.TimeTicker, failure, _persistenceProvider.TryReleaseTimeTickerClaim)
+                        .ConfigureAwait(false);
+                }
+                catch (ClaimPutBackFailedException notPutBack)
+                {
+                    _putBackRetry?.AddFrom(notPutBack);
+                    throw;
+                }
+
+                throw;
+            }
         }
         
         public async Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
