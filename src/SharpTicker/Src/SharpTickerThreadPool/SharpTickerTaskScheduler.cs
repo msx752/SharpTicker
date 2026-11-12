@@ -249,8 +249,11 @@ public sealed class SharpTickerTaskScheduler : IAsyncDisposable, ISharpTickerTas
         CancellationToken cancellationToken)
     {
         var waitCount = 0;
-        while (queue.Count >= _maxCapacityPerWorker && !cancellationToken.IsCancellationRequested)
+        while (queue.Count >= _maxCapacityPerWorker)
         {
+            // Thrown, not left by the loop condition: a caller that leaves the loop queues its job.
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (++waitCount > 100) // After 1 second, check if we're stuck
             {
                 // Force start a worker if we're waiting too long
