@@ -9,6 +9,7 @@ import { formatTime } from '@/utilities/dateTimeParser'
 import { copyText } from '@/utilities/clipboard'
 import { checkJson } from '@/utilities/jsonText'
 import { requestDataRule } from '@/utilities/requestRule'
+import { noTimeChoice, noTimeLabel, isStoredChild, runConditionLabel } from '@/utilities/childEdit'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 
 const functionNamesStore = useFunctionNameStore()
@@ -33,6 +34,13 @@ const props = defineProps({
     default: false,
   },
 })
+
+// What stands in place of a date and a time: "at once" for a new ticker or a copy, "started by its parent" for a
+// stored child without a time, nothing for any other stored ticker (the server refuses an update without a time).
+const noTime = computed(() => noTimeChoice(props.dialogProps))
+const runCondition = computed(() =>
+  isStoredChild(props.dialogProps) ? runConditionLabel(props.dialogProps.runCondition) : undefined,
+)
 
 watch(
   () => props.dialogProps.id,
@@ -237,14 +245,19 @@ const { resetForm, handleSubmit, bindField, setFieldValue, getFieldValue, values
       });
       setFieldValue('retries', props.dialogProps.retries as number);
       setFieldValue('description', props.dialogProps.description);
-      const parsed = parseUtcToDisplayDateTime(props.dialogProps.executionTime)
-      if (parsed.date) {
-        setFieldValue('executionDate', parsed.date)
+      if (noTime.value === 'startedByParent') {
+        // A child without a time opens without one, so that saving it does not give it a time.
+        setFieldValue('ignoreDateTime', true);
+      } else {
+        const parsed = parseUtcToDisplayDateTime(props.dialogProps.executionTime)
+        if (parsed.date) {
+          setFieldValue('executionDate', parsed.date)
+        }
+        if (parsed.time) {
+          setFieldValue('executionTime', parsed.time)
+        }
+        setFieldValue('ignoreDateTime', false);
       }
-      if (parsed.time) {
-        setFieldValue('executionTime', parsed.time)
-      }
-      setFieldValue('ignoreDateTime', false);
     }
     else{
       setFieldValue('ignoreDateTime', false);
@@ -613,12 +626,15 @@ defineExpose({
                       variant="outlined"
                     />
                   </v-col>
-                  <v-col>
+                  <v-col v-if="noTime !== 'none'">
                     <v-checkbox-btn
-                      label="Execute immediately (with a one-second delay)"
+                      :label="noTimeLabel(noTime)"
                       class="pe-2"
                       v-bind="bindField('ignoreDateTime')"
                     ></v-checkbox-btn>
+                  </v-col>
+                  <v-col cols="12" v-if="runCondition" class="text-medium-emphasis">
+                    Runs by the outcome of its parent: {{ runCondition }}
                   </v-col>
                 </v-row>
               </v-container>

@@ -25,6 +25,10 @@ export class GetTimeTickerResponse {
     skippedReason?:string;
     batchParent?:string;
     batchRunCondition?:string|number;
+    /** Set on a chain child: the id of its parent. */
+    parentId?:string|null;
+    /** Set on a chain child: when it runs, by the outcome of its parent. */
+    runCondition?:string|number|null;
     children?:GetTimeTickerResponse[];
 }
 
