@@ -147,7 +147,7 @@ An inline child is started this way only while the scheduler runs. When the outc
 
 ### While older instances still run
 
-During a rolling switch to SharpTicker (see [Migrating](https://github.com/msx752/SharpTicker/blob/main/MIGRATING.md#rolling-deployment)), the sections above do not describe the instances that are not switched yet: a job can run twice until the last of them is gone. An instance of an earlier SharpTicker version behaves as that version did; the release notes of the version you upgrade to say what to check.
+While instances from before a switch to SharpTicker still run against the store (see [Migrating](https://github.com/msx752/SharpTicker/blob/main/MIGRATING.md#switching-instances)), the sections above do not describe them: a job can run twice until the last of them is gone. An instance of an earlier SharpTicker version behaves as that version did; see [Upgrading](upgrading.md) for what to check.
 
 ### When a job can run more than once
 
