@@ -194,6 +194,34 @@ public class SharpTickerTaskSchedulerResilienceTests
         }
     }
 
+    // The waiting caller looked at its token only between two waits. A token cancelled just as a wait ended, or
+    // before the call, took the caller out of the wait without an exception, and its job went into the full queue.
+    [Fact]
+    public async Task ACallerWithACancelledToken_IsNotQueuedIntoAFullQueue()
+    {
+        var ran = 0;
+        var (scheduler, release, queued) = await FillTheQueueAsync(() => Interlocked.Increment(ref ran));
+        await using var _ = scheduler;
+        try
+        {
+            using var givenUp = new CancellationTokenSource();
+            givenUp.Cancel();
+            var overflowRan = 0;
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                await scheduler.QueueAsync(_ => { Interlocked.Increment(ref overflowRan); return Task.CompletedTask; }, TickerTaskPriority.Normal, givenUp.Token));
+
+            release.Set();
+            Assert.True(await WaitUntilAsync(() => Volatile.Read(ref ran) == queued), $"{Volatile.Read(ref ran)} of {queued} jobs ran");
+            Assert.Equal(0, Volatile.Read(ref overflowRan));
+        }
+        finally
+        {
+            release.Set();
+            release.Dispose();
+        }
+    }
+
     #endregion
 
     #region Workers
