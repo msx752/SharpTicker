@@ -186,8 +186,14 @@ namespace SharpTicker.Utilities
         /// </summary>
         /// <param name="configuration">IConfiguration to update based on path</param>
         /// <exception cref="ArgumentNullException">Thrown when cronUpdates parameter is null.</exception>
-        internal static void UpdateCronExpressionsFromIConfiguration(IConfiguration configuration)
+        /// <returns>
+        /// The configuration values that are not a cron expression, filled when Build() runs. Such a function keeps its
+        /// placeholder.
+        /// </returns>
+        internal static IReadOnlyList<(string Function, string ConfigurationKey, string Value)> UpdateCronExpressionsFromIConfiguration(IConfiguration configuration)
         {
+            var invalid = new List<(string Function, string ConfigurationKey, string Value)>();
+
             lock (_buildLock)
             {
                 _functionRegistrations += dict =>
@@ -199,15 +205,24 @@ namespace SharpTicker.Utilities
                             var configKey = value.cronExpression.Trim('%');
                             var mappedCronExpression = configuration[configKey];
 
-                            if (!string.IsNullOrEmpty(mappedCronExpression))
+                            if (string.IsNullOrEmpty(mappedCronExpression))
+                                continue;
+
+                            // The same rules as for a cron written in code: five fields get the seconds field.
+                            if (!CronExpression.TryParse(mappedCronExpression, out var cronExpression))
                             {
-                                dict[key] = (mappedCronExpression, value.Priority, value.Delegate,
-                                             value.MaxConcurrency);
+                                invalid.Add((key, configKey, mappedCronExpression));
+                                continue;
                             }
+
+                            dict[key] = (cronExpression.Value, value.Priority, value.Delegate,
+                                         value.MaxConcurrency);
                         }
                     }
                 };
             }
+
+            return invalid;
         }
 
         /// <summary>

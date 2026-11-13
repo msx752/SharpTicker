@@ -221,12 +221,39 @@ public class TickerFunctionProviderTests : IDisposable
         TickerFunctionProvider.RegisterFunctions(functions);
 
         var configuration = Substitute.For<IConfiguration>();
-        configuration["CronSettings:Schedule"].Returns("0 30 * * *");
+        configuration["CronSettings:Schedule"].Returns("30 8 * * *");
 
-        TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(configuration);
+        var invalid = TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(configuration);
         TickerFunctionProvider.Build();
 
-        Assert.Equal("0 30 * * *", TickerFunctionProvider.TickerFunctions["CronFunc"].cronExpression);
+        // Five fields get the seconds field, as a cron written in code does.
+        Assert.Equal("0 30 8 * * *", TickerFunctionProvider.TickerFunctions["CronFunc"].cronExpression);
+        Assert.Empty(invalid);
+    }
+
+    [Fact]
+    public void UpdateCronExpressionsFromIConfiguration_ValueThatIsNotACron_KeepsThePlaceholderAndReportsIt()
+    {
+        var functions = new Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)>
+        {
+            ["BadCronFunc"] = ("%CronSettings:Bad%", TickerTaskPriority.High, NoOpDelegate, 0),
+            ["GoodCronFunc"] = ("%CronSettings:Good%", TickerTaskPriority.High, NoOpDelegate, 0)
+        };
+
+        TickerFunctionProvider.RegisterFunctions(functions);
+
+        var configuration = Substitute.For<IConfiguration>();
+        configuration["CronSettings:Bad"].Returns("0 30 * * *");
+        configuration["CronSettings:Good"].Returns("*/10 * * * * *");
+
+        var invalid = TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(configuration);
+        Assert.Empty(invalid);
+        TickerFunctionProvider.Build();
+
+        // "0 30 * * *" reads as minute 0 of hour 30.
+        Assert.Equal(("BadCronFunc", "CronSettings:Bad", "0 30 * * *"), Assert.Single(invalid));
+        Assert.Equal("%CronSettings:Bad%", TickerFunctionProvider.TickerFunctions["BadCronFunc"].cronExpression);
+        Assert.Equal("*/10 * * * * *", TickerFunctionProvider.TickerFunctions["GoodCronFunc"].cronExpression);
     }
     
     [Fact]
@@ -242,7 +269,7 @@ public class TickerFunctionProviderTests : IDisposable
 
         // Simulate another host that contributes config-based cron update callback.
         var configuration = Substitute.For<IConfiguration>();
-        configuration["CronSettings:Schedule"].Returns("0 30 * * *");
+        configuration["CronSettings:Schedule"].Returns("30 8 * * *");
 
         TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(configuration);
        
@@ -250,7 +277,7 @@ public class TickerFunctionProviderTests : IDisposable
         TickerFunctionProvider.Build();
 
         Assert.True(TickerFunctionProvider.TickerFunctions.ContainsKey("CronRaceFunc"));
-        Assert.Equal("0 30 * * *", TickerFunctionProvider.TickerFunctions["CronRaceFunc"].cronExpression);
+        Assert.Equal("0 30 8 * * *", TickerFunctionProvider.TickerFunctions["CronRaceFunc"].cronExpression);
     }
 
     [Fact]
