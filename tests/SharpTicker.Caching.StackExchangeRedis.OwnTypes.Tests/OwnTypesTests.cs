@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -29,17 +30,42 @@ public sealed class OwnCronTicker : CronTickerEntity
     public List<string> Labels { get; set; } = [];
 }
 
-/// <summary>
-/// An application with ticker types of its own on the Redis store that sets no <c>JsonSerializerContext</c> (#162):
-/// registered with <c>AddSharpTicker</c>, started as a host, jobs added through the managers, the scheduler running them
-/// over a real Redis. This assembly is not named in an <c>InternalsVisibleTo</c> of the packages, as no application is.
-/// Each test also fails on anything the application would see go wrong: a log entry at Warning or above, or a call to its
-/// exception handler.
-/// </summary>
-public class OwnTypesWithoutAContextTests : IAsyncLifetime
+/// <summary>The context an application writes for its own types, as the Redis options ask for.</summary>
+[JsonSerializable(typeof(OwnTimeTicker))]
+[JsonSerializable(typeof(OwnCronTicker))]
+[JsonSerializable(typeof(CronTickerOccurrenceEntity<OwnCronTicker>))]
+public partial class OwnTypesJsonSerializerContext : JsonSerializerContext;
+
+/// <summary>The application sets no <c>JsonSerializerContext</c>.</summary>
+[Collection(OwnTypesTests.CollectionName)]
+public sealed class OwnTypesWithoutAContextTests : OwnTypesTests
 {
-    private const string TimeFunction = "OwnTypes.NoContext.Time";
-    private const string CronFunction = "OwnTypes.NoContext.Cron";
+    protected override JsonSerializerContext? Context => null;
+}
+
+/// <summary>The application gives a source-generated context for its types, the way for a trimmed or AOT application.</summary>
+[Collection(OwnTypesTests.CollectionName)]
+public sealed class OwnTypesWithASourceGeneratedContextTests : OwnTypesTests
+{
+    protected override JsonSerializerContext? Context => OwnTypesJsonSerializerContext.Default;
+}
+
+/// <summary>
+/// An application with ticker types of its own on the Redis store (#162): registered with <c>AddSharpTicker</c>, started
+/// as a host, jobs added through the managers, the scheduler running them over a real Redis. This assembly is not named
+/// in an <c>InternalsVisibleTo</c> of the packages, as no application is. Each test also fails on anything the
+/// application would see go wrong: a log entry at Warning or above, or a call to its exception handler. The classes that
+/// derive from this one share static counters, so they are in one collection and do not run at the same time.
+/// </summary>
+public abstract class OwnTypesTests : IAsyncLifetime
+{
+    public const string CollectionName = "OwnTypes";
+
+    /// <summary>What the application sets as <c>JsonSerializerContext</c> on the Redis options, or null for nothing.</summary>
+    protected abstract JsonSerializerContext? Context { get; }
+
+    private const string TimeFunction = "OwnTypes.Time";
+    private const string CronFunction = "OwnTypes.Cron";
     private static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(40);
 
     // How often each job (a time job, or an occurrence of the cron) ran, by its id.
@@ -101,8 +127,8 @@ public class OwnTypesWithoutAContextTests : IAsyncLifetime
         await _redis.DisposeAsync();
     }
 
-    // The application: its own ticker types, the Redis store with nothing but the connection set, its exception handler
-    // and its logging.
+    // The application: its own ticker types, the Redis store with the connection and, in one of the classes, its context,
+    // its exception handler and its logging.
     private async Task<IHost> StartAsync()
     {
         static Task Count(Guid id)
@@ -120,7 +146,12 @@ public class OwnTypesWithoutAContextTests : IAsyncLifetime
         builder.Services.AddSharpTicker<OwnTimeTicker, OwnCronTicker>(options =>
         {
             options.SetExceptionHandler<RecordingExceptionHandler>();
-            options.AddStackExchangeRedis(redis => redis.Configuration = _redis.GetConnectionString());
+            options.AddStackExchangeRedis(redis =>
+            {
+                redis.Configuration = _redis.GetConnectionString();
+                if (Context != null)
+                    redis.JsonSerializerContext = Context;
+            });
         });
 
         _host = builder.Build();
@@ -167,7 +198,7 @@ public class OwnTypesWithoutAContextTests : IAsyncLifetime
     [Fact]
     public void ThisAssembly_IsNotNamedInAnInternalsVisibleToOfThePackages()
     {
-        var self = typeof(OwnTypesWithoutAContextTests).Assembly.GetName().Name!;
+        var self = typeof(OwnTypesTests).Assembly.GetName().Name!;
         var packages = new[]
         {
             typeof(TimeTickerEntity).Assembly,
