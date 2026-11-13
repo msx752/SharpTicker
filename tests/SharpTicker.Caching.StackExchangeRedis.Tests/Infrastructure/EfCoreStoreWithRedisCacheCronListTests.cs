@@ -259,6 +259,9 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
         await WaitUntilAsync(() => fixture.Database.KeyExistsAsync(CacheKey), "the first run read the list of cron expressions");
         await first.StopAsync();
         Assert.Equal(0, Volatile.Read(ref _hostRuns));
+        // The log is looked at from here on, and up to the stop of the second run: a stop that comes while the scheduler
+        // loop opens a connection cancels that, and EF Core writes an Error for it. This test is not about a stop.
+        var loggedByTheFirstRun = _log.Entries.Count;
 
         TickerFunctionProvider.Configure(HostFunction, cronExpression: "* * * * * *");
         var second = Application("cron-list-second");
@@ -267,11 +270,12 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
 
         await WaitUntilAsync(() => Task.FromResult(Volatile.Read(ref _hostRuns) >= 2), "the job ran twice on its new schedule");
 
-        await second.StopAsync();
         // Left out: EF Core's own warning about a query of the store that loads more than one collection, which has
         // nothing to do with the list of cron expressions.
-        var problems = _log.Entries.Where(e => e.Level >= LogLevel.Warning && !e.Text.Contains("QuerySplittingBehavior"))
+        var problems = _log.Entries.Skip(loggedByTheFirstRun)
+            .Where(e => e.Level >= LogLevel.Warning && !e.Text.Contains("QuerySplittingBehavior"))
             .Select(e => e.Text).ToList();
+        await second.StopAsync();
         Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");
         Assert.True(Handled.IsEmpty, $"the exception handler was called:\n{string.Join("\n", Handled)}");
     }
