@@ -371,7 +371,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return order;
     }
 
-    // The children of the row with this id, read before the row is claimed: a failed read then leaves nothing claimed.
+    // The children of the row with this id. The claim paths read them before the row is claimed: a failed read then
+    // leaves nothing claimed.
     protected async Task<ICollection<TTimeTicker>> LoadChildrenAsync(Guid id, CancellationToken cancellationToken)
     {
         var holder = new TTimeTicker { Id = id };
@@ -391,8 +392,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             row.Children = InChildOrder(byParent[row.Id], order);
     }
 
-    // A claimed row as the handler gets it, with the children read before its claim, unless it holds them nested (older
-    // format).
+    // A claimed row as the handler gets it, with its children as rows. A row that still holds them nested (older format)
+    // is mapped as it is; the claim paths write such children as rows first (SplitNestedChainAsync).
     protected static TimeTickerEntity ForQueue(TTimeTicker row, ICollection<TTimeTicker> children)
     {
         if (HoldsNestedChildren(row))
@@ -404,6 +405,76 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     // A row written by an older version holds its children nested; they have no rows of their own.
     protected static bool HoldsNestedChildren(TTimeTicker row) => row.Children is { Count: > 0 };
+
+    // A chain stored by a version before 1.3.0 is one record: the children are held inside the parent's row. A child is
+    // started by a claim on its own row, so such a child could not start. The node that has claimed the parent writes the
+    // nodes as rows of their own before the parent is handed out. Only a claimed parent is written: an ended one is never
+    // claimed, so its children stay inside its row and do not run.
+    // Returns the children as rows, to hand out. Null when the parent must not be handed out: a write failed and the
+    // claim was put back through putBack (the next pass starts again; every step can be repeated), or the claim was lost
+    // on the way.
+    protected async Task<ICollection<TTimeTicker>> SplitNestedChainAsync(TTimeTicker claimed, Func<Exception, Task> putBack)
+    {
+        try
+        {
+            await WriteNestedChildrenAsRowsAsync(claimed).ConfigureAwait(false);
+
+            // The parent's row gives up its copy of the children, only while it is still this claim, and keeps its
+            // UpdatedAt: that is the claim's marker.
+            var written = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(claimed.Id), row =>
+            {
+                if (row == null || row.Status != claimed.Status || row.LockHolder != LockHolder || row.UpdatedAt != claimed.UpdatedAt) return null;
+                row.Children = new List<TTimeTicker>();
+                return row;
+            }).ConfigureAwait(false);
+
+            if (written == null)
+            {
+                _logger.LogDebug("Chain {Id} is not handed out: its claim was lost while its children were written as rows of their own.", claimed.Id);
+                return null;
+            }
+
+            claimed.Children = new List<TTimeTicker>();
+            var children = await LoadChildrenAsync(claimed.Id, CancellationToken.None).ConfigureAwait(false);
+            _logger.LogDebug("Chain {Id} was stored with its children inside its row (a version before 1.3.0); they were written as rows of their own.", claimed.Id);
+            return children;
+        }
+        catch (Exception failure)
+        {
+            // Logged first: when the put-back fails too, its exception leaves here and this one would be lost.
+            _logger.LogWarning(failure, "Chain {Id} is stored with its children inside its row (a version before 1.3.0) and writing them as rows of their own failed; its claim is put back and the next pass tries again.", claimed.Id);
+            await putBack(failure).ConfigureAwait(false);
+            return null;
+        }
+    }
+
+    // Each node below this one, in the order WriteChainAsync uses: the link to its parent, then its own children, then
+    // its row. The row is written only when there is none (SET NX): one that exists is the child, whatever the copy inside
+    // the parent says, and it may have run. The index entries are added from the row the key holds, and never removed.
+    private async Task WriteNestedChildrenAsRowsAsync(TTimeTicker parent)
+    {
+        var position = 0;
+        foreach (var child in (parent.Children ?? []).Where(c => c != null))
+        {
+            await IndexManager.AddTimeTickerChildAsync(parent.Id, child.Id, position++).ConfigureAwait(false);
+            await WriteNestedChildrenAsRowsAsync(child).ConfigureAwait(false);
+
+            child.ParentId = parent.Id;
+            child.Children = new List<TTimeTicker>();
+            var key = TimeTickerKey(child.Id);
+            var row = await Serializer.TryCreateAsync(key, child).ConfigureAwait(false)
+                ? child
+                : await Serializer.GetAsync<TTimeTicker>(key).ConfigureAwait(false);
+            if (row == null) continue;
+
+            await IndexManager.AddTimeTickerIndexesAddOnlyAsync(row).ConfigureAwait(false);
+            if (RedisIndexManager<TTimeTicker, TCronTicker>.WaitsForItsInlineStart(row))
+                await IndexManager.AddWaitingChildrenAsync([new HashEntry(row.Id.ToString(), row.ParentId.Value.ToString())]).ConfigureAwait(false);
+        }
+    }
+
+    private Func<Exception, Task> PutBackTimeTickerClaim(TTimeTicker claimed)
+        => failure => ClaimPutBack.PutBackOrThrowAsync(claimed.Id, claimed.UpdatedAt, TickerType.TimeTicker, failure, TryReleaseTimeTickerClaim);
 
     // The status of each parent of the given rows, for the chain gate. A parent that is not found is left out, so its
     // children wait.
@@ -476,8 +547,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     #endregion
 
     // A delayed child (one with an execution time of its own) is carried with its time, so the handler leaves it to the
-    // store. Children nested in a row of an older version have no row the store could hand out: their time is left out,
-    // so the handler runs them right after their parent, by their RunCondition, as before.
+    // store. Children still nested in a row of an older version have no rows yet (a read before the claim; the claim
+    // writes them as rows, see SplitNestedChainAsync): they are carried without their time.
     protected static TimeTickerEntity MapForQueue(TTimeTicker ticker, bool childrenAreRows)
     {
         return new TimeTickerEntity
@@ -530,6 +601,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
             if (acquired == null) continue;
 
+            if (HoldsNestedChildren(acquired))
+            {
+                var children = await SplitNestedChainAsync(acquired, _ => ReleaseAcquiredTimeTickers([acquired.Id], CancellationToken.None)).ConfigureAwait(false);
+                if (children == null) continue;
+                timeTicker.Children = ForQueue(acquired, children).Children;
+            }
+
             await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
 
             timeTicker.LockHolder = acquired.LockHolder;
@@ -579,6 +657,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
                 if (acquired == null) continue;
                 if (row == null && !await KeepClaimOfUnreadRowAsync(acquired, claimedThisPass).ConfigureAwait(false)) continue;
+
+                if (HoldsNestedChildren(acquired))
+                {
+                    children = await SplitNestedChainAsync(acquired, PutBackTimeTickerClaim(acquired)).ConfigureAwait(false);
+                    if (children == null) continue;
+                }
 
                 claimedThisPass.Add(acquired.Id);
                 await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddTimeTickerIndexesAsync(acquired)).ConfigureAwait(false);
@@ -896,6 +980,12 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
                 if (ticker == null) continue;
                 if (stored == null && !await KeepClaimOfUnreadRowAsync(ticker, Array.Empty<Guid>()).ConfigureAwait(false)) continue;
+
+                if (HoldsNestedChildren(ticker))
+                {
+                    children = await SplitNestedChainAsync(ticker, PutBackTimeTickerClaim(ticker)).ConfigureAwait(false);
+                    if (children == null) continue;
+                }
 
                 won[ticker.Id] = ticker.UpdatedAt;
                 await TryUpdateIndexAfterClaim(ticker.Id, () => IndexManager.AddTimeTickerIndexesAsync(ticker)).ConfigureAwait(false);
