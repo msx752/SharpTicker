@@ -35,17 +35,30 @@ internal sealed class ClaimPutBackRetryList
         }
 
         if (added > 0)
-        {
-            try
-            {
-                Added?.Invoke();
-            }
-            catch
-            {
-                // The rows are listed; the loop takes them at its next pass even if it was not woken.
-            }
-        }
+            RaiseAdded();
         return added;
+    }
+
+    /// <summary>
+    /// Adds the claim of a run this node stopped without an outcome (see <see cref="NodeFence"/>): the row is still
+    /// InProgress for this node, and the put-back lets the job run again.
+    /// </summary>
+    internal void Add(NotPutBackClaim claim)
+    {
+        _claims.Enqueue(claim);
+        RaiseAdded();
+    }
+
+    private void RaiseAdded()
+    {
+        try
+        {
+            Added?.Invoke();
+        }
+        catch
+        {
+            // The rows are listed; the loop takes them at its next pass even if it was not woken.
+        }
     }
 
     /// <summary>What becomes of the rows that could not be put back, for the log entry of the failed claim call.</summary>

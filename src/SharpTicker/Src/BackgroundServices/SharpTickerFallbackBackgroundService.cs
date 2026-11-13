@@ -47,7 +47,8 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
             {
                 // If the scheduler is frozen or disposed (e.g., manual start mode or shutdown),
                 // skip queuing fallback work to avoid throwing and stopping the host.
-                if (_sharpTickerTaskScheduler.IsFrozen || _sharpTickerTaskScheduler.IsDisposed)
+                // Nor while the node's fence is raised: a row claimed then is not started, only put back.
+                if (_sharpTickerTaskScheduler.IsFrozen || _sharpTickerTaskScheduler.IsDisposed || _work.StartsNoJob)
                 {
                     await Task.Delay(_fallbackJobPeriod, stoppingToken);
                     continue;

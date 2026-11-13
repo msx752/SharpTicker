@@ -36,9 +36,10 @@ internal sealed class ClaimLedger
     /// job never starts, and only a later put-back ends it. That first failure was already logged by the caller of the claim
     /// call, so the next one is written at Debug.
     /// </summary>
-    internal Entry RecordFailedPutBack(InternalFunctionContext function, DateTime claimMarker)
+    /// <param name="stoppedRun">The row is that of a run this node stopped without an outcome, not of a job that never started.</param>
+    internal Entry RecordFailedPutBack(InternalFunctionContext function, DateTime claimMarker, bool stoppedRun = false)
     {
-        var entry = new Entry(this, function, claimMarker, putBackFailed: true);
+        var entry = new Entry(this, function, claimMarker, putBackFailed: true) { StoppedRun = stoppedRun };
         _entries.TryAdd(entry, 0);
         return entry;
     }
@@ -82,6 +83,9 @@ internal sealed class ClaimLedger
 
         /// <summary>The service that recorded the claim, so its stop puts back only its own claims; null for run-now.</summary>
         internal object Owner { get; }
+
+        /// <summary>The job ran on this node and the node stopped that run without an outcome (see NodeFence); only the logs differ.</summary>
+        internal bool StoppedRun { get; init; }
 
         /// <summary>The claim call returned (won, or failed after its write may have landed): the claim is now pending.</summary>
         internal void ClaimSettled() => Interlocked.CompareExchange(ref _state, PendingState, ClaimInFlightState);

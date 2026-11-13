@@ -77,7 +77,8 @@ namespace SharpTicker.DependencyInjection
                     sp.GetRequiredService<ITickerExecutionTaskHandler>(),
                     sp.GetRequiredService<ITickerFunctionConcurrencyGate>(),
                     sp.GetService<ILoggerFactory>()?.CreateLogger<ClaimedWorkQueue>(),
-                    sp.GetRequiredService<ClaimPutBackRetryList>()));
+                    sp.GetRequiredService<ClaimPutBackRetryList>(),
+                    sp.GetRequiredService<NodeFence>()));
                 services.AddSingleton<SharpTickerSchedulerBackgroundService>();
                 services.AddSingleton<ISharpTickerHostScheduler>(provider =>
                     provider.GetRequiredService<SharpTickerSchedulerBackgroundService>());
@@ -101,6 +102,8 @@ namespace SharpTicker.DependencyInjection
                 services.AddSingleton<ISharpTickerDispatcher, NoOpSharpTickerDispatcher>();
             }
             services.AddSingleton<ITickerFunctionConcurrencyGate, TickerFunctionConcurrencyGate>();
+            // Raised by a store package that knows the node cannot show the others that it is alive; nothing raises it here.
+            services.AddSingleton<NodeFence>();
             services.AddSingleton<ITickerExecutionTaskHandler, TickerExecutionTaskHandler>();
             services.AddSingleton<ISharpTickerInstrumentation, LoggerInstrumentation>();
             services.AddSingleton<ITickerDashboardDataService<TTimeTicker, TCronTicker>, TickerDashboardDataService<TTimeTicker, TCronTicker>>();

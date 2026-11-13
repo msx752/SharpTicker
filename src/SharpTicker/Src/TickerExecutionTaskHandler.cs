@@ -260,6 +260,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     // Registered only when the background services run: without the scheduler loop nothing would write a listed outcome.
     private LostOutcomeRetryList LostOutcomes => _lostOutcomes ??= _serviceProvider.GetService<LostOutcomeRetryList>();
     private LostOutcomeRetryList _lostOutcomes;
+    // The fence of this node (see NodeFence); not registered in a container built by hand, which then has none.
+    private NodeFence Fence => _fence ??= _serviceProvider.GetService<NodeFence>();
+    private NodeFence _fence;
+    // Registered only when the background services run: without the scheduler loop nothing would put a listed claim back.
+    private ClaimPutBackRetryList PutBacks => _putBacks ??= _serviceProvider.GetService<ClaimPutBackRetryList>();
+    private ClaimPutBackRetryList _putBacks;
     private ISharpTickerDispatcher _dispatcher;
     private ISharpTickerHostScheduler _hostScheduler;
     private ILogger _logger;
@@ -321,7 +327,9 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
         // IMPORTANT: Register the ticker FIRST, before creating the SkipIfAlreadyRunningAction callback
         // This ensures the current occurrence is properly tracked when the callback checks for siblings
-        TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this);
+        var run = TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this,
+            startsWithParent: isChild && context.RunCondition == RunCondition.InProgress);
+        var stoppedByFence = false;
 
         // The job leaves the registry of running jobs on every path, a failed outcome write included: a job left listed
         // would hold a stop, which then records it as Cancelled, and make every later occurrence of its cron ticker skip
@@ -359,6 +367,15 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 }
             };
 
+            // The fence may have been raised after this run was let start and before it was registered above; the fence's
+            // cancel did not find it then. It does not start: its claim is put back like that of a run that was stopped.
+            if (context.RunMarker != null && !run.StartsWithParent && Fence is { IsRaised: true })
+            {
+                stoppedByFence = true;
+                jobActivity?.SetTag("sharpticker.job.stopped_by_node_fence", true);
+                return false;
+            }
+
             Exception lastException = null;
             var success = false;
 
@@ -390,6 +407,19 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                     success = true;
                     context.RetryCount = attempt;
                     break;
+                }
+                // The node's fence asked this run to stop (see NodeFence): another node may release the row and start the job
+                // again, so whatever the job threw after that, this run records nothing: no status, no attempt, no outcome,
+                // and the application's handlers are not told, because the job was neither cancelled by the application nor
+                // has it failed for good. Its claim is put back and the job runs again. A job that ends itself with
+                // TerminateExecutionException decided its own outcome and keeps it; one that returns normally has done its
+                // work and stores its outcome below.
+                catch (Exception ex) when (run.Fenced && ex is not TerminateExecutionException)
+                {
+                    stoppedByFence = true;
+                    jobActivity?.SetTag("sharpticker.job.stopped_by_node_fence", true);
+                    Logger?.LogDebug(ex, "{FunctionName} ({TickerId}) ended after this node asked it to stop.", context.FunctionName, context.TickerId);
+                    return false;
                 }
                 // A cancelled task counts, and so does any OperationCanceledException when this job's own token was cancelled,
                 // for example by the cancel button or by the application stopping. A plain OperationCanceledException that
@@ -510,7 +540,30 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         finally
         {
             TickerCancellationTokenManager.RemoveTickerCancellationToken(context.TickerId);
+
+            // Listed only now that the run has left the registry of running jobs: once the row is put back this node may
+            // claim it again, and that run must find its place in the registry free.
+            if (stoppedByFence)
+                ListToPutBack(context);
         }
+    }
+
+    // The row of a run the node's fence stopped is still InProgress for this node under the run's marker. The scheduler puts
+    // it back once the store answers, and only while the row is still this run's (another node may have released it).
+    private void ListToPutBack(InternalFunctionContext context)
+    {
+        if (context.RunMarker is { } marker && PutBacks is { } list)
+        {
+            list.Add(new NotPutBackClaim(context.TickerId, marker, context.Type, context.FunctionName ?? string.Empty));
+            Logger?.LogWarning(
+                "{FunctionName} ({TickerId}) was asked to stop because this node could not show the other nodes that it is alive, and they may start the job again. No outcome is stored for this run; the scheduler puts its row back once the store answers, unless another node has released it by then, and the job runs again.",
+                context.FunctionName, context.TickerId);
+            return;
+        }
+
+        Logger?.LogWarning(
+            "{FunctionName} ({TickerId}) was asked to stop because this node could not show the other nodes that it is alive, and they may start the job again. No outcome is stored for this run; its row stays InProgress until the store releases the rows of this node, and the job runs again then.",
+            context.FunctionName, context.TickerId);
     }
 
     // The final outcome write. It never throws: the job has ended either way, and the caller still has to leave the registry
@@ -724,6 +777,14 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     // back a write that may have landed), and running the child without its row would be a run nothing fences.
     private async Task<bool> TryStartInlineChildAsync(InternalFunctionContext child, CancellationToken cancellationToken)
     {
+        // While the node's fence is raised nothing new starts here: the row keeps waiting, and the fallback takes it later.
+        if (Fence is { IsRaised: true })
+        {
+            Logger?.LogDebug("Chain child {FunctionName} ({TickerId}) is not started here: this node starts no job right now; its row keeps waiting.",
+                child.FunctionName, child.TickerId);
+            return false;
+        }
+
         try
         {
             if (await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken))

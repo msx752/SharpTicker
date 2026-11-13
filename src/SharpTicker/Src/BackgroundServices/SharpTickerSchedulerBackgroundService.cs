@@ -204,8 +204,9 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     /// <summary>How long the loop sleeps at most while a put-back is waiting to be tried again. Tests shorten it.</summary>
     internal TimeSpan PutBackRetryInterval { get; set; } = TimeSpan.FromSeconds(5);
 
+    // Not while the node's fence is raised either: a row claimed then is not started, only put back.
     private bool CanHandOver(CancellationToken stoppingToken)
-        => !stoppingToken.IsCancellationRequested && !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
+        => !stoppingToken.IsCancellationRequested && !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed && !_work.StartsNoJob;
 
     // The rows of one second are planned together and the loop wakes at the earliest of them. A row whose time is later in
     // that second waits here for its own time, so no job starts before it. The rows that are due go on together, in
