@@ -67,7 +67,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         };
 
         if (redisOptions?.JsonSerializerContext != null)
-            jsonOptions.TypeInfoResolverChain.Insert(0, redisOptions.JsonSerializerContext);
+            // A context generated in the application's assembly cannot reach the members the entities fill themselves.
+            jsonOptions.TypeInfoResolverChain.Insert(0, redisOptions.JsonSerializerContext.WithEntityMembers<TTimeTicker>());
 
         // A type neither context knows, a ticker type of the application's own for example, is read through reflection.
         // A trimmed or AOT application has reflection switched off for the serializer and gives its context instead.
