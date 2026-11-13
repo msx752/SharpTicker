@@ -19,7 +19,8 @@ using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
-internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter, IFencedRunWriter
+internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter, IFencedRunWriter,
+    IJobsOfOtherNodes
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
@@ -462,6 +463,33 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
     }
     
+    public async Task<IReadOnlyList<(string NodeIdentifier, int Jobs)>> CountInProgressOfOtherNodesAsync(string nodeIdentifier, CancellationToken cancellationToken = default)
+    {
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+
+        var timeTickers = await dbContext.Set<TTimeTicker>()
+            .AsNoTracking()
+            .Where(x => x.Status == TickerStatus.InProgress && x.LockHolder != null && x.LockHolder != nodeIdentifier)
+            .GroupBy(x => x.LockHolder)
+            .Select(g => new { NodeIdentifier = g.Key, Jobs = g.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var occurrences = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .AsNoTracking()
+            .Where(x => x.Status == TickerStatus.InProgress && x.LockHolder != null && x.LockHolder != nodeIdentifier)
+            .GroupBy(x => x.LockHolder)
+            .Select(g => new { NodeIdentifier = g.Key, Jobs = g.Count() })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        return timeTickers.Concat(occurrences)
+            .GroupBy(x => x.NodeIdentifier, StringComparer.Ordinal)
+            .Select(g => (g.Key, g.Sum(x => x.Jobs)))
+            .ToList();
+    }
+
     public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
         => ReleaseDeadNodeTimeTickerResourcesCore(instanceIdentifier, null, cancellationToken);
 

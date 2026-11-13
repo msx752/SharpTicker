@@ -22,6 +22,8 @@ builder.Services.AddSharpTicker(options =>
 
 The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine.
 
+Stable means that the instance has the same name after it is replaced. The pod name of a Kubernetes StatefulSet and a fixed name per replica are; the pod name of a Deployment is new for every pod, and so is the container id, which is the machine name inside a container. With the EF Core store alone the name decides whether the jobs of a stopped instance are released at all (see [When an instance stops](#when-an-instance-stops)).
+
 The name is the lock holder on a job, and a starting instance treats every job held under its own name as left behind by an earlier run (see [When an instance stops](#when-an-instance-stops)). So two running instances with one name release each other's running jobs.
 
 ### When an instance stops
@@ -30,9 +32,11 @@ An instance that stops while it holds jobs leaves them locked. What releases the
 
 | Store | The jobs are released |
 |---|---|
-| EF Core | When the instance starts again. |
+| EF Core | When an instance starts again under the same name. With Redis next to the store, also by another running instance once the heartbeat of the stopped one has ended. |
 | Redis | When the instance starts again, or by another running instance once the heartbeat of the stopped one has ended. |
 | MongoDB | Not at all. MongoDB has no release step, so a job left `InProgress` by a process that ended stays so until you change it. |
+
+**A name that does not come back (EF Core without Redis).** A job that is `InProgress` under a name no instance starts with again stays `InProgress`: a process that ended without a signal (killed, out of memory, a lost machine) records nothing, and with the EF Core store alone nothing tells an instance that is gone from one that is running. A starting instance writes the names that hold such jobs to its log once, as Information in the category `SharpTicker.EntityFrameworkCore.StartupRelease`: the ten names with the most jobs, each with its count, and how many more names there are. With several running instances the list also has the jobs the others are running now, which end as usual. To get such a job released, start an instance under that name. A time job can also be removed on the dashboard: Cancel is refused for a job no instance runs, and then offers Force delete. To have the release happen without the same name, add Redis next to the store.
 
 **At startup (EF Core, Redis).** A starting instance releases every job held under its own name, `Queued` or `InProgress`, that was locked before this run started. Jobs the new run has claimed in the meantime are kept. With Redis the release is tried again every 30 seconds while it fails, for example while Redis cannot be reached.
 
@@ -123,7 +127,7 @@ When the store cannot be reached, the instance tries the put-back again while it
 
 The put-back has these limits:
 
-- A job whose put-back had not succeeded when the process ended stays `InProgress` until its store releases it: EF Core when the instance starts again, Redis when the instance starts again or another instance sees its heartbeat stop, MongoDB not at all.
+- A job whose put-back had not succeeded when the process ended stays `InProgress` until its store releases it: EF Core when an instance starts again under the same name, Redis when the instance starts again or another instance sees its heartbeat stop, MongoDB not at all.
 - The marker is the instance's clock in whole milliseconds. An `UpdatedAt` column that keeps less than that, such as SQL Server `datetime` or MySQL `datetime` without fractional seconds, cannot hold it exactly, so a put-back may not find its claim. The default mappings (`datetime2`, `datetime(6)`) keep enough.
 - A cron occurrence that was put back keeps its time slot, so it counts as missed: with `SkipStaleCronOccurrencesOnStartup` it is skipped when an instance starts later than the threshold.
 - With a [custom persistence provider](storage.md#custom-persistence-providers) that keeps the default put-back methods, nothing is put back.

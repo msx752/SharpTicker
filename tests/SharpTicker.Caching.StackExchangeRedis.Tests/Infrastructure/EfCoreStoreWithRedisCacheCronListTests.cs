@@ -215,6 +215,37 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
         Assert.InRange(timeToLive.Value, TimeSpan.FromMinutes(9), TimeSpan.FromMinutes(10));
     }
 
+    // #24: with the EF Core store alone, a starting node reports the jobs that are InProgress under another node
+    // identifier, because nothing releases them. With Redis next to the store its heartbeat does, so there is no report.
+    [Fact]
+    public async Task WithRedisNextToTheStore_JobsInProgressUnderAnotherIdentifier_AreNotReportedAtStartup()
+    {
+        var application = Application("cron-list");
+        var id = Guid.NewGuid();
+        using (var scope = application.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<CronListDbContext>();
+            db.Set<TimeTickerEntity>().Add(new TimeTickerEntity
+            {
+                Id = id, Function = SeededFunction, Status = TickerStatus.InProgress, ExecutionTime = DateTime.UtcNow.AddDays(1),
+                LockHolder = "a-node-that-is-gone", LockedAt = DateTime.UtcNow.AddHours(-1), Request = []
+            });
+            await db.SaveChangesAsync();
+        }
+
+        application.UseSharpTicker();
+        await application.StartAsync();
+        var startup = application.Services.GetRequiredService<TickerExecutionContext>().ExternalProviderStartup;
+        Assert.NotNull(startup);
+        await startup.WaitAsync(WaitLimit);
+
+        Assert.DoesNotContain(_log.Entries, e => e.Text.Contains("under other node identifiers"));
+        // There was something to report: the job is still InProgress under the other identifier.
+        var stored = await Store(application).GetTimeTickerById(id, CancellationToken.None);
+        Assert.Equal(TickerStatus.InProgress, stored.Status);
+        Assert.Equal("a-node-that-is-gone", stored.LockHolder);
+    }
+
     // As an application meets it: a cron in code that runs once a year, the application runs and stops, the cron is
     // changed in code to every second, the application starts again. The job has to run on its new schedule.
     [Fact]

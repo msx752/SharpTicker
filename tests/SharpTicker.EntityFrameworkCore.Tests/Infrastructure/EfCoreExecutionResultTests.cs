@@ -471,6 +471,46 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
     }
 
+    // #24: what a starting node reports. Time jobs and cron occurrences that are InProgress under another node identifier,
+    // counted per identifier; not the node's own, not a job that is not InProgress, not one without a lock holder.
+    [Fact]
+    public async Task CountInProgressOfOtherNodes_CountsTimeJobsAndOccurrencesPerIdentifier_AndLeavesOutTheNodesOwn()
+    {
+        TimeTickerEntity Job(string? holder, TickerStatus status) => new()
+        {
+            Id = Guid.NewGuid(), Function = "KnownFunction", Status = status, ExecutionTime = Earlier, LockHolder = holder,
+            LockedAt = holder == null ? null : Earlier, CreatedAt = Earlier, UpdatedAt = Earlier,
+        };
+        _seed.Set<TimeTickerEntity>().AddRange(
+            Job("pod-a", TickerStatus.InProgress), Job("pod-a", TickerStatus.InProgress), Job("pod-b", TickerStatus.InProgress),
+            Job("node-1", TickerStatus.InProgress), Job("pod-c", TickerStatus.Queued), Job("pod-c", TickerStatus.Done),
+            Job(null, TickerStatus.InProgress));
+        await _seed.SaveChangesAsync();
+        var cron = await AddCronTickerAsync();
+        var ofPodA = await AddOccurrenceAsync(cron.Id);
+        ofPodA.LockHolder = "pod-a";
+        var ofPodD = await AddOccurrenceAsync(cron.Id);
+        ofPodD.LockHolder = "pod-d";
+        await AddOccurrenceAsync(cron.Id);
+        var done = await AddOccurrenceAsync(cron.Id, TickerStatus.Done);
+        done.LockHolder = "pod-e";
+        await _seed.SaveChangesAsync();
+
+        var others = await _provider.CountInProgressOfOtherNodesAsync("node-1");
+
+        Assert.Equal(
+            new[] { ("pod-a", 3), ("pod-b", 1), ("pod-d", 1) },
+            others.OrderBy(x => x.NodeIdentifier, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task CountInProgressOfOtherNodes_IsEmpty_WhenOnlyTheNodeItselfHoldsJobs()
+    {
+        await AddLockedTimeTickerAsync();
+
+        Assert.Empty(await _provider.CountInProgressOfOtherNodesAsync("node-1"));
+    }
+
     private sealed class WarningsLoggerFactory : Microsoft.Extensions.Logging.ILoggerFactory, Microsoft.Extensions.Logging.ILogger
     {
         public List<(string Message, Exception? Exception)> Warnings { get; } = new();
