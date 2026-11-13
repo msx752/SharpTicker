@@ -10,11 +10,25 @@ using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceE
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 
 /// <summary>
-/// An application's own time ticker type: a list of its own, and a property whose converter fails.
+/// An application's own time ticker type: collections of its own (a list, a list of lists, lists under names that need
+/// quoting in a path, a dictionary), and a property whose converter fails.
 /// </summary>
 public sealed class OwnTimeTicker : TimeTickerEntity<OwnTimeTicker>
 {
     public List<string> Tags { get; set; } = [];
+
+    public List<List<string>> Groups { get; set; } = [];
+
+    [JsonPropertyName("a.b")]
+    public int[] Dotted { get; set; } = [];
+
+    [JsonPropertyName("x']y")]
+    public int[] Bracketed { get; set; } = [];
+
+    public Dictionary<string, List<int>> Labels { get; set; } = [];
+
+    // Not empty in a new instance, so a test sees the difference between "read as empty" and "left out".
+    public List<string> Seeded { get; set; } = ["seed"];
 
     [JsonConverter(typeof(FailingConverter))]
     public int Boom { get; set; }
@@ -192,15 +206,67 @@ public class EmptyCollectionRepairTests
         Assert.Equal(LogLevel.Warning, Assert.Single(_log.Entries).Level);
     }
 
-    // Only the two collections of a row are read this way. An empty list of an application's own type stays unread here.
+    // The collections of an application's own type are read the same way, under any name and in the casing of the text;
+    // an empty dictionary reads from an object as it is and stays a dictionary.
     [Fact]
-    public void AnEmptyListOfAnApplicationsOwnType_IsNotRead_AndIsReported()
+    public void EmptyCollectionsOfAnApplicationsOwnType_AreRead_AndAnEmptyDictionaryStaysADictionary()
     {
-        Assert.Null(Read<OwnTimeTicker>($$$"""{"Id":"{{{Id}}}","Tags":{},"Children":[]}"""));
+        var row = Read<OwnTimeTicker>($$$"""{"Id":"{{{Id}}}","Labels":{},"tags":{},"a.b":{},"Groups":{},"Seeded":{},"Children":[]}""");
+
+        Assert.NotNull(row);
+        Assert.Equal(Guid.Parse(Id), row.Id);
+        Assert.Empty(row.Tags);
+        Assert.Empty(row.Seeded);
+        Assert.Empty(row.Dotted);
+        Assert.Empty(row.Groups);
+        Assert.NotNull(row.Labels);
+        Assert.Empty(row.Labels);
+        Assert.DoesNotContain(_log.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
+    // An empty list inside a list, and one that is a value of a dictionary: the empty object is an element of an array
+    // or sits under a key, next to filled ones that stay as they are.
+    [Fact]
+    public void AnEmptyListInsideAListOrADictionary_IsRead_AndItsNeighboursStay()
+    {
+        var row = Read<OwnTimeTicker>($$$"""{"Id":"{{{Id}}}","Groups":[["g"],{},["h","i"],{}],"Labels":{"":{},"k":{},"k.1":[7]}}""");
+
+        Assert.NotNull(row);
+        Assert.Equal(4, row.Groups.Count);
+        Assert.Equal(["g"], row.Groups[0]);
+        Assert.Empty(row.Groups[1]);
+        Assert.Equal(["h", "i"], row.Groups[2]);
+        Assert.Empty(row.Groups[3]);
+        Assert.Empty(row.Labels["k"]);
+        Assert.Equal([7], row.Labels["k.1"]);
+        Assert.Empty(row.Labels[""]);
+        Assert.Equal(["seed"], row.Seeded);
+    }
+
+    // An object that is not empty where the type has a list is not an empty collection: the row stays unread.
+    [Theory]
+    [InlineData("""{"Tags":{"a":1}}""", "$.Tags")]
+    [InlineData("""{"Groups":[{"a":1}]}""", "$.Groups[0]")]
+    [InlineData("""{"Tags":{},"Groups":[{},{"a":1}]}""", "$.Tags")]
+    public void AnObjectThatIsNotEmpty_WhereTheTypeHasAList_IsNotRead_AndIsReported(string json, string firstFailurePath)
+    {
+        Assert.Null(Read<OwnTimeTicker>(json));
 
         var entry = Assert.Single(_log.Entries);
         Assert.Equal(LogLevel.Warning, entry.Level);
-        Assert.Equal("$.Tags", Assert.IsAssignableFrom<JsonException>(entry.Exception).Path);
+        Assert.Equal(firstFailurePath, Assert.IsAssignableFrom<JsonException>(entry.Exception).Path);
+    }
+
+    // A property name or a dictionary key that holds the two characters that end a quoted step of a path is not
+    // followed: the row stays unread and is reported, as it was before.
+    [Theory]
+    [InlineData("""{"x']y":{}}""")]
+    [InlineData("""{"Labels":{"x']y":{}}}""")]
+    public void AnEmptyListUnderANameThatEndsAPathStep_IsNotRead_AndIsReported(string json)
+    {
+        Assert.Null(Read<OwnTimeTicker>(json));
+
+        Assert.Equal(LogLevel.Warning, Assert.Single(_log.Entries).Level);
     }
 
     // The second read can fail in a way that is not a JsonException (here a converter of the application's own type).
