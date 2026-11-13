@@ -46,8 +46,50 @@ An instance that stops while it holds jobs leaves them locked. What releases the
 What this release does not do:
 
 - A running instance does not release the jobs of its own run.
-- After an outage of Redis itself, the instances that are still running are not released: each writes its heartbeat again before the others' confirmation ends.
+- After an outage of Redis itself, the instances that are still running are not released by each other: each writes its heartbeat again before the others' confirmation ends. With Redis as the job store each of them has stopped its own running jobs if the outage lasted one TTL; see below.
 - A restart under the same name before another instance released the node (about two TTLs) is not seen as a stop by the others. The restarted instance releases what its earlier run left, as described under "At startup".
+
+**A node that cannot write its heartbeat (Redis as the job store, since 1.5.0).**
+
+A node that cannot reach Redis for its heartbeat is still running its jobs, and after about two TTLs the others release them and start them again. So the node acts first:
+
+- One TTL after the last heartbeat it wrote (counted from the moment that write was sent), the node asks the jobs it is running to stop, through their cancellation token, and starts no job. It checks this every second. The log has one entry at `Error` that says so and how many jobs were asked.
+- A job that ends then is not recorded as `Cancelled`, and your exception handler is not called for it. Its row is put back once Redis answers, unless another instance has released it by then, and the job runs again from the start. A job has to be safe to run twice for this, as for any release.
+- A job that returns normally after it was asked has done its work: its outcome is stored as usual.
+- While the node is in this state the scheduler and the fallback claim nothing, and a job that was already claimed is put back instead of started.
+- The next heartbeat that is written ends the state, and the log says so at `Information`.
+
+With the default `NodeHeartbeatInterval` of one minute:
+
+| Time | What happens |
+|---|---|
+| 0 s | The last heartbeat that was written is sent. |
+| 80 s | The node asks its jobs to stop and starts none (one TTL). |
+| 80 s at the earliest | Another instance first finds the entry missing. |
+| 160 s at the earliest | Another instance releases the node's jobs (the entry stayed missing for one more TTL). |
+
+So a job that stops within about one TTL of being asked does not run at the same time as its second run.
+
+What this does not cover:
+
+- A job that ignores its cancellation token runs on. If the others release it meanwhile, its late outcome is not stored, as before.
+- A chain child that runs together with its parent (`RunCondition.InProgress`, no time of its own) is not asked to stop. Its parent is, and the child is not started a second time when the parent runs again. ([#158](https://github.com/msx752/SharpTicker/issues/158) is the reason: put back, such a child would be skipped.)
+- A process that was paused for longer than that (a long garbage collection, a suspended virtual machine) does not notice in time.
+- A run that has not written a heartbeat yet counts the TTL from its own start.
+- A Redis failover that loses the node's last heartbeat write, or an eviction of the heartbeat key, shortens the time the others wait.
+- With EF Core or MongoDB as the job store and Redis only for the heartbeat, none of this applies.
+
+**A Redis outage that every instance sees.** No instance is released by another (each writes its heartbeat again before the others' confirmation ends), but since 1.5.0 every instance stops its own running jobs once the outage has lasted one TTL, and they run again afterwards. To keep the jobs running through such an outage, as before 1.5.0, set `StopJobsWhenHeartbeatIsLost` to `false`; a node that alone cannot reach Redis can then have its running jobs started a second time.
+
+```csharp
+options.AddStackExchangeRedis(redis =>
+{
+    redis.Configuration = "...";
+    redis.StopJobsWhenHeartbeatIsLost = false; // default: true
+});
+```
+
+If the application stops while the node is in this state, a job that is still running is recorded as `Cancelled`, as any job still running at a stop is. The cancel button on a job that was already asked to stop this way does not change what happens to it: it is put back and runs again.
 
 Apart from all this, a running instance puts back its own claims whose job never started, with every store; see [A claim whose job does not start](#a-claim-whose-job-does-not-start).
 
@@ -154,7 +196,7 @@ While instances from before a switch to SharpTicker still run against the store 
 These are the cases we know of in which a job runs more than once, or twice at about the same time:
 
 - **A process dies while a job runs.** The same happens when the job finishes, its final write to the store fails, and the process ends before the scheduler has written that outcome again (see [When an outcome cannot be stored](#when-an-outcome-cannot-be-stored)). The job's row stays `InProgress`, and after a restart (EF Core, Redis) or the heartbeat release (Redis) the job runs again, and a repeated parent repeats its children. The first run's outcome is not written over the second run. This is an at-least-once limit: a durable record of the outcome outside the store is not kept.
-- **A Redis node is cut off alone.** A node that alone could not send heartbeats for about two heartbeat TTLs (a long pause, a network split that cut it off) while the other instances kept reaching Redis has its `InProgress` jobs released while they may still be running.
+- **A Redis node is cut off alone.** A node that alone could not send heartbeats for about two heartbeat TTLs while the other instances kept reaching Redis has its `InProgress` jobs released. With Redis as the job store the node has asked its jobs to stop one TTL earlier (see [A node that cannot write its heartbeat](#when-an-instance-stops)), so what still runs at the release is a job that ignored its cancellation token or took longer than about one TTL to stop, a chain child that runs together with its parent, or any job of a process that was paused. With `StopJobsWhenHeartbeatIsLost` off, or with another job store and the Redis heartbeat, every job of that node may still be running.
 - **Two running instances share a name, with EF Core or Redis.** An instance that starts with the name of another running instance frees the jobs that instance is running, through its startup release.
 - **The store loses a write it acknowledged.** For example MongoDB with a write concern of `w:1` after a primary change, or Redis after a failover to a replica that had not received the write.
 - **A custom provider writes every field on an update.** With a [custom persistence provider](storage.md#custom-persistence-providers) that writes the whole object, a copy loaded before the claim puts the old `Status` and lock back, and the job can be claimed again. The built-in stores keep the run; see [Updating a stored job](#updating-a-stored-job).
@@ -253,6 +295,12 @@ A job reports its own failure through the exception handler above. These entries
 | `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | An outcome written again, or a job recorded as `Cancelled` at the stop, was stored, but the dashboard could not be told. |
 | `SharpTicker.EntityFrameworkCore.StartupRelease` | Error | Releasing the jobs that a dead node or an earlier run of this node left locked failed when the application started. |
 | `SharpTicker.Caching.StackExchangeRedis.NodeHeartBeatBackgroundService` | Warning | With Redis as the job store: releasing the jobs an earlier run of this node left locked failed after the application started. It is tried again every 30 seconds; the release that succeeds is written at `Information`. A single job that could not be released is named in an entry of its own. |
+| `SharpTicker.Caching.StackExchangeRedis.NodeHeartBeatBackgroundService` | Error | With Redis as the job store: this node could not write its heartbeat for one TTL. It asked its running jobs to stop (the entry says how many) and starts no job until a heartbeat is written again. One entry each time it happens. The failed heartbeat writes before it are at `Warning`, one for each try. |
+| `SharpTicker.Caching.StackExchangeRedis.NodeHeartBeatBackgroundService` | Information | The heartbeat is written again; the node starts jobs again. |
+| `SharpTicker.Caching.StackExchangeRedis.NodeHeartBeatBackgroundService` | Warning | A job that was asked to stop had registered a callback on its cancellation token, and the callback threw. The entry names the job. |
+| `SharpTicker.TickerExecutionTaskHandler` | Warning | A job was asked to stop because its node could not write its heartbeat. No outcome is stored for that run; its row is put back once the store answers, unless another instance released it first, and the job runs again. |
+| `SharpTicker.BackgroundServices.ClaimedWorkQueue` | Information | The row of a job that was stopped that way was put back, or had already moved on. |
+| `SharpTicker.BackgroundServices.ClaimedWorkQueue` | Warning | A job that was already claimed was not started because its node could not write its heartbeat; it was put back. |
 | `SharpTicker.TickerExecutionTaskHandler` | Warning | Starting the delayed chain children of a parent that ended (or, for `InProgress` children, started) failed, or waking the scheduler for one due later failed. The fallback runs them. At `Error`: the children were claimed but could not be dispatched, and they stay `InProgress` until their store releases the rows of this node. |
 | `SharpTicker.TickerExecutionTaskHandler` | Warning, Error | An inline chain child (no time of its own) did not start after its parent's outcome was stored late. At `Warning`: it was not claimed, because its row was taken or changed meanwhile or the claim failed. At `Error`: the outcome was stored only while the scheduler stopped. The entry names the child and its parent. If the child's row is still `Idle`, the fallback takes it once its parent ended 30 seconds ago. |
 | `SharpTicker.TickerExecutionTaskHandler` | Warning | An inline chain child was not started inside its parent's run because its start claim failed (the store could not be reached). The child is not run without its row; the row keeps waiting and the fallback takes it once its parent ended 30 seconds ago. |
