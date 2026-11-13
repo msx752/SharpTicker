@@ -104,7 +104,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         ).ConfigureAwait(false);
 
         if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result);
+        return Serializer.DeserializeOrNull<T>((string)result, key);
     }
 
     protected async Task<T> TryReleaseAsync<T>(string key) where T : class
@@ -117,7 +117,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         ).ConfigureAwait(false);
 
         if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result);
+        return Serializer.DeserializeOrNull<T>((string)result, key);
     }
 
     protected async Task<T> TryRecoverDeadNodeAsync<T>(string key, string deadNodeId) where T : class
@@ -130,7 +130,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         ).ConfigureAwait(false);
 
         if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result);
+        return Serializer.DeserializeOrNull<T>((string)result, key);
     }
 
     // The script has committed the claim, so an index failure must not turn into a failed claim: the caller would not
@@ -158,7 +158,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         ).ConfigureAwait(false);
 
         if (result.IsNull) return (false, null);
-        return (true, Serializer.DeserializeOrNull<T>((string)result));
+        return (true, Serializer.DeserializeOrNull<T>((string)result, key));
     }
 
     // Puts back a claim whose job never started. The fallback and the loop find rows through the pending index, so the
@@ -215,7 +215,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             }
 
             var raw = (string)read;
-            var row = change(Serializer.DeserializeOrNull<T>(raw));
+            var row = change(Serializer.DeserializeOrNull<T>(raw, key));
             if (row == null) return null;
             var payload = Serializer.Serialize(row);
 
@@ -464,7 +464,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         // The row key and the index keys live in different hash slots; a stale pending entry is harmless, Acquire.lua
         // rejects a skipped row.
-        var skipped = Serializer.DeserializeOrNull<TTimeTicker>((string)result);
+        var skipped = Serializer.DeserializeOrNull<TTimeTicker>((string)result, TimeTickerKey(id));
         if (skipped != null)
             await IndexManager.AddTimeTickerIndexesAsync(skipped).ConfigureAwait(false);
     }
