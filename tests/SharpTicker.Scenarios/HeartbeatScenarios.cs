@@ -95,6 +95,64 @@ public class HeartbeatScenarios(ITestOutputHelper output)
                          $"the runner at {runnerWrote.TotalSeconds:0.0} s; {Describe(env, id)}");
     }
 
+    // #46: one node alone cannot reach Redis while it runs a job; the other node can. The cut-off node's heartbeat entry
+    // expires after one TTL, and the other node releases its rows after it stayed missing for one more TTL, the running
+    // job's row too, and starts the job again. A node that could not write its heartbeat for one TTL asks its running jobs
+    // to stop, so the first run of a job that honours its cancellation token has ended by then. Before the fix the cut-off
+    // node kept running the job, and the two runs overlapped.
+    [Fact]
+    public async Task ANodeCutOffFromRedisAlone_HasStoppedItsJob_BeforeAnotherNodeStartsItAgain()
+    {
+        var (firstEnd, second, cutAt, description) = await RunOnANodeCutOffAloneAsync("cut-off-node", Functions.Slow);
+
+        Assert.True(firstEnd != null && firstEnd.At <= second.At,
+            $"the job was started again {(second.At - cutAt).TotalSeconds:0.0} s into the cut while its first run still went on: {description}");
+        // Asked to stop about one TTL into the cut: its last heartbeat was written up to one interval (5 s) before the cut.
+        Assert.InRange(firstEnd!.At - cutAt, Ttl - TimeSpan.FromSeconds(8), Ttl + TimeSpan.FromSeconds(15));
+    }
+
+    // Control, and the limit that stays: a job that ignores its cancellation token is still running on the cut-off node
+    // when the other node starts it again. The same cut, the same timing, only the job differs.
+    [Fact]
+    public async Task AJobThatIgnoresItsToken_OnANodeCutOffFromRedisAlone_StillRunsWhenAnotherNodeStartsItAgain()
+    {
+        var (firstEnd, second, _, description) = await RunOnANodeCutOffAloneAsync("cut-off-node-stubborn", Functions.Stubborn);
+
+        Assert.True(firstEnd == null || firstEnd.At > second.At, $"the first run had ended before the second start: {description}");
+    }
+
+    private async Task<(RunEvent? FirstEnd, RunEvent Second, DateTimeOffset CutAt, string Description)> RunOnANodeCutOffAloneAsync(string name, string function)
+    {
+        const int runner = 0, observer = 1;
+        await using var env = await ScenarioEnvironment.StartAsync(name, Store.Redis, nodes: 2, startedNodes: 1, ownStoreProxy: [runner]);
+
+        // 180 s: far longer than the cut, so the first run is still going on when the second start comes unless it is stopped.
+        var id = await env.Nodes[runner].Api.AddTimeTickerAsync(new TickerSeed
+            { Function = function, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 180 } });
+        await env.UntilAsync(() => Task.FromResult(env.Runs.Starts(id) == 1), () => "the runner did not start the job", TimeSpan.FromSeconds(30));
+        await env.StartNodeAsync(observer);
+
+        // Only the runner loses Redis. The observer releases it about two TTLs after its last heartbeat (entry gone after
+        // one TTL, first miss at the next check, release one TTL later) and its fallback takes the row within 2 s.
+        await env.SetStoreProxyAsync(runner, enabled: false);
+        var cutAt = DateTimeOffset.UtcNow;
+        try
+        {
+            await env.UntilAsync(() => Task.FromResult(env.Runs.For(id).Any(e => e.IsStart && e.Node == env.Nodes[observer].Identifier)),
+                () => $"the observer did not start the job of the cut-off node: {Describe(env, id)}", Ttl + Ttl + TimeSpan.FromSeconds(40));
+        }
+        finally
+        {
+            await env.SetStoreProxyAsync(runner, enabled: true);
+        }
+
+        var second = env.Runs.For(id).First(e => e.IsStart && e.Node == env.Nodes[observer].Identifier);
+        var firstEnd = env.Runs.For(id).FirstOrDefault(e => e.IsEnd && e.Node == env.Nodes[runner].Identifier);
+        var description = Describe(env, id);
+        output.WriteLine($"cut at {cutAt:HH:mm:ss.fff}; second start {(second.At - cutAt).TotalSeconds:0.0} s into the cut; {description}");
+        return (firstEnd, second, cutAt, description);
+    }
+
     private static string Describe(ScenarioEnvironment env, Guid id)
         => string.Join("; ", env.Runs.For(id).Select(e => $"{e.Event} {e.Node} {e.At:HH:mm:ss.fff} {e.Status}"));
 }
