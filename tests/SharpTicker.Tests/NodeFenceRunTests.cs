@@ -253,7 +253,9 @@ public class NodeFenceRunTests : IAsyncLifetime
         await gate.Started.Task.WaitAsync(Limit);
         _fence.Raise(_handler);
         _fence.Clear();
-        Assert.True((await seen.Task.WaitAsync(Limit)).IsCancellationRequested);
+        // The request reaches the job from the thread pool.
+        var token = await seen.Task.WaitAsync(Limit);
+        await WaitUntilAsync(() => token.IsCancellationRequested, "the job is asked to stop");
         gate.Release.TrySetResult();
         await run.WaitAsync(Limit);
 
@@ -563,8 +565,46 @@ public class NodeFenceRunTests : IAsyncLifetime
 
         Assert.Equal(2, _fence.Raise(_handler, (id, _) => failures.Enqueue(id)));
         await runs.WaitAsync(Limit);
+        await WaitUntilAsync(() => failures.Count == 2, "both failures are reported");
 
         Assert.Equal(new[] { first.Id, second.Id }.Order(), failures.Order());
+        Assert.Equal(new[] { first.Id, second.Id }.Order(), _putBacks.TakeAll().Select(x => x.Id).Order());
+    }
+
+    // A job may do blocking work when its token is cancelled (a callback, or the code after its await). That must not hold
+    // back the request to the other jobs: each of the two jobs here blocks, when it is asked, until the other was asked too.
+    [Fact]
+    public async Task AJobThatBlocksWhenItIsAskedToStop_DoesNotHoldBackTheRequestToTheOthers()
+    {
+        var firstMarker = NextMarker();
+        var secondMarker = NextMarker();
+        var first = ClaimedRow(firstMarker);
+        var second = ClaimedRow(secondMarker);
+        await _store.AddTimeTickers([first, second], CancellationToken.None);
+        using var bothAsked = new CountdownEvent(2);
+        var sawTheOtherAsked = new ConcurrentQueue<bool>();
+        TickerFunctionDelegate blocking(Gate gate) => async (token, _, _) =>
+        {
+            token.Register(() =>
+            {
+                bothAsked.Signal();
+                sawTheOtherAsked.Enqueue(bothAsked.Wait(TimeSpan.FromSeconds(5)));
+            });
+            gate.Started.TrySetResult();
+            await gate.Release.Task.WaitAsync(token);
+        };
+        var firstGate = new Gate();
+        var secondGate = new Gate();
+
+        var runs = Task.WhenAll(
+            _handler.ExecuteTaskAsync(Context(first.Id, blocking(firstGate), firstMarker), isDue: false),
+            _handler.ExecuteTaskAsync(Context(second.Id, blocking(secondGate), secondMarker), isDue: false));
+        await Task.WhenAll(firstGate.Started.Task, secondGate.Started.Task).WaitAsync(Limit);
+
+        Assert.Equal(2, _fence.Raise(_handler));
+        await runs.WaitAsync(Limit);
+
+        Assert.Equal([true, true], sawTheOtherAsked);
         Assert.Equal(new[] { first.Id, second.Id }.Order(), _putBacks.TakeAll().Select(x => x.Id).Order());
     }
 

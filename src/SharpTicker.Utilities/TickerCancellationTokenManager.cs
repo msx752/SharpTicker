@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Models;
 
@@ -49,10 +50,10 @@ namespace SharpTicker.Utilities
         /// tell this stop from a cancellation someone asked for. The entries stay registered until their runs end: the stop
         /// of the host still waits for them. Left alone: a run whose writes are not fenced by a marker (nothing could put
         /// its row back), and a chain child that started with its parent (put back, it would be skipped, not run again).
-        /// A cancellation callback of a job that throws does not stop the others; <paramref name="onCancelFailure"/> gets
-        /// the job's id and the exception. Returns how many runs were asked to stop.
-        /// The cancel runs what each job hung on its token on the caller's thread, and that can be the rest of the job's run:
-        /// the caller should not be a thread that must not be held up.
+        /// Each token is cancelled on a thread of the pool, not here and not one after another: a cancel runs what the job
+        /// hung on its token, which can be the rest of the job's run, and a job that blocks there must hold back neither the
+        /// caller nor the request to the other jobs. A cancellation callback of a job that throws is handed to
+        /// <paramref name="onCancelFailure"/> with the job's id. Returns how many runs were marked and are being asked.
         /// </summary>
         internal static int CancelForFence(object owner, Action<Guid, Exception> onCancelFailure = null)
         {
@@ -64,21 +65,31 @@ namespace SharpTicker.Utilities
                     continue;
 
                 details.Fenced = true;
-                try
+                asked++;
+                var jobId = entry.Key;
+                _ = Task.Run(() =>
                 {
-                    details.CancellationSource?.Cancel();
-                    asked++;
-                }
-                catch (ObjectDisposedException)
-                {
-                    // The run ended meanwhile.
-                }
-                catch (Exception ex)
-                {
-                    // A callback the job registered on its token threw; the token is cancelled all the same.
-                    asked++;
-                    onCancelFailure?.Invoke(entry.Key, ex);
-                }
+                    try
+                    {
+                        details.CancellationSource?.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The run ended meanwhile.
+                    }
+                    catch (Exception ex)
+                    {
+                        // A callback the job registered on its token threw; the token is cancelled all the same.
+                        try
+                        {
+                            onCancelFailure?.Invoke(jobId, ex);
+                        }
+                        catch
+                        {
+                            // Nothing observes this task: a reporter that throws must not become an unobserved exception.
+                        }
+                    }
+                });
             }
 
             return asked;

@@ -18,8 +18,9 @@ internal sealed class NodeFence
 
     /// <summary>
     /// Raises the fence and asks the jobs <paramref name="owner"/> is running to stop (see
-    /// <see cref="TickerCancellationTokenManager.CancelForFence"/>). Returns how many were asked. It does not throw for a
-    /// job whose cancellation callback throws: <paramref name="onCancelFailure"/> gets that job's id and the exception.
+    /// <see cref="TickerCancellationTokenManager.CancelForFence"/>). Returns how many are being asked; the requests run
+    /// on the thread pool and may not have reached the jobs yet when this returns. A cancellation callback of a job that
+    /// throws is handed to <paramref name="onCancelFailure"/> with that job's id, from the pool.
     /// </summary>
     internal int Raise(object owner, Action<Guid, Exception> onCancelFailure = null)
     {

@@ -51,6 +51,11 @@ public static class ServiceExtension
                 Node: sp.GetRequiredService<SchedulerOptionsBuilder>().NodeIdentifier,
                 RunStartedAt: () => sp.GetService<TickerExecutionContext>()?.RunStartedAt,
                 ApplicationStarted: sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStarted));
+            // The same condition: with another job store this heartbeat does not fence the node.
+            services.AddSingleton(sp => new NodeSelfFence(
+                Enabled: options.StopJobsWhenHeartbeatIsLost && sp.GetRequiredService<EarlierRunRelease>().StoreIsRedis,
+                Fence: sp.GetService<NodeFence>(),
+                Owner: sp.GetService<ITickerExecutionTaskHandler>()));
             services.AddSingleton<SharpTickerRedisContext>();
             services.AddSingleton<ISharpTickerRedisContext>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
             services.AddSingleton<INodeHeartbeatRegistry>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
@@ -71,6 +76,27 @@ public static class ServiceExtension
     public class SharpTickerRedisOptionBuilder : RedisCacheOptions
     {
         public TimeSpan NodeHeartbeatInterval { get; set; } = TimeSpan.FromMinutes(1);
+
+        /// <summary>
+        /// With Redis as the job store: whether this node asks the jobs it is running to stop, and starts no job, once it
+        /// could not write its heartbeat for one heartbeat TTL (<see cref="NodeHeartbeatInterval"/> plus 20 seconds). The
+        /// other nodes may release the jobs of a node whose heartbeat stayed missing for one more TTL and start them again;
+        /// a job that stops within about one TTL of being asked does not overlap that second run. A job stopped this way
+        /// is not recorded as cancelled and the application's exception handler is not called for it: its row is put back
+        /// and the job runs again from the start, so it has to be safe to run twice. Jobs start again with the next
+        /// heartbeat that is written.
+        /// <para>
+        /// Not asked to stop: a job that ignores its cancellation token, and a chain child that started together with its
+        /// parent (<c>RunCondition.InProgress</c>).
+        /// </para>
+        /// <para>
+        /// The default is true. With it, a Redis outage longer than one TTL stops the running jobs of every node that sees
+        /// it, and they run again afterwards. Set it to false to let the jobs run on, as versions before 1.5.0 did: such an
+        /// outage then stops no job, and a node that alone cannot reach Redis may have its running jobs started a second
+        /// time while they still run. It has no effect with another job store.
+        /// </para>
+        /// </summary>
+        public bool StopJobsWhenHeartbeatIsLost { get; set; } = true;
 
         /// <summary>
         /// An existing <see cref="IConnectionMultiplexer"/> to use for all Redis operations.
