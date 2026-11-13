@@ -42,7 +42,8 @@ internal sealed class RedisSerializer
         return _db.StringSetAsync(key, payload, when: When.NotExists);
     }
 
-    // key is the Redis key the text was read from, for the log; null when the text has no key of its own.
+    // key is the Redis key the text was read from; null when the text has no key of its own, which means it is not a
+    // stored row.
     // A row that does not deserialize is tried once more with its empty objects read as empty collections (see
     // EmptyCollectionRepair); the text itself is not changed, so a compare-and-set still compares what the key holds.
     internal T DeserializeOrNull<T>(string json, string key = null) where T : class
@@ -65,6 +66,14 @@ internal sealed class RedisSerializer
                 _logger.LogWarning(ex, "Failed to deserialize Redis key '{Key}' as {Type}. Data may be corrupted.", key, typeof(T).Name);
             else
                 _logger.LogWarning(ex, "Failed to deserialize JSON payload as {Type}.", typeof(T).Name);
+            return null;
+        }
+        catch (NotSupportedException ex) when (key != null)
+        {
+            // The serializer refuses a type the stored row holds (a property of an abstract type, for example). Left to
+            // throw, one such row would end the read of every row loaded with it. Text without a key is not a stored row
+            // (the copy of an update's body): there the exception still reaches the caller, whose entity it is about.
+            _logger.LogWarning(ex, "Redis key '{Key}' cannot be read as {Type}: the serializer does not support a type it holds.", key, typeof(T).Name);
             return null;
         }
     }
