@@ -32,7 +32,8 @@ public class SchedulerShutdownTests
 
     private readonly CapturedLogs _logs = new();
 
-    private async Task<WebApplication> StartAsync(Action<IServiceCollection> map, TimeSpan? shutdownTimeout = null)
+    private async Task<WebApplication> StartAsync(Action<IServiceCollection> map, TimeSpan? shutdownTimeout = null,
+        TimeSpan? fallbackInterval = null, TimeTickerEntity? overdueJob = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
@@ -40,12 +41,18 @@ public class SchedulerShutdownTests
         if (shutdownTimeout is { } timeout)
             builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = timeout);
         map(builder.Services);
-        builder.Services.AddSharpTicker();
+        builder.Services.AddSharpTicker(o =>
+        {
+            if (fallbackInterval is { } interval)
+                o.ConfigureScheduler(s => s.FallbackIntervalChecker = interval);
+        });
         var app = builder.Build();
         app.UseSharpTicker();
         // The in-memory store is shared by the whole process. What an earlier test left in it, a cron occurrence that is due for
         // example, would be run by this host's scheduler and counted among its running jobs.
         await ClearStoreAsync(app);
+        if (overdueJob != null)
+            await StoreOf(app).AddTimeTickers(new[] { overdueJob }, default);
         await app.StartAsync();
         return app;
     }
@@ -86,6 +93,68 @@ public class SchedulerShutdownTests
         await store.RemoveTimeTickers(new[] { job.Id }, default);
         await app.DisposeAsync();
         Assert.Equal(TickerStatus.Cancelled, stored.Status);
+    }
+
+    // #73: a job may hang a callback of its own on its token, and that callback may throw. The cancel that the stop sends runs
+    // it. The job needs a moment to clean up, so a stop that does not wait for it finds its row still InProgress. The job is
+    // due two seconds after it is added, so the scheduler loop starts it.
+    [Fact]
+    public async Task AJobWhoseOwnCancellationCallbackThrows_DoesNotBreakTheStop()
+    {
+        const string function = "ShutdownCallbackThrows";
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var app = await StartAsync(s => s.MapTicker(function, async (_, ct) =>
+        {
+            using var registration = ct.Register(() => throw new InvalidOperationException("the job's own cancellation callback failed"));
+            started.TrySetResult();
+            try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+            catch (OperationCanceledException) { await Task.Delay(TimeSpan.FromSeconds(1)); throw; }
+        }));
+        var store = StoreOf(app);
+        var job = (await app.Services.GetRequiredService<ITimeTickerManager<TimeTickerEntity>>()
+            .AddAsync(new TimeTickerEntity { Function = function, ExecutionTime = DateTime.UtcNow.AddSeconds(2) })).Result;
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+        var stopError = await Record.ExceptionAsync(() => app.StopAsync());
+
+        var stored = await store.GetTimeTickerById(job.Id, default);
+        await store.RemoveTimeTickers(new[] { job.Id }, default);
+        await app.DisposeAsync();
+        Assert.Null(stopError);
+        Assert.Equal(TickerStatus.Cancelled, stored.Status);
+        Assert.Contains(_logs.Entries, e => e.Level == LogLevel.Warning && e.Exception is AggregateException
+            && e.Message.StartsWith("A cancellation callback of a running job threw"));
+    }
+
+    // The same for a job the fallback started: a row that was overdue when the application started.
+    [Fact]
+    public async Task AJobStartedByTheFallback_WhoseOwnCancellationCallbackThrows_DoesNotBreakTheStop()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var job = new TimeTickerEntity
+        {
+            Id = Guid.NewGuid(), Function = "ShutdownCallbackThrowsFallback", ExecutionTime = DateTime.UtcNow.AddMinutes(-1),
+            Status = TickerStatus.Idle, CreatedAt = DateTime.UtcNow.AddMinutes(-2), UpdatedAt = DateTime.UtcNow.AddMinutes(-2), Request = []
+        };
+        var app = await StartAsync(s => s.MapTicker("ShutdownCallbackThrowsFallback", async (_, ct) =>
+        {
+            using var registration = ct.Register(() => throw new InvalidOperationException("the job's own cancellation callback failed"));
+            started.TrySetResult();
+            try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+            catch (OperationCanceledException) { await Task.Delay(TimeSpan.FromSeconds(1)); throw; }
+        }), fallbackInterval: TimeSpan.FromSeconds(1), overdueJob: job);
+        var store = StoreOf(app);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+        var stopError = await Record.ExceptionAsync(() => app.StopAsync());
+
+        var stored = await store.GetTimeTickerById(job.Id, default);
+        await store.RemoveTimeTickers(new[] { job.Id }, default);
+        await app.DisposeAsync();
+        Assert.Null(stopError);
+        Assert.Equal(TickerStatus.Cancelled, stored.Status);
+        Assert.Contains(_logs.Entries, e => e.Level == LogLevel.Warning && e.Exception is AggregateException
+            && e.Message.StartsWith("A cancellation callback of a running job threw"));
     }
 
     [Fact]

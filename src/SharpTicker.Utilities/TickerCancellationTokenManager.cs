@@ -180,6 +180,10 @@ namespace SharpTicker.Utilities
             {
                 // Already disposed by another thread - safe to ignore
             }
+            catch (AggregateException)
+            {
+                // A callback the job registered on its token threw; the token is cancelled all the same.
+            }
 
             // Now remove and dispose
             if (TickerCancellationTokens.TryRemove(tickerId, out var removed))

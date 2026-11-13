@@ -175,7 +175,16 @@ internal class SharpTickerFallbackBackgroundService :  BackgroundService
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         Interlocked.Exchange(ref _started, 0);
-        await base.StopAsync(cancellationToken);
+        try
+        {
+            await base.StopAsync(cancellationToken);
+        }
+        catch (AggregateException ex)
+        {
+            // As in the scheduler's stop: a cancellation callback of a job this service started threw. The put-back below
+            // still has to run.
+            _logger?.LogWarning(ex, "A cancellation callback of a running job threw while the application was stopping. The stop goes on.");
+        }
         // The loop has ended: a job it handed over that has not started (one that waits for its concurrency slot, which the
         // stop ends) is put back instead of staying InProgress. Only its own: the scheduler stops later and handles the rest.
         await _work.PutBackUnstartedAsync(owner: this, cancellationToken: cancellationToken);
