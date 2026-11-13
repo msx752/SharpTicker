@@ -732,6 +732,22 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         }
 
         await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        // The seed changes cron rows without the managers, which clear the cached list themselves. A list read before
+        // this start would keep the scheduler on the expressions of the earlier code.
+        if (RedisContext.HasRedisConnection)
+        {
+            try
+            {
+                await RedisContext.DistributedCache.RemoveAsync("cron:expressions", cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // The start does not fail on it: a list this version cached ends by itself (see
+                // GetAllCronTickerExpressions). One an earlier version cached has no end.
+                _logger.LogWarning(ex, "The cached list of cron expressions could not be cleared after the cron tickers defined in code were seeded. The scheduler may plan from the earlier list until it ends, up to ten minutes after it was read; a list cached by a version that gave it no end stays until a cron is added, changed or removed.");
+            }
+        }
     }
         
     public async Task<CronTickerEntity[]> GetAllCronTickerExpressions(CancellationToken cancellationToken = default)
