@@ -14,7 +14,9 @@ These tests are local only: they are not part of `SharpTicker.slnx` and do not r
 - `tests/SharpTicker.Scenarios`: the xUnit tests. Each scenario starts a Docker network, a store (PostgreSQL 16,
   MongoDB 7 or Redis 7), a Toxiproxy in front of the store, and the nodes. Faults go through Docker and Toxiproxy.
   A scenario can give a node a store proxy of its own (the store is then cut for some nodes and not for others), and can
-  add a Redis next to an EF Core store for the node heartbeat.
+  add a Redis next to an EF Core store for the node heartbeat. With the Redis store a node can also be started as an application
+  with ticker types of its own (`SCENARIO_OWN_TYPES=1`, `OwnTypesHost.cs`); it has no dashboard, so those scenarios read
+  the store.
 
 ## Prerequisites
 

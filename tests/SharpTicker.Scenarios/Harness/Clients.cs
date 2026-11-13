@@ -28,6 +28,15 @@ public enum RunCondition
     InProgress,
 }
 
+/// <summary>A job of the scenario host's own ticker type: a list of tags, and optionally a value of an abstract type.</summary>
+public sealed class OwnSeed
+{
+    public string Function { get; set; } = Functions.Record;
+    public DateTime? ExecutionTime { get; set; }
+    public List<string> Tags { get; set; } = new();
+    public bool WithShape { get; set; }
+}
+
 public sealed class WaitRequest
 {
     public int Seconds { get; set; }
@@ -140,6 +149,15 @@ public sealed class ScenarioClient(Func<HttpClient> http)
     }
 
     public async Task<Guid> AddTimeTickerAsync(TickerSeed seed) => (await AddTimeTickersAsync(seed))[0];
+
+    /// <summary>Seeds jobs of the node's own ticker type (a node started with <c>SCENARIO_OWN_TYPES=1</c>).</summary>
+    public async Task<IReadOnlyList<Guid>> AddOwnTimeTickersAsync(params OwnSeed[] seeds)
+    {
+        var response = await http().PostAsJsonAsync("/scenario/own/time-tickers", seeds, Json.Options);
+        await EnsureSuccess(response);
+        var ids = await response.Content.ReadFromJsonAsync<List<IdResult>>(Json.Options);
+        return ids!.Select(i => i.Id).ToList();
+    }
 
     /// <summary>Seeds a chain; returns the root id and every id of the tree, depth first, root first.</summary>
     public async Task<(Guid Root, IReadOnlyList<Guid> Tree)> AddChainAsync(TickerSeed root)
