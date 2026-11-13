@@ -1,6 +1,8 @@
 #nullable disable
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 using SharpTicker.Caching.StackExchangeRedis.Helpers;
@@ -67,10 +69,19 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         if (redisOptions?.JsonSerializerContext != null)
             jsonOptions.TypeInfoResolverChain.Insert(0, redisOptions.JsonSerializerContext);
 
+        // A type neither context knows, a ticker type of the application's own for example, is read through reflection.
+        // A trimmed or AOT application has reflection switched off for the serializer and gives its context instead.
+        if (JsonSerializer.IsReflectionEnabledByDefault)
+            jsonOptions.TypeInfoResolverChain.Add(ReflectionResolver());
+
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         Serializer = new RedisSerializer(db, jsonOptions, _logger);
         IndexManager = new RedisIndexManager<TTimeTicker, TCronTicker>(db, LockHolder);
     }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Called only when JsonSerializer.IsReflectionEnabledByDefault is true.")]
+    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Called only when JsonSerializer.IsReflectionEnabledByDefault is true.")]
+    private static IJsonTypeInfoResolver ReflectionResolver() => new DefaultJsonTypeInfoResolver();
 
     #region Lua script operations
     // A claim to InProgress (the fallback, run-now). The marker is chosen before the script runs: when the call fails, the
