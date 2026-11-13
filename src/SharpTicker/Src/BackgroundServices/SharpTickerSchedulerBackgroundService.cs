@@ -483,7 +483,16 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         var lostOutcomesEpoch = _lostOutcomes?.Epoch ?? 0;
         _taskScheduler.Freeze();
         Interlocked.Exchange(ref _started, 0);
-        await base.StopAsync(cancellationToken);
+        try
+        {
+            await base.StopAsync(cancellationToken);
+        }
+        catch (AggregateException ex)
+        {
+            // Stopping cancels the token the running jobs are linked to, and a cancel runs what a job hung on its token. A
+            // callback of a job that throws comes out here, after the loop has ended. The rest of the stop still has to run.
+            _logger?.LogWarning(ex, "A cancellation callback of a running job threw while the application was stopping. The stop goes on.");
+        }
         var stillRunning = await WaitForRunningJobsAsync(cancellationToken);
         // The outcomes whose final write threw get one last write, whether or not a job is still running, and before the
         // Cancelled writes: those must not take a row whose real outcome is about to be stored.
