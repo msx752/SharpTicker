@@ -54,8 +54,12 @@ internal sealed class SharpTickerInitializerHostedService : IHostedService
         // claim of this run. The startup release of what an earlier run left locked is fenced by it.
         _executionContext.RunStartedAt ??= _serviceProvider.GetService<ITickerClock>()?.UtcNow ?? DateTime.UtcNow;
 
-        TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(_configuration);
+        var invalidCrons = TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(_configuration);
         TickerFunctionProvider.Build();
+
+        if (invalidCrons.Count > 0)
+            throw new InvalidOperationException(string.Join(Environment.NewLine, invalidCrons.Select(x =>
+                $"The cron expression '{x.Value}' that the configuration key '{x.ConfigurationKey}' gives to the function '{x.Function}' is not valid.")));
 
         var options = _executionContext.OptionsSeeding;
 

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using SharpTicker.DependencyInjection;
@@ -65,10 +66,13 @@ public class StartupServicesTests : IAsyncLifetime
     private async Task<WebApplication> StartAsync(
         Action<TickerOptionsBuilder<TimeTickerEntity, CronTickerEntity>>? configure = null,
         bool useSharpTicker = true,
-        Func<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>, Task>? beforeStart = null)
+        Func<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>, Task>? beforeStart = null,
+        Dictionary<string, string?>? configuration = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
+        if (configuration != null)
+            builder.Configuration.AddInMemoryCollection(configuration);
         builder.Services.AddSharpTicker(options =>
         {
             options.DisableBackgroundServices();
@@ -120,6 +124,47 @@ public class StartupServicesTests : IAsyncLifetime
 
         var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.WeekdayCron5");
         Assert.Equal("0 30 8 * * Mon-Fri", cron.Expression);
+    }
+
+    // #79: a cron that comes from configuration follows the rules of one written in code.
+    [Fact]
+    public async Task AFiveFieldCronFromConfiguration_IsSeededWithTheSecondsFieldAdded()
+    {
+        new ServiceCollection().MapTicker("Startup.ConfiguredCron5", (_, _) => Task.CompletedTask).WithCron("%Startup:FiveFieldCron%");
+        TickerFunctionProvider.Build();
+
+        await StartAsync(configuration: new() { ["Startup:FiveFieldCron"] = "30 8 * * *" });
+
+        var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.ConfiguredCron5");
+        Assert.Equal("0 30 8 * * *", cron.Expression);
+        Assert.NotNull(CronScheduleCache.GetNextOccurrenceOrDefault(cron.Expression, DateTime.UtcNow));
+    }
+
+    [Fact]
+    public async Task ASixFieldCronFromConfiguration_IsSeededAsWritten()
+    {
+        new ServiceCollection().MapTicker("Startup.ConfiguredCron6", (_, _) => Task.CompletedTask).WithCron("%Startup:SixFieldCron%");
+        TickerFunctionProvider.Build();
+
+        await StartAsync(configuration: new() { ["Startup:SixFieldCron"] = "15 30 8 * * MON-FRI" });
+
+        var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.ConfiguredCron6");
+        Assert.Equal("15 30 8 * * MON-FRI", cron.Expression);
+    }
+
+    [Fact]
+    public async Task ACronFromConfigurationThatIsNotValid_StopsTheStartup_NamingTheFunctionAndTheKey()
+    {
+        new ServiceCollection().MapTicker("Startup.ConfiguredCronBad", (_, _) => Task.CompletedTask).WithCron("%Startup:BadCron%");
+        TickerFunctionProvider.Build();
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => StartAsync(configuration: new() { ["Startup:BadCron"] = "every morning" }));
+
+        Assert.Contains("Startup.ConfiguredCronBad", error.Message);
+        Assert.Contains("Startup:BadCron", error.Message);
+        Assert.Contains("every morning", error.Message);
+        Assert.Empty(await Store.GetCronTickers(null, default));
     }
 
     [Fact]
