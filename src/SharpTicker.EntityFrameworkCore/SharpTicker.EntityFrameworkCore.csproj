@@ -12,7 +12,10 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="FlexLabs.EntityFrameworkCore.Upsert" Version="$(DotNetVersion)" />
+		<!-- On net8.0 the range of the other packages would resolve to 8.0.0, which does not know the official MySQL
+		     provider (MySql.EntityFrameworkCore); with 8.1.2 the crons run on it (#91). -->
+		<PackageReference Include="FlexLabs.EntityFrameworkCore.Upsert" Version="[8.1.2,9.0.0)" Condition="'$(TargetFramework)' == 'net8.0' And '$(LatestPatchDependencies)' != 'true'" />
+		<PackageReference Include="FlexLabs.EntityFrameworkCore.Upsert" Version="$(DotNetVersion)" Condition="'$(TargetFramework)' != 'net8.0' Or '$(LatestPatchDependencies)' == 'true'" />
 		<PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="$(EfCoreVersion)" />
 		<ProjectReference Include="../SharpTicker.Utilities/SharpTicker.Utilities.csproj" />
 	</ItemGroup>

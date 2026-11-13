@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A project of its own: each version of the official MySQL provider asks for one exact EF Core patch, which would
+       take every test of the EF Core test project off the lowest EF Core version the package supports. -->
+  <PropertyGroup>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <!-- The official MySQL provider (#91); it has a line of versions per EF Core major. -->
+    <PackageReference Include="MySql.EntityFrameworkCore" Version="8.0.31" Condition="'$(TargetFramework)' == 'net8.0'" />
+    <PackageReference Include="MySql.EntityFrameworkCore" Version="9.0.20" Condition="'$(TargetFramework)' == 'net9.0'" />
+    <PackageReference Include="MySql.EntityFrameworkCore" Version="10.0.12" Condition="'$(TargetFramework)' == 'net10.0'" />
+    <PackageReference Include="Testcontainers.MySql" Version="4.16.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SharpTicker\SharpTicker.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.Utilities\SharpTicker.Utilities.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.EntityFrameworkCore\SharpTicker.EntityFrameworkCore.csproj" />
+  </ItemGroup>
+
+</Project>
