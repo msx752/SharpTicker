@@ -17,6 +17,11 @@ This page points to those notes and names what needs a decision or a step from y
 
   Look for both before the upgrade. On 1.4.0, delete such jobs and add them again afterwards. With the fix for #144 the `InProgress` time jobs ran after the upgrade in that run, so delete the ones that should not run any more; the chains still have to be deleted and added again. See [Scheduling](scheduling.md#delayed-children).
 - A Redis store that was ever used by a version before 1.3.0 can still hold such `InProgress` time jobs, also when it has been on 1.3.x or 1.4.0 since. With the fix for #144 they are released when the instance starts under the `NodeIdentifier` that holds them, and run then, however old they are. Look for time jobs that are `InProgress` with no instance running them, and delete the ones that should not run.
+- With Redis as the job store and a ticker type of your own that has a collection property ([#146](https://github.com/msx752/SharpTicker/issues/146)):
+  - Up to 1.4.0, a time job whose collection was empty was claimed and not handed out. It stayed held by its instance, mostly as `InProgress`.
+  - Up to 1.4.0, an occurrence of a cron type whose collection is empty in a new instance of the type (for example `List<string> Tags = []`) ran while its outcome was not stored, and stayed `InProgress`. This does not depend on what the stored cron ticker holds, so it applies to every occurrence of such a type. The log of that version has `Failed to deserialize` warnings for them.
+  - With the fix for #146 these records are read. An instance that starts under the `NodeIdentifier` that holds them, or another instance that finds their instance stopped, releases them, and they run then: the time jobs late, and every such occurrence still in the store one more time although it ran before, all of them together.
+  - Before upgrading, delete the ones that should not run. A version up to 1.4.0 does not list these records, in its reads or in the dashboard, so look in Redis: the keys `tq:tt:<id>` (time jobs) and `tq:co:<id>` (occurrences) whose value has `"Status":2`, with no instance running them. Delete the key and take its id out of the index keys: `tq:tt:ids` and `tq:tt:pending` for a time job; `tq:co:ids`, `tq:co:pending` and `tq:cron:<cron id>:occurrences` for an occurrence.
 
 ## Release by release
 

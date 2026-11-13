@@ -6,12 +6,12 @@ using System.Text.Json.Serialization.Metadata;
 namespace SharpTicker.Caching.StackExchangeRedis.Helpers;
 
 // The Lua scripts rewrite a row through cjson, which writes an empty array as {}. Since 1.3.0 the scripts turn the two
-// collections of a row (Children, RetryIntervals) back into []; a row written before that still holds {} and does not
-// deserialize.
+// collections they know (Children, RetryIntervals) back into []; a row written before that, or an empty collection of an
+// application's own ticker type, still holds {} and does not deserialize.
 // Used only after a row failed to deserialize. The serializer says where it failed (JsonException.Path); when the value
-// there is an empty object under one of those two names, it is read as an empty array and the row is tried again, once
-// for each such place. Anything else is left as it is: the row is not readable for another reason, and the caller
-// reports the first failure.
+// there is an empty object, it is read as an empty array and the row is tried again, once for each such place. Anything
+// else is left as it is: the row is not readable for another reason, and the caller reports the first failure.
+// A value that reads from an empty object without a failure (a dictionary, an object-typed property) does not come here.
 // Nothing is written: the text in the store stays as it was until the row's next write.
 internal static class EmptyCollectionRepair
 {
@@ -48,25 +48,35 @@ internal static class EmptyCollectionRepair
 
     private static bool TryReplaceEmptyObject(JsonNode root, string path)
     {
-        if (!TryResolve(root, path, out var owner, out var name) || !IsCollectionOfARow(name))
+        if (!TryResolve(root, path, out var parent, out var name, out var index))
             return false;
 
-        if (owner[name] is not JsonObject { Count: 0 }) return false;
-        owner[name] = new JsonArray();
-        return true;
+        // A property of an object, or an element of an array (an empty list inside a list).
+        if (parent is JsonObject owner)
+        {
+            if (owner[name] is not JsonObject { Count: 0 }) return false;
+            owner[name] = new JsonArray();
+            return true;
+        }
+
+        if (parent is JsonArray list)
+        {
+            if (list[index] is not JsonObject { Count: 0 }) return false;
+            list[index] = new JsonArray();
+            return true;
+        }
+
+        return false;
     }
 
-    // The names the scripts restore, in the casing of the stored text (a context may write camelCase).
-    private static bool IsCollectionOfARow(string name)
-        => string.Equals(name, "Children", StringComparison.OrdinalIgnoreCase)
-           || string.Equals(name, "RetryIntervals", StringComparison.OrdinalIgnoreCase);
-
-    // Walks a path as System.Text.Json writes it: $.Name, $.Name[0].Other, $['a name']. Gives the object that holds the
-    // last step and the name of that step. False for a path that does not end at a property of this document.
-    private static bool TryResolve(JsonNode root, string path, out JsonObject owner, out string name)
+    // Walks a path as System.Text.Json writes it: $.Name, $.Name[0].Other, $['a name']. Gives the node that holds the last
+    // step, with the name or the index of that step. False for a path that does not lead to a value of this document; a
+    // property name or dictionary key that contains '] is not followed, and such a row stays unread.
+    private static bool TryResolve(JsonNode root, string path, out JsonNode parent, out string name, out int index)
     {
-        owner = null;
+        parent = null;
         name = null;
+        index = -1;
 
         if (string.IsNullOrEmpty(path) || path[0] != '$' || path.Length == 1)
             return false;
@@ -108,7 +118,7 @@ internal static class EmptyCollectionRepair
             JsonNode next;
             if (stepName != null)
             {
-                if (stepName.Length == 0 || current is not JsonObject holder || !holder.TryGetPropertyValue(stepName, out next))
+                if (current is not JsonObject holder || !holder.TryGetPropertyValue(stepName, out next))
                     return false;
             }
             else
@@ -120,9 +130,10 @@ internal static class EmptyCollectionRepair
 
             if (position >= path.Length)
             {
-                owner = current as JsonObject;
+                parent = current;
                 name = stepName;
-                return owner != null && name != null;
+                index = stepIndex;
+                return true;
             }
 
             current = next;
