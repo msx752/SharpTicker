@@ -155,7 +155,7 @@ A child or grandchild can have an execution time of its own (`SetExecutionTime` 
 - A delayed grandchild depends on its own parent (the child), not on the root of the chain.
 - It is claimed like any other job, also with several nodes, and once it has ended a restart does not start it again. The cases in [When a job can run more than once](operations.md#when-a-job-can-run-more-than-once) apply to it as to any job. A child that is given a time while its parent runs becomes a delayed child: the parent's run does not start it any more. A child that has already started keeps the status of its own run.
 
-Pass the child's time in UTC.
+A child's or grandchild's time follows the same `ExecutionTime` rules as the root's: a UTC value is used as it is, a `DateTimeKind.Local` value is converted to UTC, and an `Unspecified` one is read in the scheduler time zone. Through the dashboard API, a `timeZoneId` applies to every time in the chain. Versions up to 1.5.1 stored a child's time as given, so pass it in UTC there ([#81](https://github.com/msx752/SharpTicker/issues/81)).
 
 When a parent ends, the node that ran it at once starts the delayed children that may run and whose time has come, and wakes its scheduler for the next one due later. An `InProgress` delayed child is handled the same way when its parent starts. If that node stops before this, for example when the application stops while the parent runs, the fallback starts them after the restart, up to `FallbackIntervalChecker` later. A delayed child started right after its parent ends as `Done`, one started by the fallback as `DueDone`; a `RunCondition` treats both as success.
 

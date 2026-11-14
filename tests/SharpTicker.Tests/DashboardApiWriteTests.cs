@@ -68,6 +68,24 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
     }
 
     [Fact]
+    public async Task AddChain_ReadsTheTimesOfChildrenAndGrandchildrenInTheGivenTimeZone_AsTheRoots()
+    {
+        // Tokyo is UTC+9 all year: 12:00, 13:00 and 14:00 there are 03:00, 04:00 and 05:00 UTC. A zone other than the
+        // scheduler's, which reads a time without a zone too, so only the endpoint's reading can give these values.
+        Assert.NotEqual(TimeSpan.FromHours(9), SharpTicker.Utilities.CronScheduleCache.TimeZoneInfo.GetUtcOffset(new DateTime(2030, 6, 1)));
+        var id = await AddTimeTickerAsync(
+            """{"function":"TzJob","executionTime":"2030-06-01T12:00:00","children":[{"function":"OtherJob","runCondition":1,"executionTime":"2030-06-01T13:00:00","children":[{"function":"WriteJob","runCondition":1,"executionTime":"2030-06-01T14:00:00"}]}]}""",
+            "?timeZoneId=Asia/Tokyo");
+
+        var root = (await TimeTickersAsync()).Single(t => t.GetProperty("id").GetGuid() == id);
+        var child = Assert.Single(root.GetProperty("children").EnumerateArray());
+        var grandchild = Assert.Single(child.GetProperty("children").EnumerateArray());
+        Assert.Equal(new DateTime(2030, 6, 1, 3, 0, 0, DateTimeKind.Utc), AsUtc(root.GetProperty("executionTime")));
+        Assert.Equal(new DateTime(2030, 6, 1, 4, 0, 0, DateTimeKind.Utc), AsUtc(child.GetProperty("executionTime")));
+        Assert.Equal(new DateTime(2030, 6, 1, 5, 0, 0, DateTimeKind.Utc), AsUtc(grandchild.GetProperty("executionTime")));
+    }
+
+    [Fact]
     public async Task AddTimeTicker_StoresTheRetryIntervals()
     {
         var id = await AddTimeTickerAsync(
