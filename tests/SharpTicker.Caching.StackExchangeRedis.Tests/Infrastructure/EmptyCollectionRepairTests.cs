@@ -48,11 +48,32 @@ internal partial class OwnJsonSerializerContext : JsonSerializerContext;
 
 internal sealed class ListLogger<T> : ILogger<T>
 {
-    public List<(LogLevel Level, string Message, Exception? Exception)> Entries { get; } = [];
+    // The services under test log from several loops at once, so the list is guarded and read as a copy.
+    private readonly List<(LogLevel Level, string Message, Exception? Exception)> _entries = [];
+
+    public List<(LogLevel Level, string Message, Exception? Exception)> Entries
+    {
+        get
+        {
+            lock (_entries)
+                return [.. _entries];
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_entries)
+            _entries.Clear();
+    }
+
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
     public bool IsEnabled(LogLevel logLevel) => true;
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-        => Entries.Add((logLevel, formatter(state, exception), exception));
+    {
+        var entry = (logLevel, formatter(state, exception), exception);
+        lock (_entries)
+            _entries.Add(entry);
+    }
 }
 
 /// <summary>

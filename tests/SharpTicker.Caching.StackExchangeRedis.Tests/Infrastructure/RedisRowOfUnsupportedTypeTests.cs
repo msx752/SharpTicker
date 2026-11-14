@@ -191,7 +191,7 @@ public class RedisRowOfUnsupportedTypeTests(RedisTestFixture fixture) : IAsyncLi
         var other = await AddAsync(withShape: false, T0.AddMinutes(-1));
 
         Assert.Equal(1, await Provider().RemoveTimeTickers([unreadable], CancellationToken.None));
-        _log.Entries.Clear();
+        _log.Clear();
 
         Assert.False(await fixture.Database.KeyExistsAsync(RedisKeyBuilder.TimeTickerKey(unreadable)));
         Assert.Equal([other], (await Provider().GetTimeTickers(null!, CancellationToken.None)).Select(x => x.Id));
