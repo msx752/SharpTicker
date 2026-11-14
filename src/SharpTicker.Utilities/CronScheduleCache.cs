@@ -44,7 +44,17 @@ internal static partial class CronScheduleCache
 
         var localTime = TimeZoneInfo.ConvertTimeFromUtc(dateTime, timeZone);
 
-        var nextOccurrence = parsed.GetNextOccurrence(localTime);
+        DateTime nextOccurrence;
+        try
+        {
+            nextOccurrence = parsed.GetNextOccurrence(localTime);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // An expression that parses but matches no date (the 30th of February): the cron library runs past the last
+            // year it can search and throws. Such an expression has no next occurrence (#194).
+            return null;
+        }
 
         try
         {
