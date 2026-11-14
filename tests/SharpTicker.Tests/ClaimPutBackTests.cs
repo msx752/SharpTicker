@@ -97,4 +97,37 @@ public class ClaimPutBackTests
         Assert.True(list.IsEmpty);
         Assert.Empty(list.TakeAll());
     }
+
+    // A put-back failure that was itself the failure of a second put-back in the same call (#155): the rows of both reach
+    // the retry list, or the ones of the first stay InProgress for this node until it restarts.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APutBackFailure_ThatFollowsAnotherPutBackFailure_ListsTheRowsOfBoth(bool firstFailureIsAPutBackFailure)
+    {
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+        Exception earlier = firstFailureIsAPutBackFailure
+            ? new ClaimPutBackFailedException(1, [new InvalidOperationException("the claim failed"), new TimeoutException("its put-back failed")],
+                [new NotPutBackClaim(first, MarkerA, TickerType.TimeTicker)])
+            : new InvalidOperationException("the claim failed");
+
+        var thrown = await Assert.ThrowsAsync<ClaimPutBackFailedException>(() => ClaimPutBack.PutBackOrThrowAsync(
+            new Dictionary<Guid, DateTime> { [second] = MarkerB }, TickerType.TimeTicker, earlier,
+            (_, _, _) => throw new TimeoutException("the store is down")));
+
+        var list = new ClaimPutBackRetryList();
+        list.AddFrom(thrown);
+
+        Assert.Equal(firstFailureIsAPutBackFailure ? [second, first] : [second], list.TakeAll().Select(c => c.Id).ToArray());
+    }
+
+    [Fact]
+    public void FindIn_FindsAFailureInsideAnotherFailure_AfterTheOuterOne()
+    {
+        var inner = new ClaimPutBackFailedException(1, [new InvalidOperationException()]);
+        var outer = new ClaimPutBackFailedException(1, [inner, new TimeoutException()]);
+
+        Assert.Equal([outer, inner], ClaimPutBackFailedException.FindIn(new Exception("wrapped", outer)));
+    }
 }
