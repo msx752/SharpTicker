@@ -472,6 +472,9 @@ public class LostOutcomeDrainTests : IAsyncLifetime
 
             Assert.Equal(TickerStatus.Done, (await Row(id)).Status);
             Assert.Equal(1, runs);
+            // The loop stores the outcome first and takes it off the list after that.
+            while (!list.IsEmpty && DateTime.UtcNow < deadline)
+                await Task.Delay(25);
             Assert.True(list.IsEmpty);
         }
         finally
