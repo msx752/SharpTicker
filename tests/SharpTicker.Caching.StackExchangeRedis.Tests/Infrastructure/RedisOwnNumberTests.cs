@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging.Abstractions;
 using SharpTicker.Caching.StackExchangeRedis.Helpers;
@@ -5,6 +6,7 @@ using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Models;
 using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceExtension;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
@@ -17,7 +19,10 @@ public sealed class NumberedTimeTicker : TimeTickerEntity<NumberedTimeTicker>
     public double Ratio { get; set; }
 }
 
-public sealed class NumberedCronTicker : CronTickerEntity;
+public sealed class NumberedCronTicker : CronTickerEntity
+{
+    public long Ticks { get; set; }
+}
 
 [JsonSourceGenerationOptions(PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(NumberedTimeTicker))]
@@ -165,5 +170,29 @@ public class RedisOwnNumberTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Empty(await Drain(Provider().QueueTimedOutTimeTickers(CancellationToken.None)));
 
         await AssertNumbersKeptAsync(child.Id, ticks, ratio, TickerStatus.Skipped);
+    }
+
+    // An occurrence row holds the application's cron ticker: its numbers go through the occurrence's claims too. The
+    // occurrence is queued, its cron ticker is given the number, it is put back, and the fallback takes it.
+    [Theory]
+    [InlineData(99_999_999_999_999L)]
+    [InlineData(long.MaxValue)]
+    public async Task TheClaimsOfAnOccurrence_KeepTheNumbersOfItsCronTicker(long ticks)
+    {
+        var provider = Provider();
+        var slot = (T0, new[] { new InternalManagerContext(Guid.NewGuid()) { FunctionName = "numbered-cron-fn", Expression = "* * * * *" } });
+        var id = Assert.Single(await Drain(provider.QueueCronTickerOccurrences(slot, CancellationToken.None))).Id;
+        var key = RedisKeyBuilder.CronOccurrenceKey(id);
+        var row = JsonNode.Parse((string)(await fixture.Database.StringGetAsync(key))!)!;
+        row["CronTicker"]!["Ticks"] = ticks;
+        await fixture.Database.StringSetAsync(key, row.ToJsonString());
+
+        await provider.ReleaseAcquiredCronTickerOccurrences([id], CancellationToken.None);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.Equal([id], (await Drain(provider.QueueTimedOutCronTickerOccurrences(CancellationToken.None))).Select(x => x.Id));
+
+        var stored = Assert.Single(await Provider("reader").GetAllCronTickerOccurrences(null!, CancellationToken.None));
+        Assert.Equal(TickerStatus.InProgress, stored.Status);
+        Assert.Equal(ticks, stored.CronTicker.Ticks);
     }
 }

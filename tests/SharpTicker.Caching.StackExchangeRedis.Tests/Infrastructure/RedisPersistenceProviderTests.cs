@@ -285,36 +285,6 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
             });
     }
 
-    private string SetJsonProperties(string json, Dictionary<string, object?> props)
-    {
-        using var doc = JsonDocument.Parse(json);
-        using var ms = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(ms))
-        {
-            writer.WriteStartObject();
-            foreach (var prop in doc.RootElement.EnumerateObject())
-            {
-                if (props.TryGetValue(prop.Name, out var newVal))
-                {
-                    writer.WritePropertyName(prop.Name);
-                    switch (newVal)
-                    {
-                        case null: writer.WriteNullValue(); break;
-                        case int i: writer.WriteNumberValue(i); break;
-                        case string s: writer.WriteStringValue(s); break;
-                        default: writer.WriteStringValue(newVal.ToString()); break;
-                    }
-                }
-                else
-                {
-                    prop.WriteTo(writer);
-                }
-            }
-            writer.WriteEndObject();
-        }
-        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
-    }
-
     #endregion
 
     #region Seed Helpers

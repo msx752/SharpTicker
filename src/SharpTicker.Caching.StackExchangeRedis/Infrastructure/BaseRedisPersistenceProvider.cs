@@ -20,7 +20,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
 {
-    // Each claim is one script on one key; the connection multiplexes concurrent calls.
+    // Each claim is a read and a compare-and-set script on one key; the connection multiplexes concurrent calls.
     public ValueTask<int> GetMaxConcurrentClaimsAsync(CancellationToken cancellationToken = default) => new(ClaimFanOut.Default);
 
     protected readonly IDatabase Db;
@@ -566,7 +566,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
            && ChainRunGate.IsFinal(status)
            && !ChainRunGate.Allows(row.RunCondition, status);
 
-    // IChildSkipWriter: only a row that has not started is skipped (SkipNotStarted.lua), so a delayed child this store
+    // IChildSkipWriter: only a row that has not started is skipped (SkipNotStartedAsync), so a delayed child this store
     // already handed out keeps the status of its run.
     public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
     {
@@ -1154,7 +1154,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     private static DateTime EarlierRunCutoff(DateTime runStartedAt)
         => new(runStartedAt.Ticks - runStartedAt.Ticks % TimeSpan.TicksPerMillisecond, runStartedAt.Kind);
 
-    // The rows RecoverDeadNode.lua releases (held by the node; Idle, Queued or InProgress), narrowed to those locked before
+    // The rows TryRecoverDeadNodeAsync releases (held by the node; Idle, Queued or InProgress), narrowed to those locked before
     // the cutoff. A row without LockedAt is left alone: nothing says it is older than this run.
     private static bool IsLeftByEarlierRun(string lockHolder, DateTime? lockedAt, TickerStatus status, string node, DateTime cutoff)
         => lockHolder == node
