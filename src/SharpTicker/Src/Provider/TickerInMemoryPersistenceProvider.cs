@@ -146,7 +146,7 @@ namespace SharpTicker.Provider
                     || !ChainRunGate.FallbackMayDecideChildWithoutTime(parent.Status, parent.ExecutedAt, now))
                     continue;
 
-                if (!ChainRunGate.AllowsRunNow(child.RunCondition, parent.Status, hasOwnTime: false))
+                if (!ChainRunGate.FallbackRunsChildWithoutTime(child.RunCondition, parent.Status))
                 {
                     SkipNotStarted(child, now);
                     continue;

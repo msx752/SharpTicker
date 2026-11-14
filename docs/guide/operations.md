@@ -77,7 +77,7 @@ So a job that stops within about one TTL of being asked does not run at the same
 What this does not cover:
 
 - A job that ignores its cancellation token runs on. If the others release it meanwhile, its late outcome is not stored, as before.
-- A chain child that runs together with its parent (`RunCondition.InProgress`, no time of its own) is not asked to stop. Its parent is, and the child is not started a second time when the parent runs again. ([#158](https://github.com/msx752/SharpTicker/issues/158) is the reason: put back, such a child would be skipped.)
+- A chain child that runs together with its parent (`RunCondition.InProgress`, no time of its own) is not asked to stop. Its parent is, and the child is not started a second time while its row is held. Once the other instances release the node's rows, the parent's next run starts it again, or, if the parent has already ended, the fallback does; so a child still running on the cut-off node can run twice at the same time.
 - A process that was paused for longer than that (a long garbage collection, a suspended virtual machine) does not notice in time.
 - A run that has not written a heartbeat yet counts the TTL from its own start.
 - A Redis failover that loses the node's last heartbeat write, or an eviction of the heartbeat key, shortens the time the others wait.

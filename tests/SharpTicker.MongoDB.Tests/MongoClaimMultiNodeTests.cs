@@ -1353,13 +1353,13 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal(childStatus, (await ReadTimeTicker(childId)).Status);
     }
 
-    // The outcome does not let the child run, or the child was to start with its parent (InProgress) and the parent is
-    // over: it never runs. What it carries follows on a later pass, as for a delayed child.
+    // The outcome does not let the child run: it never runs. What it carries follows on a later pass, as for a delayed
+    // child. A child that was to start with its parent (InProgress) is skipped only when the parent never started.
     [Theory]
     [InlineData(TickerStatus.Failed, RunCondition.OnSuccess)]
     [InlineData(TickerStatus.Skipped, RunCondition.OnAnyCompletedStatus)]
     [InlineData(TickerStatus.Skipped, null)]
-    [InlineData(TickerStatus.Done, RunCondition.InProgress)]
+    [InlineData(TickerStatus.Skipped, RunCondition.InProgress)]
     public async Task TheFallback_SkipsAChildWithoutATime_ThatItsEndedParentDoesNotLetRun(TickerStatus parentStatus, RunCondition? condition)
     {
         var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), condition);
@@ -1370,6 +1370,21 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal(TickerStatus.Skipped, row.Status);
         Assert.Equal(ChainRunGate.NotMatchedReason, row.SkippedReason);
         Assert.Equal(T0, row.ExecutedAt);
+    }
+
+    // #158: a child that was to start with its parent (InProgress) and still waits after the parent ended, because its
+    // start never came or because its run was released with its node, runs as a child with another condition does.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.DueDone)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    public async Task TheFallback_TakesAnInProgressChildWithoutATime_WhoseParentStartedAndEnded(TickerStatus parentStatus)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), RunCondition.InProgress);
+
+        Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
+        Assert.Empty(await Fallback("node-B"));
     }
 
     [Fact]
