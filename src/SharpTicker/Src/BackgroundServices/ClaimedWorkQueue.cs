@@ -25,6 +25,7 @@ internal sealed class ClaimedWorkQueue
     private readonly ITickerFunctionConcurrencyGate _concurrencyGate;
     private readonly ILogger _logger;
     private readonly ClaimPutBackRetryList _putBackRetry;
+    private readonly NodeFence _fence;
 
     public ClaimedWorkQueue(
         IInternalTickerManager internalTickerManager,
@@ -32,9 +33,11 @@ internal sealed class ClaimedWorkQueue
         ITickerExecutionTaskHandler taskHandler,
         ITickerFunctionConcurrencyGate concurrencyGate,
         ILogger logger = null,
-        ClaimPutBackRetryList putBackRetry = null)
+        ClaimPutBackRetryList putBackRetry = null,
+        NodeFence fence = null)
     {
         _putBackRetry = putBackRetry;
+        _fence = fence;
         _internalTickerManager = internalTickerManager ?? throw new ArgumentNullException(nameof(internalTickerManager));
         _taskScheduler = taskScheduler ?? throw new ArgumentNullException(nameof(taskScheduler));
         _taskHandler = taskHandler ?? throw new ArgumentNullException(nameof(taskHandler));
@@ -44,6 +47,12 @@ internal sealed class ClaimedWorkQueue
 
     /// <summary>The claims won and not started yet. Each one ends as a started job or as a row put back.</summary>
     internal ClaimLedger Claims { get; } = new();
+
+    /// <summary>
+    /// Whether the node's fence is raised (see <see cref="NodeFence"/>): the loop and the fallback then claim nothing, so a
+    /// row is not claimed and put back over and over while the store answers and the fence is still up.
+    /// </summary>
+    internal bool StartsNoJob => _fence is { IsRaised: true };
 
     /// <summary>Whether the scheduler takes work: a claim won while it does not is put back, not queued.</summary>
     internal bool SchedulerTakesWork => !_taskScheduler.IsFrozen && !_taskScheduler.IsDisposed;
@@ -79,6 +88,18 @@ internal sealed class ClaimedWorkQueue
                     {
                         _logger?.LogDebug("Job {FunctionName} ({TickerId}) got its slot as the application was stopping; it does not start and the stop puts its claim back.",
                             function.FunctionName, function.TickerId);
+                        return;
+                    }
+
+                    // While the node's fence is raised no job starts: the other nodes may release this node's rows, and a
+                    // job started now would run while they start it again. The loop and the fallback claim nothing then;
+                    // this is for a claim that was already won (it waited for its slot, or came from run-now). It is put
+                    // back, for at most PutBackAttemptLimit so the worker and the slot are not held for as long as the
+                    // store stays silent; a put-back that did not land stays in the ledger for the loop to try again.
+                    if (StartsNoJob)
+                    {
+                        using var limit = new CancellationTokenSource(PutBackAttemptLimit);
+                        await PutBackAsync(entry, NotStartedWhileFenced, cancellationToken: limit.Token).ConfigureAwait(false);
                         return;
                     }
 
@@ -119,6 +140,9 @@ internal sealed class ClaimedWorkQueue
         }
     }
 
+    private const string NotStartedWhileFenced = "this node starts no job while it cannot show the other nodes that it is alive";
+    private const string StoppedWhileFenced = "it could not show the other nodes that it is alive";
+
     /// <summary>
     /// Puts back a claim whose job did not start: the fenced write moves the row back to Idle only while it is still this
     /// claim (InProgress, this node, this marker), and the fallback then runs the job once. A job that started meanwhile, or
@@ -140,6 +164,16 @@ internal sealed class ClaimedWorkQueue
         catch (Exception ex)
         {
             entry.RevertFailed();
+            if (entry.StoppedRun)
+            {
+                // The run's own log entry said that the row is put back once the store answers; a stop ends the tries.
+                _logger?.Log(lastAttempt ? LogLevel.Error : LogLevel.Debug, ex,
+                    "Job {FunctionName} ({TickerId}) was stopped by this node ({Reason}), and its row could not be put back{Then}.",
+                    function.FunctionName, function.TickerId, reason,
+                    lastAttempt ? ". It stays InProgress until the store releases the rows of this node" : "; the scheduler tries again");
+                return false;
+            }
+
             if (lastAttempt)
             {
                 // Nothing tries again after a stop: the row stays InProgress until its store releases this node's rows.
@@ -163,7 +197,10 @@ internal sealed class ClaimedWorkQueue
 
         if (!putBack)
         {
-            if (quietWhenNothingToPutBack)
+            if (entry.StoppedRun)
+                _logger?.LogInformation("Job {FunctionName} ({TickerId}) was stopped by this node ({Reason}). Its row had already moved on (released by another node, or ended), so there was nothing to put back.",
+                    function.FunctionName, function.TickerId, reason);
+            else if (quietWhenNothingToPutBack)
                 _logger?.LogDebug(cause, "Job {FunctionName} ({TickerId}) did not start ({Reason}); its row was not this claim, so there was nothing to put back.",
                     function.FunctionName, function.TickerId, reason);
             else
@@ -172,8 +209,13 @@ internal sealed class ClaimedWorkQueue
             return true;
         }
 
-        _logger?.LogWarning(cause, "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}). It was put back and runs once the fallback picks it up.",
-            function.FunctionName, function.TickerId, reason);
+        // The run's own log entry was the warning; the put-back that follows it is information.
+        if (entry.StoppedRun)
+            _logger?.LogInformation("Job {FunctionName} ({TickerId}) was stopped by this node ({Reason}). Its row was put back and the job runs again once the fallback picks it up.",
+                function.FunctionName, function.TickerId, reason);
+        else
+            _logger?.LogWarning(cause, "Job {FunctionName} ({TickerId}) was claimed but did not start ({Reason}). It was put back and runs once the fallback picks it up.",
+                function.FunctionName, function.TickerId, reason);
 
         try
         {
@@ -205,7 +247,8 @@ internal sealed class ClaimedWorkQueue
 
     // The rows whose put-back failed inside a claim call become claims of the ledger that can never start, so the loop tries
     // their put-back again like any other that failed. Only the id, the type and the marker are known: the put-back needs no
-    // more, and the logs name the job by its id.
+    // more, and the logs name the job by its id. The row of a run this node stopped (see NodeFence) comes the same way,
+    // with the name of its function.
     private void AdoptFailedPutBacks()
     {
         if (_putBackRetry == null)
@@ -217,11 +260,11 @@ internal sealed class ClaimedWorkQueue
             {
                 TickerId = claim.Id,
                 Type = claim.Type,
-                FunctionName = "(not read: its claim call failed)",
+                FunctionName = claim.StoppedFunction ?? "(not read: its claim call failed)",
                 ClaimMarker = claim.ClaimMarker,
                 Status = TickerStatus.InProgress
             };
-            Claims.RecordFailedPutBack(function, claim.ClaimMarker);
+            Claims.RecordFailedPutBack(function, claim.ClaimMarker, stoppedRun: claim.StoppedFunction != null);
         }
     }
 
@@ -240,7 +283,7 @@ internal sealed class ClaimedWorkQueue
         foreach (var entry in Claims.PendingPutBacks())
         {
             using var limit = new CancellationTokenSource(PutBackAttemptLimit);
-            if (!await PutBackAsync(entry, "a put-back that failed earlier", cancellationToken: limit.Token).ConfigureAwait(false))
+            if (!await PutBackAsync(entry, entry.StoppedRun ? StoppedWhileFenced : "a put-back that failed earlier", cancellationToken: limit.Token).ConfigureAwait(false))
                 return;
         }
     }
@@ -260,7 +303,7 @@ internal sealed class ClaimedWorkQueue
         foreach (var entry in Claims.Pending(owner))
             // The sweep of every claim is the scheduler's, which stops last: no one tries after it. While the scheduler still
             // runs, its loop retries what fails in the fallback's sweep.
-            await PutBackAsync(entry, "the application stopped before its worker started it", lastAttempt: owner == null,
+            await PutBackAsync(entry, entry.StoppedRun ? StoppedWhileFenced : "the application stopped before its worker started it", lastAttempt: owner == null,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 }

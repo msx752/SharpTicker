@@ -22,15 +22,28 @@ namespace SharpTicker.Caching.StackExchangeRedis;
 /// With Redis as the job store it also releases, once at startup, what an earlier run of this node left locked; see
 /// <see cref="ReleaseEarlierRunAsync"/>.
 /// </para>
+/// <para>
+/// With Redis as the job store it also fences its own node (see <see cref="NodeFence"/>). A node that cannot write its
+/// heartbeat goes on running its jobs, and the others release them once its entry stayed missing for a whole TTL, which
+/// is two TTLs after the last heartbeat it wrote. So one TTL after the last heartbeat that was written, counted from the
+/// moment that write was sent (the store took it then at the earliest, so the entry is there until one TTL after that
+/// moment at least), the node asks its jobs to stop and starts none until a heartbeat is written again. A look every
+/// second, on a timer of its own, decides it: the write itself may hang on the store. What it does not cover: a process
+/// that was paused takes up its loops in any order; a job that ignores its cancellation token runs on; a run that has
+/// not written a heartbeat yet counts the TTL from its own start; and a heartbeat written in the very moment the node
+/// fences itself can leave it fenced until the next one is written.
+/// </para>
 /// </summary>
 internal class NodeHeartBeatBackgroundService : BackgroundService
 {
     internal static readonly TimeSpan WriteRetryDelay = TimeSpan.FromSeconds(5);
     internal static readonly TimeSpan MaxCheckInterval = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan EarlierRunReleaseRetryDelay = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan SelfCheckInterval = TimeSpan.FromSeconds(1);
 
     private int _started;
     private readonly EarlierRunRelease _earlierRunRelease;
+    private readonly NodeSelfFence _selfFence;
     private readonly INodeHeartbeatRegistry _registry;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly ISharpTickerNotificationHubSender _notificationHubSender;
@@ -44,10 +57,15 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     private readonly Dictionary<string, long> _suspectedSince = new();
     private long? _lastCheckStart;
 
+    // When the last heartbeat that was written had been sent; the start of the run until one was written.
+    private long _lastWrittenHeartbeatSentAt;
+    // Whether this service has raised the fence and not seen a heartbeat written since.
+    private int _fenced;
+
     public NodeHeartBeatBackgroundService(ServiceExtension.SharpTickerRedisOptionBuilder redisOptions, INodeHeartbeatRegistry registry,
         IInternalTickerManager internalTickerManager, ISharpTickerNotificationHubSender notificationHubSender, ILogger<NodeHeartBeatBackgroundService> logger,
-        EarlierRunRelease earlierRunRelease)
-        : this(redisOptions, registry, internalTickerManager, notificationHubSender, logger, TimeProvider.System, earlierRunRelease)
+        EarlierRunRelease earlierRunRelease, NodeSelfFence selfFence)
+        : this(redisOptions, registry, internalTickerManager, notificationHubSender, logger, TimeProvider.System, earlierRunRelease, selfFence)
     {
     }
 
@@ -55,8 +73,9 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     // never picks up a TimeProvider the application registered.
     internal NodeHeartBeatBackgroundService(ServiceExtension.SharpTickerRedisOptionBuilder redisOptions, INodeHeartbeatRegistry registry,
         IInternalTickerManager internalTickerManager, ISharpTickerNotificationHubSender notificationHubSender, ILogger<NodeHeartBeatBackgroundService> logger,
-        TimeProvider timeProvider, EarlierRunRelease earlierRunRelease = null)
+        TimeProvider timeProvider, EarlierRunRelease earlierRunRelease = null, NodeSelfFence selfFence = null)
     {
+        _selfFence = selfFence is { Enabled: true, Fence: not null, Owner: not null } ? selfFence : null;
         _registry = registry;
         _internalTickerManager = internalTickerManager;
         _notificationHubSender = notificationHubSender;
@@ -71,6 +90,9 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     /// <summary>Raised after each check of the other nodes, whatever its result. For tests.</summary>
     internal event Action CheckCompleted;
 
+    /// <summary>Raised after each look at this node's own heartbeat, whatever its result. For tests.</summary>
+    internal event Action SelfCheckCompleted;
+
     public override Task StartAsync(CancellationToken ct)
     {
         return Interlocked.CompareExchange(ref _started, 1, 0) != 0
@@ -83,12 +105,79 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
         _suspectedSince.Clear();
         _lastCheckStart = null;
 
-        // Two loops, so that a long release never holds back this node's own heartbeat. Both timers exist before the
+        // The TTL of this node's own heartbeat is counted from the start of this run until a heartbeat is written. A fence
+        // a stop left raised stays raised until then: the node could not show that it is alive when it stopped.
+        Volatile.Write(ref _lastWrittenHeartbeatSentAt, _timeProvider.GetTimestamp());
+
+        // A loop each, so that a long release never holds back this node's own heartbeat. Both timers exist before the
         // first write, so the check interval counts from before this node's first heartbeat.
         var writeTimer = new PeriodicTimer(_interval, _timeProvider);
         var checkTimer = new PeriodicTimer(_checkInterval, _timeProvider);
         EarlierRunReleaseTask = ReleaseEarlierRunAsync(stoppingToken);
-        return Task.WhenAll(WriteLoopAsync(writeTimer, stoppingToken), CheckLoopAsync(checkTimer, stoppingToken), EarlierRunReleaseTask);
+        // A third loop when this node fences itself: the heartbeat write it watches may hang on the store.
+        var selfCheck = _selfFence == null
+            ? Task.CompletedTask
+            : SelfCheckLoopAsync(new PeriodicTimer(SelfCheckInterval, _timeProvider), stoppingToken);
+        return Task.WhenAll(WriteLoopAsync(writeTimer, stoppingToken), CheckLoopAsync(checkTimer, stoppingToken), EarlierRunReleaseTask, selfCheck);
+    }
+
+    private async Task SelfCheckLoopAsync(PeriodicTimer timer, CancellationToken stoppingToken)
+    {
+        using var _ = timer;
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                try
+                {
+                    FenceWhenTheHeartbeatIsLost();
+                }
+                catch (Exception ex)
+                {
+                    // Must not end the loop, and with it the service and the host.
+                    _logger.LogError(ex, "Looking at this node's own heartbeat failed; it is looked at again in {Delay}.", SelfCheckInterval);
+                }
+                finally
+                {
+                    SelfCheckCompleted?.Invoke();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    private void FenceWhenTheHeartbeatIsLost()
+    {
+        if (Volatile.Read(ref _fenced) != 0)
+            return;
+
+        var notWrittenFor = _timeProvider.GetElapsedTime(Volatile.Read(ref _lastWrittenHeartbeatSentAt));
+        if (notWrittenFor < _ttl)
+            return;
+
+        Volatile.Write(ref _fenced, 1);
+        var asked = _selfFence.Fence.Raise(_selfFence.Owner, (jobId, ex) =>
+            _logger.LogWarning(ex, "Job {JobId} was asked to stop, and a callback it had registered on its cancellation token threw.", jobId));
+        _logger.LogError(
+            "This node could not write its heartbeat for {NotWrittenFor}, so the other nodes may take it for stopped and start its jobs again. " +
+            "It asked its {Asked} running job(s) to stop and starts no job until its heartbeat is written again. " +
+            "A job that stops is put back and runs again; a job that ignores its cancellation token runs on.",
+            notWrittenFor, asked);
+    }
+
+    // A heartbeat was written: the node may start jobs again. The fence is cleared on every such heartbeat, whatever this
+    // service remembers: one written in the moment the fence is being raised could otherwise leave it raised.
+    private void ClearFence()
+    {
+        if (_selfFence == null)
+            return;
+
+        var wasFenced = Interlocked.Exchange(ref _fenced, 0) != 0;
+        _selfFence.Fence.Clear();
+        if (wasFenced)
+            _logger.LogInformation("The heartbeat of this node is written again; the node starts jobs again.");
     }
 
     /// <summary>The startup release of this run: ends when it released, had nothing to do, or the host stopped. For tests.</summary>
@@ -159,8 +248,16 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested)
             {
+                // Taken before the write is sent: the entry lives one TTL from when the store took it, which is not earlier.
+                var sentAt = _timeProvider.GetTimestamp();
                 if (await TryWriteHeartbeatAsync())
                 {
+                    Volatile.Write(ref _lastWrittenHeartbeatSentAt, sentAt);
+                    // A reply that took a whole TTL says nothing about now: the entry may be gone again. The next write,
+                    // which follows at once (its tick is due), decides.
+                    if (_timeProvider.GetElapsedTime(sentAt) < _ttl)
+                        ClearFence();
+
                     if (!await timer.WaitForNextTickAsync(stoppingToken))
                         return;
                 }

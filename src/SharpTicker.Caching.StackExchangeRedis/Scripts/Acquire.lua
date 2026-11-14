@@ -1,6 +1,7 @@
 -- KEYS[1] = ticker key
 -- ARGV[1] = lockHolder, ARGV[2] = now (ISO), ARGV[3] = targetStatus (int)
 -- ARGV[4] = expectedUpdatedAt (ISO or empty), ARGV[5] = statusIdle, ARGV[6] = statusQueued
+-- ARGV[7] = optional: the same expected moment as the serializer writes it (trailing zeros of the fraction trimmed)
 -- Returns: updated JSON on success, nil on failure
 local json = redis.call('GET', KEYS[1])
 if not json then return nil end
@@ -14,7 +15,8 @@ if holder and holder ~= '' and holder ~= cjson.null and holder ~= ARGV[1] then r
 local expectedUpdatedAt = ARGV[4]
 if expectedUpdatedAt ~= '' then
     local currentUpdatedAt = obj['UpdatedAt'] or obj['updatedAt']
-    if currentUpdatedAt ~= expectedUpdatedAt then return nil end
+    -- A row the application wrote has UpdatedAt as the serializer writes it; one a script wrote has all seven digits.
+    if currentUpdatedAt ~= expectedUpdatedAt and currentUpdatedAt ~= ARGV[7] then return nil end
 end
 obj['LockHolder'] = ARGV[1]
 obj['lockHolder'] = nil

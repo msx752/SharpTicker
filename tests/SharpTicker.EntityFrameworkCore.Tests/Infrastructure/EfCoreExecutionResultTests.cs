@@ -471,6 +471,138 @@ public class EfCoreExecutionResultTests : IAsyncLifetime
         Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "KnownFunction"));
     }
 
+    // #24: what a starting node reports. Time jobs and cron occurrences that are InProgress under another node identifier,
+    // counted per identifier; not the node's own, not a job that is not InProgress, not one without a lock holder.
+    [Fact]
+    public async Task CountInProgressOfOtherNodes_CountsTimeJobsAndOccurrencesPerIdentifier_AndLeavesOutTheNodesOwn()
+    {
+        TimeTickerEntity Job(string? holder, TickerStatus status) => new()
+        {
+            Id = Guid.NewGuid(), Function = "KnownFunction", Status = status, ExecutionTime = Earlier, LockHolder = holder,
+            LockedAt = holder == null ? null : Earlier, CreatedAt = Earlier, UpdatedAt = Earlier,
+        };
+        _seed.Set<TimeTickerEntity>().AddRange(
+            Job("pod-a", TickerStatus.InProgress), Job("pod-a", TickerStatus.InProgress), Job("pod-b", TickerStatus.InProgress),
+            Job("node-1", TickerStatus.InProgress), Job("pod-c", TickerStatus.Queued), Job("pod-c", TickerStatus.Done),
+            Job(null, TickerStatus.InProgress));
+        await _seed.SaveChangesAsync();
+        var cron = await AddCronTickerAsync();
+        var ofPodA = await AddOccurrenceAsync(cron.Id);
+        ofPodA.LockHolder = "pod-a";
+        var ofPodD = await AddOccurrenceAsync(cron.Id);
+        ofPodD.LockHolder = "pod-d";
+        await AddOccurrenceAsync(cron.Id);
+        var done = await AddOccurrenceAsync(cron.Id, TickerStatus.Done);
+        done.LockHolder = "pod-e";
+        await _seed.SaveChangesAsync();
+
+        var others = await _provider.CountInProgressOfOtherNodesAsync("node-1");
+
+        Assert.Equal(
+            new[] { ("pod-a", 3), ("pod-b", 1), ("pod-d", 1) },
+            others.OrderBy(x => x.NodeIdentifier, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task CountInProgressOfOtherNodes_IsEmpty_WhenOnlyTheNodeItselfHoldsJobs()
+    {
+        await AddLockedTimeTickerAsync();
+
+        Assert.Empty(await _provider.CountInProgressOfOtherNodesAsync("node-1"));
+    }
+
+    private sealed class WarningsLoggerFactory : Microsoft.Extensions.Logging.ILoggerFactory, Microsoft.Extensions.Logging.ILogger
+    {
+        public List<(string Message, Exception? Exception)> Warnings { get; } = new();
+
+        public Microsoft.Extensions.Logging.ILogger CreateLogger(string categoryName) => this;
+
+        public void AddProvider(Microsoft.Extensions.Logging.ILoggerProvider provider)
+        {
+        }
+
+        public void Dispose()
+        {
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel >= Microsoft.Extensions.Logging.LogLevel.Warning)
+                Warnings.Add((formatter(state, exception), exception));
+        }
+    }
+
+    // A node that has Redis next to its store (#93).
+    private (TestableProvider Provider, Microsoft.Extensions.Caching.Distributed.IDistributedCache Cache, WarningsLoggerFactory Log) NodeWithRedis()
+    {
+        var cache = Substitute.For<Microsoft.Extensions.Caching.Distributed.IDistributedCache>();
+        var redis = Substitute.For<ISharpTickerRedisContext>();
+        redis.HasRedisConnection.Returns(true);
+        redis.DistributedCache.Returns(cache);
+        var log = new WarningsLoggerFactory();
+        var services = new ServiceCollection();
+        services.AddSingleton<IDbContextFactory<TestSharpTickerDbContext>>(new PooledDbContextFactory<TestSharpTickerDbContext>(_options));
+        services.AddSingleton<Microsoft.Extensions.Logging.ILoggerFactory>(log);
+        var clock = Substitute.For<ITickerClock>();
+        clock.UtcNow.Returns(Now);
+        return (new TestableProvider(services.BuildServiceProvider(), clock, new SchedulerOptionsBuilder { NodeIdentifier = "node-redis" }, redis), cache, log);
+    }
+
+    // The seed changes cron rows without the managers, so it clears the list of cron expressions kept in Redis itself.
+    [Fact]
+    public async Task WithRedis_TheSeedClearsTheCachedListOfCronExpressions_AfterItsRowsAreStored()
+    {
+        var (provider, cache, log) = NodeWithRedis();
+        var storedWhenCleared = -1;
+        cache.RemoveAsync("cron:expressions", Arg.Any<CancellationToken>()).Returns(async _ =>
+        {
+            await using var db = Verify();
+            storedWhenCleared = await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined");
+        });
+
+        await provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await cache.Received(1).RemoveAsync("cron:expressions", Arg.Any<CancellationToken>());
+        Assert.Equal(1, storedWhenCleared);
+        Assert.Empty(log.Warnings);
+    }
+
+    // Redis does not answer at the start: the cron tickers are seeded all the same, the start does not fail, and the log
+    // says that the earlier list may be used until it ends.
+    [Fact]
+    public async Task WithRedis_ClearingTheCachedListFails_TheSeedIsStoredAndTheStartGoesOn_WithAWarning()
+    {
+        var (provider, cache, log) = NodeWithRedis();
+        var failure = new InvalidOperationException("no connection to Redis");
+        cache.RemoveAsync("cron:expressions", Arg.Any<CancellationToken>()).Returns(Task.FromException(failure));
+
+        await provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default);
+
+        await using var db = Verify();
+        Assert.Equal(1, await db.Set<CronTickerEntity>().CountAsync(x => x.Function == "NewlyDefined"));
+        var warning = Assert.Single(log.Warnings);
+        Assert.Same(failure, warning.Exception);
+        Assert.Contains("cached list of cron expressions could not be cleared", warning.Message);
+    }
+
+    // A stop that cancels the seed is not turned into a warning.
+    [Fact]
+    public async Task WithRedis_ClearingTheCachedListIsCancelled_TheCancellationGoesOn()
+    {
+        var (provider, cache, log) = NodeWithRedis();
+        cache.RemoveAsync("cron:expressions", Arg.Any<CancellationToken>()).Returns(Task.FromException(new OperationCanceledException()));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.MigrateDefinedCronTickers(new[] { ("NewlyDefined", "0 0 3 * * *") }, default));
+
+        Assert.Empty(log.Warnings);
+    }
+
     private TestableProvider NodeThatRunsBeforeItsFirstWrite(Func<Task> other)
     {
         var options = new DbContextOptionsBuilder<TestSharpTickerDbContext>()

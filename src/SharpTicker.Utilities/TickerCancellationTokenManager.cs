@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Models;
 
@@ -13,7 +14,10 @@ namespace SharpTicker.Utilities
         private static readonly ConcurrentDictionary<Guid, TickerCancellationTokenDetails>  TickerCancellationTokens = new();
         private static readonly ConcurrentDictionary<Guid, ConcurrentHashSet<Guid>> ParentIdIndex = new();
 
-        internal static void AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue, object owner = null)
+        // Returns the entry of this run. When another run of the same id is still registered, that one stays the registered
+        // entry and the returned one is not in the registry.
+        internal static TickerCancellationTokenDetails AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue, object owner = null,
+            bool startsWithParent = false)
         {
             var details = new TickerCancellationTokenDetails
             {
@@ -23,7 +27,8 @@ namespace SharpTicker.Utilities
                 IsDue = isDue,
                 ParentId = context.ParentId ?? Guid.Empty,
                 Owner = owner,
-                RunMarker = context.RunMarker
+                RunMarker = context.RunMarker,
+                StartsWithParent = startsWithParent
             };
             
             TickerCancellationTokens.TryAdd(context.TickerId, details);
@@ -35,6 +40,59 @@ namespace SharpTicker.Utilities
                     key => { var set = new ConcurrentHashSet<Guid>(); set.Add(context.TickerId); return set; },
                     (key, existing) => { existing.Add(context.TickerId); return existing; });
             }
+
+            return details;
+        }
+
+        /// <summary>
+        /// Asks the jobs <paramref name="owner"/> is running to stop because the node's fence was raised (see
+        /// <see cref="NodeFence"/>), and marks each of those runs as fenced before its token is cancelled, so the run can
+        /// tell this stop from a cancellation someone asked for. The entries stay registered until their runs end: the stop
+        /// of the host still waits for them. Left alone: a run whose writes are not fenced by a marker (nothing could put
+        /// its row back), and a chain child that started with its parent (put back, it would be skipped, not run again).
+        /// Each token is cancelled on a thread of the pool, not here and not one after another: a cancel runs what the job
+        /// hung on its token, which can be the rest of the job's run, and a job that blocks there must hold back neither the
+        /// caller nor the request to the other jobs. A cancellation callback of a job that throws is handed to
+        /// <paramref name="onCancelFailure"/> with the job's id. Returns how many runs were marked and are being asked.
+        /// </summary>
+        internal static int CancelForFence(object owner, Action<Guid, Exception> onCancelFailure = null)
+        {
+            var asked = 0;
+            foreach (var entry in TickerCancellationTokens)
+            {
+                var details = entry.Value;
+                if (!ReferenceEquals(details.Owner, owner) || details.RunMarker is null || details.StartsWithParent)
+                    continue;
+
+                details.Fenced = true;
+                asked++;
+                var jobId = entry.Key;
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        details.CancellationSource?.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The run ended meanwhile.
+                    }
+                    catch (Exception ex)
+                    {
+                        // A callback the job registered on its token threw; the token is cancelled all the same.
+                        try
+                        {
+                            onCancelFailure?.Invoke(jobId, ex);
+                        }
+                        catch
+                        {
+                            // Nothing observes this task: a reporter that throws must not become an unobserved exception.
+                        }
+                    }
+                });
+            }
+
+            return asked;
         }
         
         /// <summary>
@@ -122,6 +180,10 @@ namespace SharpTicker.Utilities
             {
                 // Already disposed by another thread - safe to ignore
             }
+            catch (AggregateException)
+            {
+                // A callback the job registered on its token threw; the token is cancelled all the same.
+            }
 
             // Now remove and dispose
             if (TickerCancellationTokens.TryRemove(tickerId, out var removed))
@@ -202,6 +264,15 @@ namespace SharpTicker.Utilities
         internal object Owner { get; set; }
         // The marker that fences the run's writes (InternalFunctionContext.RunMarker), for the stop's write of a job still running.
         internal DateTime? RunMarker { get; set; }
+        // A chain child without a time of its own that started together with its parent (RunCondition.InProgress).
+        internal bool StartsWithParent { get; set; }
+        // Set by CancelForFence before the token is cancelled, and never cleared: this run was stopped by the node's fence.
+        internal bool Fenced
+        {
+            get => Volatile.Read(ref _fenced);
+            set => Volatile.Write(ref _fenced, value);
+        }
+        private bool _fenced;
     }
     
     /// <summary>

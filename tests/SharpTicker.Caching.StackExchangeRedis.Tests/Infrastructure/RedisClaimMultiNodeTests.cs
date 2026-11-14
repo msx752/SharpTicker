@@ -22,8 +22,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 {
     private static readonly DateTime T0 = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
 
-    // A tick count that does not end in 0, so the stored JSON text equals DateTime.ToString("O") and the
-    // compare-and-set in QueueTimeTickers can match (see Probe_RedisQueueCasFailsOnTrailingZeroTimestamp).
+    // A stamp with seven digits in its fraction. Up to #176 the claim of the scheduler loop took only such a row; the cases
+    // for the other spellings are in RedisLoopClaimStampTests.
     private static readonly DateTime SeedUpdatedAt = T0.AddHours(-1).AddTicks(1234567);
 
     private readonly FakeTickerClock _clock = new(T0);
@@ -495,7 +495,7 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         _clock.Advance(TimeSpan.FromSeconds(2));
         AssertCarriesTheChain(Assert.Single(await Drain(nodeA.QueueTimedOutTimeTickers(CancellationToken.None))), child.Id, grandchild.Id);
 
-        // The claim script rewrote the row and kept the nested children.
+        // The claim wrote the nodes as rows of their own; the chain reads as before.
         AssertCarriesTheChain(await ReadTimeTicker(nodeA, parent.Id), child.Id, grandchild.Id);
     }
 
@@ -684,10 +684,11 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(RunCondition.OnFailure, carriedGrandchild.RunCondition);
     }
 
-    // A chain stored by an older version keeps its children nested in the parent's row: they have no row the store
-    // could hand out later, so a delayed one is carried without its time and runs right after its parent, as before.
+    // A chain stored by an older version keeps its children nested in the parent's row. Read before its claim, a delayed
+    // one is carried without its time: it has no row yet. The claim writes the nodes as rows of their own, so the parent
+    // is handed out with the delayed child's time, and the store hands that child out at its time.
     [Fact]
-    public async Task ADelayedChildOfAnOldFormatChain_IsCarriedWithoutItsTime()
+    public async Task ADelayedChildOfAnOldFormatChain_IsCarriedWithItsTimeOnceItsParentIsClaimed()
     {
         var chain = NewChain();
         chain.Child.ExecutionTime = T0.AddHours(2);
@@ -704,7 +705,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
         _clock.Advance(TimeSpan.FromSeconds(2));
         carried = Assert.Single(Assert.Single(await nodeA.AcquireImmediateTimeTickersAsync([chain.Parent.Id], CancellationToken.None)).Children);
-        Assert.Null(carried.ExecutionTime);
+        Assert.Equal(T0.AddHours(2), carried.ExecutionTime);
+        Assert.Equal(T0.AddHours(3), Assert.Single(carried.Children).ExecutionTime);
     }
 
     // A parent row (not due, or already run) with a delayed child.

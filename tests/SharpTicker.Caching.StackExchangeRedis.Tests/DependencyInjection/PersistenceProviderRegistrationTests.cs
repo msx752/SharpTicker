@@ -215,4 +215,59 @@ public class PersistenceProviderRegistrationTests
 
         Assert.False(provider.GetRequiredService<EarlierRunRelease>().StoreIsRedis);
     }
+
+    // The heartbeat fences its own node (#46) only with Redis as the job store, with the fence and the execution handler
+    // of this host, and only while the option is on.
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void WithTheRedisStore_TheHeartbeatFencesItsNode_UnlessTheOptionIsOff(bool? option, bool expected)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(HostLifetime(CancellationToken.None));
+        services.AddSharpTicker(options =>
+        {
+            options.AddStackExchangeRedis(redis =>
+            {
+                redis.ConnectionMultiplexer = NSubstitute.Substitute.For<StackExchange.Redis.IConnectionMultiplexer>();
+                if (option is { } value)
+                    redis.StopJobsWhenHeartbeatIsLost = value;
+            });
+        });
+        var provider = services.BuildServiceProvider();
+
+        var selfFence = provider.GetRequiredService<NodeSelfFence>();
+
+        Assert.Equal(expected, selfFence.Enabled);
+        Assert.Same(provider.GetRequiredService<SharpTicker.Utilities.NodeFence>(), selfFence.Fence);
+        Assert.Same(provider.GetRequiredService<SharpTicker.Utilities.Interfaces.ITickerExecutionTaskHandler>(), selfFence.Owner);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void WithEfCoreAsTheStore_TheRedisHeartbeatDoesNotFenceItsNode(bool efCoreFirst)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(HostLifetime(CancellationToken.None));
+        services.AddDbContext<TestDbContext>(options => options.UseSqlite($"Data Source=SelfFence{efCoreFirst};Mode=Memory;Cache=Shared"));
+        services.AddSharpTicker(options =>
+        {
+            if (efCoreFirst)
+                options.AddOperationalStore(ef => ef.UseApplicationDbContext<TestDbContext>(ConfigurationType.UseModelCustomizer));
+            options.AddStackExchangeRedis(redis => redis.ConnectionMultiplexer = NSubstitute.Substitute.For<StackExchange.Redis.IConnectionMultiplexer>());
+            if (!efCoreFirst)
+                options.AddOperationalStore(ef => ef.UseApplicationDbContext<TestDbContext>(ConfigurationType.UseModelCustomizer));
+        });
+        var provider = services.BuildServiceProvider();
+
+        Assert.False(provider.GetRequiredService<NodeSelfFence>().Enabled);
+    }
+
+    [Fact]
+    public void TheOptionToStopJobsWhenTheHeartbeatIsLost_IsOnByDefault()
+        => Assert.True(new SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceExtension.SharpTickerRedisOptionBuilder().StopJobsWhenHeartbeatIsLost);
 }

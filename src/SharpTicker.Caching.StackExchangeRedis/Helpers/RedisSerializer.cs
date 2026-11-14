@@ -23,15 +23,7 @@ internal sealed class RedisSerializer
     {
         var val = await _db.StringGetAsync(key).ConfigureAwait(false);
         if (val.IsNullOrEmpty) return null;
-        try
-        {
-            return (T)JsonSerializer.Deserialize((string)val, GetTypeInfo<T>());
-        }
-        catch (JsonException ex)
-        {
-            _logger.LogWarning(ex, "Failed to deserialize Redis key '{Key}' as {Type}. Data may be corrupted.", key, typeof(T).Name);
-            return null;
-        }
+        return DeserializeOrNull<T>((string)val, key);
     }
 
     internal Task SetAsync<T>(string key, T value) where T : class
@@ -50,16 +42,38 @@ internal sealed class RedisSerializer
         return _db.StringSetAsync(key, payload, when: When.NotExists);
     }
 
-    internal T DeserializeOrNull<T>(string json) where T : class
+    // key is the Redis key the text was read from; null when the text has no key of its own, which means it is not a
+    // stored row.
+    // A row that does not deserialize is tried once more with its empty objects read as empty collections (see
+    // EmptyCollectionRepair); the text itself is not changed, so a compare-and-set still compares what the key holds.
+    internal T DeserializeOrNull<T>(string json, string key = null) where T : class
     {
         if (string.IsNullOrEmpty(json)) return null;
+        var typeInfo = GetTypeInfo<T>();
         try
         {
-            return (T)JsonSerializer.Deserialize(json, GetTypeInfo<T>());
+            return (T)JsonSerializer.Deserialize(json, typeInfo);
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "Failed to deserialize JSON payload as {Type}.", typeof(T).Name);
+            if (EmptyCollectionRepair.TryRead(json, typeInfo, ex) is T repaired)
+            {
+                _logger.LogDebug("Redis key '{Key}' holds an empty collection written as an object ({Path}); it was read as empty.", key, ex.Path);
+                return repaired;
+            }
+
+            if (key != null)
+                _logger.LogWarning(ex, "Failed to deserialize Redis key '{Key}' as {Type}. Data may be corrupted.", key, typeof(T).Name);
+            else
+                _logger.LogWarning(ex, "Failed to deserialize JSON payload as {Type}.", typeof(T).Name);
+            return null;
+        }
+        catch (NotSupportedException ex) when (key != null)
+        {
+            // The serializer refuses a type the stored row holds (a property of an abstract type, for example). Left to
+            // throw, one such row would end the read of every row loaded with it. Text without a key is not a stored row
+            // (the copy of an update's body): there the exception still reaches the caller, whose entity it is about.
+            _logger.LogWarning(ex, "Redis key '{Key}' cannot be read as {Type}: the serializer does not support a type it holds.", key, typeof(T).Name);
             return null;
         }
     }
@@ -88,7 +102,7 @@ internal sealed class RedisSerializer
         for (var i = 0; i < values.Length; i++)
         {
             if (values[i].IsNullOrEmpty) continue;
-            var item = DeserializeOrNull<T>((string)values[i]);
+            var item = DeserializeOrNull<T>((string)values[i], keys[i]);
             if (item != null && (predicate == null || predicate(item)))
                 list.Add(item);
         }
@@ -111,7 +125,7 @@ internal sealed class RedisSerializer
         for (var i = 0; i < values.Length; i++)
         {
             if (values[i].IsNullOrEmpty) continue;
-            var item = DeserializeOrNull<T>((string)values[i]);
+            var item = DeserializeOrNull<T>((string)values[i], keys[i]);
             if (item != null) list.Add(item);
         }
 

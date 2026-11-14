@@ -33,6 +33,25 @@ public class TickerCancellationTokenManagerTests : IDisposable
         Assert.True(token.IsCancellationRequested);
     }
 
+    // #73: a callback the job hung on its token throws when the token is cancelled.
+    [Fact]
+    public void RequestCancellationById_WhenTheJobsOwnCallbackThrows_StillCancels_RemovesTheEntry_AndReportsTheCancel()
+    {
+        var cts = new CancellationTokenSource();
+        var tickerId = Guid.NewGuid();
+        var parentId = Guid.NewGuid();
+        var token = cts.Token;
+        token.Register(() => throw new InvalidOperationException("the job's own cancellation callback failed"));
+        TickerCancellationTokenManager.AddTickerCancellationToken(cts, MakeContext(tickerId, parentId), isDue: false);
+
+        var result = TickerCancellationTokenManager.RequestTickerCancellationById(tickerId);
+
+        Assert.True(result);
+        Assert.True(token.IsCancellationRequested);
+        Assert.False(TickerCancellationTokenManager.IsParentRunning(parentId));
+        Assert.False(TickerCancellationTokenManager.RequestTickerCancellationById(tickerId));
+    }
+
     [Fact]
     public void RequestCancellationById_Returns_False_For_Unknown_Id()
     {

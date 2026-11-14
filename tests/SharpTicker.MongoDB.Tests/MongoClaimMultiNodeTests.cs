@@ -634,6 +634,54 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
             => Entries.Add((logLevel, exception));
     }
 
+    // #55: the fallback reads the overdue rows and then claims them one by one. Between the two, another node moves the
+    // job to a later time. The row the fallback read is no longer the row in the store: it is not claimed, and the job
+    // keeps its new time. That holds whichever way the other node's clock is off: behind, so the UpdatedAt it writes is
+    // earlier than the one the fallback read (the case that was claimed), or ahead, so it is later.
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(3)]
+    public async Task Fallback_ARowRescheduledBetweenTheReadAndTheClaim_IsNotClaimed_WhicheverWayTheOtherNodesClockIsOff(int hoursOff)
+    {
+        var id = await SeedTimeTicker();
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var later = T0.AddDays(1);
+        var stamp = T0.AddHours(hoursOff);
+        var other = CreateProvider("node-B", new FakeClock(stamp));
+        var fallback = CreateNodeWithHook("update", 1, () =>
+        {
+            // What the manager of that node writes: the row with its new time, stamped with that node's clock.
+            var row = ReadTimeTicker(id).GetAwaiter().GetResult();
+            row.ExecutionTime = later;
+            row.UpdatedAt = stamp;
+            Assert.Equal(1, other.UpdateTimeTickers([row], CancellationToken.None).GetAwaiter().GetResult());
+        });
+
+        var claimed = await Drain(fallback.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Empty(claimed);
+        var stored = await ReadTimeTicker(id);
+        Assert.Equal(TickerStatus.Idle, stored.Status);
+        Assert.Null(stored.LockHolder);
+        Assert.Equal(later, stored.ExecutionTime);
+    }
+
+    // The claim compares the UpdatedAt it read. A running application stamps rows from a clock that is finer than the
+    // millisecond MongoDB keeps; the value that was read is the stored one, so such a row is claimed as any other.
+    [Fact]
+    public async Task Fallback_ARowStampedFinerThanAMillisecond_IsClaimed()
+    {
+        var node = CreateProvider("node-A");
+        var ticker = NewTimeTicker(updatedAt: T0.AddHours(-1).AddTicks(1234));
+        await node.AddTimeTickers([ticker], CancellationToken.None);
+        _clock.Advance(TimeSpan.FromSeconds(2));
+
+        var claimed = await Drain(node.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Equal(ticker.Id, Assert.Single(claimed).Id);
+        Assert.Equal(TickerStatus.InProgress, (await ReadTimeTicker(ticker.Id)).Status);
+    }
+
     [Fact]
     public async Task AcquireImmediate_DuplicateIds_ReturnsTheRowOnce()
     {

@@ -33,7 +33,9 @@
     <Project Path="src/SharpTicker/SharpTicker.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/SharpTicker.Caching.StackExchangeRedis.OwnTypes.Tests/SharpTicker.Caching.StackExchangeRedis.OwnTypes.Tests.csproj" />
     <Project Path="tests/SharpTicker.Caching.StackExchangeRedis.Tests/SharpTicker.Caching.StackExchangeRedis.Tests.csproj" />
+    <Project Path="tests/SharpTicker.EntityFrameworkCore.MySql.Tests/SharpTicker.EntityFrameworkCore.MySql.Tests.csproj" />
     <Project Path="tests/SharpTicker.EntityFrameworkCore.Tests/SharpTicker.EntityFrameworkCore.Tests.csproj" />
     <Project Path="tests/SharpTicker.MongoDB.Tests/SharpTicker.MongoDB.Tests.csproj" />
     <Project Path="tests/SharpTicker.Samples.Tests/SharpTicker.Samples.Tests.csproj" />

@@ -147,7 +147,7 @@ public static class Invariants
         bool Hit(params string[] types) => faults.Any(f => types.Contains(f.Type) && f.NodeIdentifier == node
                                                          && (taken == null || f.At >= taken.Value - Slack));
 
-        // docs/guide/operations.md, "What is guaranteed": MongoDB has no release step for an instance that stopped. A Redis
+        // docs/guide/operations.md, "When an instance stops": MongoDB has no release step for an instance that stopped. A Redis
         // node that is killed and started again releases what its earlier run left, so a kill explains nothing there.
         if (store == Store.MongoDb && Hit("kill"))
             return "MongoDB kill";

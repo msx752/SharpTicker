@@ -129,11 +129,13 @@ namespace SharpTicker.MongoDB.Infrastructure
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // The status check keeps a row another node already moved to InProgress out of reach, even when
-                // that node's clock is behind and wrote an earlier UpdatedAt.
+                // The row has to be the one that was read: any write since then changed UpdatedAt, also one by a node
+                // whose clock is behind and wrote an earlier value (a job moved to a later time would run now, with
+                // what was read). The value comes from the store, so it compares as stored. The status check keeps a
+                // row another node already moved to InProgress out of reach.
                 var filter = fb.And(
                     fb.Eq(x => x.Id, candidate.Id),
-                    fb.Lte(x => x.UpdatedAt, candidate.UpdatedAt),
+                    fb.Eq(x => x.UpdatedAt, candidate.UpdatedAt),
                     fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued }));
 
                 // Every InProgress write of this node carries its own claim marker (see ClaimMarkers).

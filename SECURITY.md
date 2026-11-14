@@ -22,4 +22,4 @@ Security fixes are made on the latest released version. There is one version lin
 | .NET 9           | Yes, throughout 1.x |
 | .NET 8           | Yes, throughout 1.x |
 
-Microsoft ends support for .NET 8 and .NET 9 on November 10, 2026. SharpTicker fixes its own code for these targets for the whole 1.x line, but it cannot fix vulnerabilities in the .NET runtime itself; plan your .NET upgrade accordingly. See [Versioning](README.md#versioning).
+Microsoft ended support for .NET 8 and .NET 9 on November 10, 2026. SharpTicker fixes its own code for these targets for the whole 1.x line, but it cannot fix vulnerabilities in the .NET runtime itself, and those runtimes no longer get fixes from Microsoft. See [Versioning](README.md#versioning).

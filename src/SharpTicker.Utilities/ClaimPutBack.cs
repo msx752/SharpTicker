@@ -53,8 +53,12 @@ internal static class ClaimPutBack
     }
 }
 
-/// <summary>A claimed row whose put-back failed: still InProgress for this node under <see cref="ClaimMarker"/>.</summary>
-internal readonly record struct NotPutBackClaim(Guid Id, DateTime ClaimMarker, TickerType Type);
+/// <summary>
+/// A row that is still InProgress for this node under <see cref="ClaimMarker"/> and has to be put back: a claimed row
+/// whose put-back failed, or, with <see cref="StoppedFunction"/>, the row of a run of that function this node stopped
+/// without an outcome (see <see cref="NodeFence"/>).
+/// </summary>
+internal readonly record struct NotPutBackClaim(Guid Id, DateTime ClaimMarker, TickerType Type, string StoppedFunction = null);
 
 /// <summary>
 /// A claim call failed after it had claimed rows, and some of them could not be put back. The first inner exception is the

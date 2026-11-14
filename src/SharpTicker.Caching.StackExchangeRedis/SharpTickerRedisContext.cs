@@ -140,7 +140,9 @@ internal class SharpTickerRedisContext : ISharpTickerRedisContext, INodeHeartbea
             JsonSerializer.Serialize(writer, result, typeInfo);
             await writer.FlushAsync(cancellationToken);
 
-            await _cache.SetAsync(cacheKey, bufferWriter.WrittenMemory.ToArray(), cancellationToken);
+            // Without a lifetime the entry would stay until something removes it.
+            await _cache.SetAsync(cacheKey, bufferWriter.WrittenMemory.ToArray(),
+                new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = expiration }, cancellationToken);
         }
         catch (Exception)
         {

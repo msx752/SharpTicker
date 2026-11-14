@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using SharpTicker.EntityFrameworkCore.Infrastructure;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Instrumentation;
@@ -58,10 +59,16 @@ public static class ServiceExtension
                                ?? serviceProvider.GetService<ITickerClock>()?.UtcNow
                                ?? DateTime.UtcNow;
 
+            // With Redis next to the store, its heartbeat releases the jobs of a node that is gone; without it nothing
+            // does, so the jobs under other identifiers are reported once (#24).
+            var jobsOfOtherNodes = serviceProvider.GetService<ISharpTickerRedisContext>()?.HasRedisConnection == true
+                ? null
+                : serviceProvider.GetService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>() as IJobsOfOtherNodes;
+
             hostLifetime.ApplicationStarted.Register(() =>
             {
                 // The context keeps the task so that whoever needs to know the release is over, a test for one, can wait for it.
-                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, runStartedAt, hostScheduler, logger));
+                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, runStartedAt, hostScheduler, logger, jobsOfOtherNodes));
                 if (executionContext != null)
                     executionContext.ExternalProviderStartup = release;
             });
@@ -80,7 +87,8 @@ public static class ServiceExtension
         string nodeIdentifier,
         DateTime runStartedAt,
         ISharpTickerHostScheduler hostScheduler,
-        ILogger logger)
+        ILogger logger,
+        IJobsOfOtherNodes jobsOfOtherNodes = null)
     {
         try
         {
@@ -100,5 +108,29 @@ public static class ServiceExtension
             logger.LogError(ex, "Releasing the jobs held by dead nodes and by an earlier run of node {NodeIdentifier} failed at startup. " +
                                 "Jobs that were left InProgress were not released by this step.", nodeIdentifier);
         }
+
+        if (jobsOfOtherNodes == null)
+            return;
+
+        try
+        {
+            var others = await jobsOfOtherNodes.CountInProgressOfOtherNodesAsync(nodeIdentifier);
+            if (others.Count == 0)
+                return;
+
+            // Every container that was replaced can have left an identifier, so the list is cut.
+            var listed = others.OrderByDescending(x => x.Jobs).ThenBy(x => x.NodeIdentifier, StringComparer.Ordinal).Take(MaxNodesInLog)
+                .Select(x => $"{x.NodeIdentifier} ({x.Jobs})");
+            var nodes = string.Join(", ", listed) + (others.Count > MaxNodesInLog ? $" and {others.Count - MaxNodesInLog} more" : "");
+            logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. With the EF Core store and no Redis heartbeat, " +
+                                  "such a job is released when a node with the same identifier starts. A job of a node that is still running ends as usual. " +
+                                  "If no node runs or starts under that identifier again, the job stays InProgress until it is removed.", others.Sum(x => x.Jobs), nodes);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Counting the jobs that are InProgress under other node identifiers failed at startup.");
+        }
     }
+
+    private const int MaxNodesInLog = 10;
 }
