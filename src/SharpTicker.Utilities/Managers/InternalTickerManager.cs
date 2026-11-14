@@ -742,9 +742,19 @@ namespace SharpTicker.Utilities.Managers
         public async Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default)
         {
             var now = _clock.UtcNow;
-            var cronTickers = await _persistenceProvider.GetAllCronTickerExpressions(cancellationToken).ConfigureAwait(false);
+            CronTickerEntity[] cronTickers;
+            try
+            {
+                cronTickers = await _persistenceProvider.GetAllCronTickerExpressions(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                // Only a check: a store that cannot be read now must not stop the startup.
+                _logger?.LogWarning(ex, "The cron tickers could not be read at startup to look for expressions without a next occurrence; the check is not made in this run.");
+                return;
+            }
 
-            foreach (var cronTicker in cronTickers)
+            foreach (var cronTicker in cronTickers ?? [])
             {
                 DateTime? next;
                 Exception failure = null;
@@ -754,14 +764,14 @@ namespace SharpTicker.Utilities.Managers
                 }
                 catch (Exception ex)
                 {
-                    // An expression that matches no date (such as the 30th of February) can make the cron library throw.
+                    // The cron library throws for an expression that matches no date (such as the 30th of February).
                     next = null;
                     failure = ex;
                 }
 
                 if (next is null)
                     _logger?.LogWarning(failure,
-                        "The cron ticker {CronTickerId} of the function {FunctionName} has the expression '{Expression}', which has no next occurrence, so it does not run. Correct or remove its expression; an expression has six fields, the first being the seconds.",
+                        "The cron ticker {CronTickerId} of the function {FunctionName} has the expression '{Expression}', which has no next occurrence, so it does not run. Correct its expression (six fields, the first being the seconds) or remove the cron ticker.",
                         cronTicker.Id, cronTicker.Function, cronTicker.Expression);
             }
         }

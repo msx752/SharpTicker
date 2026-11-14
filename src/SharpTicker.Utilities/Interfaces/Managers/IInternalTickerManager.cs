@@ -61,7 +61,8 @@ namespace SharpTicker.Utilities.Interfaces.Managers
 
         /// <summary>
         /// Logs a Warning for each enabled cron ticker whose expression has no next occurrence: it does not parse, or it
-        /// matches no date. The scheduler skips such a cron ticker without a word, so this is the only sign of it (#79).
+        /// matches no date. Such a cron ticker does not run, and nothing else says so (#79). A store that cannot be read
+        /// is logged as a Warning too; the check never stops the startup.
         /// </summary>
         Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default);
     }
