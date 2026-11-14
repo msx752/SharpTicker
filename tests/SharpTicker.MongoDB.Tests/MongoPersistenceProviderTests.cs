@@ -160,6 +160,70 @@ public class MongoPersistenceProviderTests : IClassFixture<MongoTestFixture>, IA
     }
 
     [Fact]
+    public async Task ReleaseDeadNodeOccurrenceResources_ReleasesTheQueuedOccurrencesThatNodeHolds()
+    {
+        var cron = NewCron();
+        await _f.Provider.InsertCronTickers([cron], CancellationToken.None);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(),
+            CronTickerId = cron.Id,
+            ExecutionTime = _f.FixedNow.AddMinutes(5),
+            Status = TickerStatus.Queued,
+            LockHolder = "dead-node",
+            LockedAt = _f.FixedNow.AddMinutes(-1),
+            CreatedAt = _f.FixedNow.AddHours(-1),
+            UpdatedAt = _f.FixedNow.AddHours(-1)
+        };
+        await _f.CronTickerOccurrences.InsertOneAsync(occurrence);
+
+        await _f.Provider.ReleaseDeadNodeOccurrenceResources("dead-node", CancellationToken.None);
+
+        var after = await _f.CronTickerOccurrences.Find(x => x.Id == occurrence.Id).FirstAsync();
+        Assert.Equal((TickerStatus.Idle, (string?)null, (DateTime?)null), (after.Status, after.LockHolder, after.LockedAt));
+    }
+
+    // A row that waits and is not locked belongs to no node, so the release of a dead node must not write it (#90).
+    [Fact]
+    public async Task ReleaseDeadNodeTimeTickerResources_DoesNotRewriteWaitingRowsThatNoNodeHolds()
+    {
+        var ticker = NewTimeTicker();
+        await _f.Provider.AddTimeTickers([ticker], CancellationToken.None);
+        var updatedAt = _f.FixedNow.AddHours(-1);
+        await _f.TimeTickers.UpdateOneAsync(
+            Builders<TimeTickerEntity>.Filter.Eq(x => x.Id, ticker.Id),
+            Builders<TimeTickerEntity>.Update.Set(x => x.UpdatedAt, updatedAt));
+
+        await _f.Provider.ReleaseDeadNodeTimeTickerResources("dead-node", CancellationToken.None);
+
+        var after = await _f.Provider.GetTimeTickerById(ticker.Id, CancellationToken.None);
+        Assert.Equal(updatedAt, after!.UpdatedAt);
+    }
+
+    [Fact]
+    public async Task ReleaseDeadNodeOccurrenceResources_DoesNotRewriteWaitingOccurrencesThatNoNodeHolds()
+    {
+        var cron = NewCron();
+        await _f.Provider.InsertCronTickers([cron], CancellationToken.None);
+        var updatedAt = _f.FixedNow.AddHours(-1);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(),
+            CronTickerId = cron.Id,
+            ExecutionTime = _f.FixedNow.AddMinutes(5),
+            Status = TickerStatus.Idle,
+            CreatedAt = updatedAt,
+            UpdatedAt = updatedAt
+        };
+        await _f.CronTickerOccurrences.InsertOneAsync(occurrence);
+
+        await _f.Provider.ReleaseDeadNodeOccurrenceResources("dead-node", CancellationToken.None);
+
+        var after = await _f.CronTickerOccurrences.Find(x => x.Id == occurrence.Id).FirstAsync();
+        Assert.Equal(updatedAt, after.UpdatedAt);
+    }
+
+    [Fact]
     public async Task InsertCronTickerOccurrences_UniqueIndexBlocksDuplicateSlots()
     {
         var cron = NewCron();
