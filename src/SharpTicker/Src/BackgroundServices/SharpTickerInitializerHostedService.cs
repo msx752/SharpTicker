@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -54,8 +55,9 @@ internal sealed class SharpTickerInitializerHostedService : IHostedService
         // claim of this run. The startup release of what an earlier run left locked is fenced by it.
         _executionContext.RunStartedAt ??= _serviceProvider.GetService<ITickerClock>()?.UtcNow ?? DateTime.UtcNow;
 
-        var invalidCrons = TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(_configuration);
-        TickerFunctionProvider.Build();
+        // UseSharpTicker built the registry already (#75). This build adds what was mapped since then, and it gives the
+        // configuration values that are not a cron expression again, so the start stops on them as before.
+        var invalidCrons = BuildFunctionRegistry();
 
         if (invalidCrons.Count > 0)
             throw new InvalidOperationException(string.Join(Environment.NewLine, invalidCrons.Select(x =>
@@ -92,6 +94,19 @@ internal sealed class SharpTickerInitializerHostedService : IHostedService
             _executionContext.ExternalProviderApplicationAction(_serviceProvider);
             _executionContext.ExternalProviderApplicationAction = null;
         }
+    }
+
+    /// <summary>
+    /// Builds the function registry from what is mapped, with the <c>%Key%</c> crons taken from the configuration. It has
+    /// no I/O, so <c>UseSharpTicker</c> calls it too: a ticker added before the host starts finds its function (#75).
+    /// A placeholder that was replaced in an earlier build is not read again; one that is still there is read again.
+    /// </summary>
+    /// <returns>The configuration values that are not a cron expression; such a function keeps its placeholder.</returns>
+    internal IReadOnlyList<(string Function, string ConfigurationKey, string Value)> BuildFunctionRegistry()
+    {
+        var invalidCrons = TickerFunctionProvider.UpdateCronExpressionsFromIConfiguration(_configuration);
+        TickerFunctionProvider.Build();
+        return invalidCrons;
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
