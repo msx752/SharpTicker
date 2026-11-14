@@ -187,7 +187,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                 .ToList();
 
             var neverRuns = leftWaiting
-                .Where(c => !ChainRunGate.AllowsRunNow(c.RunCondition, parentEnds[c.ParentId.Value].Status, hasOwnTime: false))
+                .Where(c => !ChainRunGate.FallbackRunsChildWithoutTime(c.RunCondition, parentEnds[c.ParentId.Value].Status))
                 .Select(c => c.Id)
                 .ToArray();
             if (neverRuns.Length > 0)

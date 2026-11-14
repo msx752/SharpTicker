@@ -745,7 +745,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                     continue;
                 }
 
-                if (!ChainRunGate.AllowsRunNow(child.RunCondition, parentStatus, hasOwnTime: false))
+                if (!ChainRunGate.FallbackRunsChildWithoutTime(child.RunCondition, parentStatus))
                 {
                     try
                     {

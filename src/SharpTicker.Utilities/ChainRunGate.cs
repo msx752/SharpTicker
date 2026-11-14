@@ -57,6 +57,16 @@ namespace SharpTicker.Utilities
             => Allows(condition, parentStatus) && (hasOwnTime || condition != RunCondition.InProgress);
 
         /// <summary>
+        /// Whether the fallback claims a child without a time of its own that still waits after its parent ended
+        /// (<see cref="FallbackMayDecideChildWithoutTime"/>), or skips it. It follows <see cref="Allows"/>: an
+        /// <see cref="RunCondition.InProgress"/> child runs once its parent has started, so its parent's final outcome lets it
+        /// run unless the parent was skipped. Its start never came, or its run was released with its node (#158); the row
+        /// does not tell the two apart.
+        /// </summary>
+        internal static bool FallbackRunsChildWithoutTime(RunCondition? condition, TickerStatus parentStatus)
+            => Allows(condition, parentStatus);
+
+        /// <summary>
         /// How long a parent must have ended before the fallback takes a child without a time of its own that is still
         /// waiting. Such a child is started by its parent's run right after the parent ends; the fallback is only for a
         /// start that never came (the node stopped, or the store could not be reached).
@@ -66,7 +76,7 @@ namespace SharpTicker.Utilities
         /// <summary>
         /// Whether the fallback may look at a waiting child without a time of its own: its parent has a final status and
         /// ended at least <see cref="FallbackGraceForChildWithoutTime"/> ago. A final parent without an end time counts as
-        /// ended long ago. The child is then claimed when <see cref="AllowsRunNow"/> lets it run, and skipped otherwise.
+        /// ended long ago. The child is then claimed when <see cref="FallbackRunsChildWithoutTime"/> lets it run, and skipped otherwise.
         /// </summary>
         internal static bool FallbackMayDecideChildWithoutTime(TickerStatus parentStatus, DateTime? parentEndedAt, DateTime now)
             => IsFinal(parentStatus) && (parentEndedAt == null || parentEndedAt <= now - FallbackGraceForChildWithoutTime);
