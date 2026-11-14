@@ -235,7 +235,7 @@ namespace SharpTicker.Utilities.Managers
 
             if (CronScheduleCache.GetNextOccurrenceOrDefault(entity.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
-                    new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
+                    new TickerValidatorException($"Cannot parse expression {entity.Expression}, or it matches no date"));
 
             if (CronRangeCheck.HasBackwardsRange(entity.Expression))
                 return new TickerResult<TCronTicker>(
@@ -312,7 +312,7 @@ namespace SharpTicker.Utilities.Managers
 
             if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
-                    new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}, or it matches no date"));
 
             if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
                 return new TickerResult<TCronTicker>(
@@ -509,7 +509,7 @@ namespace SharpTicker.Utilities.Managers
 
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(entity.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
-                    errors.Add(new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
+                    errors.Add(new TickerValidatorException($"Cannot parse expression {entity.Expression}, or it matches no date"));
                     continue;
                 }
 
@@ -643,7 +643,7 @@ namespace SharpTicker.Utilities.Managers
 
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
-                    errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}, or it matches no date"));
                     continue;
                 }
 

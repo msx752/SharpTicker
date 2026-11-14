@@ -764,7 +764,8 @@ namespace SharpTicker.Utilities.Managers
                 }
                 catch (Exception ex)
                 {
-                    // The cron library throws for an expression that matches no date (such as the 30th of February).
+                    // Only a check: an exception of the cron library is read as no next occurrence (CronScheduleCache already
+                    // does so for an expression that matches no date, #194).
                     next = null;
                     failure = ex;
                 }

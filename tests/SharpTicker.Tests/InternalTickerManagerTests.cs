@@ -544,6 +544,28 @@ public class InternalTickerManagerTests
         Assert.Equal(executionTime, functions[0].ExecutionTime);
     }
 
+    // Candidate 106: an expression that matches no date (the 30th of February) parses, and the cron library throws when
+    // asked for its next occurrence. With such a cron ticker stored, the loop's read must still give the other jobs.
+    [Fact]
+    public async Task GetNextTickers_ACronTickerWhoseExpressionMatchesNoDate_DoesNotHideATimeTicker()
+    {
+        var timeTicker = new TimeTickerEntity
+        {
+            Id = Guid.NewGuid(), Function = "TimeFunc", ExecutionTime = _now.AddMinutes(5), Children = new List<TimeTickerEntity>()
+        };
+        _persistence.GetAllCronTickerExpressions(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new[] { new CronTickerEntity { Id = Guid.NewGuid(), Function = "NoDate", Expression = "0 0 0 30 2 *" } }));
+        _persistence.GetEarliestTimeTickers(Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new TimeTickerEntity[] { timeTicker }));
+        _persistence.QueueTimeTickers(Arg.Any<TimeTickerEntity[]>(), Arg.Any<CancellationToken>())
+            .Returns(ToAsyncEnumerable(new[] { timeTicker }));
+
+        var (timeRemaining, functions) = await _manager.GetNextTickers(CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromMinutes(5), timeRemaining);
+        Assert.Equal(timeTicker.Id, Assert.Single(functions).TickerId);
+    }
+
     [Fact]
     public async Task GetNextTickers_CronOccurrencesAvailable_QueuesAndReturnsThem()
     {
