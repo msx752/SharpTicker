@@ -739,6 +739,43 @@ namespace SharpTicker.Utilities.Managers
         public async Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default)
             => await _persistenceProvider.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken).ConfigureAwait(false);
 
+        public async Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default)
+        {
+            var now = _clock.UtcNow;
+            CronTickerEntity[] cronTickers;
+            try
+            {
+                cronTickers = await _persistenceProvider.GetAllCronTickerExpressions(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                // Only a check: a store that cannot be read now must not stop the startup.
+                _logger?.LogWarning(ex, "The cron tickers could not be read at startup to look for expressions without a next occurrence; the check is not made in this run.");
+                return;
+            }
+
+            foreach (var cronTicker in cronTickers ?? [])
+            {
+                DateTime? next;
+                Exception failure = null;
+                try
+                {
+                    next = CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, now);
+                }
+                catch (Exception ex)
+                {
+                    // The cron library throws for an expression that matches no date (such as the 30th of February).
+                    next = null;
+                    failure = ex;
+                }
+
+                if (next is null)
+                    _logger?.LogWarning(failure,
+                        "The cron ticker {CronTickerId} of the function {FunctionName} has the expression '{Expression}', which has no next occurrence, so it does not run. Correct its expression (six fields, the first being the seconds) or remove the cron ticker.",
+                        cronTicker.Id, cronTicker.Function, cronTicker.Expression);
+            }
+        }
+
         public Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
             => ReleaseBothAsync(
                 () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken),

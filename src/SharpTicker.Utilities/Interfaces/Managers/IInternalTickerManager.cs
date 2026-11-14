@@ -58,5 +58,12 @@ namespace SharpTicker.Utilities.Interfaces.Managers
         // this call won, ready to dispatch; a failed claim is logged and returns none, the fallback then runs them.
         Task<InternalFunctionContext[]> AcquireDelayedChildrenAsync(Guid[] ids, CancellationToken cancellationToken = default);
         Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Logs a Warning for each enabled cron ticker whose expression has no next occurrence: it does not parse, or it
+        /// matches no date. Such a cron ticker does not run, and nothing else says so (#79). A store that cannot be read
+        /// is logged as a Warning too; the check never stops the startup.
+        /// </summary>
+        Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default);
     }
 }

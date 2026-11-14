@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using SharpTicker.DependencyInjection;
 using SharpTicker.Provider;
 using SharpTicker.Utilities;
@@ -32,6 +33,28 @@ public class StartupServicesTests : IAsyncLifetime
     private const string DefinedCron = "Startup.DefinedCron";
 
     private WebApplication? _app;
+    private readonly RecordingLoggerProvider _log = new();
+
+    private sealed class RecordingLoggerProvider : ILoggerProvider
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<(LogLevel Level, string Category, string Text)> Entries { get; } = new();
+
+        public ILogger CreateLogger(string categoryName) => new Logger(categoryName, Entries);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class Logger(string category, System.Collections.Concurrent.ConcurrentQueue<(LogLevel, string, string)> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+                => entries.Enqueue((logLevel, category, formatter(state, exception)));
+        }
+    }
 
     public StartupServicesTests()
     {
@@ -49,6 +72,12 @@ public class StartupServicesTests : IAsyncLifetime
             await _app.DisposeAsync();
         }
         await ClearStoreAsync();
+
+        // The function registry is shared by the process. A function whose cron is a placeholder that a later host has no
+        // configuration for would be seeded with the placeholder, which has no next occurrence; take its cron away.
+        foreach (var function in new[] { "Startup.ConfiguredCron5", "Startup.ConfiguredCron6", "Startup.ConfiguredCronBad" })
+            TickerFunctionProvider.Configure(function, cronExpression: string.Empty);
+        TickerFunctionProvider.Build();
     }
 
     private static async Task ClearStoreAsync()
@@ -71,6 +100,7 @@ public class StartupServicesTests : IAsyncLifetime
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
+        builder.Logging.AddProvider(_log);
         if (configuration != null)
             builder.Configuration.AddInMemoryCollection(configuration);
         builder.Services.AddSharpTicker(options =>
@@ -124,6 +154,37 @@ public class StartupServicesTests : IAsyncLifetime
 
         var cron = Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == "Startup.WeekdayCron5");
         Assert.Equal("0 30 8 * * Mon-Fri", cron.Expression);
+    }
+
+    // #79: a stored cron ticker whose expression has no next occurrence never runs; the startup names it once, as a
+    // Warning. Such a row can come from a version before the fix for configuration crons (five fields stored as they
+    // were), from a placeholder whose configuration key is missing, from an expression that matches no date (the cron
+    // library throws for it; the startup goes on), or from an edit outside the library.
+    [Fact]
+    public async Task AStoredCronTickerWithoutANextOccurrence_IsNamedOnceInAWarningAtStartup()
+    {
+        var fiveFields = new CronTickerEntity { Id = Guid.NewGuid(), Function = "Startup.StoredFiveFields", Expression = "30 8 * * *" };
+        var notACron = new CronTickerEntity { Id = Guid.NewGuid(), Function = "Startup.StoredNotACron", Expression = "%Startup:MissingKey%" };
+        var noDate = new CronTickerEntity { Id = Guid.NewGuid(), Function = "Startup.StoredNoDate", Expression = "0 0 0 30 2 *" };
+        var valid = new CronTickerEntity { Id = Guid.NewGuid(), Function = "Startup.StoredValid", Expression = "0 0 0 * * *" };
+        var paused = new CronTickerEntity { Id = Guid.NewGuid(), Function = "Startup.StoredPaused", Expression = "30 8 * * *", IsEnabled = false };
+
+        await StartAsync(beforeStart: store => store.InsertCronTickers([fiveFields, notACron, noDate, valid, paused], default));
+
+        var warnings = _log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToArray();
+        Assert.Single(warnings, w => w.Contains(fiveFields.Id.ToString()) && w.Contains("'30 8 * * *'") && w.Contains("Startup.StoredFiveFields"));
+        Assert.Single(warnings, w => w.Contains(notACron.Id.ToString()) && w.Contains("'%Startup:MissingKey%'"));
+        Assert.Single(warnings, w => w.Contains(noDate.Id.ToString()) && w.Contains("'0 0 0 30 2 *'"));
+        Assert.DoesNotContain(warnings, w => w.Contains(valid.Id.ToString()) || w.Contains(paused.Id.ToString()));
+    }
+
+    [Fact]
+    public async Task CronTickersThatAllHaveANextOccurrence_LogNoWarningAtStartup()
+    {
+        await StartAsync();
+
+        Assert.Single(await Store.GetCronTickers(null, default), c => c.Function == DefinedCron);
+        Assert.Empty(_log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => $"{e.Category}: {e.Text}"));
     }
 
     // #79: a cron that comes from configuration follows the rules of one written in code.

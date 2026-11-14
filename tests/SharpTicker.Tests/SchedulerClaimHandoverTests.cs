@@ -439,6 +439,7 @@ public class SchedulerClaimHandoverTests : IAsyncLifetime
         public Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] context, CancellationToken cancellationToken = default) => inner.UpdateSkipTimeTickersWithUnifiedContextAsync(context, cancellationToken);
         public Task<InternalFunctionContext[]> AcquireDelayedChildrenAsync(Guid[] ids, CancellationToken cancellationToken = default) => inner.AcquireDelayedChildrenAsync(ids, cancellationToken);
         public Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default) => inner.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken);
+        public Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default) => inner.WarnAboutCronTickersWithoutANextOccurrenceAsync(cancellationToken);
     }
 
     private async Task<Guid> SeedTimeTicker(string function, DateTime? executionTime = null)
