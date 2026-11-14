@@ -137,4 +137,49 @@ public class RedisStoredRowScenarios(ITestOutputHelper output)
         Assert.True(await StatusAsync(db, onFailure) == TickerStatus.Skipped, $"the child for a failed parent was not skipped: {description}");
         Assert.Equal([1, 1, 1, 0], new[] { parent, onSuccess, grandchild, onFailure }.Select(id => env.Runs.Starts(id)));
     }
+
+    // #152: a chain stored by a version before 1.3.0 whose parent ended long ago (on 1.3.x its children ran inside the
+    // parent's run, without their state being stored). Saving the parent in the dashboard wrote the children as Idle rows of
+    // an ended parent, and the fallback ran the ones the parent's outcome lets run: a second run. With the fix the edit
+    // changes the parent's record only.
+    [Fact]
+    public async Task AnEditOfAChainStoredByAVersionBefore130_WhoseParentEnded_RunsNoChild()
+    {
+        await using var env = await ScenarioEnvironment.StartAsync("older-ended-chain", Store.Redis, nodes: 1, startedNodes: 0);
+        await using var redis = await ConnectionMultiplexer.ConnectAsync(env.DirectStoreConnection);
+        var db = redis.GetDatabase();
+        var now = DateTime.UtcNow;
+
+        string Node(Guid id, string executionTime, int? runCondition, string children, int status = 0, string executedAt = "null")
+            => "{\"Status\":" + status + ",\"LockHolder\":null,\"Request\":\"\",\"ExecutionTime\":" + executionTime
+               + ",\"LockedAt\":null,\"ExecutedAt\":" + executedAt + ",\"ExceptionMessage\":null,\"SkippedReason\":null,\"ElapsedTime\":0,"
+               + "\"Retries\":0,\"RetryCount\":0,\"RetryIntervals\":null,\"ParentId\":null,\"Children\":" + children
+               + ",\"RunCondition\":" + (runCondition?.ToString() ?? "null") + ",\"Id\":\"" + id + "\",\"Function\":\"" + Functions.Record + "\","
+               + "\"Description\":null,\"InitIdentifier\":null,\"CreatedAt\":" + Q(now.AddHours(-3)) + ",\"UpdatedAt\":" + Q(now.AddHours(-2)) + "}";
+
+        // parent (Done two hours ago) -> onSuccess (OnSuccess) -> grandchild (OnSuccess); onFailure (OnFailure)
+        Guid parent = Guid.NewGuid(), onSuccess = Guid.NewGuid(), grandchild = Guid.NewGuid(), onFailure = Guid.NewGuid();
+        var parentTime = now.AddHours(-2);
+        var text = Node(parent, Q(parentTime), null,
+            "[" + Node(onSuccess, "null", (int)RunCondition.OnSuccess, "[" + Node(grandchild, "null", (int)RunCondition.OnSuccess, "[]") + "]")
+            + "," + Node(onFailure, "null", (int)RunCondition.OnFailure, "[]") + "]",
+            status: (int)TickerStatus.Done, executedAt: Q(parentTime));
+        await db.StringSetAsync(Key(parent), text);
+        await db.SetAddAsync(Ids, parent.ToString());
+
+        await env.StartNodeAsync(0);
+        // The control before the edit: an ended chain is left as it is.
+        await Task.Delay(TimeSpan.FromSeconds(6));
+        Assert.Equal([0, 0, 0], new[] { onSuccess, grandchild, onFailure }.Select(id => env.Runs.Starts(id)));
+
+        await env.Nodes[0].Dashboard.UpdateTimeTickerAsync(parent, Functions.Record, null, parentTime);
+
+        // Before the fix the fallback (every 2 s here) ran the children within seconds; a minute leaves room for any pass.
+        await Task.Delay(TimeSpan.FromSeconds(60));
+        var description = await DescribeAsync(env, db, parent, onSuccess, grandchild, onFailure);
+        output.WriteLine(description);
+        Assert.Equal([0, 0, 0, 0], new[] { parent, onSuccess, grandchild, onFailure }.Select(id => env.Runs.Starts(id)));
+        Assert.Equal(TickerStatus.Done, await StatusAsync(db, parent));
+        Assert.All(new[] { onSuccess, grandchild, onFailure }, id => Assert.False(db.KeyExists(Key(id)), $"a row was written for child {id}: {description}"));
+    }
 }
