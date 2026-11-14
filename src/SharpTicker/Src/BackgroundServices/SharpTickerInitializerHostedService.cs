@@ -84,6 +84,9 @@ internal sealed class SharpTickerInitializerHostedService : IHostedService
         // duplicate executions at startup.
         await SkipStaleCronOccurrencesAsync(_serviceProvider, cancellationToken);
 
+        // A stored cron ticker the scheduler can never run is otherwise skipped without a word (#79).
+        await _serviceProvider.GetRequiredService<IInternalTickerManager>().WarnAboutCronTickersWithoutANextOccurrenceAsync(cancellationToken);
+
         if (_executionContext.ExternalProviderApplicationAction != null)
         {
             _executionContext.ExternalProviderApplicationAction(_serviceProvider);

@@ -739,6 +739,33 @@ namespace SharpTicker.Utilities.Managers
         public async Task<int> SkipStaleCronOccurrencesAsync(TimeSpan staleThreshold, CancellationToken cancellationToken = default)
             => await _persistenceProvider.SkipStaleCronOccurrencesAsync(staleThreshold, cancellationToken).ConfigureAwait(false);
 
+        public async Task WarnAboutCronTickersWithoutANextOccurrenceAsync(CancellationToken cancellationToken = default)
+        {
+            var now = _clock.UtcNow;
+            var cronTickers = await _persistenceProvider.GetAllCronTickerExpressions(cancellationToken).ConfigureAwait(false);
+
+            foreach (var cronTicker in cronTickers)
+            {
+                DateTime? next;
+                Exception failure = null;
+                try
+                {
+                    next = CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, now);
+                }
+                catch (Exception ex)
+                {
+                    // An expression that matches no date (such as the 30th of February) can make the cron library throw.
+                    next = null;
+                    failure = ex;
+                }
+
+                if (next is null)
+                    _logger?.LogWarning(failure,
+                        "The cron ticker {CronTickerId} of the function {FunctionName} has the expression '{Expression}', which has no next occurrence, so it does not run. Correct or remove its expression; an expression has six fields, the first being the seconds.",
+                        cronTicker.Id, cronTicker.Function, cronTicker.Expression);
+            }
+        }
+
         public Task ReleaseDeadNodeResources(string instanceIdentifier, CancellationToken cancellationToken = default)
             => ReleaseBothAsync(
                 () => _persistenceProvider.ReleaseDeadNodeOccurrenceResources(instanceIdentifier, cancellationToken),
