@@ -482,13 +482,9 @@ public static class DashboardEndpoints
         // Use Dashboard-specific JSON options
         var chainRoot = (TTimeTicker)JsonSerializer.Deserialize(jsonString, dashboardOptions.DashboardJsonOptions.GetTypeInfo(typeof(TTimeTicker)));
 
-        if (chainRoot?.ExecutionTime is DateTime executionTime && !string.IsNullOrEmpty(timeZoneId))
-        {
-            var tz = TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
-            var unspecified = DateTime.SpecifyKind(executionTime, DateTimeKind.Unspecified);
-            var utc = TimeZoneInfo.ConvertTimeToUtc(unspecified, tz);
-            chainRoot.ExecutionTime = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
-        }
+        // Every time in the chain is read in the given time zone, the children's and grandchildren's as the root's (#81).
+        if (chainRoot != null && !string.IsNullOrEmpty(timeZoneId))
+            ReadChainTimesInTimeZone(chainRoot, TimeZoneInfo.FindSystemTimeZoneById(timeZoneId));
 
         var scope = VisibilityScope<TTimeTicker, TCronTicker>.For(context);
         if (FirstHiddenFunction(scope, chainRoot) is { } hidden)
@@ -517,6 +513,26 @@ public static class DashboardEndpoints
             Message = result.IsSucceeded ? "Chain jobs created successfully" : FailureMessage(context, "Failed to create chain jobs", result.Exception),
             TickerId = result.Result?.Id
         }, dashboardOptions.DashboardJsonOptions);
+    }
+
+    private static void ReadChainTimesInTimeZone<TTimeTicker>(TTimeTicker ticker, TimeZoneInfo tz)
+        where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
+    {
+        if (ticker.ExecutionTime is DateTime executionTime)
+        {
+            var unspecified = DateTime.SpecifyKind(executionTime, DateTimeKind.Unspecified);
+            var utc = TimeZoneInfo.ConvertTimeToUtc(unspecified, tz);
+            ticker.ExecutionTime = DateTime.SpecifyKind(utc, DateTimeKind.Utc);
+        }
+
+        if (ticker.Children == null)
+            return;
+
+        foreach (var child in ticker.Children)
+        {
+            if (child != null)
+                ReadChainTimesInTimeZone(child, tz);
+        }
     }
 
     private static async Task UpdateTimeTicker<TTimeTicker, TCronTicker>(HttpContext context)
