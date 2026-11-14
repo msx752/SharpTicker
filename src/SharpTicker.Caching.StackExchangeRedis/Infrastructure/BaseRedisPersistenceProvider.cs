@@ -194,7 +194,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // rejects it. Written after the put-back, a failed index write would leave an Idle row that nothing looks at; this way a
     // failure leaves the row InProgress and the caller tries again, and a put-back whose reply was lost is already indexed.
     // The row key and the index keys live in different hash slots, so they cannot share one script.
-    protected async Task<bool> TryReleaseClaimAsync<T>(string key, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle)
+    protected async Task<bool> TryReleaseClaimAsync<T>(string key, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle,
+        Func<T, TickerStatus> statusOf)
         where T : class
     {
         // A row that is not this claim is left alone without any write; the compare-and-set below checks again.
@@ -214,9 +215,24 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             return stored;
         }).ConfigureAwait(false);
 
-        // A row that moved on keeps the extra pending entry until its next write updates its index; Acquire.lua rejects
-        // it meanwhile.
-        return released != null;
+        if (released != null)
+            return true;
+
+        // The row moved on between the read and the set. When it ended, the pending entry written above would stay on it for
+        // good, so its index is written again as the row is now (#57), as the fallback does for an ended time ticker. A row
+        // that has not ended is left alone: it may be another node's by now, whose entry must not be removed, and its own
+        // writes keep its index. A failure here does not undo anything: the fallback drops the entry of an ended row.
+        try
+        {
+            var current = await Serializer.GetAsync<T>(key).ConfigureAwait(false);
+            if (current != null && statusOf(current) is not (TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress))
+                await indexAsIdle(current).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "A put-back of {Key} found the row changed, and its pending index entry could not be written again.", key);
+        }
+        return false;
     }
 
     private const int MaxCompareAndSetRounds = 5;
@@ -891,7 +907,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             TimeTickerKey(id),
             row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
             row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; row.UpdatedAt = Clock.UtcNow; },
-            row => IndexManager.AddTimeTickerIndexesAsync(row));
+            row => IndexManager.AddTimeTickerIndexesAsync(row),
+            row => row.Status);
 
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken = default)
     {
@@ -1362,11 +1379,25 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             var acquired = await TryClaimInProgressAsync<CronTickerOccurrenceEntity<TCronTicker>>(
                 CronOccurrenceKey(id), id, TryReleaseCronOccurrenceClaim).ConfigureAwait(false);
 
-            if (acquired == null) continue;
+            if (acquired == null)
+            {
+                await DropEndedPendingEntryAsync(id).ConfigureAwait(false);
+                continue;
+            }
 
             await TryUpdateIndexAfterClaim(acquired.Id, () => IndexManager.AddCronOccurrenceIndexesAsync(acquired)).ConfigureAwait(false);
             yield return acquired;
         }
+    }
+
+    // A due pending entry the fallback could not claim, whose occurrence has ended (an index write that never landed after
+    // its run): dropped, as DropEndedPendingEntriesAsync does for time tickers, or every pass would try to claim it (#57).
+    // An occurrence that is still Idle, Queued or InProgress keeps its entry: it is someone's to write.
+    private async Task DropEndedPendingEntryAsync(Guid id)
+    {
+        var row = await Serializer.GetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id)).ConfigureAwait(false);
+        if (row is { Status: not (TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress) })
+            await TryUpdateIndexAfterClaim(id, () => IndexManager.AddCronOccurrenceIndexesAsync(row)).ConfigureAwait(false);
     }
 
     public async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
@@ -1384,7 +1415,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             CronOccurrenceKey(id),
             row => row.Status == TickerStatus.InProgress && row.LockHolder == LockHolder && row.UpdatedAt == claimMarker,
             row => { row.Status = TickerStatus.Idle; row.LockHolder = null; row.LockedAt = null; row.UpdatedAt = Clock.UtcNow; },
-            row => IndexManager.AddCronOccurrenceIndexesAsync(row));
+            row => IndexManager.AddCronOccurrenceIndexesAsync(row),
+            row => row.Status);
 
     public async Task UpdateCronTickerOccurrence(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
     {

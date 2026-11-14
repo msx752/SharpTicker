@@ -197,6 +197,62 @@ public class SchedulerBackgroundServiceRestartTests : IAsyncLifetime
         Assert.True(await WaitUntilAsync(() => PollCount() >= 2));
     }
 
+    // The loop's first read plans 300 ms ahead; its second read blocks until the test lets it return "next in one hour".
+    private (Task Reading, Action ReadReturns, Func<int> Polls) ALoopWhoseSecondReadBlocks()
+    {
+        var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readResult = new TaskCompletionSource<(TimeSpan, InternalFunctionContext[])>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var polls = 0;
+        _manager.GetNextTickers(Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            switch (Interlocked.Increment(ref polls))
+            {
+                case 1:
+                    return Task.FromResult((TimeSpan.FromMilliseconds(300), Array.Empty<InternalFunctionContext>()));
+                case 2:
+                    reading.TrySetResult();
+                    return readResult.Task;
+                default:
+                    return Task.FromResult((TimeSpan.FromHours(1), Array.Empty<InternalFunctionContext>()));
+            }
+        });
+        return (reading.Task, () => readResult.TrySetResult((TimeSpan.FromHours(1), Array.Empty<InternalFunctionContext>())), () => Volatile.Read(ref polls));
+    }
+
+    // While the loop reads its next plan, the planned time is still the one the loop just woke up for, which has passed,
+    // so a new ticker due later is not "earlier than planned". When the read did not see the new row (it was stored after
+    // the read began), the loop would sleep until what the read found, with nothing to wake it for the new ticker (#78).
+    [Fact]
+    public async Task ATickerAddedWhileTheLoopReadsItsNextPlan_StillWakesTheLoop()
+    {
+        var (reading, readReturns, polls) = ALoopWhoseSecondReadBlocks();
+        await _service.StartAsync(CancellationToken.None);
+        await reading.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Ten minutes ahead, and the read then returns "next in one hour": it did not see the new ticker.
+        _service.RestartIfNeeded(DateTime.UtcNow.AddMinutes(10));
+        readReturns();
+
+        Assert.True(await WaitUntilAsync(() => polls() >= 3),
+            $"the loop was not woken for a ticker added while it read its plan; polls: {polls()}");
+    }
+
+    // The same moment, with a ticker the new plan already covers: it is due after what the read found, so the loop sleeps on.
+    [Fact]
+    public async Task ATickerAddedWhileTheLoopReadsItsNextPlan_ThatIsNotBeforeTheNewPlan_DoesNotRestartTheLoop()
+    {
+        var (reading, readReturns, polls) = ALoopWhoseSecondReadBlocks();
+        await _service.StartAsync(CancellationToken.None);
+        await reading.WaitAsync(TimeSpan.FromSeconds(10));
+
+        _service.RestartIfNeeded(DateTime.UtcNow.AddHours(2));
+        readReturns();
+        Assert.True(await WaitUntilAsync(() => _executionContext.GetNextPlannedOccurrence() > DateTime.UtcNow.AddMinutes(30)), "the second read did not end");
+        await Task.Delay(500);
+
+        Assert.Equal(2, polls());
+    }
+
     [Fact]
     public async Task ARestartRequestWithoutATime_IsIgnored()
     {

@@ -148,6 +148,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 _executionContext.SetFunctions(null);
             }
             
+            // From here until the new plan is set, the planned time is the one of the pass before.
+            Interlocked.Exchange(ref _earliestAddedWhileReadingTicks, long.MaxValue);
+            Interlocked.Exchange(ref _readingPlan, 1);
+
             var (timeRemaining, functions) =
                 await _internalTickerManager.GetNextTickers(cancellationToken);
 
@@ -173,6 +177,12 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                     : timeRemaining;
                 _executionContext.SetNextPlannedOccurrence(DateTime.UtcNow.Add(sleepDuration));
             }
+
+            // A ticker added during the read was compared with the plan of the pass before; it is compared with the new one.
+            Volatile.Write(ref _readingPlan, 0);
+            var addedWhileReading = Interlocked.Exchange(ref _earliestAddedWhileReadingTicks, long.MaxValue);
+            if (addedWhileReading != long.MaxValue)
+                RestartIfNeeded(new DateTime(addedWhileReading, DateTimeKind.Utc));
 
             // A put-back or an outcome write that failed is tried again on the loop's next pass, and an idle loop could sleep
             // up to a day.
@@ -446,11 +456,27 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         }
     }
 
+    // While the loop reads its next plan, the planned time is still the one it just woke up for, and a ticker stored after
+    // the read began is not in what the read returns. The earliest time asked for during a read is kept, and the loop asks
+    // again for it once the new plan is set (#78).
+    private int _readingPlan;
+    private long _earliestAddedWhileReadingTicks = long.MaxValue;
+
     public void RestartIfNeeded(DateTime? dateTime)
     {
         if (!dateTime.HasValue)
             return;
-        
+
+        if (Volatile.Read(ref _readingPlan) != 0)
+        {
+            var ticks = dateTime.Value.Ticks;
+            long seen;
+            while (ticks < (seen = Volatile.Read(ref _earliestAddedWhileReadingTicks))
+                   && Interlocked.CompareExchange(ref _earliestAddedWhileReadingTicks, ticks, seen) != seen)
+            {
+            }
+        }
+
         var now = DateTime.UtcNow;
         var nextPlannedOccurrence = _executionContext.GetNextPlannedOccurrence();
         

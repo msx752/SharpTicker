@@ -498,15 +498,17 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
     // With lockedBefore only the rows that node locked before that moment are released; every claim sets LockedAt, so a row
     // this run claimed since keeps its lock. Without it, the release takes every row of that node, as before.
+    // Only rows that node holds: a waiting row no node holds is left alone, because writing its UpdatedAt would make the
+    // loop of a live node, which queues a row only as it read it, miss the row.
     private async Task ReleaseDeadNodeTimeTickerResourcesCore(string instanceIdentifier, DateTime? lockedBefore, CancellationToken cancellationToken)
     {
         var now = _clock.UtcNow;
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
 
-        var waiting = dbContext.Set<TTimeTicker>().WhereCanAcquire(instanceIdentifier);
+        var waiting = dbContext.Set<TTimeTicker>().WhereCanAcquire(instanceIdentifier).Where(x => x.LockHolder == instanceIdentifier);
         if (lockedBefore is { } waitingBefore)
-            waiting = waiting.Where(x => x.LockHolder == instanceIdentifier && x.LockedAt < waitingBefore);
+            waiting = waiting.Where(x => x.LockedAt < waitingBefore);
 
         await waiting
             .ExecuteUpdateAsync(setter => setter
@@ -915,9 +917,10 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
 
-        var waiting = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>().WhereCanAcquire(instanceIdentifier);
+        var waiting = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>().WhereCanAcquire(instanceIdentifier)
+            .Where(x => x.LockHolder == instanceIdentifier);
         if (lockedBefore is { } waitingBefore)
-            waiting = waiting.Where(x => x.LockHolder == instanceIdentifier && x.LockedAt < waitingBefore);
+            waiting = waiting.Where(x => x.LockedAt < waitingBefore);
 
         await waiting
             .ExecuteUpdateAsync(setter => setter
