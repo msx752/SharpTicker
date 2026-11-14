@@ -104,7 +104,23 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
-    protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "", DateTime? claimMarker = null) where T : class
+    // The text System.Text.Json writes for a DateTime: the round-trip format without the trailing zeros of the fraction,
+    // and without the point when no digit is left. The claim of the scheduler loop compares UpdatedAt as text, and a row
+    // the application wrote holds this spelling.
+    internal static string AsTheSerializerWrites(DateTime value)
+    {
+        var text = value.ToString("O");
+        const int point = 19, end = 27;
+        var keep = end;
+        while (keep > point + 1 && text[keep - 1] == '0')
+            keep--;
+        if (keep == point + 1)
+            keep = point;
+        return string.Concat(text.AsSpan(0, keep), text.AsSpan(end));
+    }
+
+    protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "", DateTime? claimMarker = null,
+        string expectedUpdatedAtAsStored = "") where T : class
     {
         // A move to InProgress (the fallback, run-now) carries this node's next claim marker, like every InProgress write.
         var now = claimMarker ?? (targetStatus == TickerStatus.InProgress ? Clock.NextClaimMarker() : Clock.UtcNow);
@@ -112,7 +128,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             AcquireScript,
             [(RedisKey)key],
             [(RedisValue)LockHolder, (RedisValue)now.ToString("O"), (RedisValue)(int)targetStatus,
-             (RedisValue)(expectedUpdatedAt ?? ""), LuaStatusIdle, LuaStatusQueued]
+             (RedisValue)(expectedUpdatedAt ?? ""), LuaStatusIdle, LuaStatusQueued, (RedisValue)(expectedUpdatedAtAsStored ?? "")]
         ).ConfigureAwait(false);
 
         if (result.IsNull) return null;
@@ -609,7 +625,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             var acquired = await TryAcquireAsync<TTimeTicker>(
                 TimeTickerKey(timeTicker.Id),
                 TickerStatus.Queued,
-                timeTicker.UpdatedAt.ToString("O")).ConfigureAwait(false);
+                timeTicker.UpdatedAt.ToString("O"),
+                expectedUpdatedAtAsStored: AsTheSerializerWrites(timeTicker.UpdatedAt)).ConfigureAwait(false);
 
             if (acquired == null) continue;
 

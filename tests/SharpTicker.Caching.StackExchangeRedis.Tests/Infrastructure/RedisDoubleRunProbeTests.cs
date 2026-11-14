@@ -41,27 +41,6 @@ public class RedisDoubleRunProbeTests(RedisTestFixture fixture) : IAsyncLifetime
             Request = []
         };
 
-    // Side note from the findings: QueueTimeTickers compares UpdatedAt.ToString("O") (always seven fractional digits)
-    // with the JSON text System.Text.Json stored (trailing zeros trimmed). A row whose UpdatedAt ends in a zero tick
-    // never matches, so the main loop cannot queue it and only the fallback picks it up later.
-    [Fact]
-    public async Task Probe_RedisQueueCasFailsOnTrailingZeroTimestamp()
-    {
-        var clock = new FakeTickerClock(T0);
-        var node = fixture.CreateProvider("node-A", clock);
-        var trailingZero = NewTimeTicker(updatedAt: T0.AddHours(-1).AddTicks(1234560));
-        var noTrailingZero = NewTimeTicker(updatedAt: T0.AddHours(-1).AddTicks(1234567));
-        await node.AddTimeTickers([trailingZero, noTrailingZero], CancellationToken.None);
-
-        var window = await node.GetEarliestTimeTickers(CancellationToken.None);
-        Assert.Equal(2, window.Length);
-        await Drain(node.QueueTimeTickers(window, CancellationToken.None));
-
-        // Both rows carry the exact timestamp the loop read; only the one without a trailing zero was claimed.
-        Assert.Equal(TickerStatus.Idle, await RawStatus(trailingZero.Id));
-        Assert.Equal(TickerStatus.Queued, await RawStatus(noTrailingZero.Id));
-    }
-
     private async Task<string?> RawJson(Guid id)
         => (string?)await fixture.Database.StringGetAsync(SharpTicker.Caching.StackExchangeRedis.Helpers.RedisKeyBuilder.TimeTickerKey(id));
 
