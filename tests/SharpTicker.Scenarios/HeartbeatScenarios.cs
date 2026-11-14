@@ -22,6 +22,9 @@ public class HeartbeatScenarios(ITestOutputHelper output)
     // needs to write must together stay inside one TTL; the scenario measures that and is inconclusive otherwise.
     // With Redis as the job store, and with EF Core as the job store and Redis next to it: the heartbeat then releases
     // the EF Core rows, and only Redis is out of reach.
+    // With Redis as the job store a node that cannot write its heartbeat for one TTL stops its jobs itself since #46, so
+    // the job would not run through this outage. The nodes of that variant run with StopJobsWhenHeartbeatIsLost off: what
+    // is looked at here is the release by the other node, and the node stopping its own job has its own scenario below.
     [Theory]
     [InlineData(Store.Redis)]
     [InlineData(Store.EfCorePostgres)]
@@ -29,7 +32,8 @@ public class HeartbeatScenarios(ITestOutputHelper output)
     {
         const int runner = 0, observer = 1;
         await using var env = store == Store.Redis
-            ? await ScenarioEnvironment.StartAsync("outage-past-ttl", store, nodes: 2, startedNodes: 1, ownStoreProxy: [observer])
+            ? await ScenarioEnvironment.StartAsync("outage-past-ttl", store, nodes: 2, startedNodes: 1, ownStoreProxy: [observer],
+                nodeEnvironment: _ => new Dictionary<string, string> { ["SCENARIO_KEEP_JOBS_WHEN_HEARTBEAT_IS_LOST"] = "1" })
             : await ScenarioEnvironment.StartAsync("outage-past-ttl", store, nodes: 2, startedNodes: 1, heartbeatRedis: true);
         Task SetRedisAsync(int node, bool reachable)
             => store == Store.Redis ? env.SetStoreProxyAsync(node, reachable) : env.SetHeartbeatProxyAsync(node, reachable);

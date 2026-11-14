@@ -23,6 +23,8 @@ using MongoStore = SharpTicker.MongoDB.DependencyInjection.ServiceExtension;
 //                            string; the node then uses Redis next to its store (node heartbeat, release of nodes whose
 //                            heartbeat stopped)
 //   SCENARIO_OWN_TYPES       optional, with the Redis store: 1 = the application has ticker types of its own (OwnTypesHost)
+//   SCENARIO_KEEP_JOBS_WHEN_HEARTBEAT_IS_LOST  optional, with the Redis store: 1 = StopJobsWhenHeartbeatIsLost is off, so
+//                            a node that cannot write its heartbeat goes on running its jobs, as before #46
 //   SCENARIO_MAX_CONCURRENCY      optional: the scheduler's MaxConcurrency
 //   SCENARIO_IDLE_WORKER_TIMEOUT  optional: the scheduler's IdleWorkerTimeOut, in seconds
 //   SCENARIO_MIGRATIONS      optional, EF Core: documented | unedited = use that context and its migrations (the migration scenarios);
@@ -104,6 +106,10 @@ builder.Services.AddSharpTicker(options =>
         redis.Configuration = redisConnection;
         redis.InstanceName = Required("SCENARIO_REDIS_INSTANCE");
         redis.NodeHeartbeatInterval = TimeSpan.FromSeconds(5);
+        // By name: the nodes are also built from commits that do not have the option yet, where a node went on running
+        // its jobs anyway.
+        if (Environment.GetEnvironmentVariable("SCENARIO_KEEP_JOBS_WHEN_HEARTBEAT_IS_LOST") == "1")
+            redis.GetType().GetProperty("StopJobsWhenHeartbeatIsLost")?.SetValue(redis, false);
     });
 
     options.AddDashboard(dashboard => dashboard.WithNoAuth());
