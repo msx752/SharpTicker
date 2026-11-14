@@ -1231,6 +1231,76 @@ public class EfCorePersistenceProviderTests : IAsyncLifetime
         Assert.Equal("healthy-node", dbOcc.LockHolder);
     }
 
+    // The heartbeat of the Redis cache calls this overload for each dead node. A row that waits and is not locked belongs
+    // to no node, so the release of one dead node must not write it (#90).
+    [Fact]
+    public async Task ReleaseDeadNodeTimeTickerResources_DoesNotRewriteWaitingRowsThatNoNodeHolds()
+    {
+        var updatedAt = _fixedNow.AddHours(-1);
+        var waiting = CreateTimeTicker(status: TickerStatus.Idle, lockHolder: null, lockedAt: null, updatedAt: updatedAt);
+        await SeedTimeTickers(waiting);
+
+        await _provider.ReleaseDeadNodeTimeTickerResources("dead-node-1", CancellationToken.None);
+
+        using var ctx = CreateVerifyContext();
+        var dbTicker = await ctx.Set<TimeTickerEntity>().AsNoTracking().FirstAsync(t => t.Id == waiting.Id);
+        Assert.Equal(updatedAt, dbTicker.UpdatedAt);
+    }
+
+    // The rows the dead node holds as a claim leaves them (Queued, locked) are still released, for both kinds of row.
+    [Fact]
+    public async Task ReleaseDeadNodeResources_StillReleasesTheQueuedRowsTheDeadNodeHolds()
+    {
+        var ticker = CreateTimeTicker(status: TickerStatus.Queued, lockHolder: "dead-node-1", lockedAt: _fixedNow.AddMinutes(-1));
+        await SeedTimeTickers(ticker);
+        var cron = CreateCronTicker();
+        await SeedCronTickers(cron);
+        var occurrence = CreateCronOccurrence(cron.Id, status: TickerStatus.Queued, lockHolder: "dead-node-1", lockedAt: _fixedNow.AddMinutes(-1));
+        await SeedCronOccurrences(occurrence);
+
+        await _provider.ReleaseDeadNodeTimeTickerResources("dead-node-1", CancellationToken.None);
+        await _provider.ReleaseDeadNodeOccurrenceResources("dead-node-1", CancellationToken.None);
+
+        using var ctx = CreateVerifyContext();
+        var dbTicker = await ctx.Set<TimeTickerEntity>().AsNoTracking().FirstAsync(t => t.Id == ticker.Id);
+        Assert.Equal((TickerStatus.Idle, (string)null, (DateTime?)null), (dbTicker.Status, dbTicker.LockHolder, dbTicker.LockedAt));
+        var dbOcc = await ctx.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().FirstAsync(o => o.Id == occurrence.Id);
+        Assert.Equal((TickerStatus.Idle, (string)null, (DateTime?)null), (dbOcc.Status, dbOcc.LockHolder, dbOcc.LockedAt));
+    }
+
+    // What the rewrite costs: the main loop of a live node reads the next rows, a dead node is released meanwhile, and the
+    // queue step compares UpdatedAt with what it read, so the row is not queued and starts late through the fallback.
+    [Fact]
+    public async Task ReleaseDeadNodeTimeTickerResources_BetweenReadAndQueue_DoesNotStopTheMainLoopQueueingTheRow()
+    {
+        var waiting = CreateTimeTicker(status: TickerStatus.Idle, executionTime: _fixedNow.AddMinutes(1));
+        await SeedTimeTickers(waiting);
+
+        var read = await _provider.GetEarliestTimeTickers(CancellationToken.None);
+        Assert.Single(read);
+
+        await _provider.ReleaseDeadNodeTimeTickerResources("dead-node-1", CancellationToken.None);
+
+        var queued = await ToListAsync(_provider.QueueTimeTickers(read, CancellationToken.None));
+        Assert.Single(queued);
+    }
+
+    [Fact]
+    public async Task ReleaseDeadNodeOccurrenceResources_DoesNotRewriteWaitingOccurrencesThatNoNodeHolds()
+    {
+        var cron = CreateCronTicker();
+        await SeedCronTickers(cron);
+        var updatedAt = _fixedNow.AddHours(-1);
+        var waiting = CreateCronOccurrence(cron.Id, status: TickerStatus.Idle, lockHolder: null, lockedAt: null, updatedAt: updatedAt);
+        await SeedCronOccurrences(waiting);
+
+        await _provider.ReleaseDeadNodeOccurrenceResources("dead-node-1", CancellationToken.None);
+
+        using var ctx = CreateVerifyContext();
+        var dbOcc = await ctx.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().FirstAsync(o => o.Id == waiting.Id);
+        Assert.Equal(updatedAt, dbOcc.UpdatedAt);
+    }
+
     // =========================================================================
     // Additional edge cases
     // =========================================================================

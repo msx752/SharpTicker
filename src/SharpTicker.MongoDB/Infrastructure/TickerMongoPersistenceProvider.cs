@@ -507,9 +507,12 @@ namespace SharpTicker.MongoDB.Infrastructure
         {
             var now = _clock.UtcNow;
             var coll = _context.TimeTickers;
+            var fb = Builders<TTimeTicker>.Filter;
 
+            // Only rows that node holds: a waiting row no node holds is left alone, because writing its UpdatedAt would
+            // make the loop of a live node, which queues a row only as it read it, miss the row.
             await coll.UpdateManyAsync(
-                MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(instanceIdentifier),
+                fb.And(MongoUpdateBuilders.CanAcquireTimeTicker<TTimeTicker>(instanceIdentifier), fb.Eq(x => x.LockHolder, instanceIdentifier)),
                 Builders<TTimeTicker>.Update
                     .Set(x => x.LockHolder, (string)null)
                     .Set(x => x.LockedAt, (DateTime?)null)
@@ -517,7 +520,6 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Set(x => x.UpdatedAt, now),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            var fb = Builders<TTimeTicker>.Filter;
             await coll.UpdateManyAsync(
                 fb.And(fb.Eq(x => x.LockHolder, instanceIdentifier), fb.Eq(x => x.Status, TickerStatus.InProgress)),
                 Builders<TTimeTicker>.Update
@@ -1016,9 +1018,11 @@ namespace SharpTicker.MongoDB.Infrastructure
         {
             var now = _clock.UtcNow;
             var coll = _context.CronTickerOccurrences;
+            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
 
+            // Only the occurrences that node holds, as for the time tickers.
             await coll.UpdateManyAsync(
-                MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(instanceIdentifier),
+                fb.And(MongoUpdateBuilders.CanAcquireCronOccurrence<TCronTicker>(instanceIdentifier), fb.Eq(x => x.LockHolder, instanceIdentifier)),
                 Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
                     .Set(x => x.LockHolder, (string)null)
                     .Set(x => x.LockedAt, (DateTime?)null)
@@ -1026,7 +1030,6 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Set(x => x.UpdatedAt, now),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            var fb = Builders<CronTickerOccurrenceEntity<TCronTicker>>.Filter;
             await coll.UpdateManyAsync(
                 fb.And(fb.Eq(x => x.LockHolder, instanceIdentifier), fb.Eq(x => x.Status, TickerStatus.InProgress)),
                 Builders<CronTickerOccurrenceEntity<TCronTicker>>.Update
