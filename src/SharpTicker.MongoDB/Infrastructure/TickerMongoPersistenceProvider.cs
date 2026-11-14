@@ -1540,7 +1540,7 @@ namespace SharpTicker.MongoDB.Infrastructure
                || (parentStatuses.TryGetValue(parentId.Value, out var status) && ChainRunGate.Allows(condition, status));
 
         // The gate of a claim by id (ChainRunGate.AllowsRunNow): an InProgress child without a time of its own is left out.
-        // It starts with its parent and is never handed out on its own.
+        // It starts with its parent and is not handed out by a claim by id; the fallback takes it once its parent has ended.
         private static bool RunNowGateOpen(Guid? parentId, RunCondition? condition, bool hasOwnTime, Dictionary<Guid, TickerStatus> parentStatuses)
             => parentId == null
                || (parentStatuses.TryGetValue(parentId.Value, out var status) && ChainRunGate.AllowsRunNow(condition, status, hasOwnTime));

@@ -49,7 +49,8 @@ namespace SharpTicker.Utilities
         /// <see cref="NodeFence"/>), and marks each of those runs as fenced before its token is cancelled, so the run can
         /// tell this stop from a cancellation someone asked for. The entries stay registered until their runs end: the stop
         /// of the host still waits for them. Left alone: a run whose writes are not fenced by a marker (nothing could put
-        /// its row back), and a chain child that started with its parent (put back, it would be skipped, not run again).
+        /// its row back), and a chain child that started with its parent. Since #158 such a child, put back, would be run
+        /// again like any other; leaving it alone is kept as it is until that is decided (it can then run twice at once).
         /// Each token is cancelled on a thread of the pool, not here and not one after another: a cancel runs what the job
         /// hung on its token, which can be the rest of the job's run, and a job that blocks there must hold back neither the
         /// caller nor the request to the other jobs. A cancellation callback of a job that throws is handed to

@@ -50,8 +50,8 @@ namespace SharpTicker.Utilities
         /// Whether a claim by id (run-now) may hand out a chain child. A delayed child (<paramref name="hasOwnTime"/>) follows
         /// <see cref="Allows"/>. A child without a time of its own normally runs inside its parent's run, so it is handed
         /// out only once its parent has ended with an outcome it runs on: that is how it follows a parent outcome that was
-        /// stored late. An <see cref="RunCondition.InProgress"/> child without a time starts with its parent and is never
-        /// handed out on its own.
+        /// stored late. An <see cref="RunCondition.InProgress"/> child without a time starts with its parent and is not
+        /// handed out by a claim by id; the fallback takes it once its parent has ended (<see cref="FallbackRunsChildWithoutTime"/>).
         /// </summary>
         internal static bool AllowsRunNow(RunCondition? condition, TickerStatus parentStatus, bool hasOwnTime)
             => Allows(condition, parentStatus) && (hasOwnTime || condition != RunCondition.InProgress);
