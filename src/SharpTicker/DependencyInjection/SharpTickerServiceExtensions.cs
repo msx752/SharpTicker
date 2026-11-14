@@ -154,7 +154,8 @@ namespace SharpTicker.DependencyInjection
                 initializer.InitializationRequested = true;
 
                 // The registry is built here, without I/O, so a ticker added before the host starts finds its function
-                // (#75). A cron from the configuration that is not valid stops the start of the host, as before.
+                // (#75). A %Key% cron is read from the configuration at this point. A cron from the configuration that is not
+                // valid stops the start of the host, as before. A function mapped after this call is built at the start.
                 initializer.BuildFunctionRegistry();
             }
 

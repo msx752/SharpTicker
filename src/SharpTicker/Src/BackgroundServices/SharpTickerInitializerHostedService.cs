@@ -14,8 +14,8 @@ using SharpTicker.Utilities.Interfaces.Managers;
 namespace SharpTicker.BackgroundServices;
 
 /// <summary>
-/// Performs SharpTicker startup initialization (function discovery, cron ticker seeding,
-/// external provider setup) as part of the host lifecycle.
+/// Performs SharpTicker startup initialization (cron ticker seeding, external provider setup) as part of the host
+/// lifecycle. The function registry is built in <c>UseSharpTicker</c> (#75) and again here, for functions mapped after it.
 ///
 /// By running inside <see cref="IHostedService.StartAsync"/> instead of inline in
 /// <c>UseSharpTicker</c>, this service is naturally skipped by design-time tools
