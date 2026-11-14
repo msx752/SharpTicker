@@ -22,8 +22,8 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 {
     private static readonly DateTime T0 = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
 
-    // A tick count that does not end in 0, so the stored JSON text equals DateTime.ToString("O") and the
-    // compare-and-set in QueueTimeTickers can match (see Probe_RedisQueueCasFailsOnTrailingZeroTimestamp).
+    // A stamp with seven digits in its fraction. Up to #176 the claim of the scheduler loop took only such a row; the cases
+    // for the other spellings are in RedisLoopClaimStampTests.
     private static readonly DateTime SeedUpdatedAt = T0.AddHours(-1).AddTicks(1234567);
 
     private readonly FakeTickerClock _clock = new(T0);
