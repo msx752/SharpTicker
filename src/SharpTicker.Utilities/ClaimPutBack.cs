@@ -74,7 +74,8 @@ internal sealed class ClaimPutBackFailedException(int claimed, IEnumerable<Excep
 
     /// <summary>
     /// Every <see cref="ClaimPutBackFailedException"/> in <paramref name="exception"/>: itself, or wrapped as the inner exception
-    /// of another (a <c>ClaimsInterruptedException</c>, an execution strategy) or of an <see cref="AggregateException"/>.
+    /// of another (a <c>ClaimsInterruptedException</c>, an execution strategy) or of an <see cref="AggregateException"/>, and
+    /// one that is the claim failure of another (a put-back failed, and the put-back of the rows won before it failed too).
     /// </summary>
     internal static IEnumerable<ClaimPutBackFailedException> FindIn(Exception exception)
     {
@@ -84,6 +85,9 @@ internal sealed class ClaimPutBackFailedException(int claimed, IEnumerable<Excep
         if (exception is ClaimPutBackFailedException found)
         {
             yield return found;
+            foreach (var inner in found.InnerExceptions)
+            foreach (var nested in FindIn(inner))
+                yield return nested;
             yield break;
         }
 
