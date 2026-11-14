@@ -249,15 +249,11 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
         _db.CreateBatch(Arg.Any<object>()).Returns(batch);
     }
 
-    private static int Rvi(RedisValue v) => int.Parse(v.ToString());
-
-    private static readonly string MarkInProgressScriptText = LuaScriptLoader.Load("MarkInProgress");
     private static readonly string CompareAndSetScriptText = LuaScriptLoader.Load("CompareAndSet");
 
     private void SetupScriptOperations()
     {
-        // ScriptEvaluateAsync handles Acquire/Release/RecoverDeadNode/MarkInProgress Lua scripts.
-        // We simulate the Lua behavior in C# by inspecting the script + args.
+        // ScriptEvaluateAsync: the store's only script is CompareAndSet (claims, releases and skips are written through it).
         _db.ScriptEvaluateAsync(Arg.Any<string>(), Arg.Any<RedisKey[]?>(), Arg.Any<RedisValue[]?>(), Arg.Any<CommandFlags>())
             .Returns(callInfo =>
             {
@@ -275,107 +271,7 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
                     return RedisResult.Create((RedisValue)1);
                 }
 
-                if (!_store.TryGetValue(entityKey, out var json))
-                    return RedisResult.Create(RedisValue.Null);
-
-                var obj = JsonSerializer.Deserialize<JsonElement>(json);
-                var status = obj.GetProperty("Status").GetInt32();
-                var lockHolder = obj.TryGetProperty("LockHolder", out var lh) && lh.ValueKind != JsonValueKind.Null
-                    ? lh.GetString() : null;
-
-                // Differentiate scripts by arg count: Acquire=6, Release=4, RecoverDeadNode=5
-                if (argv.Length == 5)
-                {
-                    // RecoverDeadNode: ARGV[0]=deadNodeId, ARGV[1]=now, ARGV[2]=statusIdle, ARGV[3]=statusQueued, ARGV[4]=statusInProgress
-                    var deadNodeId = (string)argv[0];
-                    var statusIdle = Rvi(argv[2]);
-                    var statusQueued = Rvi(argv[3]);
-                    var statusInProgress = Rvi(argv[4]);
-                    if (lockHolder != deadNodeId) return RedisResult.Create(RedisValue.Null);
-                    if (status != statusIdle && status != statusQueued && status != statusInProgress)
-                        return RedisResult.Create(RedisValue.Null);
-
-                    var updated = SetJsonProperties(json, new Dictionary<string, object>
-                    {
-                        ["LockHolder"] = null,
-                        ["LockedAt"] = null,
-                        ["Status"] = statusIdle,
-                        ["UpdatedAt"] = (string)argv[1]
-                    });
-                    _store[entityKey] = updated;
-                    return RedisResult.Create((RedisValue)updated);
-                }
-
-                // Same ARGV count as Release, told apart by the loaded script text.
-                if (script == MarkInProgressScriptText)
-                {
-                    // MarkInProgress: ARGV[0]=lockHolder, ARGV[1]=now, ARGV[2]=statusQueued, ARGV[3]=statusInProgress
-                    if (status != Rvi(argv[2]) || lockHolder != (string)argv[0])
-                        return RedisResult.Create(RedisValue.Null);
-
-                    var marked = SetJsonProperties(json, new Dictionary<string, object>
-                    {
-                        ["Status"] = Rvi(argv[3]),
-                        ["UpdatedAt"] = (string)argv[1]
-                    });
-                    _store[entityKey] = marked;
-                    return RedisResult.Create((RedisValue)marked);
-                }
-
-                if (argv.Length == 4)
-                {
-                    // Release: ARGV[0]=lockHolder, ARGV[1]=now, ARGV[2]=statusIdle, ARGV[3]=statusQueued
-                    var reqLockHolder = (string)argv[0];
-                    var statusIdle = Rvi(argv[2]);
-                    var statusQueued = Rvi(argv[3]);
-                    if (status != statusIdle && status != statusQueued) return RedisResult.Create(RedisValue.Null);
-                    if (!string.IsNullOrEmpty(lockHolder) && lockHolder != reqLockHolder)
-                        return RedisResult.Create(RedisValue.Null);
-
-                    var updated = SetJsonProperties(json, new Dictionary<string, object>
-                    {
-                        ["LockHolder"] = null,
-                        ["LockedAt"] = null,
-                        ["Status"] = statusIdle,
-                        ["UpdatedAt"] = (string)argv[1]
-                    });
-                    _store[entityKey] = updated;
-                    return RedisResult.Create((RedisValue)updated);
-                }
-
-                // Acquire: ARGV[0]=lockHolder, ARGV[1]=now, ARGV[2]=targetStatus, ARGV[3]=expectedUpdatedAt, ARGV[4]=statusIdle, ARGV[5]=statusQueued
-                {
-                    var reqLockHolder = (string)argv[0];
-                    var targetStatus = Rvi(argv[2]);
-                    var expectedUpdatedAt = (string)argv[3];
-                    var statusIdle = Rvi(argv[4]);
-                    var statusQueued = Rvi(argv[5]);
-
-                    if (status != statusIdle && status != statusQueued) return RedisResult.Create(RedisValue.Null);
-                    if (!string.IsNullOrEmpty(lockHolder) && lockHolder != reqLockHolder)
-                        return RedisResult.Create(RedisValue.Null);
-
-                    if (!string.IsNullOrEmpty(expectedUpdatedAt))
-                    {
-                        var currentUpdatedAt = obj.TryGetProperty("UpdatedAt", out var ua) ? ua.GetString() : null;
-                        // Compare as DateTimes to handle format differences (JSON vs ISO "O")
-                        if (currentUpdatedAt == null ||
-                            !DateTime.TryParse(currentUpdatedAt, out var currentDt) ||
-                            !DateTime.TryParse(expectedUpdatedAt, out var expectedDt) ||
-                            currentDt != expectedDt)
-                            return RedisResult.Create(RedisValue.Null);
-                    }
-
-                    var updated = SetJsonProperties(json, new Dictionary<string, object>
-                    {
-                        ["LockHolder"] = reqLockHolder,
-                        ["LockedAt"] = (string)argv[1],
-                        ["Status"] = targetStatus,
-                        ["UpdatedAt"] = (string)argv[1]
-                    });
-                    _store[entityKey] = updated;
-                    return RedisResult.Create((RedisValue)updated);
-                }
+                throw new InvalidOperationException("The store ran a script the test does not know.");
             });
     }
 

@@ -70,7 +70,7 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
 
     // After a fenced write of a run (IFencedRunWriter): add-only. The row may have been released (and indexed as pending)
     // right after the write; a removal decided on the written copy would race that add and drop the entry of a row that can
-    // be claimed. A pending entry left for a row that cannot be claimed is harmless: the claim scripts reject it, and the
+    // be claimed. A pending entry left for a row that cannot be claimed is harmless: a claim refuses the row, and the
     // fallback drops the entry of an ended row.
     internal Task AddTimeTickerIndexesAddOnlyAsync(TTimeTicker ticker)
     {

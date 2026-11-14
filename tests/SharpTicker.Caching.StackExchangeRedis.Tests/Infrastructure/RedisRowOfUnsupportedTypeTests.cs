@@ -163,9 +163,9 @@ public class RedisRowOfUnsupportedTypeTests(RedisTestFixture fixture) : IAsyncLi
         Assert.Equal(new[] { first, second }.Order(), handedOut.Select(x => x.Id).Order());
         AssertOnlyThisRowIsReported(unreadable);
 
-        // The claim script takes a row the read could not give, as it does for a row whose text does not parse; the row
-        // comes back unreadable again, so it is held by the node and not handed out, in this pass and in the next.
-        Assert.Equal(((int)TickerStatus.InProgress, Node), await StoredAsync(unreadable));
+        // The claim reads the row again and cannot read it either, so it leaves it as it is: not held by the node and not
+        // handed out, in this pass and in the next. Up to 1.5.1 a claim script took it and it stayed InProgress (#151).
+        Assert.Equal(((int)TickerStatus.Idle, (string?)null), await StoredAsync(unreadable));
         Assert.Empty(await Drain(provider.QueueTimedOutTimeTickers(CancellationToken.None)));
         AssertOnlyThisRowIsReported(unreadable);
     }

@@ -30,17 +30,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     protected readonly RedisIndexManager<TTimeTicker, TCronTicker> IndexManager;
     private readonly ILogger _logger;
 
-    // Lua status constants matching TickerStatus enum values
-    private static readonly RedisValue LuaStatusIdle = (int)TickerStatus.Idle;
-    private static readonly RedisValue LuaStatusQueued = (int)TickerStatus.Queued;
-    private static readonly RedisValue LuaStatusInProgress = (int)TickerStatus.InProgress;
-
     // Raw script strings with KEYS[]/ARGV[] notation (AOT-safe)
-    private static readonly string AcquireScript = LuaScriptLoader.Load("Acquire");
-    private static readonly string ReleaseScript = LuaScriptLoader.Load("Release");
-    private static readonly string RecoverDeadNodeScript = LuaScriptLoader.Load("RecoverDeadNode");
-    private static readonly string MarkInProgressScript = LuaScriptLoader.Load("MarkInProgress");
-    private static readonly string SkipNotStartedScript = LuaScriptLoader.Load("SkipNotStarted");
     private static readonly string CompareAndSetScript = LuaScriptLoader.Load("CompareAndSet");
 
     // Test seams, null in production: called between the read and the set of a compare-and-set, with the key, and after a
@@ -84,10 +74,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Called only when JsonSerializer.IsReflectionEnabledByDefault is true.")]
     private static IJsonTypeInfoResolver ReflectionResolver() => new DefaultJsonTypeInfoResolver();
 
-    #region Lua script operations
-    // A claim to InProgress (the fallback, run-now). The marker is chosen before the script runs: when the call fails, the
-    // script may have landed (a lost reply), so the row is put back with that marker before the failure goes on. When it
-    // did not land, the fenced release finds nothing to change.
+    #region Claims and the compare-and-set
+    // A claim to InProgress (the fallback, run-now). The marker is chosen before the write: when the call fails, the write
+    // may have landed (a lost reply), so the row is put back with that marker before the failure goes on. When it did not
+    // land, the fenced release finds nothing to change.
     protected async Task<T> TryClaimInProgressAsync<T>(string key, Guid id, Func<Guid, DateTime, CancellationToken, Task<bool>> release)
         where T : class
     {
@@ -104,65 +94,83 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
-    // The text System.Text.Json writes for a DateTime: the round-trip format without the trailing zeros of the fraction,
-    // and without the point when no digit is left. The claim of the scheduler loop compares UpdatedAt as text, and a row
-    // the application wrote holds this spelling.
-    internal static string AsTheSerializerWrites(DateTime value)
+    // The claims, releases and skips below change a row in C#, through CompareAndSetAsync: the row is read and written by
+    // the serializer that wrote it, so every value of an application's own ticker type comes back as it was stored. Up to
+    // 1.5.1 these were Lua scripts that decoded and encoded the row with the JSON library of Redis, which keeps 14
+    // significant digits (#151). A row that does not deserialize is not changed by them.
+
+    // The claim fields of a time ticker row or an occurrence row: the two types share no base type that holds them.
+    private static (TickerStatus Status, string LockHolder, DateTime UpdatedAt) ClaimFieldsOf<T>(T row) => row switch
     {
-        var text = value.ToString("O");
-        const int point = 19, end = 27;
-        var keep = end;
-        while (keep > point + 1 && text[keep - 1] == '0')
-            keep--;
-        if (keep == point + 1)
-            keep = point;
-        return string.Concat(text.AsSpan(0, keep), text.AsSpan(end));
+        TTimeTicker t => (t.Status, t.LockHolder, t.UpdatedAt),
+        CronTickerOccurrenceEntity<TCronTicker> o => (o.Status, o.LockHolder, o.UpdatedAt),
+        _ => throw new NotSupportedException($"{typeof(T).Name} is not a row the store claims.")
+    };
+
+    private static void SetClaimFields<T>(T row, TickerStatus status, string lockHolder, DateTime? lockedAt, DateTime updatedAt)
+    {
+        switch (row)
+        {
+            case TTimeTicker t:
+                t.Status = status; t.LockHolder = lockHolder; t.LockedAt = lockedAt; t.UpdatedAt = updatedAt;
+                break;
+            case CronTickerOccurrenceEntity<TCronTicker> o:
+                o.Status = status; o.LockHolder = lockHolder; o.LockedAt = lockedAt; o.UpdatedAt = updatedAt;
+                break;
+            default:
+                throw new NotSupportedException($"{typeof(T).Name} is not a row the store claims.");
+        }
     }
 
-    protected async Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, string expectedUpdatedAt = "", DateTime? claimMarker = null,
-        string expectedUpdatedAtAsStored = "") where T : class
+    // Not started (Idle or Queued) and held by nobody or by this node.
+    private bool IsClaimable(TickerStatus status, string lockHolder)
+        => status is TickerStatus.Idle or TickerStatus.Queued && (string.IsNullOrEmpty(lockHolder) || lockHolder == LockHolder);
+
+    // expectedUpdatedAt: the loop's claim takes the row only while it is the one it read (compared as a DateTime).
+    protected Task<T> TryAcquireAsync<T>(string key, TickerStatus targetStatus, DateTime? expectedUpdatedAt = null, DateTime? claimMarker = null)
+        where T : class
     {
         // A move to InProgress (the fallback, run-now) carries this node's next claim marker, like every InProgress write.
         var now = claimMarker ?? (targetStatus == TickerStatus.InProgress ? Clock.NextClaimMarker() : Clock.UtcNow);
-        var result = await Db.ScriptEvaluateAsync(
-            AcquireScript,
-            [(RedisKey)key],
-            [(RedisValue)LockHolder, (RedisValue)now.ToString("O"), (RedisValue)(int)targetStatus,
-             (RedisValue)(expectedUpdatedAt ?? ""), LuaStatusIdle, LuaStatusQueued, (RedisValue)(expectedUpdatedAtAsStored ?? "")]
-        ).ConfigureAwait(false);
-
-        if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result, key);
+        return CompareAndSetAsync<T>(key, row =>
+        {
+            if (row == null) return null;
+            var (status, holder, updatedAt) = ClaimFieldsOf(row);
+            if (!IsClaimable(status, holder)) return null;
+            if (expectedUpdatedAt != null && updatedAt != expectedUpdatedAt.Value) return null;
+            SetClaimFields(row, targetStatus, LockHolder, now, now);
+            return row;
+        });
     }
 
-    protected async Task<T> TryReleaseAsync<T>(string key) where T : class
+    protected Task<T> TryReleaseAsync<T>(string key) where T : class
     {
         var now = Clock.UtcNow;
-        var result = await Db.ScriptEvaluateAsync(
-            ReleaseScript,
-            [(RedisKey)key],
-            [(RedisValue)LockHolder, (RedisValue)now.ToString("O"), LuaStatusIdle, LuaStatusQueued]
-        ).ConfigureAwait(false);
-
-        if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result, key);
+        return CompareAndSetAsync<T>(key, row =>
+        {
+            if (row == null) return null;
+            var (status, holder, _) = ClaimFieldsOf(row);
+            if (!IsClaimable(status, holder)) return null;
+            SetClaimFields(row, TickerStatus.Idle, null, null, now);
+            return row;
+        });
     }
 
-    protected async Task<T> TryRecoverDeadNodeAsync<T>(string key, string deadNodeId) where T : class
+    protected Task<T> TryRecoverDeadNodeAsync<T>(string key, string deadNodeId) where T : class
     {
         var now = Clock.UtcNow;
-        var result = await Db.ScriptEvaluateAsync(
-            RecoverDeadNodeScript,
-            [(RedisKey)key],
-            [(RedisValue)deadNodeId, (RedisValue)now.ToString("O"), LuaStatusIdle, LuaStatusQueued, LuaStatusInProgress]
-        ).ConfigureAwait(false);
-
-        if (result.IsNull) return null;
-        return Serializer.DeserializeOrNull<T>((string)result, key);
+        return CompareAndSetAsync<T>(key, row =>
+        {
+            if (row == null) return null;
+            var (status, holder, _) = ClaimFieldsOf(row);
+            if (holder != deadNodeId || status is not (TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress)) return null;
+            SetClaimFields(row, TickerStatus.Idle, null, null, now);
+            return row;
+        });
     }
 
-    // The script has committed the claim, so an index failure must not turn into a failed claim: the caller would not
-    // run a row that is already InProgress. A stale pending entry is harmless, Acquire.lua rejects it.
+    // The claim is written, so an index failure must not turn into a failed claim: the caller would not run a row that is
+    // already InProgress. A stale pending entry is harmless, a claim refuses the row.
     protected async Task TryUpdateIndexAfterClaim(Guid id, Func<Task> updateIndex)
     {
         try
@@ -175,23 +183,27 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
-    // Fenced Queued -> InProgress claim. Claimed is true when the script moved the row; Row can still be null if the
-    // stored JSON does not deserialize, which does not undo the claim.
+    // Fenced Queued -> InProgress claim: only while the row is still Queued and held by this node.
     protected async Task<(bool Claimed, T Row)> TryMarkInProgressAsync<T>(string key, DateTime claimMarker) where T : class
     {
-        var result = await Db.ScriptEvaluateAsync(
-            MarkInProgressScript,
-            [(RedisKey)key],
-            [(RedisValue)LockHolder, (RedisValue)claimMarker.ToString("O"), LuaStatusQueued, LuaStatusInProgress]
-        ).ConfigureAwait(false);
-
-        if (result.IsNull) return (false, null);
-        return (true, Serializer.DeserializeOrNull<T>((string)result, key));
+        var row = await CompareAndSetAsync<T>(key, stored =>
+        {
+            if (stored == null) return null;
+            var (status, holder, _) = ClaimFieldsOf(stored);
+            if (status != TickerStatus.Queued || holder != LockHolder) return null;
+            switch (stored)
+            {
+                case TTimeTicker t: t.Status = TickerStatus.InProgress; t.UpdatedAt = claimMarker; break;
+                case CronTickerOccurrenceEntity<TCronTicker> o: o.Status = TickerStatus.InProgress; o.UpdatedAt = claimMarker; break;
+            }
+            return stored;
+        }).ConfigureAwait(false);
+        return (row != null, row);
     }
 
     // Puts back a claim whose job never started. The fallback and the loop find rows through the pending index, so the
-    // index entries of the put-back row are written first: while the row is still InProgress they are harmless, Acquire.lua
-    // rejects it. Written after the put-back, a failed index write would leave an Idle row that nothing looks at; this way a
+    // index entries of the put-back row are written first: while the row is still InProgress they are harmless, a claim
+    // refuses it. Written after the put-back, a failed index write would leave an Idle row that nothing looks at; this way a
     // failure leaves the row InProgress and the caller tries again, and a put-back whose reply was lost is already indexed.
     // The row key and the index keys live in different hash slots, so they cannot share one script.
     protected async Task<bool> TryReleaseClaimAsync<T>(string key, Func<T, bool> isThisClaim, Action<T> asIdle, Func<T, Task> indexAsIdle,
@@ -206,8 +218,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         asIdle(row);
         await indexAsIdle(row).ConfigureAwait(false);
 
-        // The marker is compared as a date on the deserialized row, not as text: a claim script writes it in one text form
-        // and a later write of the row from C# (an inline child's start, an edit while it is claimed) in another.
+        // The marker is compared as a date on the deserialized row, not as text: a row written by a version up to 1.5.1
+        // holds a claim's date in another text form than a write from C#.
         var released = await CompareAndSetAsync<T>(key, stored =>
         {
             if (stored == null || !isThisClaim(stored)) return null;
@@ -566,20 +578,23 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
+    // Only while the row has not started (Idle or Queued), so a child that was handed out keeps the status of its run.
     private async Task SkipNotStartedAsync(Guid id, string reason, DateTime executedAt, DateTime now)
     {
-        var result = await Db.ScriptEvaluateAsync(
-            SkipNotStartedScript,
-            [(RedisKey)TimeTickerKey(id)],
-            [LuaStatusIdle, LuaStatusQueued, (RedisValue)(int)TickerStatus.Skipped, (RedisValue)reason,
-             (RedisValue)executedAt.ToString("O"), (RedisValue)now.ToString("O")]
-        ).ConfigureAwait(false);
+        var skipped = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(id), row =>
+        {
+            if (row == null || row.Status is not (TickerStatus.Idle or TickerStatus.Queued)) return null;
+            row.Status = TickerStatus.Skipped;
+            row.SkippedReason = reason;
+            row.ExecutedAt = executedAt;
+            row.LockHolder = null;
+            row.LockedAt = null;
+            row.UpdatedAt = now;
+            return row;
+        }).ConfigureAwait(false);
 
-        if (result.IsNull) return;
-
-        // The row key and the index keys live in different hash slots; a stale pending entry is harmless, Acquire.lua
-        // rejects a skipped row.
-        var skipped = Serializer.DeserializeOrNull<TTimeTicker>((string)result, TimeTickerKey(id));
+        // The row key and the index keys live in different hash slots; a stale pending entry is harmless, a claim refuses
+        // a skipped row.
         if (skipped != null)
             await IndexManager.AddTimeTickerIndexesAsync(skipped).ConfigureAwait(false);
     }
@@ -641,8 +656,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             var acquired = await TryAcquireAsync<TTimeTicker>(
                 TimeTickerKey(timeTicker.Id),
                 TickerStatus.Queued,
-                timeTicker.UpdatedAt.ToString("O"),
-                expectedUpdatedAtAsStored: AsTheSerializerWrites(timeTicker.UpdatedAt)).ConfigureAwait(false);
+                timeTicker.UpdatedAt).ConfigureAwait(false);
 
             if (acquired == null) continue;
 
@@ -693,8 +707,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // A row that does not deserialize still goes to the claim script, which rewrites it in a readable form;
-                // its gate is checked on the row the script returns.
+                // A row that does not deserialize is not claimed: the claim reads it again and leaves it as it is. One that
+                // became readable since this read has its gate checked on the row the claim returns.
                 if (rows.TryGetValue(id, out var row) && !ChainGateOpen(row, parentStatuses)) continue;
 
                 var children = await LoadChildrenAsync(id, cancellationToken).ConfigureAwait(false);
@@ -1014,7 +1028,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
                 // A chain child is handed out by id only when its parent's status lets it run (RunNowGateOpen); a finished
                 // status never changes back, so the gate read here holds at the claim. A row that does not deserialize
-                // still goes to the claim script, which rewrites it in a readable form.
+                // is not claimed.
                 var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
                 if (stored?.ParentId != null
                     && !RunNowGateOpen(stored, await LoadParentStatusesAsync([stored], CancellationToken.None).ConfigureAwait(false)))
@@ -1085,7 +1099,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // The index entries of a row are written before the row itself, as in TryReleaseClaimAsync: the fallback and the loop
     // find rows through the pending index, so a row set Idle whose index write then failed would be a row nothing looks
     // at, and a later pass would no longer see it as held. Written first, a failure leaves the row held and the next pass
-    // does both again; an entry for a row that turns out to be claimed by this run is harmless, Acquire.lua rejects it.
+    // does both again; an entry for a row that turns out to be claimed by this run is harmless, a claim refuses it.
     // The row is then written through the compare-and-set, which checks the rule again on what the key holds at that
     // moment, so a claim made since the read is kept.
     // One row that fails does not keep the others held: it is logged, the pass goes on, and the pass fails at its end so
