@@ -451,6 +451,57 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.DoesNotContain(Keys(), key => key.EndsWith(":children") || key == RedisKeyBuilder.TimeTickerWaitingChildrenKey);
     }
 
+    // An update of an ended parent (what the dashboard's edit sends, with or without the children) keeps the children
+    // inside its row as well. Written as rows they would be Idle children of an ended parent, and the fallback would run
+    // the ones the parent's outcome lets run (#152).
+    [Theory]
+    [InlineData((int)TickerStatus.Done, false)]
+    [InlineData((int)TickerStatus.Done, true)]
+    [InlineData((int)TickerStatus.Failed, false)]
+    [InlineData((int)TickerStatus.Failed, true)]
+    [InlineData((int)TickerStatus.DueDone, true)]
+    [InlineData((int)TickerStatus.Cancelled, true)]
+    public async Task AnUpdateOfAnEndedParent_KeepsItsChildrenInsideItsRow_AndNoneOfThemRuns(int status, bool bodyCarriesChildren)
+    {
+        var chain = await SeedAsync(T0.AddHours(-2), T0.AddHours(-1), parentStatus: status, parentExecutedAt: Q(T0.AddHours(-2)));
+        var provider = fixture.CreateProvider(NodeA, _clock);
+        var body = await provider.GetTimeTickerById(chain.Parent, CancellationToken.None);
+        Assert.Equal(3, body.Children.Count);
+        body.Description = "edited";
+        if (!bodyCarriesChildren)
+            body.Children = new List<TimeTickerEntity>();
+
+        await provider.UpdateTimeTickers([body], CancellationToken.None);
+        var ran = await RunPassesAsync();
+
+        Assert.Empty(ran);
+        Assert.All(await Task.WhenAll(chain.Descendants.Select(RawAsync)), Assert.Null);
+        var stored = await StoredAsync(chain.Parent);
+        Assert.Equal("edited", Text(stored, "Description"));
+        Assert.Equal(status, stored.GetProperty("Status").GetInt32());
+        Assert.Equal(3, stored.GetProperty("Children").GetArrayLength());
+        var read = await provider.GetTimeTickerById(chain.Parent, CancellationToken.None);
+        Assert.Equal([chain.Child0, chain.Child1, chain.Delayed], read.Children.Select(c => c.Id));
+    }
+
+    // The control: an update of a parent that has not run yet still writes the children as rows of their own.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnUpdateOfAParentThatHasNotRunYet_WritesItsChildrenAsRows(bool bodyCarriesChildren)
+    {
+        var chain = await SeedAsync(T0.AddHours(1), T0.AddHours(2));
+        var provider = fixture.CreateProvider(NodeA, _clock);
+        var body = await provider.GetTimeTickerById(chain.Parent, CancellationToken.None);
+        if (!bodyCarriesChildren)
+            body.Children = new List<TimeTickerEntity>();
+
+        await provider.UpdateTimeTickers([body], CancellationToken.None);
+
+        Assert.All(await Task.WhenAll(chain.Descendants.Select(RawAsync)), Assert.NotNull);
+        Assert.Equal(0, (await StoredAsync(chain.Parent)).GetProperty("Children").GetArrayLength());
+    }
+
     // A parent another node holds is not this node's to write: its row and its children stay as they are.
     [Theory]
     [InlineData((int)TickerStatus.InProgress)]

@@ -103,7 +103,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     // An update also writes the chain nodes it carries, as rows of their own. Children it does not carry are kept; a row
     // stored by an older version with its children nested is split into rows, with the nested children when the update
-    // carries none.
+    // carries none. When that row has ended, it keeps its children nested and none is written as a row.
     public async Task<int> UpdateTimeTickers(TTimeTicker[] tickers, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
@@ -122,12 +122,27 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         var children = depth < MaxChainDepth ? ticker.Children?.Where(c => c != null).ToList() ?? [] : [];
 
-        if (!adding && children.Count == 0)
+        // The children an ended row of an older version holds nested: they stay inside the row (see below).
+        ICollection<TTimeTicker> keptNested = null;
+        if (!adding && (depth == 0 || children.Count == 0))
         {
-            // A row of an older version holds its children nested: an update that carries none splits those into rows.
             var stored = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(ticker.Id)).ConfigureAwait(false);
             if (stored?.Children is { Count: > 0 } nested)
-                children = nested.Where(c => c != null).ToList();
+            {
+                if (depth == 0 && ChainRunGate.IsFinal(stored.Status))
+                {
+                    // The chain ended on the older version, and its children ran or were passed over there without that
+                    // being stored: as rows they would be Idle children of an ended parent, and the fallback would run them.
+                    // The children the update carries are not written either; the stored ones are kept as they are.
+                    keptNested = nested;
+                    children = [];
+                }
+                else if (children.Count == 0)
+                {
+                    // A row of an older version holds its children nested: an update that carries none splits those into rows.
+                    children = nested.Where(c => c != null).ToList();
+                }
+            }
         }
 
         for (var position = 0; position < children.Count; position++)
@@ -143,7 +158,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         // The row is stored without its children; they are rows of their own. The caller's entity keeps them.
         var carried = ticker.Children;
-        ticker.Children = new List<TTimeTicker>();
+        ticker.Children = keptNested ?? new List<TTimeTicker>();
         TTimeTicker written;
         try
         {
