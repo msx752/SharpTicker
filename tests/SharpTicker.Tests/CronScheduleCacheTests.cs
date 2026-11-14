@@ -17,6 +17,19 @@ public class CronScheduleCacheTests
         Assert.Null(next);
     }
 
+    // #194: an expression that parses but matches no date. The cron library throws for it; it has no next occurrence.
+    [Theory]
+    [InlineData("0 0 0 30 2 *")]
+    [InlineData("0 0 0 31 4 *")]
+    public void GetNextOccurrenceOrDefault_Returns_Null_For_An_Expression_That_Matches_No_Date(string expression)
+    {
+        CronScheduleCache.TimeZoneInfo = TimeZoneInfo.Utc;
+
+        var next = CronScheduleCache.GetNextOccurrenceOrDefault(expression, new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        Assert.Null(next);
+    }
+
     [Fact]
     public void GetNextOccurrenceOrDefault_Normalizes_Whitespace_And_Caches()
     {

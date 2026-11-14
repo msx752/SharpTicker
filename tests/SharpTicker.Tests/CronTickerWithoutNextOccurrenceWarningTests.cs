@@ -70,8 +70,9 @@ public class CronTickerWithoutNextOccurrenceWarningTests
         Assert.Empty(_log.Entries);
     }
 
+    // The cron library throws for an expression that matches no date; since #194 that is read as no next occurrence.
     [Fact]
-    public async Task AnExpressionTheCronLibraryThrowsFor_IsNamedWithTheException()
+    public async Task AnExpressionThatMatchesNoDate_IsNamed()
     {
         var noDate = new CronTickerEntity { Id = Guid.NewGuid(), Function = "NoDate", Expression = "0 0 0 30 2 *" };
         _store.GetAllCronTickerExpressions(Arg.Any<CancellationToken>()).Returns([noDate]);
@@ -81,6 +82,5 @@ public class CronTickerWithoutNextOccurrenceWarningTests
         var entry = Assert.Single(_log.Entries);
         Assert.Equal(LogLevel.Warning, entry.Level);
         Assert.Contains(noDate.Id.ToString(), entry.Text);
-        Assert.NotNull(entry.Exception);
     }
 }

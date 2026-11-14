@@ -606,6 +606,22 @@ public class TickerManagerTests : IDisposable
         Assert.Contains(InvalidFunctionName, result.Exception.Message);
     }
 
+    // #194: an expression that parses but matches no date is refused, not thrown from the cron library.
+    [Fact]
+    public async Task AddAndUpdateCronTickerAsync_AnExpressionThatMatchesNoDate_ReturnsFailure()
+    {
+        var ticker = new CronTickerEntity { Id = Guid.NewGuid(), Function = ValidFunctionName, Expression = "0 0 0 30 2 *" };
+
+        var added = await _cronTickerManager.AddAsync(ticker, CancellationToken.None);
+        var updated = await _cronTickerManager.UpdateAsync(ticker, CancellationToken.None);
+
+        Assert.False(added.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(added.Exception);
+        Assert.Contains("0 0 0 30 2 *", added.Exception.Message);
+        Assert.False(updated.IsSucceeded);
+        Assert.IsType<TickerValidatorException>(updated.Exception);
+    }
+
     [Fact]
     public async Task UpdateCronTickerAsync_InvalidExpression_ReturnsFailure()
     {

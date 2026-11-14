@@ -158,8 +158,8 @@ public class StartupServicesTests : IAsyncLifetime
 
     // #79: a stored cron ticker whose expression has no next occurrence never runs; the startup names it once, as a
     // Warning. Such a row can come from a version before the fix for configuration crons (five fields stored as they
-    // were), from a placeholder whose configuration key is missing, from an expression that matches no date (the cron
-    // library throws for it; the startup goes on), or from an edit outside the library.
+    // were), from a placeholder whose configuration key is missing, from an expression that matches no date, or from an
+    // edit outside the library.
     [Fact]
     public async Task AStoredCronTickerWithoutANextOccurrence_IsNamedOnceInAWarningAtStartup()
     {
