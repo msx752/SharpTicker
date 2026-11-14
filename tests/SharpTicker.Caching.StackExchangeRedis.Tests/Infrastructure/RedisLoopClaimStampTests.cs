@@ -15,10 +15,11 @@ using SharpTicker.Utilities.Interfaces.Managers;
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 
 /// <summary>
-/// The claim of the scheduler loop on Redis takes a row only when its UpdatedAt is the one that was read (#176). It
-/// compares the value as text. A row the application wrote holds UpdatedAt as System.Text.Json writes it, with the
-/// trailing zeros of the fraction trimmed; the value the claim compared with always had seven digits. A job whose
-/// UpdatedAt ended in a zero was never claimed by the loop and was started by the fallback, up to its interval late.
+/// The claim of the scheduler loop on Redis takes a row only when its UpdatedAt is the one that was read (#176). Up to
+/// 1.4.0 it compared the value as text: a row the application wrote holds UpdatedAt as System.Text.Json writes it, with
+/// the trailing zeros of the fraction trimmed, and the value the claim compared with always had seven digits. A job whose
+/// UpdatedAt ended in a zero was never claimed by the loop and was started by the fallback, up to its interval late. Since
+/// #151 the claim compares the deserialized value.
 /// </summary>
 [Collection(RedisTestFixture.CollectionName)]
 public class RedisLoopClaimStampTests(RedisTestFixture fixture) : IAsyncLifetime
@@ -97,26 +98,6 @@ public class RedisLoopClaimStampTests(RedisTestFixture fixture) : IAsyncLifetime
 
         Assert.Empty(await ClaimAsync(store, read));
         Assert.Equal(TickerStatus.Idle, (await store.GetTimeTickerById(job.Id, CancellationToken.None)).Status);
-    }
-
-    // The second spelling the claim sends is the serializer's own.
-    [Theory]
-    [InlineData(1234567, DateTimeKind.Utc)]
-    [InlineData(1234560, DateTimeKind.Utc)]
-    [InlineData(1230000, DateTimeKind.Utc)]
-    [InlineData(1000000, DateTimeKind.Utc)]
-    [InlineData(0, DateTimeKind.Utc)]
-    [InlineData(1230000, DateTimeKind.Unspecified)]
-    [InlineData(0, DateTimeKind.Unspecified)]
-    [InlineData(1230000, DateTimeKind.Local)]
-    [InlineData(0, DateTimeKind.Local)]
-    public void TheSecondSpelling_IsTheTextTheSerializerWrites(int ticksOfTheSecond, DateTimeKind kind)
-    {
-        var value = new DateTime(2025, 6, 15, 11, 55, 0, kind).AddTicks(ticksOfTheSecond);
-
-        var spelled = BaseRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>.AsTheSerializerWrites(value);
-
-        Assert.Equal(JsonSerializer.Serialize(value).Trim('"'), spelled);
     }
 
     // A clock that gives whole milliseconds, as some do: every stamp ends in zeros.

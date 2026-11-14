@@ -103,14 +103,20 @@ public class RedisOwnCollectionTests(RedisTestFixture fixture) : IAsyncLifetime
 
     private Task<string> RawTimeTickerAsync(Guid id) => RawAsync(RedisKeyBuilder.TimeTickerKey(id));
 
-    // What the tests below rest on: a script writes an empty list as an object, and a filled row holds no such object.
+    // What the tests below rest on. Up to 1.5.1 every claim, release and skip was a script that wrote an empty list as an
+    // object, so rows in the store hold that shape. Since #151 these writes are made in C# and write a list as an array;
+    // with empty: true the row is put back into the shape a version up to 1.5.1 left, so the next step reads such a row.
+    // A filled row holds no such object either way.
     private async Task AssertStoredShapeAsync(Guid id, bool empty)
     {
-        var raw = await RawTimeTickerAsync(id);
-        if (empty)
-            Assert.Contains("\"Tags\":{}", raw);
-        else
-            Assert.DoesNotContain("{}", raw.Replace("\"Labels\":{}", ""));
+        var key = RedisKeyBuilder.TimeTickerKey(id);
+        var raw = await RawAsync(key);
+        Assert.DoesNotContain("{}", raw.Replace("\"Labels\":{}", ""));
+        if (!empty) return;
+
+        var legacy = raw.Replace("\"Tags\":[]", "\"Tags\":{}").Replace("\"Groups\":[]", "\"Groups\":{}");
+        Assert.Contains("\"Tags\":{}", legacy);
+        await fixture.Database.StringSetAsync(key, legacy);
     }
 
     // The fallback hands the job out one time, its outcome is stored, and that write stores the lists as arrays again;
@@ -258,7 +264,8 @@ public class RedisOwnCollectionTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Equal([id], window.Select(x => x.Id));
     }
 
-    // A list inside a list: the script writes the empty inner list as an object that is an element of an array.
+    // A list inside a list: a version up to 1.5.1 wrote the empty inner list as an object that is an element of an array.
+    // Such a row is handed out, and the claim writes the inner list as an array again.
     [Fact]
     public async Task ADueJobWithAnEmptyListInsideAList_IsHandedOutByTheFallback()
     {
@@ -269,10 +276,14 @@ public class RedisOwnCollectionTests(RedisTestFixture fixture) : IAsyncLifetime
         };
         var provider = Provider();
         await provider.AddTimeTickers([ticker], CancellationToken.None);
+        var key = RedisKeyBuilder.TimeTickerKey(ticker.Id);
+        var legacy = (await RawTimeTickerAsync(ticker.Id)).Replace("\"Groups\":[[],[\"g\"]]", "\"Groups\":[{},[\"g\"]]");
+        Assert.Contains("\"Groups\":[{},[\"g\"]]", legacy);
+        await fixture.Database.StringSetAsync(key, legacy);
 
         Assert.Equal([ticker.Id], (await Drain(provider.QueueTimedOutTimeTickers(CancellationToken.None))).Select(x => x.Id));
 
-        Assert.Contains("\"Groups\":[{},[\"g\"]]", await RawTimeTickerAsync(ticker.Id));
+        Assert.Contains("\"Groups\":[[],[\"g\"]]", await RawTimeTickerAsync(ticker.Id));
         var read = await provider.GetTimeTickerById(ticker.Id, CancellationToken.None);
         Assert.Equal(2, read.Groups.Count);
         Assert.Empty(read.Groups[0]);
@@ -290,8 +301,15 @@ public class RedisOwnCollectionTests(RedisTestFixture fixture) : IAsyncLifetime
     private async Task<Guid> QueueOccurrenceAsync(Guid? cronId = null)
         => Assert.Single(await Drain(Provider().QueueCronTickerOccurrences(Slot(cronId ?? Guid.NewGuid()), CancellationToken.None))).Id;
 
+    // As AssertStoredShapeAsync: the occurrence was written with its list as an array, and is put back into the shape a
+    // version up to 1.5.1 left (the list as an object), so the next step reads such a row.
     private async Task AssertOccurrenceHoldsAnObjectAsync(Guid id)
-        => Assert.Contains("\"Tags\":{}", await RawAsync(RedisKeyBuilder.CronOccurrenceKey(id)));
+    {
+        var key = RedisKeyBuilder.CronOccurrenceKey(id);
+        var raw = await RawAsync(key);
+        Assert.Contains("\"Tags\":[]", raw);
+        await fixture.Database.StringSetAsync(key, raw.Replace("\"Tags\":[]", "\"Tags\":{}"));
+    }
 
     // Taken as Queued, marked InProgress (the script writes the list as an object), read while it runs, and its outcome
     // stored by the fenced write a run makes. Without that write the occurrence would stay InProgress after it ran.
