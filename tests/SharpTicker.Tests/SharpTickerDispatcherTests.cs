@@ -68,6 +68,57 @@ public class SharpTickerDispatcherTests
         await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    // A job without a claim marker waits for its function's only slot, and the application stops. The job that holds the slot
+    // ends on that stop and frees the slot before the stop reaches the waiting job, so its wait succeeds although the stop has
+    // begun. It must not start: it would run with a cancelled token and end Cancelled (#88). The control: a slot freed without
+    // a stop starts the waiting job.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DispatchAsync_UnclaimedJob_ASlotFreedByTheStop_DoesNotStartTheWaitingJob(bool freedByTheStop)
+    {
+        var running = new List<Task>();
+        _taskScheduler.QueueAsync(Arg.Any<Func<CancellationToken, Task>>(), Arg.Any<TickerTaskPriority>(), Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                running.Add(call.ArgAt<Func<CancellationToken, Task>>(0)(call.ArgAt<CancellationToken>(2)));
+                return ValueTask.CompletedTask;
+            });
+        var startedWith = new List<bool>();
+        _taskHandler.ExecuteTaskAsync(Arg.Any<InternalFunctionContext>(), Arg.Any<bool>(), Arg.Any<CancellationToken>())
+            .Returns(call => { lock (startedWith) startedWith.Add(call.ArgAt<CancellationToken>(2).IsCancellationRequested); return Task.CompletedTask; });
+        var gate = new TickerFunctionConcurrencyGate();
+        var function = "Dispatcher.SlotFreedByTheStop." + freedByTheStop;
+        var slot = gate.GetSemaphoreOrNull(function, 1)!;
+        await slot.WaitAsync(); // another run of the same function holds the only slot
+        using var stopping = new CancellationTokenSource();
+        var lifetime = Substitute.For<Microsoft.Extensions.Hosting.IHostApplicationLifetime>();
+        lifetime.ApplicationStopping.Returns(stopping.Token);
+        var dispatcher = new SharpTickerDispatcher(_taskScheduler, _taskHandler, gate, lifetime);
+
+        await dispatcher.DispatchAsync([new InternalFunctionContext
+        {
+            TickerId = Guid.NewGuid(), FunctionName = function, CachedMaxConcurrency = 1, CachedPriority = TickerTaskPriority.Normal
+        }]);
+        if (freedByTheStop)
+        {
+            // Registered after the waiting job's wait, so it runs first: the holder ends on the stop and frees the slot.
+            stopping.Token.Register(() => slot.Release());
+            stopping.Cancel();
+        }
+        else
+        {
+            slot.Release();
+        }
+        await Task.WhenAll(running).WaitAsync(TimeSpan.FromSeconds(5));
+
+        if (freedByTheStop)
+            Assert.True(startedWith.Count == 0, $"the job started after the stop began; its token was cancelled: {string.Join(", ", startedWith)}");
+        else
+            Assert.Equal([false], startedWith);
+        Assert.Equal(1, slot.CurrentCount);
+    }
+
     [Fact]
     public void Constructor_ThrowsArgumentNullException_WhenTaskSchedulerIsNull()
     {
