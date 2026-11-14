@@ -99,6 +99,12 @@ namespace SharpTicker.Dispatcher
 
                         try
                         {
+                            // The stop can free the slot before it reaches this wait (the run that held it ended on the
+                            // stop), so the wait succeeds with the token cancelled: such a job does not start, as on the
+                            // claimed path.
+                            if (ct.IsCancellationRequested)
+                                return;
+
                             await _taskHandler.ExecuteTaskAsync(context, false, ct).ConfigureAwait(false);
                         }
                         finally
