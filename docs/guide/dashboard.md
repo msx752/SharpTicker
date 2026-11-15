@@ -29,6 +29,7 @@ The dashboard is served by the application at `/ticker/dashboard`. `UseSharpTick
 - **Cron tickers:** add, edit, duplicate, enable or disable, and **Run Now** to add an occurrence and run it immediately. Each cron has its occurrences and a graph of their results.
 - **Retry intervals** are entered in seconds, one per retry, and are saved with the ticker.
 - **A refused action** keeps its dialog open with what you typed, and a notification shows the reason, such as an invalid cron expression.
+- **Ticker types of your own** (`AddSharpTicker<TTimeTicker, TCronTicker>`): the time ticker lists, the occurrence lists of a cron, and adding and updating a ticker work with them. Up to 1.5.2 these requests failed with a `NotSupportedException` ([#95](https://github.com/msx752/SharpTicker/issues/95)). The dashboard reads and writes such types through reflection. In a trimmed or AOT application, where the serializer has reflection switched off, it does not, and these requests fail as they did up to 1.5.2.
 
 The dashboard uses three words. A **function** is the code you registered. A **ticker** is a scheduled entry that points at a function: a time ticker runs once, a cron ticker repeats. A **job** is one run of a ticker, with its status, and the actions that stop or count runs (cancel, statistics) say job.
 
