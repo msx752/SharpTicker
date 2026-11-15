@@ -249,9 +249,12 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     }
 
     // Removes the rows with every descendant, as the other stores do: a child left without its parent would never run.
-    // The row goes first and its children are read after it: a node that writes the children of a chain stored before
-    // 1.3.0 as rows (SplitNestedChainAsync) has linked every one of them before its last write of the parent's row, which
-    // lands only while the row exists. When that write lands, the walk below finds them all; when it comes after the
+    // The descendants' rows go before the parent's row and its index entries go last, so a delete that stops on the way
+    // leaves the parent listed, and deleting it again removes the rest. The chain's children are read again after the
+    // parent's row is gone: a node that writes the children of a chain stored before 1.3.0 as rows (SplitNestedChainAsync)
+    // may link more of them during the first walk. It links each one into its parent's children set, before that node's
+    // own children, and before its last write of the parent's row, which lands only while the row exists. The first walk
+    // keeps the children sets, so when that write landed, the second walk finds every node; when it comes after the
     // delete, it fails and that node removes the rows it wrote (#153).
     public async Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default)
     {
@@ -260,22 +263,23 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             cancellationToken.ThrowIfCancellationRequested();
             var row = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
+            await RemoveDescendantsAsync(id, depth: 0, keepChildrenSets: true).ConfigureAwait(false);
             if (await Db.KeyDeleteAsync(TimeTickerKey(id)).ConfigureAwait(false))
                 count++;
-            await RemoveDescendantsAsync(id, depth: 0).ConfigureAwait(false);
+            await RemoveDescendantsAsync(id, depth: 0, keepChildrenSets: false).ConfigureAwait(false);
             await IndexManager.RemoveTimeTickerIndexesAsync(id, row?.ParentId).ConfigureAwait(false);
         }
         return count;
     }
 
-    private async Task RemoveDescendantsAsync(Guid parentId, int depth)
+    private async Task RemoveDescendantsAsync(Guid parentId, int depth, bool keepChildrenSets)
     {
         if (depth >= MaxChainDepth) return;
 
         foreach (var childId in await IndexManager.GetTimeTickerChildIdsAsync(parentId).ConfigureAwait(false))
         {
-            await RemoveDescendantsAsync(childId, depth + 1).ConfigureAwait(false);
-            await IndexManager.RemoveTimeTickerIndexesAsync(childId).ConfigureAwait(false);
+            await RemoveDescendantsAsync(childId, depth + 1, keepChildrenSets).ConfigureAwait(false);
+            await IndexManager.RemoveTimeTickerIndexesAsync(childId, keepChildrenSet: keepChildrenSets).ConfigureAwait(false);
             await Db.KeyDeleteAsync(TimeTickerKey(childId)).ConfigureAwait(false);
         }
     }

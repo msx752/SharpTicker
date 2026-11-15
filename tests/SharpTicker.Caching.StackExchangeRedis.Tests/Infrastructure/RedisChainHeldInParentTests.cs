@@ -775,38 +775,154 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.IsType<RedisConnectionException>(warning.Exception);
     }
 
-    // Runs an action once, before the first call of the given method on the given key, and waits for it.
+    public enum HeldAfterReading
+    {
+        TheParentsChildren,
+        TheFirstChildsChildren
+    }
+
+    // The delete reads a children set (the parent's, or its first child's) and is held right after that read, while the
+    // split finishes. A link the split writes into that set after the read is still found: the children sets stay until
+    // the parent's row is gone.
+    [Theory]
+    [InlineData(ClaimPath.Fallback, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.RunNow, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.Loop, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.Fallback, HeldAfterReading.TheFirstChildsChildren)]
+    [InlineData(ClaimPath.RunNow, HeldAfterReading.TheFirstChildsChildren)]
+    [InlineData(ClaimPath.Loop, HeldAfterReading.TheFirstChildsChildren)]
+    public async Task ADeleteHeldRightAfterItReadAChildrenSet_WhileTheSplitFinishes_LeavesNoRowOfItsChain(ClaimPath path, HeldAfterReading held)
+    {
+        var chain = await SeedForAsync(path);
+        var deleteHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b = fixture.CreateProvider(NodeB, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(held == HeldAfterReading.TheParentsChildren ? chain.Parent : chain.Child0),
+            async () =>
+            {
+                deleteHeld.SetResult();
+                await resumeDelete.Task;
+            },
+            after: true));
+        Task<int>? delete = null;
+        var a = fixture.CreateProvider(NodeA, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0),
+            async () =>
+            {
+                delete = Task.Run(() => b.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+                await deleteHeld.Task;
+            }));
+
+        await ClaimAsync(a, path, chain.Parent);
+        resumeDelete.SetResult();
+
+        Assert.True(delete != null, "the delete was not started during the split");
+        Assert.Equal(1, await delete!);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // A chain stored as rows (1.3.0 and later), as AddTimeTickers writes it.
+    private async Task<Chain> AddChainAsRowsAsync()
+    {
+        TimeTickerEntity Node(string function, DateTime? time, RunCondition? condition = null) => new()
+        {
+            Id = Guid.NewGuid(), Function = function, ExecutionTime = time, RunCondition = condition, Status = TickerStatus.Idle, Request = []
+        };
+        var grand = Node("grand", null, RunCondition.OnSuccess);
+        var child0 = Node("child0", null, RunCondition.OnSuccess);
+        child0.Children = [grand];
+        var child1 = Node("child1", null, RunCondition.OnFailure);
+        var delayed = Node("delayed", T0.AddHours(2), RunCondition.OnSuccess);
+        var parent = Node("parent", T0.AddHours(1));
+        parent.Children = [child0, child1, delayed];
+        await fixture.CreateProvider("seed", _clock).AddTimeTickers([parent], CancellationToken.None);
+        return new Chain(parent.Id, child0.Id, grand.Id, child1.Id, delayed.Id);
+    }
+
+    // The control: a chain stored as rows is deleted with every row, link and index entry.
+    [Fact]
+    public async Task AChainStoredAsRows_IsDeletedWithEveryRow()
+    {
+        var chain = await AddChainAsRowsAsync();
+
+        Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    public enum DeleteStops
+    {
+        // Before anything is removed: the first read of the parent's children.
+        AtTheFirstReadOfTheChildren,
+        // After the children's rows are removed, before the parent's row is.
+        AtTheParentsRow
+    }
+
+    // A delete of a chain stored as rows stops on a store failure. The parent's row is still there and listed, so the
+    // chain can be deleted again, and that second delete removes all of it: no child row is left behind a parent that is
+    // gone.
+    [Theory]
+    [InlineData(DeleteStops.AtTheFirstReadOfTheChildren)]
+    [InlineData(DeleteStops.AtTheParentsRow)]
+    public async Task ADeleteThatStops_LeavesTheParentListed_AndASecondDeleteRemovesTheChain(DeleteStops stop)
+    {
+        var chain = await AddChainAsRowsAsync();
+        var failing = stop == DeleteStops.AtTheFirstReadOfTheChildren
+            ? BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Parent),
+                () => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed"))
+            : BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.KeyDeleteAsync), RedisKeyBuilder.TimeTickerKey(chain.Parent),
+                () => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed"));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => fixture.CreateProvider(NodeB, _clock, failing).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        var provider = fixture.CreateProvider(NodeB, _clock);
+        Assert.Contains(chain.Parent, (await provider.GetTimeTickers(null!, CancellationToken.None)).Select(t => t.Id));
+        Assert.Equal(1, await provider.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // Runs an action once, before (or, with after, after) the first call of the given method on the given key, and waits
+    // for it. An action that throws fails that call.
     public class BeforeCallDatabase : DispatchProxy
     {
+        private static readonly MethodInfo AroundMethod = typeof(BeforeCallDatabase).GetMethod(nameof(Around), BindingFlags.NonPublic | BindingFlags.Instance)!;
+
         private IDatabase _inner = null!;
         private string _method = "";
         private string _key = "";
-        private Func<Task> _before = null!;
+        private Func<Task> _action = null!;
+        private bool _after;
         private int _fired;
 
-        public static IDatabase Create(IDatabase inner, string method, string key, Func<Task> before)
+        public static IDatabase Create(IDatabase inner, string method, string key, Func<Task> action, bool after = false)
         {
             var proxy = DispatchProxy.Create<IDatabase, BeforeCallDatabase>();
             var hooked = (BeforeCallDatabase)(object)proxy;
             hooked._inner = inner;
             hooked._method = method;
             hooked._key = key;
-            hooked._before = before;
+            hooked._action = action;
+            hooked._after = after;
             return proxy;
         }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
-            if (targetMethod!.Name == _method && targetMethod.ReturnType == typeof(Task<bool>)
-                && args![0] is RedisKey key && key == _key && Interlocked.Exchange(ref _fired, 1) == 0)
-                return ThenCall(targetMethod, args);
+            var returnType = targetMethod!.ReturnType;
+            if (targetMethod.Name == _method && returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(Task<>)
+                && args!.Length > 0 && args[0] is RedisKey key && key == _key && Interlocked.Exchange(ref _fired, 1) == 0)
+                return AroundMethod.MakeGenericMethod(returnType.GetGenericArguments()[0]).Invoke(this, [targetMethod, args]);
             return Call(targetMethod, args);
         }
 
-        private async Task<bool> ThenCall(MethodInfo targetMethod, object?[]? args)
+        private async Task<T> Around<T>(MethodInfo targetMethod, object?[]? args)
         {
-            await _before();
-            return await (Task<bool>)Call(targetMethod, args)!;
+            if (!_after)
+                await _action();
+            var result = await (Task<T>)Call(targetMethod, args)!;
+            if (_after)
+                await _action();
+            return result;
         }
 
         private object? Call(MethodInfo targetMethod, object?[]? args)

@@ -95,15 +95,15 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
     internal async Task<Guid[]> GetTimeTickerChildIdsAsync(Guid parentId)
         => ParseGuidSet(await _db.SortedSetRangeByRankAsync(TimeTickerChildrenKey(parentId)).ConfigureAwait(false));
 
-    // Also drops the row's own children set and its entry in its parent's children set.
-    internal Task RemoveTimeTickerIndexesAsync(Guid id, Guid? parentId = null)
+    // Also drops the row's own children set (unless keepChildrenSet) and its entry in its parent's children set.
+    internal Task RemoveTimeTickerIndexesAsync(Guid id, Guid? parentId = null, bool keepChildrenSet = false)
     {
         var batch = _db.CreateBatch();
         var idStr = (RedisValue)id.ToString();
 
         var t1 = batch.SetRemoveAsync(TimeTickerIdsKey, idStr);
         var t2 = batch.SortedSetRemoveAsync(TimeTickerPendingKey, idStr);
-        var t3 = batch.KeyDeleteAsync(TimeTickerChildrenKey(id));
+        var t3 = keepChildrenSet ? Task.CompletedTask : batch.KeyDeleteAsync(TimeTickerChildrenKey(id));
         var t4 = parentId.HasValue ? batch.SortedSetRemoveAsync(TimeTickerChildrenKey(parentId.Value), idStr) : Task.CompletedTask;
         var t5 = batch.HashDeleteAsync(TimeTickerWaitingChildrenKey, idStr);
 
