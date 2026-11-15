@@ -955,11 +955,16 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
     // The parent is deleted during the split (after its first link), and a later write of the split fails. The node finds
     // the parent gone and removes the rows it wrote, as it does when only its last write of the parent's row fails; it does
     // not log that the claim is put back and the next pass tries again, since no pass ever takes a deleted parent.
+    // failAt 1 fails the grandchild's row (only links are written after the delete); 2 fails the first child's row, after
+    // the grandchild's row and its index entries were written.
     [Theory]
-    [InlineData(ClaimPath.Fallback)]
-    [InlineData(ClaimPath.RunNow)]
-    [InlineData(ClaimPath.Loop)]
-    public async Task AParentDeletedDuringTheSplit_WhoseLaterWriteFails_LeavesNoRowOfItsChain(ClaimPath path)
+    [InlineData(ClaimPath.Fallback, 1)]
+    [InlineData(ClaimPath.RunNow, 1)]
+    [InlineData(ClaimPath.Loop, 1)]
+    [InlineData(ClaimPath.Fallback, 2)]
+    [InlineData(ClaimPath.RunNow, 2)]
+    [InlineData(ClaimPath.Loop, 2)]
+    public async Task AParentDeletedDuringTheSplit_WhoseLaterWriteFails_LeavesNoRowOfItsChain(ClaimPath path, int failAt)
     {
         var chain = await SeedForAsync(path);
         var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
@@ -969,10 +974,10 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
             Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
             deleted = true;
         }
-        // The first row the split writes (the grandchild's) fails, after the delete read the parent's children.
+        // A row the split writes fails, after the delete read the parent's children.
         var database = RedisClaimMultiNodeTests.FailingDatabase.Create(
             BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync),
-            nameof(IDatabase.StringSetAsync), 1);
+            nameof(IDatabase.StringSetAsync), failAt);
         var a = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(database, _clock,
             new SchedulerOptionsBuilder { NodeIdentifier = NodeA },
             new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);

@@ -577,8 +577,9 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             exists = await Db.KeyExistsAsync(TimeTickerKey(parentId)).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex)
         {
+            // Any failure, a cancellation too: the caller then puts the claim back, as it did before this check.
             _logger.LogWarning(ex, "Chain {Id} is not handed out: it stopped while its children were written as rows of their own, and checking whether it was deleted failed. If it was deleted, rows of its children may be left without a parent; they do not run.", parentId);
             return null;
         }
@@ -598,7 +599,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Chain {Id} is not handed out: it was deleted while its children were written as rows of their own, and removing those rows failed. Rows of its children may be left without a parent; they do not run.", parentId);
+            _logger.LogWarning(failure == null ? ex : new AggregateException(failure, ex), "Chain {Id} is not handed out: it was deleted while its children were written as rows of their own, and removing those rows failed. Rows of its children may be left without a parent; they do not run.", parentId);
         }
         return true;
     }
