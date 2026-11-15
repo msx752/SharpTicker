@@ -49,8 +49,33 @@ public class InProgressLeaseOptionTests
     public void AHostWithoutTheBackgroundServices_HasNoLease()
         => Assert.Equal(0, LeaseServices(disableBackgroundServices: true));
 
-    [Fact]
-    public void ANegativeLease_IsRefused()
-        => Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new SharpTickerEfCoreOptionBuilder<TimeTickerEntity, CronTickerEntity>().SetInProgressLease(TimeSpan.FromSeconds(-1)));
+    // Zero, or from 1 second up to 30 days. Below a second the renewal itself can take longer than the lease; far above
+    // 30 days the timer of a fifth of the lease cannot be made and the host does not start.
+    public static TheoryData<TimeSpan> RefusedLeases => new()
+    {
+        TimeSpan.FromSeconds(-1), TimeSpan.FromTicks(1), TimeSpan.FromMilliseconds(999),
+        TimeSpan.FromDays(30) + TimeSpan.FromTicks(1), TimeSpan.FromDays(365), TimeSpan.MaxValue, TimeSpan.MinValue
+    };
+
+    public static TheoryData<TimeSpan> AcceptedLeases => new()
+    {
+        TimeSpan.Zero, TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(5), TimeSpan.FromDays(30)
+    };
+
+    [Theory]
+    [MemberData(nameof(RefusedLeases))]
+    public void ALeaseOutsideTheRange_IsRefused_NamingTheRange(TimeSpan lease)
+    {
+        var refused = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SharpTickerEfCoreOptionBuilder<TimeTickerEntity, CronTickerEntity>().SetInProgressLease(lease));
+
+        Assert.Equal("lease", refused.ParamName);
+        Assert.Contains("1 second", refused.Message);
+        Assert.Contains("30 days", refused.Message);
+    }
+
+    [Theory]
+    [MemberData(nameof(AcceptedLeases))]
+    public void ALeaseInTheRange_IsKept(TimeSpan lease)
+        => Assert.Equal(lease, new SharpTickerEfCoreOptionBuilder<TimeTickerEntity, CronTickerEntity>().SetInProgressLease(lease).InProgressLease);
 }

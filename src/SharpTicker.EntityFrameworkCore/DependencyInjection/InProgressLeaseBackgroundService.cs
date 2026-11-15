@@ -42,8 +42,8 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
         _store = store as IInProgressLease;
         _executionContext = executionContext;
         _lease = options.InProgressLease;
-        // A timer needs at least a millisecond.
-        _interval = TimeSpan.FromTicks(Math.Max(_lease.Ticks / 5, TimeSpan.TicksPerMillisecond));
+        // SetInProgressLease keeps the lease from 1 second up to 30 days, so a fifth of it is a period the timer accepts.
+        _interval = TimeSpan.FromTicks(_lease.Ticks / 5);
         _logger = loggerFactory?.CreateLogger(LogCategory) ?? NullLogger.Instance;
     }
 
@@ -77,7 +77,12 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
         {
             await _store.RenewInProgressLeaseAsync(runStartedAt, stoppingToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        catch (Exception ex) when (stoppingToken.IsCancellationRequested)
+        {
+            StoppedDuringAPass(ex);
+            return;
+        }
+        catch (Exception ex)
         {
             _logger.LogWarning(ex, "Renewing the lease of the jobs this node runs failed; it is tried again in {Interval}. If it fails for {Lease}, " +
                                    "other instances release these jobs and run them again.", _interval, _lease);
@@ -95,9 +100,18 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
             _logger.LogInformation("{Released} job(s) that were InProgress under other node identifiers, with a lock not renewed for {Lease}, were released; the fallback runs them again: {Nodes}.",
                 released, _lease, names);
         }
-        catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+        catch (Exception ex) when (stoppingToken.IsCancellationRequested)
+        {
+            StoppedDuringAPass(ex);
+        }
+        catch (Exception ex)
         {
             _logger.LogWarning(ex, "Releasing the jobs of other nodes whose lease ended failed; it is tried again in {Interval}.", _interval);
         }
     }
+
+    // The host stops: what the store throws now (a disposed context pool, a cancelled command) says nothing about the
+    // store, so the service ends as a stop, not as a failure.
+    private void StoppedDuringAPass(Exception ex)
+        => _logger.LogDebug(ex, "A lease pass ended because the host stops.");
 }
