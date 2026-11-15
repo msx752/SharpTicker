@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using Xunit;
 
@@ -504,6 +505,58 @@ public abstract class DashboardApiReadTests<TFixture> : IClassFixture<TFixture> 
             await _api.Store.RemoveTimeTickers(new[] { ticker.Id });
         }
     }
+
+    // #31: a job keeps the name of the node that locked it after it ended, so every container that ever ran a job is
+    // listed. Each name comes with its latest lock, latest first, so a name that locked nothing for a month is not shown
+    // ahead of the node that locks jobs now only because it has more old rows. These stores know nothing about which
+    // nodes run, so the answer says nothing about it either.
+    [Fact]
+    public async Task MachineJobs_GiveEachNameItsLatestLock_LatestFirst_AndNoHeartbeat()
+    {
+        var now = DateTime.UtcNow;
+        var monthAgo = new DateTime(now.Ticks - now.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc).AddDays(-30);
+        var minuteAgo = new DateTime(now.Ticks - now.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc).AddMinutes(-1);
+
+        TimeTickerEntity Locked(TickerStatus status, string holder, DateTime lockedAt)
+        {
+            var ticker = _api.Time(Guid.NewGuid(), "SeedJob", status, _api.Today);
+            ticker.LockHolder = holder;
+            ticker.LockedAt = lockedAt;
+            return ticker;
+        }
+
+        var tickers = new[]
+        {
+            Locked(TickerStatus.Done, "container-gone", monthAgo.AddHours(-1)),
+            Locked(TickerStatus.Done, "container-gone", monthAgo),
+            Locked(TickerStatus.InProgress, "node-live", minuteAgo),
+        };
+        await _api.Store.AddTimeTickers(tickers);
+        var logsBefore = _api.Logs.Entries.Length;
+        try
+        {
+            var jobs = (await _api.GetAsync("/ticker/machine/jobs")).EnumerateArray().ToArray();
+
+            Assert.Equal(new[] { "node-live", "container-gone" }, jobs.Select(j => j.GetProperty("item1").GetString()));
+            Assert.Equal(new[] { 1, 2 }, jobs.Select(j => j.GetProperty("item2").GetInt32()));
+            Assert.True(jobs[0].TryGetProperty("lastLockedAt", out var live), jobs[0].GetRawText());
+            Assert.Equal(minuteAgo, ParseUtc(live.GetString()!));
+            Assert.Equal(monthAgo, ParseUtc(jobs[1].GetProperty("lastLockedAt").GetString()!));
+            foreach (var job in jobs)
+                Assert.True(!job.TryGetProperty("hasHeartbeat", out var heartbeat) || heartbeat.ValueKind == JsonValueKind.Null, job.GetRawText());
+
+            var problems = _api.Logs.Entries.Skip(logsBefore).Where(e => e.Level >= Microsoft.Extensions.Logging.LogLevel.Warning).ToArray();
+            Assert.True(problems.Length == 0, string.Join(Environment.NewLine, problems.Select(p => $"{p.Level} {p.Category}: {p.Message}")));
+        }
+        finally
+        {
+            await _api.Store.RemoveTimeTickers(tickers.Select(t => t.Id).ToArray());
+        }
+    }
+
+    private static DateTime ParseUtc(string text)
+        => DateTime.Parse(text, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal);
 
     #endregion
 }
