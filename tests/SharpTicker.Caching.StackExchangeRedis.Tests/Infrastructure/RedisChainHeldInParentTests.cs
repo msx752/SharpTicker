@@ -408,6 +408,8 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         var parent = await StoredAsync(chain.Parent);
         Assert.Equal(TickerStatus.InProgress, (TickerStatus)parent.GetProperty("Status").GetInt32());
         Assert.Equal(NodeA, Text(parent, "LockHolder"));
+        // The loop's Queued hand-out does not start the job: its mark is refused once the row is InProgress, so the parent runs once.
+        Assert.False(await loop.TryMarkTimeTickerInProgress(chain.Parent, _clock.NextClaimMarker(), CancellationToken.None));
     }
 
     // The same, and the read of the children after the claim fails: the parent is not handed out, its claim is put back,
