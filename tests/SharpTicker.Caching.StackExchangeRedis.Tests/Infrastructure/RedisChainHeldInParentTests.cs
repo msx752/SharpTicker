@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.Caching.StackExchangeRedis.Helpers;
 using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
@@ -14,6 +15,7 @@ using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Managers;
 using SharpTicker.Utilities.Models;
 using StackExchange.Redis;
+using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceExtension;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 
@@ -668,7 +670,7 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
         var database = when == DeletedWhen.AfterTheFirstLink
             // The second link is the first child's link to its own child: the first link has landed.
-            ? BeforeLinkDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync)
+            ? BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync)
             : null;
         var a = fixture.CreateProvider(NodeA, _clock, database);
         var writesOfTheParent = 0;
@@ -711,28 +713,92 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.Empty(indexed.Intersect(ids));
     }
 
-    // Runs an action once, before the first write of a link into the given children set, and waits for it.
-    public class BeforeLinkDatabase : DispatchProxy
+    // The delete starts while the split writes (after its first link) and is held before it removes the parent's row; the
+    // split finishes in that pause, so its last write of the parent's row lands. The delete then finds every row the split
+    // wrote, and the parent was handed out with all its children: it was not deleted yet when it was claimed.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    [InlineData(ClaimPath.Loop)]
+    public async Task ADeleteThatStartsDuringTheSplit_AndRemovesTheParentsRowAfterIt_LeavesNoRowOfItsChain(ClaimPath path)
+    {
+        var chain = await SeedForAsync(path);
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var deleteHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b = fixture.CreateProvider(NodeB, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.KeyDeleteAsync), parentKey,
+            async () =>
+            {
+                deleteHeld.SetResult();
+                await resumeDelete.Task;
+            }));
+        Task<int>? delete = null;
+        var a = fixture.CreateProvider(NodeA, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0),
+            async () =>
+            {
+                delete = Task.Run(() => b.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+                await deleteHeld.Task;
+            }));
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+        resumeDelete.SetResult();
+
+        Assert.True(delete != null, "the delete was not started during the split");
+        Assert.Equal(1, await delete!);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+        AssertHandedOutAsRows(chain, Assert.Single(handedOut), DelayedTimeFor(path));
+    }
+
+    // The parent was deleted during the split and the check that finds the delete fails: the parent is not handed out, and
+    // what is logged says so; it does not say that the claim is put back and the next pass tries again.
+    [Fact]
+    public async Task WhenTheCheckForADeletedParentFails_TheWarningSaysWhatHappened()
+    {
+        var chain = await SeedOverdueAsync();
+        var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        async Task DeleteTheParentAsync()
+            => Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+        var database = RedisClaimMultiNodeTests.FailingDatabase.Create(
+            BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync),
+            nameof(IDatabase.KeyExistsAsync), 1);
+        var a = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(database, _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = NodeA },
+            new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);
+
+        Assert.Empty(await ClaimAsync(a, ClaimPath.RunNow, chain.Parent));
+
+        var warning = Assert.Single(log.Entries, e => e.Level >= LogLevel.Warning);
+        Assert.Contains(chain.Parent.ToString(), warning.Message);
+        Assert.Contains("deleted", warning.Message);
+        Assert.DoesNotContain("put back", warning.Message);
+        Assert.IsType<RedisConnectionException>(warning.Exception);
+    }
+
+    // Runs an action once, before the first call of the given method on the given key, and waits for it.
+    public class BeforeCallDatabase : DispatchProxy
     {
         private IDatabase _inner = null!;
-        private string _childrenKey = "";
+        private string _method = "";
+        private string _key = "";
         private Func<Task> _before = null!;
         private int _fired;
 
-        public static IDatabase Create(IDatabase inner, string childrenKey, Func<Task> before)
+        public static IDatabase Create(IDatabase inner, string method, string key, Func<Task> before)
         {
-            var proxy = DispatchProxy.Create<IDatabase, BeforeLinkDatabase>();
-            var hooked = (BeforeLinkDatabase)(object)proxy;
+            var proxy = DispatchProxy.Create<IDatabase, BeforeCallDatabase>();
+            var hooked = (BeforeCallDatabase)(object)proxy;
             hooked._inner = inner;
-            hooked._childrenKey = childrenKey;
+            hooked._method = method;
+            hooked._key = key;
             hooked._before = before;
             return proxy;
         }
 
         protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
         {
-            if (targetMethod!.Name == nameof(IDatabase.SortedSetAddAsync) && targetMethod.ReturnType == typeof(Task<bool>)
-                && args![0] is RedisKey key && key == _childrenKey && Interlocked.Exchange(ref _fired, 1) == 0)
+            if (targetMethod!.Name == _method && targetMethod.ReturnType == typeof(Task<bool>)
+                && args![0] is RedisKey key && key == _key && Interlocked.Exchange(ref _fired, 1) == 0)
                 return ThenCall(targetMethod, args);
             return Call(targetMethod, args);
         }

@@ -249,6 +249,10 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     }
 
     // Removes the rows with every descendant, as the other stores do: a child left without its parent would never run.
+    // The row goes first and its children are read after it: a node that writes the children of a chain stored before
+    // 1.3.0 as rows (SplitNestedChainAsync) has linked every one of them before its last write of the parent's row, which
+    // lands only while the row exists. When that write lands, the walk below finds them all; when it comes after the
+    // delete, it fails and that node removes the rows it wrote (#153).
     public async Task<int> RemoveTimeTickers(Guid[] tickerIds, CancellationToken cancellationToken = default)
     {
         var count = 0;
@@ -256,10 +260,10 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             cancellationToken.ThrowIfCancellationRequested();
             var row = await Serializer.GetAsync<TTimeTicker>(TimeTickerKey(id)).ConfigureAwait(false);
-            await RemoveDescendantsAsync(id, depth: 0).ConfigureAwait(false);
-            await IndexManager.RemoveTimeTickerIndexesAsync(id, row?.ParentId).ConfigureAwait(false);
             if (await Db.KeyDeleteAsync(TimeTickerKey(id)).ConfigureAwait(false))
                 count++;
+            await RemoveDescendantsAsync(id, depth: 0).ConfigureAwait(false);
+            await IndexManager.RemoveTimeTickerIndexesAsync(id, row?.ParentId).ConfigureAwait(false);
         }
         return count;
     }

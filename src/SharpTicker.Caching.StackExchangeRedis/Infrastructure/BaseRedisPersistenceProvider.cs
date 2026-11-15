@@ -488,16 +488,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
             if (written == null)
             {
-                // A delete of the parent while the rows were written removed only the children its children set held then;
-                // the rows written after it would be left without a parent, and wait for good (#153).
-                if (!await Db.KeyExistsAsync(parentKey).ConfigureAwait(false))
-                {
-                    await RemoveWrittenChildrenAsync(claimed.Id, writtenIds).ConfigureAwait(false);
-                    _logger.LogDebug("Chain {Id} is not handed out: it was deleted while its children were written as rows of their own, and those rows were removed.", claimed.Id);
-                    return null;
-                }
-
-                _logger.LogDebug("Chain {Id} is not handed out: its claim was lost while its children were written as rows of their own.", claimed.Id);
+                await RemoveWrittenChildrenIfDeletedAsync(claimed.Id, writtenIds).ConfigureAwait(false);
                 return null;
             }
 
@@ -542,23 +533,34 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
-    // After the parent was deleted: what the delete removes for each descendant (row, children set, index entries), for
-    // each node whose link this node wrote, and the parent's children set the links wrote again. A failure is logged and
-    // leaves the rows that are not removed yet without a parent: they wait and do not run.
-    private async Task RemoveWrittenChildrenAsync(Guid parentId, List<Guid> writtenIds)
+    // The last write of the parent's row did not land. When the parent was deleted while the rows were written, the delete
+    // may have read its children set before some of them were linked (RemoveTimeTickers); those rows would be left without
+    // a parent and wait for good (#153). So this removes what the delete removes for each descendant (row, children set,
+    // index entries), for each node whose link this node wrote, and the parent's children set the links wrote again.
+    // When the parent still exists, the claim was lost and the rows are the chain's. The claim is not put back either way:
+    // there is no row to put back, or it is another claim's. A failure is logged and leaves the rows that are not removed
+    // yet without a parent: they wait and do not run.
+    private async Task RemoveWrittenChildrenIfDeletedAsync(Guid parentId, List<Guid> writtenIds)
     {
         try
         {
+            if (await Db.KeyExistsAsync(TimeTickerKey(parentId)).ConfigureAwait(false))
+            {
+                _logger.LogDebug("Chain {Id} is not handed out: its claim was lost while its children were written as rows of their own.", parentId);
+                return;
+            }
+
             foreach (var id in writtenIds)
             {
                 await IndexManager.RemoveTimeTickerIndexesAsync(id).ConfigureAwait(false);
                 await Db.KeyDeleteAsync(TimeTickerKey(id)).ConfigureAwait(false);
             }
             await IndexManager.RemoveTimeTickerIndexesAsync(parentId).ConfigureAwait(false);
+            _logger.LogDebug("Chain {Id} is not handed out: it was deleted while its children were written as rows of their own, and those rows were removed.", parentId);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "Chain {Id} was deleted while its children were written as rows of their own, and removing those rows failed; they are left without a parent and do not run.", parentId);
+            _logger.LogWarning(ex, "Chain {Id} is not handed out: its claim was lost while its children were written as rows of their own, and checking whether it was deleted, or removing those rows after a delete, failed. If it was deleted, rows of its children may be left without a parent; they do not run.", parentId);
         }
     }
 
