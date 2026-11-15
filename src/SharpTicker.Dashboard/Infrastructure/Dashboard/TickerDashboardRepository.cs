@@ -20,7 +20,7 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
         where TCronTicker : CronTickerEntity, new()
     {
         /// <summary>Name shown for jobs that are locked but have no lock holder recorded.</summary>
-        private const string UnknownMachine = "unknown";
+        internal const string UnknownMachine = "unknown";
 
         private readonly ITickerPersistenceProvider<TTimeTicker, TCronTicker> _persistenceProvider;
         private readonly ISharpTickerHostScheduler _sharpTickerHostScheduler;
@@ -379,48 +379,34 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
                 .ToList();
         }
 
-        public async Task<IList<(string, int)>> GetMachineJobsAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
+        /// <summary>
+        /// The node identifiers that locked the jobs still in the store, each with its number of jobs and its latest lock,
+        /// latest first. A job keeps the identifier after it ended, so this is not the list of nodes that run now (#31).
+        /// </summary>
+        public async Task<IList<(string Node, int Jobs, DateTime LastLockedAt)>> GetMachineJobsAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
             // The locked rows are read, because the query of a store cannot group by the lock holder; their children and
             // cron are not.
             var timeTickers = await VisibleTimeTickers(visibility).Where(x => x.LockedAt != null).ToArrayAsync(cancellationToken);
-            var timeTickerCounts = timeTickers
-                .GroupBy(x => x.LockHolder ?? UnknownMachine)
-                .Select(g => new { LockHolder = g.Key, Count = g.Count() })
-                .ToList();
 
             var cronTickerOccurrences = await (await VisibleOccurrencesAsync(visibility, cancellationToken))
                 .Where(x => x.LockedAt != null)
                 .ToArrayAsync(cancellationToken);
-            var cronTickerCounts = cronTickerOccurrences
-                .GroupBy(x => x.LockHolder ?? UnknownMachine)
-                .Select(g => new { LockHolder = g.Key, Count = g.Count() })
-                .ToList();
 
-            // Combine results into a single dictionary
-            var combined = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var locks = timeTickers.Select(x => (Holder: x.LockHolder, LockedAt: x.LockedAt.Value))
+                .Concat(cronTickerOccurrences.Select(x => (Holder: x.LockHolder, LockedAt: x.LockedAt.Value)));
 
-            foreach (var item in timeTickerCounts)
-            {
-                if (combined.ContainsKey(item.LockHolder))
-                    combined[item.LockHolder] += item.Count;
-                else
-                    combined[item.LockHolder] = item.Count;
-            }
-
-            foreach (var item in cronTickerCounts)
-            {
-                if (combined.ContainsKey(item.LockHolder))
-                    combined[item.LockHolder] += item.Count;
-                else
-                    combined[item.LockHolder] = item.Count;
-            }
-
-            return combined
-                .Select(x => (x.Key, x.Value))
-                .OrderByDescending(x => x.Item2) // Optional: most active machines first
+            return locks
+                .GroupBy(x => x.Holder ?? UnknownMachine, StringComparer.OrdinalIgnoreCase)
+                .Select(g => (Node: g.Key, Jobs: g.Count(), LastLockedAt: AsUtc(g.Max(x => x.LockedAt))))
+                .OrderByDescending(x => x.LastLockedAt)
+                .ThenByDescending(x => x.Jobs)
                 .ToList();
         }
+
+        // Lock times are written in UTC; a store may read them back without the kind (SQLite).
+        private static DateTime AsUtc(DateTime value)
+            => value.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(value, DateTimeKind.Utc) : value.ToUniversalTime();
 
         public async Task<CronTickerEntity[]> GetCronTickersAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
             => await _persistenceProvider.GetCronTickers(visibility?.CronTickers, cancellationToken);
