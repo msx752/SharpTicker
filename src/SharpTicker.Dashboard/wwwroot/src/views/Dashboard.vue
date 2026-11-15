@@ -3,6 +3,7 @@ import { tickerService } from '@/http/services/tickerService'
 import { formatDate } from '@/utilities/dateTimeParser'
 import { summarizeJobStatuses, formatShare } from '@/utilities/jobStatistics'
 import { priorityNote } from '@/utilities/priorityNote'
+import { lockHoldersSubtitle, toLockHolderRow, type LockHolderRow } from '@/utilities/lockHolders'
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import TickerNotificationHub, { methodName } from '@/hub/tickerNotificationHub'
 import { useFunctionNameStore } from '@/stores/functionNames'
@@ -49,13 +50,8 @@ onMounted(async () => {
   await getJobStatusesPastWeek.requestAsync()
 
   await getMachineJobs.requestAsync().then((res) => {
-    machineItems.value = []
-    res.forEach((item) => {
-      machineItems.value.push({
-        machine: item.item1,
-        locked: `${item.item2} Jobs`,
-      })
-    })
+    machineItems.value = res.map((item) => toLockHolderRow(item))
+    machinesSubtitle.value = lockHoldersSubtitle(res)
     currentMachinesPage.value = 1
   })
   await functionNamesStore.loadData().then((res) => {
@@ -140,7 +136,8 @@ const seriesColors: { [key: string]: string } = {
   Skipped: '#BA68C8', // Medium Orchid (Purple)
 }
 
-const machineItems: Ref<Array<{ machine: string; locked: string }>> = ref([])
+const machineItems: Ref<Array<LockHolderRow>> = ref([])
+const machinesSubtitle = ref('')
 
 // Machines pagination
 const machinesPerPage = ref(10)
@@ -468,9 +465,9 @@ const getVisiblePageNumbers = () => {
           <div class="card-header">
             <h2 class="card-title">
               <v-icon class="title-icon" color="primary">mdi-server-network</v-icon>
-              Machines
+              Lock holders
             </h2>
-            <p class="card-subtitle">{{ machineItems.length }} lock holders, jobs counted all time</p>
+            <p class="card-subtitle">{{ machinesSubtitle }}</p>
           </div>
 
           <div class="machines-list">

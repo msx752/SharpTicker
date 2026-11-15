@@ -33,6 +33,6 @@ namespace SharpTicker.Utilities.Interfaces
         IEnumerable<(string, (string, string, TickerTaskPriority))> GetTickerFunctions();
         Task<IList<(int, int)>> GetLastWeekJobStatusesAsync(CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
         Task<IList<(TickerStatus, int)>> GetOverallJobStatusesAsync(CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
-        Task<IList<(string, int)>> GetMachineJobsAsync(CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
+        Task<IList<(string Node, int Jobs, DateTime LastLockedAt)>> GetMachineJobsAsync(CancellationToken cancellationToken = default, TickerVisibility<TTimeTicker, TCronTicker> visibility = null);
     }
 }

@@ -46,6 +46,8 @@ export class GetOptions{
 export class GetMachineJobs{
     item1!:string;
     item2!:number;
+    lastLockedAt?:string | null;
+    hasHeartbeat?:boolean | null;
 }
 
 

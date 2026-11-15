@@ -33,6 +33,14 @@ public static class ServiceExtension
             => services.AddSingleton(_ => efCoreOptionBuilder);
             
         tickerConfiguration.ExternalProviderConfigServiceAction += efCoreOptionBuilder.ConfigureServices;
+
+        // The lease on InProgress jobs (#24), only on a host that runs jobs: a host without the background services claims
+        // nothing to renew. Read when the services are added, after the whole configuration ran.
+        tickerConfiguration.ExternalProviderConfigServiceAction += services =>
+        {
+            if (tickerConfiguration.RegisterBackgroundServices && efCoreOptionBuilder.InProgressLease > TimeSpan.Zero)
+                services.AddHostedService<InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>>();
+        };
             
         UseApplicationService(tickerConfiguration, efCoreOptionBuilder);
             
@@ -68,7 +76,8 @@ public static class ServiceExtension
             hostLifetime.ApplicationStarted.Register(() =>
             {
                 // The context keeps the task so that whoever needs to know the release is over, a test for one, can wait for it.
-                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, runStartedAt, hostScheduler, logger, jobsOfOtherNodes));
+                var release = Task.Run(() => ReleaseDeadNodeResourcesOnStartAsync(internalTickerManager, schedulerOptions.NodeIdentifier, runStartedAt, hostScheduler, logger, jobsOfOtherNodes,
+                    tickerConfiguration.RegisterBackgroundServices ? options.InProgressLease : TimeSpan.Zero));
                 if (executionContext != null)
                     executionContext.ExternalProviderStartup = release;
             });
@@ -88,7 +97,8 @@ public static class ServiceExtension
         DateTime runStartedAt,
         ISharpTickerHostScheduler hostScheduler,
         ILogger logger,
-        IJobsOfOtherNodes jobsOfOtherNodes = null)
+        IJobsOfOtherNodes jobsOfOtherNodes = null,
+        TimeSpan inProgressLease = default)
     {
         try
         {
@@ -122,9 +132,14 @@ public static class ServiceExtension
             var listed = others.OrderByDescending(x => x.Jobs).ThenBy(x => x.NodeIdentifier, StringComparer.Ordinal).Take(MaxNodesInLog)
                 .Select(x => $"{x.NodeIdentifier} ({x.Jobs})");
             var nodes = string.Join(", ", listed) + (others.Count > MaxNodesInLog ? $" and {others.Count - MaxNodesInLog} more" : "");
-            logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. With the EF Core store and no Redis heartbeat, " +
-                                  "such a job is released when a node with the same identifier starts. A job of a node that is still running ends as usual. " +
-                                  "If no node runs or starts under that identifier again, the job stays InProgress until it is removed.", others.Sum(x => x.Jobs), nodes);
+            if (inProgressLease > TimeSpan.Zero)
+                logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. A job of a node that is still running ends as usual. " +
+                                      "A job whose lock is not renewed for {Lease}, because no node runs under that identifier, is released by a running node and runs again.",
+                    others.Sum(x => x.Jobs), nodes, inProgressLease);
+            else
+                logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. With the EF Core store, no Redis heartbeat and the lease turned off, " +
+                                      "such a job is released when a node with the same identifier starts. A job of a node that is still running ends as usual. " +
+                                      "If no node runs or starts under that identifier again, the job stays InProgress until it is removed.", others.Sum(x => x.Jobs), nodes);
         }
         catch (Exception ex)
         {

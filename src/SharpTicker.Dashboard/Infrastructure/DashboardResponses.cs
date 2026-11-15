@@ -94,6 +94,29 @@ internal class TupleResponse<T1, T2>
     public T2 Item2 { get; set; }
 }
 
+/// <summary>
+/// One name in the Lock holders panel (Machines up to 1.5.2): a node identifier that locked jobs still in the store. A job keeps that name after it
+/// ended, so the name of a node that is gone stays here. <see cref="Item1"/> and <see cref="Item2"/> keep the names the
+/// answer had up to 1.5.2.
+/// </summary>
+internal class LockHolderResponse
+{
+    /// <summary>The node identifier, or "unknown" for locked jobs without one.</summary>
+    public string Item1 { get; set; }
+
+    /// <summary>How many jobs in the store carry the name, finished ones included.</summary>
+    public int Item2 { get; set; }
+
+    /// <summary>The latest time one of those jobs was locked, in UTC.</summary>
+    public DateTime LastLockedAt { get; set; }
+
+    /// <summary>
+    /// With Redis: whether the node has a heartbeat entry now. Null when there is no heartbeat to look at (no Redis), for
+    /// "unknown", and when Redis could not be read.
+    /// </summary>
+    public bool? HasHeartbeat { get; set; }
+}
+
 internal class FrontendConfigResponse
 {
     public string BasePath { get; set; }

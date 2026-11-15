@@ -572,18 +572,26 @@ public static class DashboardEndpoints
 
         // The body must not reach other tickers: with a rule the children in it are dropped, because editing one ticker
         // never changes its children and a child with the id of a ticker the user cannot see would be written too.
+        var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+        TTimeTicker stored = null;
         if (scope.TimeTickers != null)
         {
             timeTicker.Children = new List<TTimeTicker>();
 
             // ParentId can be set from the body, so it may not move the ticker under one the user cannot see
-            var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
-            var stored = await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
+            stored = await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
             if (await scope.NamesAHiddenParentAsync(provider, timeTicker, stored?.ParentId, cancellationToken))
             {
                 await WriteJson(context, new ActionResponse { Success = false, Message = HiddenParentMessage }, dashboardOptions.DashboardJsonOptions);
                 return;
             }
+        }
+
+        // The properties of the application's own type that the body does not send keep their stored values
+        if (OwnPropertiesOfStoredRow<TTimeTicker>.Properties.Length > 0)
+        {
+            stored ??= await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
+            OwnPropertiesOfStoredRow<TTimeTicker>.KeepTheOnesTheBodyDoesNotSend(timeTicker, stored, jsonString, dashboardOptions.DashboardJsonOptions);
         }
 
         var result = await timeTickerManager.UpdateAsync(timeTicker, cancellationToken);
@@ -879,6 +887,14 @@ public static class DashboardEndpoints
             return;
         }
 
+        // The properties of the application's own type that the body does not send keep their stored values
+        if (OwnPropertiesOfStoredRow<TCronTicker>.Properties.Length > 0)
+        {
+            var stored = await context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>()
+                .GetCronTickerById(cronTicker.Id, cancellationToken);
+            OwnPropertiesOfStoredRow<TCronTicker>.KeepTheOnesTheBodyDoesNotSend(cronTicker, stored, jsonString, dashboardOptions.DashboardJsonOptions);
+        }
+
         var result = await cronTickerManager.UpdateAsync(cronTicker, cancellationToken);
 
         await WriteJson(context, new ActionResponse
@@ -1127,7 +1143,33 @@ public static class DashboardEndpoints
         var cancellationToken = context.RequestAborted;
 
         var machineJobs = await repository.GetMachineJobsAsync(cancellationToken, visibility: VisibilityScope<TTimeTicker, TCronTicker>.For(context).Filter);
-        await WriteJson(context, machineJobs.Select(x => new TupleResponse<string, int> { Item1 = x.Item1, Item2 = x.Item2 }).ToArray(), dashboardOptions.DashboardJsonOptions);
+        var response = machineJobs
+            .Select(x => new LockHolderResponse { Item1 = x.Node, Item2 = x.Jobs, LastLockedAt = x.LastLockedAt })
+            .ToArray();
+
+        // A job keeps the name of the node that locked it, so the names alone do not tell which nodes run. Only the Redis
+        // heartbeat does; without Redis HasHeartbeat stays null.
+        var heartbeats = context.RequestServices.GetService<ISharpTickerRedisContext>();
+        if (heartbeats?.HasRedisConnection == true)
+        {
+            try
+            {
+                // Started together: one after another, a few hundred names add up to seconds per load.
+                var holders = response.Where(x => x.Item1 != Infrastructure.Dashboard.TickerDashboardRepository<TTimeTicker, TCronTicker>.UnknownMachine).ToArray();
+                var found = await Task.WhenAll(holders.Select(x => heartbeats.HasHeartbeatAsync(x.Item1, cancellationToken)));
+                for (var i = 0; i < holders.Length; i++)
+                    holders[i].HasHeartbeat = found[i];
+            }
+            catch (Exception ex)
+            {
+                foreach (var holder in response)
+                    holder.HasHeartbeat = null;
+                context.RequestServices.GetService<ILoggerFactory>()?.CreateLogger(typeof(DashboardEndpoints))
+                    .LogDebug(ex, "The heartbeats of the nodes could not be read for the Lock holders panel.");
+            }
+        }
+
+        await WriteJson(context, response, dashboardOptions.DashboardJsonOptions);
     }
 
     internal static string? ToIanaTimeZoneId(TimeZoneInfo? timeZone)

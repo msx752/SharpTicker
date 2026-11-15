@@ -34,6 +34,7 @@ namespace SharpTicker.Dashboard.Infrastructure;
 [JsonSerializable(typeof(TupleResponse<string, int>[]))]
 [JsonSerializable(typeof(TupleResponse<TickerStatus, int>))]
 [JsonSerializable(typeof(TupleResponse<TickerStatus, int>[]))]
+[JsonSerializable(typeof(LockHolderResponse[]))]
 // Graph data DTOs
 [JsonSerializable(typeof(TickerGraphData))]
 [JsonSerializable(typeof(TickerGraphData[]))]
