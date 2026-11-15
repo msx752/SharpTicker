@@ -436,6 +436,28 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return holder.Children;
     }
 
+    // Whether the children read before a claim may be incomplete: the row read before them (null when it did not read)
+    // held them nested (a chain stored before 1.3.0), and the claimed row no longer does. Another pass of this node (its
+    // loop holds the row Queued) wrote them as rows in between, and the read came while it was writing them (#154).
+    protected static bool ChildrenWereWrittenAsRowsBeforeTheClaim(TTimeTicker readBefore, TTimeTicker claimed)
+        => (readBefore == null || HoldsNestedChildren(readBefore)) && !HoldsNestedChildren(claimed);
+
+    // The children of a claimed row, read again. Null when the read failed: the claim was put back through putBack.
+    protected async Task<ICollection<TTimeTicker>> LoadChildrenAfterClaimAsync(TTimeTicker claimed, Func<Exception, Task> putBack)
+    {
+        try
+        {
+            return await LoadChildrenAsync(claimed.Id, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception failure)
+        {
+            // Logged first: when the put-back fails too, its exception leaves here and this one would be lost.
+            _logger.LogWarning(failure, "Reading the children of chain {Id} after its claim failed; its claim is put back and the next pass tries again.", claimed.Id);
+            await putBack(failure).ConfigureAwait(false);
+            return null;
+        }
+    }
+
     // For reads that load every row anyway: links them by ParentId, reading only the order of the children.
     protected async Task LinkLoadedChildrenAsync(IReadOnlyCollection<TTimeTicker> rows)
     {
@@ -720,6 +742,11 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 if (HoldsNestedChildren(acquired))
                 {
                     children = await SplitNestedChainAsync(acquired, PutBackTimeTickerClaim(acquired)).ConfigureAwait(false);
+                    if (children == null) continue;
+                }
+                else if (ChildrenWereWrittenAsRowsBeforeTheClaim(row, acquired))
+                {
+                    children = await LoadChildrenAfterClaimAsync(acquired, PutBackTimeTickerClaim(acquired)).ConfigureAwait(false);
                     if (children == null) continue;
                 }
 
@@ -1044,6 +1071,11 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 if (HoldsNestedChildren(ticker))
                 {
                     children = await SplitNestedChainAsync(ticker, PutBackTimeTickerClaim(ticker)).ConfigureAwait(false);
+                    if (children == null) continue;
+                }
+                else if (ChildrenWereWrittenAsRowsBeforeTheClaim(stored, ticker))
+                {
+                    children = await LoadChildrenAfterClaimAsync(ticker, PutBackTimeTickerClaim(ticker)).ConfigureAwait(false);
                     if (children == null) continue;
                 }
 
