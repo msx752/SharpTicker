@@ -76,7 +76,8 @@ public class DesignTimeDiscoveryTests
     }
 
     // An application context that takes the non-generic DbContextOptions gets the last registered one from the container.
-    // Registering the store's options must not take that place, whatever the order of the two registrations.
+    // Registering the store's options must not take that place when AddDbContext comes before AddSharpTicker; in the
+    // other order the application's registration is the last one anyway.
     [Fact]
     public void UseSharpTickerDbContext_AnApplicationContextWithNonGenericOptionsKeepsItsOwnOptions()
     {
