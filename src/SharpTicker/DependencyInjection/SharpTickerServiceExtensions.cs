@@ -132,10 +132,10 @@ namespace SharpTicker.DependencyInjection
         /// <summary>
         /// Initializes SharpTicker for generic host applications (Console, MAUI, WPF, Worker Services, etc.).
         ///
-        /// This method configures middleware and scheduler settings. All I/O-bound
-        /// initialization (function discovery, database seeding, external provider startup)
-        /// is deferred to <see cref="SharpTickerInitializerHostedService"/> which runs when
-        /// the host starts. This means design-time tools that build the host without
+        /// This method configures middleware and scheduler settings and builds the function
+        /// registry, so a ticker can be added before the host starts. All I/O-bound
+        /// initialization (database seeding, external provider startup) is deferred to
+        /// <see cref="SharpTickerInitializerHostedService"/> which runs when the host starts. This means design-time tools that build the host without
         /// starting it (OpenAPI generators, EF migration tools, etc.) will not trigger
         /// database operations.
         /// </summary>
@@ -150,7 +150,14 @@ namespace SharpTicker.DependencyInjection
             // so it should perform startup I/O when the host starts.
             var initializer = serviceProvider.GetService<SharpTickerInitializerHostedService>();
             if (initializer != null)
+            {
                 initializer.InitializationRequested = true;
+
+                // The registry is built here, without I/O, so a ticker added before the host starts finds its function
+                // (#75). A %Key% cron is read from the configuration at this point. A cron from the configuration that is not
+                // valid stops the start of the host, as before. A function mapped after this call is built at the start.
+                initializer.BuildFunctionRegistry();
+            }
 
             // If background services are registered, configure them
             if (backgroundScheduler != null)
