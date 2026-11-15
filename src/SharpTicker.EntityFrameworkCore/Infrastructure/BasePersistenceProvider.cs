@@ -20,7 +20,7 @@ using SharpTicker.Utilities.Models;
 namespace SharpTicker.EntityFrameworkCore.Infrastructure;
 
 internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTicker> : IClaimFanOut, IChildSkipWriter, IFencedRunWriter,
-    IJobsOfOtherNodes
+    IJobsOfOtherNodes, IInProgressLease
     where TDbContext : DbContext
     where TTimeTicker : TimeTickerEntity<TTimeTicker>, new()
     where TCronTicker : CronTickerEntity, new()
@@ -489,6 +489,79 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Select(g => (g.Key, g.Sum(x => x.Jobs)))
             .ToList();
     }
+
+    #region IInProgressLease
+
+    // One statement per table, whatever the number of rows. By the rows' state, not by what this node has in memory, so a
+    // claim that waits for a slot of its function and an outcome that waits to be written again are renewed too.
+    // UpdatedAt is not written: it holds the claim marker that fences the run's writes.
+    public async Task<int> RenewInProgressLeaseAsync(DateTime runStartedAt, CancellationToken cancellationToken = default)
+    {
+        var now = _clock.UtcNow;
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+
+        var timeTickers = await dbContext.Set<TTimeTicker>()
+            .Where(x => x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress && x.LockedAt >= runStartedAt)
+            .ExecuteUpdateAsync(setter => setter.SetProperty(x => x.LockedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+
+        var occurrences = await dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress && x.LockedAt >= runStartedAt)
+            .ExecuteUpdateAsync(setter => setter.SetProperty(x => x.LockedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+
+        return timeTickers + occurrences;
+    }
+
+    // The write of the running branch of ReleaseDeadNode*ResourcesCore, for every other node at once. The names are read
+    // first for the log only; a row that changes in between is counted by the write, not by the names.
+    public async Task<(int Released, IReadOnlyList<(string NodeIdentifier, int Jobs)> Nodes)> ReleaseExpiredInProgressOfOtherNodesAsync(TimeSpan lease, CancellationToken cancellationToken = default)
+    {
+        var now = _clock.UtcNow;
+        var lockedBefore = now - lease;
+        using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var dbContext = session.Context;
+
+        var timeTickers = dbContext.Set<TTimeTicker>()
+            .Where(x => x.Status == TickerStatus.InProgress && x.LockHolder != null && x.LockHolder != _lockHolder && x.LockedAt < lockedBefore);
+        var occurrences = dbContext.Set<CronTickerOccurrenceEntity<TCronTicker>>()
+            .Where(x => x.Status == TickerStatus.InProgress && x.LockHolder != null && x.LockHolder != _lockHolder && x.LockedAt < lockedBefore);
+
+        var timeTickerNodes = await timeTickers.AsNoTracking()
+            .GroupBy(x => x.LockHolder).Select(g => new { NodeIdentifier = g.Key, Jobs = g.Count() })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var occurrenceNodes = await occurrences.AsNoTracking()
+            .GroupBy(x => x.LockHolder).Select(g => new { NodeIdentifier = g.Key, Jobs = g.Count() })
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+
+        if (timeTickerNodes.Count == 0 && occurrenceNodes.Count == 0)
+            return (0, []);
+
+        var released = await timeTickers
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+
+        released += await occurrences
+            .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.LockHolder, _ => null)
+                .SetProperty(x => x.LockedAt, _ => null)
+                .SetProperty(x => x.Status, TickerStatus.Idle)
+                .SetProperty(x => x.UpdatedAt, now), cancellationToken)
+            .ConfigureAwait(false);
+
+        var nodes = timeTickerNodes.Concat(occurrenceNodes)
+            .GroupBy(x => x.NodeIdentifier, StringComparer.Ordinal)
+            .Select(g => (g.Key, g.Sum(x => x.Jobs)))
+            .ToList();
+        return (released, nodes);
+    }
+
+    #endregion
 
     public Task ReleaseDeadNodeTimeTickerResources(string instanceIdentifier, CancellationToken cancellationToken = default)
         => ReleaseDeadNodeTimeTickerResourcesCore(instanceIdentifier, null, cancellationToken);
