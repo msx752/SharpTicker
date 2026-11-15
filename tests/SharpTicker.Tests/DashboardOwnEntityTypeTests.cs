@@ -29,6 +29,10 @@ namespace SharpTicker.Tests;
 public class AppTimeTicker : TimeTickerEntity<AppTimeTicker>
 {
     public string? Tenant { get; set; }
+
+    /// <summary>Kept out of the dashboard's answers and bodies.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? Internal { get; set; }
 }
 
 /// <summary>An application's own cron ticker type, with a column of its own (#95).</summary>
@@ -53,7 +57,7 @@ public abstract class OwnEntityTypeDashboardHost : IAsyncLifetime
 
     public CapturedLogs Logs { get; } = new();
     public HttpClient Client { get; private set; } = null!;
-    private ITickerPersistenceProvider<AppTimeTicker, AppCronTicker> Store { get; set; } = null!;
+    public ITickerPersistenceProvider<AppTimeTicker, AppCronTicker> Store { get; private set; } = null!;
 
     protected abstract void ConfigureStore(TickerOptionsBuilder<AppTimeTicker, AppCronTicker> options);
 
@@ -106,7 +110,7 @@ public abstract class OwnEntityTypeDashboardHost : IAsyncLifetime
             new AppTimeTicker
             {
                 Id = TimeId, Function = "OwnTypeJob", Status = TickerStatus.Idle, ExecutionTime = today.AddDays(2).AddHours(12),
-                Description = "own type", Tenant = "tenant-a", CreatedAt = today, UpdatedAt = today,
+                Description = "own type", Tenant = "tenant-a", Internal = "kept", CreatedAt = today, UpdatedAt = today,
             },
         });
         await Store.InsertCronTickers(new[]
@@ -213,6 +217,7 @@ public abstract class DashboardOwnEntityTypeTests<THost> : IAsyncLifetime where 
         Assert.Equal(OwnEntityTypeDashboardHost.TimeId, row.GetProperty("id").GetGuid());
         if (_host.KeepsOwnColumns)
             Assert.Equal("tenant-a", row.GetProperty("tenant").GetString());
+        Assert.False(row.TryGetProperty("internal", out _));
         AssertNothingLoggedAtWarningOrAbove();
     }
 
@@ -231,7 +236,7 @@ public abstract class DashboardOwnEntityTypeTests<THost> : IAsyncLifetime where 
     public async Task AddingAndUpdatingATimeTicker_ReadsTheAppsOwnType()
     {
         var (status, body) = await _host.SendAsync(HttpMethod.Post, "/time-ticker/add",
-            $$"""{"function":"OwnTypeJob","executionTime":"{{InTwoDays}}","description":"added"}""");
+            $$"""{"function":"OwnTypeJob","executionTime":"{{InTwoDays}}","description":"added","tenant":"tenant-c"}""");
         Assert.True(status == 200, body);
         var added = JsonDocument.Parse(body).RootElement;
         Assert.True(added.GetProperty("success").GetBoolean(), body);
@@ -244,6 +249,8 @@ public abstract class DashboardOwnEntityTypeTests<THost> : IAsyncLifetime where 
 
         var row = Rows(await GetAsync("/time-tickers")).Single(t => t.GetProperty("id").GetGuid() == id);
         Assert.Equal("changed", row.GetProperty("description").GetString());
+        if (_host.KeepsOwnColumns)
+            Assert.Equal("tenant-c", row.GetProperty("tenant").GetString());
         AssertNothingLoggedAtWarningOrAbove();
     }
 
@@ -264,6 +271,75 @@ public abstract class DashboardOwnEntityTypeTests<THost> : IAsyncLifetime where 
 
         var row = Rows(await GetAsync("/cron-tickers")).Single(c => c.GetProperty("id").GetGuid() == id);
         Assert.Equal("0 30 * * * *", row.GetProperty("expression").GetString());
+        AssertNothingLoggedAtWarningOrAbove();
+    }
+
+    // The dashboard's edit dialog sends the columns of the plain entity only. An edit there must not wipe a column of the
+    // application's own type that the body does not name: EF Core writes every column of the instance it is given.
+
+    [Fact]
+    public async Task UpdatingATimeTickerWithoutItsOwnProperty_KeepsTheStoredValue()
+    {
+        var (status, body) = await _host.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={OwnEntityTypeDashboardHost.TimeId}",
+            $$"""{"function":"OwnTypeJob","executionTime":"{{InTwoDays}}","description":"changed"}""");
+        Assert.True(status == 200, body);
+        Assert.True(JsonDocument.Parse(body).RootElement.GetProperty("success").GetBoolean(), body);
+
+        var stored = await _host.Store.GetTimeTickerById(OwnEntityTypeDashboardHost.TimeId);
+        Assert.Equal("changed", stored.Description);
+        if (_host.KeepsOwnColumns)
+        {
+            Assert.Equal("tenant-a", stored.Tenant);
+            Assert.Equal("kept", stored.Internal);
+        }
+        AssertNothingLoggedAtWarningOrAbove();
+    }
+
+    [Fact]
+    public async Task UpdatingATimeTickerWithItsOwnProperty_StoresTheNewValue()
+    {
+        var (status, body) = await _host.SendAsync(HttpMethod.Put, $"/time-ticker/update?id={OwnEntityTypeDashboardHost.TimeId}",
+            $$"""{"function":"OwnTypeJob","executionTime":"{{InTwoDays}}","description":"changed","tenant":"tenant-b","internal":"from the body"}""");
+        Assert.True(status == 200, body);
+        Assert.True(JsonDocument.Parse(body).RootElement.GetProperty("success").GetBoolean(), body);
+
+        var stored = await _host.Store.GetTimeTickerById(OwnEntityTypeDashboardHost.TimeId);
+        Assert.Equal("changed", stored.Description);
+        if (_host.KeepsOwnColumns)
+        {
+            Assert.Equal("tenant-b", stored.Tenant);
+            Assert.Equal("kept", stored.Internal);
+        }
+        AssertNothingLoggedAtWarningOrAbove();
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerWithoutItsOwnProperty_KeepsTheStoredValue()
+    {
+        var (status, body) = await _host.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={OwnEntityTypeDashboardHost.CronId}",
+            """{"function":"OwnTypeCron","expression":"0 30 * * * *","description":"changed"}""");
+        Assert.True(status == 200, body);
+        Assert.True(JsonDocument.Parse(body).RootElement.GetProperty("success").GetBoolean(), body);
+
+        var stored = await _host.Store.GetCronTickerById(OwnEntityTypeDashboardHost.CronId, default);
+        Assert.Equal("0 30 * * * *", stored.Expression);
+        if (_host.KeepsOwnColumns)
+            Assert.Equal("tenant-a", stored.Tenant);
+        AssertNothingLoggedAtWarningOrAbove();
+    }
+
+    [Fact]
+    public async Task UpdatingACronTickerWithItsOwnProperty_StoresTheNewValue()
+    {
+        var (status, body) = await _host.SendAsync(HttpMethod.Put, $"/cron-ticker/update?id={OwnEntityTypeDashboardHost.CronId}",
+            """{"function":"OwnTypeCron","expression":"0 30 * * * *","description":"changed","Tenant":"tenant-b"}""");
+        Assert.True(status == 200, body);
+        Assert.True(JsonDocument.Parse(body).RootElement.GetProperty("success").GetBoolean(), body);
+
+        var stored = await _host.Store.GetCronTickerById(OwnEntityTypeDashboardHost.CronId, default);
+        Assert.Equal("0 30 * * * *", stored.Expression);
+        if (_host.KeepsOwnColumns)
+            Assert.Equal("tenant-b", stored.Tenant);
         AssertNothingLoggedAtWarningOrAbove();
     }
 }

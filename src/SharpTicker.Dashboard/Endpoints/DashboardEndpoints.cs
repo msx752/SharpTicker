@@ -572,18 +572,26 @@ public static class DashboardEndpoints
 
         // The body must not reach other tickers: with a rule the children in it are dropped, because editing one ticker
         // never changes its children and a child with the id of a ticker the user cannot see would be written too.
+        var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
+        TTimeTicker stored = null;
         if (scope.TimeTickers != null)
         {
             timeTicker.Children = new List<TTimeTicker>();
 
             // ParentId can be set from the body, so it may not move the ticker under one the user cannot see
-            var provider = context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>();
-            var stored = await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
+            stored = await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
             if (await scope.NamesAHiddenParentAsync(provider, timeTicker, stored?.ParentId, cancellationToken))
             {
                 await WriteJson(context, new ActionResponse { Success = false, Message = HiddenParentMessage }, dashboardOptions.DashboardJsonOptions);
                 return;
             }
+        }
+
+        // The properties of the application's own type that the body does not send keep their stored values
+        if (OwnPropertiesOfStoredRow<TTimeTicker>.Properties.Length > 0)
+        {
+            stored ??= await provider.GetTimeTickerById(timeTicker.Id, cancellationToken);
+            OwnPropertiesOfStoredRow<TTimeTicker>.KeepTheOnesTheBodyDoesNotSend(timeTicker, stored, jsonString, dashboardOptions.DashboardJsonOptions);
         }
 
         var result = await timeTickerManager.UpdateAsync(timeTicker, cancellationToken);
@@ -877,6 +885,14 @@ public static class DashboardEndpoints
         {
             await WriteJson(context, new ActionResponse { Success = false, Message = HiddenFunctionMessage(updatedFunction) }, dashboardOptions.DashboardJsonOptions);
             return;
+        }
+
+        // The properties of the application's own type that the body does not send keep their stored values
+        if (OwnPropertiesOfStoredRow<TCronTicker>.Properties.Length > 0)
+        {
+            var stored = await context.RequestServices.GetRequiredService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>()
+                .GetCronTickerById(cronTicker.Id, cancellationToken);
+            OwnPropertiesOfStoredRow<TCronTicker>.KeepTheOnesTheBodyDoesNotSend(cronTicker, stored, jsonString, dashboardOptions.DashboardJsonOptions);
         }
 
         var result = await cronTickerManager.UpdateAsync(cronTicker, cancellationToken);
