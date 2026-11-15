@@ -249,8 +249,9 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     }
 
     // Removes the rows with every descendant, as the other stores do: a child left without its parent would never run.
-    // The descendants' rows go before the parent's row and its index entries go last, so a delete that stops on the way
-    // leaves the parent listed, and deleting it again removes the rest. The chain's children are read again after the
+    // The descendants' rows go before the parent's row and its index entries go last, so a delete that stops before the
+    // parent's row is removed leaves the parent listed, and deleting it again removes the rest. One that stops after it
+    // leaves no row, only index entries and children sets of rows that are gone; reads skip those. The chain's children are read again after the
     // parent's row is gone: a node that writes the children of a chain stored before 1.3.0 as rows (SplitNestedChainAsync)
     // may link more of them during the first walk. It links each one into its parent's children set, before that node's
     // own children, and before its last write of the parent's row, which lands only while the row exists. The first walk

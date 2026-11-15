@@ -952,6 +952,39 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.IsType<RedisConnectionException>(warning.Exception);
     }
 
+    // The parent is deleted during the split (after its first link), and a later write of the split fails. The node finds
+    // the parent gone and removes the rows it wrote, as it does when only its last write of the parent's row fails; it does
+    // not log that the claim is put back and the next pass tries again, since no pass ever takes a deleted parent.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    [InlineData(ClaimPath.Loop)]
+    public async Task AParentDeletedDuringTheSplit_WhoseLaterWriteFails_LeavesNoRowOfItsChain(ClaimPath path)
+    {
+        var chain = await SeedForAsync(path);
+        var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        var deleted = false;
+        async Task DeleteTheParentAsync()
+        {
+            Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+            deleted = true;
+        }
+        // The first row the split writes (the grandchild's) fails, after the delete read the parent's children.
+        var database = RedisClaimMultiNodeTests.FailingDatabase.Create(
+            BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync),
+            nameof(IDatabase.StringSetAsync), 1);
+        var a = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(database, _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = NodeA },
+            new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+
+        Assert.True(deleted, "the parent was not deleted during the split");
+        Assert.Empty(handedOut);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+        Assert.DoesNotContain(log.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
     public enum HeldAfterReading
     {
         TheParentsChildren,
