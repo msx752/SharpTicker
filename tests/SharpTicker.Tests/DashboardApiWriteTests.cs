@@ -210,6 +210,31 @@ public abstract class DashboardApiWriteTests<TFixture> : IAsyncLifetime where TF
 
     #endregion
 
+    #region The request of a ticker
+
+    // MatchType: 1 when the stored request reads as the function's request type, 2 when it does not or the function has
+    // none. Up to 1.5.2 the dashboard's options had no metadata for an application's request type, so it was 2 for every
+    // typed request (#95).
+
+    [Theory]
+    [InlineData("{\"OrderId\":\"A-2\",\"Amount\":3.5}", 1)]
+    [InlineData("{\"OrderId\":\"A-2\",\"Amount\":\"not a number\"}", 2)]
+    public async Task TickerRequest_OfATypedFunction_SaysWhetherItReadsAsTheRequestType(string request, int matchType)
+    {
+        var id = Guid.NewGuid();
+        await _api.Store.AddTimeTickers(new[]
+        {
+            _api.Time(id, DashboardApiFixture.TypedFunction, TickerStatus.Idle, _api.Tomorrow, request: request),
+        });
+
+        var response = await _api.GetAsync($"/ticker-request/{id}?tickerType=1");
+
+        Assert.Equal(request, response.GetProperty("result").GetString());
+        Assert.Equal(matchType, response.GetProperty("matchType").GetInt32());
+    }
+
+    #endregion
+
     #region Cron tickers
 
     [Fact]

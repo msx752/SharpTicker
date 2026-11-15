@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Reflection;
 using System.Text.Encodings.Web;
@@ -31,7 +32,8 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 Converters = { new StringToByteArrayConverter() },
                 TypeInfoResolverChain = { DashboardJsonSerializerContext.Default }
             };
-            
+            AddReflectionResolverWhenReflectionIsOn(config.DashboardJsonOptions, JsonSerializer.IsReflectionEnabledByDefault);
+
             // Register the dashboard configuration for DI
             services.AddSingleton(config);
 
@@ -48,6 +50,25 @@ namespace SharpTicker.Dashboard.DependencyInjection
                 options.AddPolicy("SharpTicker_Dashboard_CORS", config.CorsPolicyBuilder);
             });
         }
+
+        /// <summary>
+        /// The dashboard's source-generated context knows the plain entity types only. An application that registers its
+        /// own ticker types (<c>AddSharpTicker&lt;TTimeTicker, TCronTicker&gt;</c>) gets lists, occurrences and request
+        /// bodies of those types, which the context has no metadata for (#95). When reflection-based serialization is on,
+        /// a type the context does not know is read and written through reflection; the context stays first, so the plain
+        /// types are handled as before. A trimmed or AOT application has reflection off and is left as it is.
+        /// </summary>
+        internal static void AddReflectionResolverWhenReflectionIsOn(JsonSerializerOptions options, bool reflectionIsEnabled)
+        {
+            if (!reflectionIsEnabled)
+                return;
+
+            options.TypeInfoResolverChain.Add(ReflectionResolver());
+        }
+
+        [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Called only when JsonSerializer.IsReflectionEnabledByDefault is true.")]
+        [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Called only when JsonSerializer.IsReflectionEnabledByDefault is true.")]
+        private static IJsonTypeInfoResolver ReflectionResolver() => new DefaultJsonTypeInfoResolver();
 
         /// <summary>
         /// The hub sends ids, text, JSON elements and the connection status. SignalR's JSON protocol serializes them
