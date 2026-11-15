@@ -123,6 +123,23 @@ public class StartupReleaseTests
         Assert.Contains("released when a node with the same identifier starts", entry.Message);
     }
 
+    // With the lease on (the default), the report says that such a job is released once its lock is not renewed.
+    [Fact]
+    public async Task JobsInProgressUnderOtherIdentifiers_WithTheLease_TheReportNamesTheLease()
+    {
+        var others = new JobsOfOtherNodes(() => new[] { ("pod-a", 2) });
+        var logger = new CapturedLogger();
+
+        await ServiceExtension.ReleaseDeadNodeResourcesOnStartAsync(ManagerWhoseReleaseWorks(), "node-a", RunStartedAt, null, logger, others,
+            TimeSpan.FromMinutes(5));
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.StartsWith("2 job(s) are InProgress under other node identifiers: pod-a (2).", entry.Message);
+        Assert.Contains("not renewed for 00:05:00", entry.Message);
+        Assert.DoesNotContain("stays InProgress", entry.Message);
+    }
+
     [Fact]
     public async Task NoJobsUnderOtherIdentifiers_NothingIsLogged()
     {
