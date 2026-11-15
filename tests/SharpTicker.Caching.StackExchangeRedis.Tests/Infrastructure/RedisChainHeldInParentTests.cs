@@ -368,6 +368,183 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
 
     #endregion
 
+    #region The fallback or run-now of the node whose loop is writing the rows (#154)
+
+    // The loop of node A has queued the parent and is writing its children as rows; it stops after the first child's row.
+    // The fallback or run-now of the same node reads the children then (only the first child has a row), and claims the
+    // parent after the loop has taken the children out of the parent's row. The parent is handed out with all its children.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    public async Task TheClaimOfTheNodeWhoseLoopIsWritingTheRows_HandsTheParentOutWithAllItsChildren(ClaimPath path)
+    {
+        var chain = await SeedForAsync(ClaimPath.Loop);
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loop = fixture.CreateProvider(NodeA, _clock,
+            PausingDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerKey(chain.Child0), paused, resume.Task));
+        var other = fixture.CreateProvider(NodeA, _clock);
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var loopTask = Task.Run(async () =>
+            await Drain(loop.QueueTimeTickers(await loop.GetEarliestTimeTickers(CancellationToken.None), CancellationToken.None)));
+        await paused.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        // The parent is overdue for the fallback now; the loop holds it Queued.
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var resumed = false;
+        other.BeforeCompareAndSetHook = async key =>
+        {
+            // The first write of the parent's row is this claim: the children were read before it.
+            if (key != parentKey || resumed) return;
+            resumed = true;
+            resume.SetResult();
+            await loopTask.WaitAsync(TimeSpan.FromSeconds(30));
+        };
+
+        var handedOut = await ClaimAsync(other, path, chain.Parent);
+
+        Assert.True(resumed, "the claim of the parent was not reached");
+        Assert.Single(await loopTask);
+        AssertHandedOutAsRows(chain, Assert.Single(handedOut), T0.AddSeconds(30));
+        await AssertStoredAsRowsAsync(chain);
+        var parent = await StoredAsync(chain.Parent);
+        Assert.Equal(TickerStatus.InProgress, (TickerStatus)parent.GetProperty("Status").GetInt32());
+        Assert.Equal(NodeA, Text(parent, "LockHolder"));
+        // The loop's Queued hand-out does not start the job: its mark is refused once the row is InProgress, so the parent runs once.
+        Assert.False(await loop.TryMarkTimeTickerInProgress(chain.Parent, _clock.NextClaimMarker(), CancellationToken.None));
+    }
+
+    // The same, and the read of the children after the claim fails: the parent is not handed out, its claim is put back,
+    // and the next claim hands it out with all its children.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    public async Task WhenTheReadOfTheChildrenAfterTheClaimFails_TheClaimIsPutBack_AndTheNextClaimHandsOutAllChildren(ClaimPath path)
+    {
+        var chain = await SeedForAsync(ClaimPath.Loop);
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loop = fixture.CreateProvider(NodeA, _clock,
+            PausingDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerKey(chain.Child0), paused, resume.Task));
+        var failing = FailingWhenArmedDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync));
+        var other = fixture.CreateProvider(NodeA, _clock, failing);
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var loopTask = Task.Run(async () =>
+            await Drain(loop.QueueTimeTickers(await loop.GetEarliestTimeTickers(CancellationToken.None), CancellationToken.None)));
+        await paused.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var resumed = false;
+        other.BeforeCompareAndSetHook = async key =>
+        {
+            if (key != parentKey || resumed) return;
+            resumed = true;
+            resume.SetResult();
+            await loopTask.WaitAsync(TimeSpan.FromSeconds(30));
+            ((FailingWhenArmedDatabase)(object)failing).Armed = true;
+        };
+
+        var handedOut = await ClaimAsync(other, path, chain.Parent);
+
+        Assert.True(resumed, "the claim of the parent was not reached");
+        Assert.True(((FailingWhenArmedDatabase)(object)failing).Failed, "the read after the claim did not fail");
+        Assert.Single(await loopTask);
+        Assert.Empty(handedOut);
+        var parent = await StoredAsync(chain.Parent);
+        Assert.Equal(TickerStatus.Idle, (TickerStatus)parent.GetProperty("Status").GetInt32());
+        Assert.Null(Text(parent, "LockHolder"));
+        Assert.True(await IsPendingAsync(chain.Parent));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var again = await ClaimAsync(fixture.CreateProvider(NodeA, _clock), path, chain.Parent);
+        AssertHandedOutAsRows(chain, Assert.Single(again), T0.AddSeconds(30));
+        await AssertStoredAsRowsAsync(chain);
+    }
+
+    // Once armed, the first call of one method throws.
+    public class FailingWhenArmedDatabase : System.Reflection.DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _method = "";
+
+        public bool Armed { get; set; }
+        public bool Failed { get; private set; }
+
+        public static IDatabase Create(IDatabase inner, string method)
+        {
+            var proxy = Create<IDatabase, FailingWhenArmedDatabase>();
+            var failing = (FailingWhenArmedDatabase)(object)proxy;
+            failing._inner = inner;
+            failing._method = method;
+            return proxy;
+        }
+
+        protected override object? Invoke(System.Reflection.MethodInfo? targetMethod, object?[]? args)
+        {
+            if (Armed && !Failed && targetMethod!.Name == _method)
+            {
+                Failed = true;
+                throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
+            }
+
+            try
+            {
+                return targetMethod!.Invoke(_inner, args);
+            }
+            catch (System.Reflection.TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
+    }
+
+    // Stops after the write of one key has landed, until resume completes.
+    public class PausingDatabase : System.Reflection.DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _key = "";
+        private TaskCompletionSource _paused = null!;
+        private Task _resume = null!;
+
+        public static IDatabase Create(IDatabase inner, string key, TaskCompletionSource paused, Task resume)
+        {
+            var proxy = Create<IDatabase, PausingDatabase>();
+            var pausing = (PausingDatabase)(object)proxy;
+            pausing._inner = inner;
+            pausing._key = key;
+            pausing._paused = paused;
+            pausing._resume = resume;
+            return proxy;
+        }
+
+        private async Task<bool> LandThenPause(Task<bool> call)
+        {
+            var result = await call.ConfigureAwait(false);
+            _paused.TrySetResult();
+            await _resume.ConfigureAwait(false);
+            return result;
+        }
+
+        protected override object? Invoke(System.Reflection.MethodInfo? targetMethod, object?[]? args)
+        {
+            try
+            {
+                var result = targetMethod!.Invoke(_inner, args);
+                if (targetMethod.Name == nameof(IDatabase.StringSetAsync) && args is [RedisKey key, ..] && key == _key)
+                    return LandThenPause((Task<bool>)result!);
+                return result;
+            }
+            catch (System.Reflection.TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
+    }
+
+    #endregion
+
     #region A chain that was written as rows only in part
 
     public enum HalfWay
