@@ -23,6 +23,11 @@
     <ProjectReference Include="..\..\src\SharpTicker\SharpTicker.csproj" />
     <ProjectReference Include="..\..\src\SharpTicker.Utilities\SharpTicker.Utilities.csproj" />
     <ProjectReference Include="..\..\src\SharpTicker.MongoDB\SharpTicker.MongoDB.csproj" />
+    <ProjectReference Include="..\..\src\SharpTicker.Dashboard\SharpTicker.Dashboard.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\DashboardStatusCountCheck.cs" Link="Shared\DashboardStatusCountCheck.cs" />
   </ItemGroup>
 
 </Project>

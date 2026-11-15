@@ -9,6 +9,7 @@ using SharpTicker.Utilities;
 using SharpTicker.Utilities.DashboardDtos;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Infrastructure;
 using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Models;
 
@@ -88,31 +89,66 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
         public async Task<IList<Tuple<TickerStatus, int>>> GetTimeTickerFullDataAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var timeTickers = await _persistenceProvider.GetTimeTickers(visibility?.TimeTickers, cancellationToken: cancellationToken);
+            var statusCounts = await CountByStatusAsync(VisibleTimeTickers(visibility), cancellationToken);
 
-            var allStatuses = Enum.GetValues<TickerStatus>();
-
-            // Group by status and get counts
-            var rawData = timeTickers
-                .GroupBy(x => x.Status)
-                .Select(g => new
-                {
-                    Status = g.Key,
-                    Count = g.Count()
-                })
+            // Every status is included, also the ones with a count of 0
+            return Enum.GetValues<TickerStatus>()
+                .Select(status => new Tuple<TickerStatus, int>(status, statusCounts.GetValueOrDefault(status, 0)))
                 .ToList();
+        }
 
-            // Create a dictionary for quick lookup
-            var statusCounts = rawData.ToDictionary(x => x.Status, x => x.Count);
+        /// <summary>
+        /// The time tickers the status counts and the jobs per machine are made of: the top-level ones the user may see, the
+        /// rows GetTimeTickers returns. Their children are not loaded.
+        /// </summary>
+        private ITickerQueryable<TTimeTicker> VisibleTimeTickers(TickerVisibility<TTimeTicker, TCronTicker> visibility)
+        {
+            var query = _persistenceProvider.TimeTickersQuery().AsNoTracking().Where(x => x.ParentId == null);
+            return visibility?.TimeTickers == null ? query : query.Where(visibility.TimeTickers);
+        }
 
-            // Ensure all statuses are included, even those with 0 count
-            var result = allStatuses
-                .Select(status => new Tuple<TickerStatus, int>(
-                    status,
-                    statusCounts.GetValueOrDefault(status, 0)))
-                .ToList();
+        /// <summary>The occurrences of the crons the user may see, without their cron.</summary>
+        private async Task<ITickerQueryable<CronTickerOccurrenceEntity<TCronTicker>>> VisibleOccurrencesAsync(
+            TickerVisibility<TTimeTicker, TCronTicker> visibility, CancellationToken cancellationToken)
+        {
+            var query = _persistenceProvider.CronTickerOccurrencesQuery().AsNoTracking();
+            var ofVisibleCrons = await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken);
+            return ofVisibleCrons == null ? query : query.Where(ofVisibleCrons);
+        }
 
-            return result;
+        private Task<Dictionary<TickerStatus, int>> CountByStatusAsync(ITickerQueryable<TTimeTicker> rows, CancellationToken cancellationToken)
+            => CountByStatusAsync(rows, status => x => x.Status == status, x => x.Status, cancellationToken);
+
+        private Task<Dictionary<TickerStatus, int>> CountByStatusAsync(ITickerQueryable<CronTickerOccurrenceEntity<TCronTicker>> rows, CancellationToken cancellationToken)
+            => CountByStatusAsync(rows, status => x => x.Status == status, x => x.Status, cancellationToken);
+
+        /// <summary>
+        /// The number of rows per status, for the statuses that occur. A store with a query of its own (EF Core, MongoDB, a
+        /// custom provider) counts each status, so no row is read. The in-memory query of the in-memory and Redis stores
+        /// reads every row for each count, so there the rows are read once and counted here, as up to 1.5.2.
+        /// </summary>
+        private static async Task<Dictionary<TickerStatus, int>> CountByStatusAsync<TEntity>(
+            ITickerQueryable<TEntity> rows,
+            Func<TickerStatus, Expression<Func<TEntity, bool>>> hasStatus,
+            Func<TEntity, TickerStatus> statusOf,
+            CancellationToken cancellationToken)
+        {
+            if (rows is InMemoryTickerQueryable<TEntity>)
+            {
+                return (await rows.ToArrayAsync(cancellationToken).ConfigureAwait(false))
+                    .GroupBy(statusOf)
+                    .ToDictionary(g => g.Key, g => g.Count());
+            }
+
+            var counts = new Dictionary<TickerStatus, int>();
+            foreach (var status in Enum.GetValues<TickerStatus>())
+            {
+                var count = await rows.Where(hasStatus(status)).CountAsync(cancellationToken).ConfigureAwait(false);
+                if (count > 0)
+                    counts[status] = count;
+            }
+
+            return counts;
         }
 
         public async Task<IList<TickerGraphData>> GetTimeTickersGraphSpecificDataAsync(
@@ -227,28 +263,12 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
         public async Task<IList<Tuple<TickerStatus, int>>> GetCronTickerFullDataAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
-                await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken), cancellationToken: cancellationToken);
-            var allStatuses = Enum.GetValues<TickerStatus>();
+            var statusCounts = await CountByStatusAsync(await VisibleOccurrencesAsync(visibility, cancellationToken), cancellationToken);
 
-            var rawData = cronTickerOccurrences
-                .GroupBy(x => x.Status)
-                .Select(g => new
-                {
-                    Status = g.Key,
-                    Count = g.Count()
-                })
+            // Every status is included, also the ones with a count of 0
+            return Enum.GetValues<TickerStatus>()
+                .Select(status => new Tuple<TickerStatus, int>(status, statusCounts.GetValueOrDefault(status, 0)))
                 .ToList();
-
-            var statusCounts = rawData.ToDictionary(x => x.Status, x => x.Count);
-
-            var result = allStatuses
-                .Select(status => new Tuple<TickerStatus, int>(
-                    status,
-                    statusCounts.GetValueOrDefault(status, 0)))
-                .ToList();
-
-            return result;
         }
 
         public async Task<IList<TickerGraphData>> GetCronTickersGraphSpecificDataAsync(
@@ -349,56 +369,29 @@ namespace SharpTicker.Dashboard.Infrastructure.Dashboard
 
         public async Task<IList<(TickerStatus, int)>> GetOverallJobStatusesAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            var timeTickers = await _persistenceProvider.GetTimeTickers(visibility?.TimeTickers, cancellationToken);
-            var timeStatusCounts = timeTickers
-                .GroupBy(x => x.Status)
-                .Select(g => new { Status = g.Key, Count = g.Count() })
-                .ToList();
+            var timeStatusCounts = await CountByStatusAsync(VisibleTimeTickers(visibility), cancellationToken);
+            var cronStatusCounts = await CountByStatusAsync(await VisibleOccurrencesAsync(visibility, cancellationToken), cancellationToken);
 
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
-                await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken), cancellationToken);
-            var cronStatusCounts = cronTickerOccurrences
-                .GroupBy(x => x.Status)
-                .Select(g => new { Status = g.Key, Count = g.Count() })
-                .ToList();
-
-            // Combine counts into a Dictionary<TickerStatus, int>
-            var combined = new Dictionary<TickerStatus, int>();
-
-            foreach (var item in timeStatusCounts)
-            {
-                if (combined.ContainsKey(item.Status))
-                    combined[item.Status] += item.Count;
-                else
-                    combined[item.Status] = item.Count;
-            }
-
-            foreach (var item in cronStatusCounts)
-            {
-                if (combined.ContainsKey(item.Status))
-                    combined[item.Status] += item.Count;
-                else
-                    combined[item.Status] = item.Count;
-            }
-
-            // Return as list of tuples
-            return combined
-                .Select(kvp => (kvp.Key, kvp.Value))
+            // Only the statuses that occur, in either table
+            return Enum.GetValues<TickerStatus>()
+                .Select(status => (status, timeStatusCounts.GetValueOrDefault(status, 0) + cronStatusCounts.GetValueOrDefault(status, 0)))
+                .Where(x => x.Item2 > 0)
                 .ToList();
         }
 
         public async Task<IList<(string, int)>> GetMachineJobsAsync(CancellationToken cancellationToken, TickerVisibility<TTimeTicker, TCronTicker> visibility = null)
         {
-            Expression<Func<TTimeTicker, bool>> locked = x => x.LockedAt != null;
-            var timeTickers = await _persistenceProvider.GetTimeTickers(locked.And(visibility?.TimeTickers), cancellationToken);
+            // The locked rows are read, because the query of a store cannot group by the lock holder; their children and
+            // cron are not.
+            var timeTickers = await VisibleTimeTickers(visibility).Where(x => x.LockedAt != null).ToArrayAsync(cancellationToken);
             var timeTickerCounts = timeTickers
                 .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
                 .ToList();
 
-            Expression<Func<CronTickerOccurrenceEntity<TCronTicker>, bool>> occurrenceLocked = x => x.LockedAt != null;
-            var cronTickerOccurrences = await _persistenceProvider.GetAllCronTickerOccurrences(
-                occurrenceLocked.And(await OccurrencesOfVisibleCronsAsync(visibility, cancellationToken)), cancellationToken);
+            var cronTickerOccurrences = await (await VisibleOccurrencesAsync(visibility, cancellationToken))
+                .Where(x => x.LockedAt != null)
+                .ToArrayAsync(cancellationToken);
             var cronTickerCounts = cronTickerOccurrences
                 .GroupBy(x => x.LockHolder ?? UnknownMachine)
                 .Select(g => new { LockHolder = g.Key, Count = g.Count() })
