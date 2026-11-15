@@ -473,11 +473,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     {
         try
         {
-            await WriteNestedChildrenAsRowsAsync(claimed).ConfigureAwait(false);
+            var writtenIds = new List<Guid>();
+            await WriteNestedChildrenAsRowsAsync(claimed, writtenIds).ConfigureAwait(false);
 
             // The parent's row gives up its copy of the children, only while it is still this claim, and keeps its
             // UpdatedAt: that is the claim's marker.
-            var written = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(claimed.Id), row =>
+            var parentKey = TimeTickerKey(claimed.Id);
+            var written = await CompareAndSetAsync<TTimeTicker>(parentKey, row =>
             {
                 if (row == null || row.Status != claimed.Status || row.LockHolder != LockHolder || row.UpdatedAt != claimed.UpdatedAt) return null;
                 row.Children = new List<TTimeTicker>();
@@ -486,6 +488,15 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
             if (written == null)
             {
+                // A delete of the parent while the rows were written removed only the children its children set held then;
+                // the rows written after it would be left without a parent, and wait for good (#153).
+                if (!await Db.KeyExistsAsync(parentKey).ConfigureAwait(false))
+                {
+                    await RemoveWrittenChildrenAsync(claimed.Id, writtenIds).ConfigureAwait(false);
+                    _logger.LogDebug("Chain {Id} is not handed out: it was deleted while its children were written as rows of their own, and those rows were removed.", claimed.Id);
+                    return null;
+                }
+
                 _logger.LogDebug("Chain {Id} is not handed out: its claim was lost while its children were written as rows of their own.", claimed.Id);
                 return null;
             }
@@ -507,13 +518,15 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // Each node below this one, in the order WriteChainAsync uses: the link to its parent, then its own children, then
     // its row. The row is written only when there is none (SET NX): one that exists is the child, whatever the copy inside
     // the parent says, and it may have run. The index entries are added from the row the key holds, and never removed.
-    private async Task WriteNestedChildrenAsRowsAsync(TTimeTicker parent)
+    // writtenIds gets the id of each node below this one, as its link is written.
+    private async Task WriteNestedChildrenAsRowsAsync(TTimeTicker parent, List<Guid> writtenIds)
     {
         var position = 0;
         foreach (var child in (parent.Children ?? []).Where(c => c != null))
         {
+            writtenIds.Add(child.Id);
             await IndexManager.AddTimeTickerChildAsync(parent.Id, child.Id, position++).ConfigureAwait(false);
-            await WriteNestedChildrenAsRowsAsync(child).ConfigureAwait(false);
+            await WriteNestedChildrenAsRowsAsync(child, writtenIds).ConfigureAwait(false);
 
             child.ParentId = parent.Id;
             child.Children = new List<TTimeTicker>();
@@ -526,6 +539,26 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             await IndexManager.AddTimeTickerIndexesAddOnlyAsync(row).ConfigureAwait(false);
             if (RedisIndexManager<TTimeTicker, TCronTicker>.WaitsForItsInlineStart(row))
                 await IndexManager.AddWaitingChildrenAsync([new HashEntry(row.Id.ToString(), row.ParentId.Value.ToString())]).ConfigureAwait(false);
+        }
+    }
+
+    // After the parent was deleted: what the delete removes for each descendant (row, children set, index entries), for
+    // each node whose link this node wrote, and the parent's children set the links wrote again. A failure is logged and
+    // leaves the rows that are not removed yet without a parent: they wait and do not run.
+    private async Task RemoveWrittenChildrenAsync(Guid parentId, List<Guid> writtenIds)
+    {
+        try
+        {
+            foreach (var id in writtenIds)
+            {
+                await IndexManager.RemoveTimeTickerIndexesAsync(id).ConfigureAwait(false);
+                await Db.KeyDeleteAsync(TimeTickerKey(id)).ConfigureAwait(false);
+            }
+            await IndexManager.RemoveTimeTickerIndexesAsync(parentId).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Chain {Id} was deleted while its children were written as rows of their own, and removing those rows failed; they are left without a parent and do not run.", parentId);
         }
     }
 

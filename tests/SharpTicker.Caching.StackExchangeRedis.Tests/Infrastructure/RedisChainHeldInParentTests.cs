@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using NSubstitute;
@@ -629,6 +630,130 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.Equal(afterB, await RawAsync(chain.Parent));
         Assert.Equal(laterHolder, Text(await StoredAsync(chain.Parent), "LockHolder"));
         await AssertStoredAsRowsAsync(chain);
+    }
+
+    #endregion
+
+    #region A parent deleted while its children are written as rows (#153)
+
+    public enum DeletedWhen
+    {
+        // After the first link is written (the parent's link to its first child), before any row of a child.
+        AfterTheFirstLink,
+        // After every row of a child is written, between the read and the set of the write that takes the children out
+        // of the parent's row.
+        BeforeTheParentsRowIsWritten
+    }
+
+    // The parent is deleted while the node that claimed it writes its children as rows. The delete removes what the
+    // parent's children set held at that moment; the rows written after it are removed by the node that wrote them, so
+    // no row, link or index entry of the chain is left, and the parent is not handed out.
+    [Theory]
+    [InlineData(ClaimPath.Fallback, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.RunNow, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.Loop, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.Fallback, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    [InlineData(ClaimPath.RunNow, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    [InlineData(ClaimPath.Loop, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    public async Task AParentDeletedWhileItsChildrenAreWrittenAsRows_LeavesNoRowOfItsChain(ClaimPath path, DeletedWhen when)
+    {
+        var chain = await SeedForAsync(path);
+        var deleted = false;
+        async Task DeleteTheParentAsync()
+        {
+            Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+            deleted = true;
+        }
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var database = when == DeletedWhen.AfterTheFirstLink
+            // The second link is the first child's link to its own child: the first link has landed.
+            ? BeforeLinkDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync)
+            : null;
+        var a = fixture.CreateProvider(NodeA, _clock, database);
+        var writesOfTheParent = 0;
+        if (when == DeletedWhen.BeforeTheParentsRowIsWritten)
+            a.BeforeCompareAndSetHook = async key =>
+            {
+                // The first write of the parent's row is the claim; the one after it takes the children out.
+                if (key == parentKey && ++writesOfTheParent == 2)
+                    await DeleteTheParentAsync();
+            };
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+
+        Assert.True(deleted, "the parent was not deleted during the split");
+        Assert.Empty(handedOut);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // The control: a delete after the claim returned finds every child through the children sets.
+    [Fact]
+    public async Task AParentDeletedAfterItsChildrenWereWrittenAsRows_LeavesNoRowOfItsChain()
+    {
+        var chain = await SeedOverdueAsync();
+        Assert.Single(await ClaimAsync(fixture.CreateProvider(NodeA, _clock), ClaimPath.Fallback, chain.Parent));
+
+        Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    private async Task AssertNothingOfTheChainIsLeftAsync(Chain chain)
+    {
+        var ids = new[] { chain.Parent }.Concat(chain.Descendants).Select(id => id.ToString()).ToArray();
+        Assert.DoesNotContain(Keys(), key => ids.Any(key.Contains));
+        var db = fixture.Database;
+        var indexed = (await db.SetMembersAsync(RedisKeyBuilder.TimeTickerIdsKey)).Select(m => (string)m!)
+            .Concat((await db.SortedSetRangeByRankAsync(RedisKeyBuilder.TimeTickerPendingKey)).Select(m => (string)m!))
+            .Concat((await db.HashGetAllAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey)).SelectMany(e => new[] { (string)e.Name!, (string)e.Value! }))
+            .ToArray();
+        Assert.Empty(indexed.Intersect(ids));
+    }
+
+    // Runs an action once, before the first write of a link into the given children set, and waits for it.
+    public class BeforeLinkDatabase : DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _childrenKey = "";
+        private Func<Task> _before = null!;
+        private int _fired;
+
+        public static IDatabase Create(IDatabase inner, string childrenKey, Func<Task> before)
+        {
+            var proxy = DispatchProxy.Create<IDatabase, BeforeLinkDatabase>();
+            var hooked = (BeforeLinkDatabase)(object)proxy;
+            hooked._inner = inner;
+            hooked._childrenKey = childrenKey;
+            hooked._before = before;
+            return proxy;
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            if (targetMethod!.Name == nameof(IDatabase.SortedSetAddAsync) && targetMethod.ReturnType == typeof(Task<bool>)
+                && args![0] is RedisKey key && key == _childrenKey && Interlocked.Exchange(ref _fired, 1) == 0)
+                return ThenCall(targetMethod, args);
+            return Call(targetMethod, args);
+        }
+
+        private async Task<bool> ThenCall(MethodInfo targetMethod, object?[]? args)
+        {
+            await _before();
+            return await (Task<bool>)Call(targetMethod, args)!;
+        }
+
+        private object? Call(MethodInfo targetMethod, object?[]? args)
+        {
+            try
+            {
+                return targetMethod.Invoke(_inner, args);
+            }
+            catch (TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
     }
 
     #endregion
