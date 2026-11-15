@@ -53,15 +53,24 @@ public static class ServiceBuilder
         builder.ConfigureServices = (services) =>
         {
             services.TryAddSingleton<IDbContextFactory<TContext>>(sp =>
-            {
-                var optionsBuilder = new DbContextOptionsBuilder<TContext>();
-                optionsAction.Invoke(optionsBuilder);
-                optionsBuilder.UseApplicationServiceProvider(sp);
-                return new PooledDbContextFactory<TContext>(optionsBuilder.Options, builder.PoolSize);
-            });
+                new PooledDbContextFactory<TContext>(BuildSharpTickerDbContextOptions<TContext>(optionsAction, sp), builder.PoolSize));
+            // The EF Core tools (dotnet ef) find a context by the non-generic DbContextOptions registered in the
+            // application's services and then create it through the IDbContextFactory above (#89). It goes before the
+            // other registrations: an application context whose constructor takes the non-generic DbContextOptions
+            // is given the last one registered.
+            services.Insert(0, ServiceDescriptor.Singleton<DbContextOptions>(sp => BuildSharpTickerDbContextOptions<TContext>(optionsAction, sp)));
             services.TryAddScoped<TContext>(sp => sp.GetRequiredService<IDbContextFactory<TContext>>().CreateDbContext());
             services.AddSingleton<ITickerPersistenceProvider<TTimeTicker, TCronTicker>, TickerEfCorePersistenceProvider<TContext, TTimeTicker, TCronTicker>>();
         };
+    }
+
+    private static DbContextOptions<TContext> BuildSharpTickerDbContextOptions<TContext>(Action<DbContextOptionsBuilder> optionsAction, IServiceProvider serviceProvider)
+        where TContext : DbContext
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<TContext>();
+        optionsAction.Invoke(optionsBuilder);
+        optionsBuilder.UseApplicationServiceProvider(serviceProvider);
+        return optionsBuilder.Options;
     }
 
 #if NET9_0_OR_GREATER
