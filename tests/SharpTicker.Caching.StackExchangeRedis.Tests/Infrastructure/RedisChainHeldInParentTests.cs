@@ -610,9 +610,11 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
         TimeTickerEntity[]? takenByB = null;
         string? afterB = null;
+        var writesOfTheParent = 0;
         a.BeforeCompareAndSetHook = async key =>
         {
-            if (key != parentKey || takenByB != null) return;
+            // The first write of the parent's row is the claim itself; the one after it takes the children out.
+            if (key != parentKey || ++writesOfTheParent < 2 || takenByB != null) return;
             var held = await aOther.GetTimeTickerById(chain.Parent, CancellationToken.None);
             Assert.True(await aOther.TryReleaseTimeTickerClaim(chain.Parent, held.UpdatedAt, CancellationToken.None));
             takenByB = await b.AcquireImmediateTimeTickersAsync([chain.Parent], CancellationToken.None);

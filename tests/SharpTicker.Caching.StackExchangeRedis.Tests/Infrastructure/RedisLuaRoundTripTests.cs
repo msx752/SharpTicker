@@ -126,35 +126,21 @@ public class RedisLuaRoundTripTests(RedisTestFixture fixture) : IAsyncLifetime
         Assert.Empty(read.RetryIntervals!);
     }
 
-    // The block is copied into every script that re-encodes a row (EVAL cannot share code), and a script that misses
-    // it silently loses jobs. Every embedded script that re-encodes a row must carry the same block, and any new one must
-    // carry it too. A script that only compares and sets the text it is given (CompareAndSet) does not re-encode.
+    // #151: a script that decodes and encodes a row writes its numbers with the 14 digits of the JSON library of Redis and
+    // its empty collections as objects. The store's scripts only compare and set the text they are given; one that
+    // re-encodes a row must not come back.
     [Fact]
-    public void LuaScripts_ShareTheSameEmptyCollectionBlock()
+    public void NoEmbeddedScript_DecodesOrEncodesARow()
     {
         var assembly = typeof(SharpTicker.Caching.StackExchangeRedis.Infrastructure.TickerRedisPersistenceProvider<,>).Assembly;
-        var texts = assembly.GetManifestResourceNames().Where(x => x.EndsWith(".lua", StringComparison.Ordinal))
-            .ToDictionary(name => name, name =>
-            {
-                using var reader = new StreamReader(assembly.GetManifestResourceStream(name)!);
-                return reader.ReadToEnd().Replace("\r\n", "\n");
-            });
-        var names = texts.Where(x => x.Value.Contains("cjson.encode", StringComparison.Ordinal)).Select(x => x.Key).ToArray();
-        Assert.True(names.Length >= 4, "expected Acquire, Release, RecoverDeadNode and MarkInProgress");
+        var scripts = assembly.GetManifestResourceNames().Where(x => x.EndsWith(".lua", StringComparison.Ordinal)).ToArray();
 
-        var blocks = names.ToDictionary(name => name, name =>
+        Assert.NotEmpty(scripts);
+        foreach (var name in scripts)
         {
-            var text = texts[name];
-            var start = text.IndexOf("-- cjson writes an empty array", StringComparison.Ordinal);
-            var endMarker = "'\"RetryIntervals\":[]'))";
-            var end = text.IndexOf(endMarker, StringComparison.Ordinal);
-            return start >= 0 && end > start ? text[start..(end + endMarker.Length)] : "<block missing>";
-        });
-
-        Assert.DoesNotContain("<block missing>", blocks.Values);
-        Assert.Single(blocks.Values.Distinct());
-        Assert.Contains("\"Children\":{}", blocks.Values.First());
-        Assert.Contains("\"RetryIntervals\":{}", blocks.Values.First());
+            using var reader = new StreamReader(assembly.GetManifestResourceStream(name)!);
+            Assert.DoesNotContain("cjson", reader.ReadToEnd(), StringComparison.Ordinal);
+        }
     }
 
     [Fact]

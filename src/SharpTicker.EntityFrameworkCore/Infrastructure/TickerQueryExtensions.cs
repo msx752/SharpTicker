@@ -39,7 +39,8 @@ public static class TickerQueryExtensions
     }
 
     // The gate of a claim by id (ChainRunGate.AllowsRunNow): as WhereChainGateOpen, but an InProgress child without a time
-    // of its own is left out. It starts with its parent and is never handed out on its own.
+    // of its own is left out. It starts with its parent and is not handed out by a claim by id; the fallback takes it once
+    // its parent has ended.
     internal static IQueryable<TTimeTicker> WhereRunNowGateOpen<TTimeTicker>(this IQueryable<TTimeTicker> q) where TTimeTicker : TimeTickerEntity<TTimeTicker>
         => q.WhereChainGateOpen()
             .Where(e => e.ParentId == null || e.ExecutionTime != null || e.RunCondition != RunCondition.InProgress);

@@ -1108,13 +1108,13 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(childStatus, (await ReadTimeTicker(CreateProvider("reader"), childId)).Status);
     }
 
-    // The outcome does not let the child run, or the child was to start with its parent (InProgress) and the parent is
-    // over: it never runs. What it carries follows on a later pass, as for a delayed child.
+    // The outcome does not let the child run: it never runs. What it carries follows on a later pass, as for a delayed
+    // child. A child that was to start with its parent (InProgress) is skipped only when the parent never started.
     [Theory]
     [InlineData(TickerStatus.Failed, RunCondition.OnSuccess)]
     [InlineData(TickerStatus.Skipped, RunCondition.OnAnyCompletedStatus)]
     [InlineData(TickerStatus.Skipped, null)]
-    [InlineData(TickerStatus.Done, RunCondition.InProgress)]
+    [InlineData(TickerStatus.Skipped, RunCondition.InProgress)]
     public async Task TheFallback_SkipsAChildWithoutATime_ThatItsEndedParentDoesNotLetRun(TickerStatus parentStatus, RunCondition? condition)
     {
         var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), condition);
@@ -1126,6 +1126,39 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
         Assert.Equal(ChainRunGate.NotMatchedReason, row.SkippedReason);
         Assert.Equal(T0, row.ExecutedAt);
         Assert.False(await HasWaitingEntry(childId));
+    }
+
+    // #158: a child that was to start with its parent (InProgress) and still waits after the parent ended, because its
+    // start never came or because its run was released with its node, runs as a child with another condition does.
+    [Theory]
+    [InlineData(TickerStatus.Done)]
+    [InlineData(TickerStatus.DueDone)]
+    [InlineData(TickerStatus.Failed)]
+    [InlineData(TickerStatus.Cancelled)]
+    public async Task TheFallback_TakesAnInProgressChildWithoutATime_WhoseParentStartedAndEnded(TickerStatus parentStatus)
+    {
+        var childId = await SeedLeftWaiting(parentStatus, T0.AddSeconds(-30), RunCondition.InProgress);
+
+        Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
+        Assert.Empty(await Fallback("node-B"));
+    }
+
+    // #158 as it happens: node X starts the child with its parent, X stops, another node releases X's rows; the child's
+    // interrupted run is taken by the fallback once its parent has ended, not recorded Skipped.
+    [Fact]
+    public async Task AnInProgressChildWithoutATime_WhoseRunWasReleasedWithItsNode_IsTakenByTheFallback()
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddMinutes(-1), RunCondition.InProgress);
+        Assert.Equal(1, await ((IFencedRunWriter)CreateProvider("node-X")).StartInlineChildAsync(childId, T0.AddMilliseconds(500), CancellationToken.None));
+        Assert.Empty(await Fallback());
+
+        await CreateProvider("node-B").ReleaseDeadNodeTimeTickerResources("node-X", CancellationToken.None);
+        Assert.Equal(TickerStatus.Idle, (await ReadTimeTicker(CreateProvider("reader"), childId)).Status);
+
+        Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
+        var row = await ReadTimeTicker(CreateProvider("reader"), childId);
+        Assert.Equal(TickerStatus.InProgress, row.Status);
+        Assert.Equal("node-A", row.LockHolder);
     }
 
     [Fact]

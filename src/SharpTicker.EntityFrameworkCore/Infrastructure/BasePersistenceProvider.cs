@@ -238,7 +238,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Select(x => new { x.Id, x.RunCondition, ParentStatus = x.Parent.Status })
             .ToListAsync(cancellationToken).ConfigureAwait(false);
 
-        var neverRuns = leftWaiting.Where(x => !ChainRunGate.AllowsRunNow(x.RunCondition, x.ParentStatus, hasOwnTime: false)).Select(x => x.Id).ToList();
+        var neverRuns = leftWaiting.Where(x => !ChainRunGate.FallbackRunsChildWithoutTime(x.RunCondition, x.ParentStatus)).Select(x => x.Id).ToList();
         if (neverRuns.Count > 0)
         {
             try

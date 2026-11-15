@@ -175,6 +175,7 @@ namespace SharpTicker.Utilities.Managers
             entity.ExecutionTime = entity.ExecutionTime == null
                 ? _clock.UtcNow
                 : ConvertToUtcIfNeeded(entity.ExecutionTime.Value);
+            ConvertChildTimesToUtcIfNeeded(entity);
 
             entity.CreatedAt = _clock.UtcNow;
             entity.UpdatedAt = _clock.UtcNow;
@@ -234,7 +235,7 @@ namespace SharpTicker.Utilities.Managers
 
             if (CronScheduleCache.GetNextOccurrenceOrDefault(entity.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
-                    new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
+                    new TickerValidatorException($"Cannot parse expression {entity.Expression}, or it matches no date"));
 
             if (CronRangeCheck.HasBackwardsRange(entity.Expression))
                 return new TickerResult<TCronTicker>(
@@ -311,7 +312,7 @@ namespace SharpTicker.Utilities.Managers
 
             if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 return new TickerResult<TCronTicker>(
-                    new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}, or it matches no date"));
 
             if (CronRangeCheck.HasBackwardsRange(cronTicker.Expression))
                 return new TickerResult<TCronTicker>(
@@ -395,6 +396,24 @@ namespace SharpTicker.Utilities.Managers
             };
         }
 
+        // The times of delayed children and grandchildren are read the same way as the root's (#81).
+        private static void ConvertChildTimesToUtcIfNeeded(TTimeTicker parent)
+        {
+            if (parent.Children == null)
+                return;
+
+            foreach (var child in parent.Children)
+            {
+                if (child == null)
+                    continue;
+
+                if (child.ExecutionTime.HasValue)
+                    child.ExecutionTime = ConvertToUtcIfNeeded(child.ExecutionTime.Value);
+
+                ConvertChildTimesToUtcIfNeeded(child);
+            }
+        }
+
 
         private async Task<TickerResult<List<TTimeTicker>>> AddTimeTickersBatchAsync(List<TTimeTicker> entities, CancellationToken cancellationToken = default)
         {
@@ -419,6 +438,7 @@ namespace SharpTicker.Utilities.Managers
 
                 entity.ExecutionTime ??= now;
                 entity.ExecutionTime = ConvertToUtcIfNeeded(entity.ExecutionTime.Value);
+                ConvertChildTimesToUtcIfNeeded(entity);
 
                 // Align with single AddTimeTickerAsync: initialize timestamps
                 entity.CreatedAt = now;
@@ -489,7 +509,7 @@ namespace SharpTicker.Utilities.Managers
 
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(entity.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
-                    errors.Add(new TickerValidatorException($"Cannot parse expression {entity.Expression}"));
+                    errors.Add(new TickerValidatorException($"Cannot parse expression {entity.Expression}, or it matches no date"));
                     continue;
                 }
 
@@ -623,7 +643,7 @@ namespace SharpTicker.Utilities.Managers
 
                 if (CronScheduleCache.GetNextOccurrenceOrDefault(cronTicker.Expression, _clock.UtcNow) is not { } nextOccurrence)
                 {
-                    errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}"));
+                    errors.Add(new TickerValidatorException($"Cannot parse expression {cronTicker.Expression}, or it matches no date"));
                     continue;
                 }
 

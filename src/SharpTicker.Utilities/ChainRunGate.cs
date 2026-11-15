@@ -50,11 +50,21 @@ namespace SharpTicker.Utilities
         /// Whether a claim by id (run-now) may hand out a chain child. A delayed child (<paramref name="hasOwnTime"/>) follows
         /// <see cref="Allows"/>. A child without a time of its own normally runs inside its parent's run, so it is handed
         /// out only once its parent has ended with an outcome it runs on: that is how it follows a parent outcome that was
-        /// stored late. An <see cref="RunCondition.InProgress"/> child without a time starts with its parent and is never
-        /// handed out on its own.
+        /// stored late. An <see cref="RunCondition.InProgress"/> child without a time starts with its parent and is not
+        /// handed out by a claim by id; the fallback takes it once its parent has ended (<see cref="FallbackRunsChildWithoutTime"/>).
         /// </summary>
         internal static bool AllowsRunNow(RunCondition? condition, TickerStatus parentStatus, bool hasOwnTime)
             => Allows(condition, parentStatus) && (hasOwnTime || condition != RunCondition.InProgress);
+
+        /// <summary>
+        /// Whether the fallback claims a child without a time of its own that still waits after its parent ended
+        /// (<see cref="FallbackMayDecideChildWithoutTime"/>), or skips it. It follows <see cref="Allows"/>: an
+        /// <see cref="RunCondition.InProgress"/> child runs once its parent has started, so its parent's final outcome lets it
+        /// run unless the parent was skipped. Its start never came, or its run was released with its node (#158); the row
+        /// does not tell the two apart.
+        /// </summary>
+        internal static bool FallbackRunsChildWithoutTime(RunCondition? condition, TickerStatus parentStatus)
+            => Allows(condition, parentStatus);
 
         /// <summary>
         /// How long a parent must have ended before the fallback takes a child without a time of its own that is still
@@ -66,7 +76,7 @@ namespace SharpTicker.Utilities
         /// <summary>
         /// Whether the fallback may look at a waiting child without a time of its own: its parent has a final status and
         /// ended at least <see cref="FallbackGraceForChildWithoutTime"/> ago. A final parent without an end time counts as
-        /// ended long ago. The child is then claimed when <see cref="AllowsRunNow"/> lets it run, and skipped otherwise.
+        /// ended long ago. The child is then claimed when <see cref="FallbackRunsChildWithoutTime"/> lets it run, and skipped otherwise.
         /// </summary>
         internal static bool FallbackMayDecideChildWithoutTime(TickerStatus parentStatus, DateTime? parentEndedAt, DateTime now)
             => IsFinal(parentStatus) && (parentEndedAt == null || parentEndedAt <= now - FallbackGraceForChildWithoutTime);

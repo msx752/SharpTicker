@@ -62,6 +62,11 @@ public class ConfigurationCronEndToEndTests : IAsyncLifetime
             await _app.DisposeAsync();
         }
         await ClearStoreAsync();
+
+        // The function registry is shared by the process: a later host without this configuration would seed the
+        // placeholder, which has no next occurrence.
+        TickerFunctionProvider.Configure(Function, cronExpression: string.Empty);
+        TickerFunctionProvider.Build();
     }
 
     private static async Task ClearStoreAsync()

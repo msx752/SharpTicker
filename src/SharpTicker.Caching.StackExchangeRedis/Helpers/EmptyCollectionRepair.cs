@@ -5,9 +5,9 @@ using System.Text.Json.Serialization.Metadata;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Helpers;
 
-// The Lua scripts rewrite a row through cjson, which writes an empty array as {}. Since 1.3.0 the scripts turn the two
-// collections they know (Children, RetryIntervals) back into []; a row written before that, or an empty collection of an
-// application's own ticker type, still holds {} and does not deserialize.
+// Up to 1.5.1 the Lua scripts rewrote a row through cjson, which writes an empty array as {}. From 1.3.0 the scripts turned
+// the two collections they knew (Children, RetryIntervals) back into []; a row written before that, or an empty collection
+// of an application's own ticker type, still holds {} until its next write and does not deserialize.
 // Used only after a row failed to deserialize. The serializer says where it failed (JsonException.Path); when the value
 // there is an empty object, it is read as an empty array and the row is tried again, once for each such place. Anything
 // else is left as it is: the row is not readable for another reason, and the caller reports the first failure.
