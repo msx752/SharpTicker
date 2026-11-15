@@ -43,6 +43,7 @@ This page points to those notes and names what needs a decision or a step from y
   - Upgrade all instances together, and set the same lease on all of them, or turn it off on all of them. An instance of an earlier version, or one with the lease off, does not renew its locks, so an instance with the lease on releases the jobs it runs for longer than the lease, and they run twice. With different values, the shorter lease releases the jobs of the others earlier than their lease expects.
   - A row with no `LockedAt` or no lock holder is not released by the lease.
   - For a job that is `InProgress`, `LockedAt` and the dashboard's "Locked At" now show when the lock was last renewed.
+- With the EF Core store and `UseSharpTickerDbContext`, from the version after 1.5.2 ([#89](https://github.com/msx752/SharpTicker/issues/89)): the EF Core tools find `SharpTickerDbContext` in the application's services, so `dotnet ef migrations add` works in a project that has no migrations for it yet. In a project that also registers a context of its own (`AddDbContext<AppDbContext>`) and has no migrations for `SharpTickerDbContext`, the tools picked the application's context up to 1.5.2 when no `--context` was given; now they find both and stop with `More than one DbContext was found`. Scripts that run `dotnet ef database update`, `dotnet ef migrations script` or `dotnet ef migrations bundle` without `--context` in such a project need `--context AppDbContext` after the upgrade.
 
 ## Release by release
 

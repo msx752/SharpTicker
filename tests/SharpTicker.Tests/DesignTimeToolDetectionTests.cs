@@ -50,13 +50,14 @@ public class DesignTimeToolDetectionTests
     [Fact]
     public void UseSharpTicker_Does_Not_Perform_IO()
     {
-        // UseSharpTicker should complete without touching the database or building functions.
+        // UseSharpTicker should complete without touching the database. It builds the function registry (#75), which is
+        // in-memory work only.
         var services = new ServiceCollection();
         services.AddSharpTicker();
 
         var host = BuildMinimalHost(services);
 
-        // This should not throw — no DB access, no function scanning
+        // This should not throw — no DB access
         var result = host.UseSharpTicker();
         Assert.Same(host, result);
     }
