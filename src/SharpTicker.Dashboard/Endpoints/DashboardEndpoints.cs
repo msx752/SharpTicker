@@ -1138,8 +1138,11 @@ public static class DashboardEndpoints
         {
             try
             {
-                foreach (var holder in response.Where(x => x.Item1 != Infrastructure.Dashboard.TickerDashboardRepository<TTimeTicker, TCronTicker>.UnknownMachine))
-                    holder.HasHeartbeat = await heartbeats.HasHeartbeatAsync(holder.Item1);
+                // Started together: one after another, a few hundred names add up to seconds per load.
+                var holders = response.Where(x => x.Item1 != Infrastructure.Dashboard.TickerDashboardRepository<TTimeTicker, TCronTicker>.UnknownMachine).ToArray();
+                var found = await Task.WhenAll(holders.Select(x => heartbeats.HasHeartbeatAsync(x.Item1, cancellationToken)));
+                for (var i = 0; i < holders.Length; i++)
+                    holders[i].HasHeartbeat = found[i];
             }
             catch (Exception ex)
             {

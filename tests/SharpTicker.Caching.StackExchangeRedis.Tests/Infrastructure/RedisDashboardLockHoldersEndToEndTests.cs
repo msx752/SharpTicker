@@ -151,6 +151,15 @@ public class RedisDashboardLockHoldersEndToEndTests(RedisTestFixture fixture) : 
         Assert.Equal(minuteAgo, ParseUtc(jobs[0].GetProperty("lastLockedAt").GetString()!));
         Assert.Equal(monthAgo, ParseUtc(jobs[1].GetProperty("lastLockedAt").GetString()!));
 
+        // What the dashboard page says about an instance that serves only the dashboard: with the background services
+        // off it still writes its heartbeat.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (string.IsNullOrEmpty(await cache.GetStringAsync($"hb:{Node}")))
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"hb:{Node} was not written within 30 s");
+            await Task.Delay(100);
+        }
+
         var problems = _log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToArray();
         Assert.True(problems.Length == 0, string.Join(Environment.NewLine, problems));
     }

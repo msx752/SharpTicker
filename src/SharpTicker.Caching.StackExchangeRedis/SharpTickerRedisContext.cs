@@ -75,7 +75,8 @@ internal class SharpTickerRedisContext : ISharpTickerRedisContext, INodeHeartbea
     public async Task<bool> IsNodeAliveAsync(string node)
         => !string.IsNullOrEmpty(await _cache.GetStringAsync($"hb:{node}"));
 
-    public async Task<bool?> HasHeartbeatAsync(string node) => await IsNodeAliveAsync(node);
+    public async Task<bool?> HasHeartbeatAsync(string node, CancellationToken cancellationToken = default)
+        => !string.IsNullOrEmpty(await _cache.GetStringAsync($"hb:{node}", cancellationToken));
 
     public Task RemoveNodeFromRegistryAsync(string node)
         => RemoveNodesFromRegistryAsync([node]);

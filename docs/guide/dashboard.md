@@ -113,7 +113,7 @@ Every instance that shares the store can serve the dashboard. It reads from the 
 
 The **Lock holders** panel (called Machines up to 1.5.2) lists the node identifiers that locked the jobs in the store, each with the number of those jobs and how long ago it last locked one, latest first. A job keeps the name after it ended, so the name of a node that stopped or was replaced stays in the list as long as its jobs are stored. The one marked Current is the node that serves the dashboard.
 
-- With Redis, each name also shows whether that node has a heartbeat: `heartbeat` when it wrote one within the heartbeat TTL (`NodeHeartbeatInterval` plus 20 seconds), `no heartbeat` otherwise.
+- With Redis, each name also shows whether that node has a heartbeat: `heartbeat` when it wrote one within the heartbeat TTL (`NodeHeartbeatInterval` plus 20 seconds), `no heartbeat` otherwise. An instance with the background services off (`DisableBackgroundServices`), one that serves only the dashboard for example, writes its heartbeat too, so `heartbeat` says that the instance runs, not that it runs jobs.
 - The EF Core, MongoDB and in-memory stores keep no record of which nodes run, so there the panel shows the names and their latest lock only. With the EF Core lease on, a node renews the lock of the jobs it runs, so a name that runs a long job keeps a recent latest lock.
 
 Up to 1.5.2 the panel was ordered by the number of jobs and showed neither the latest lock nor the heartbeat. A stable `NodeIdentifier` keeps the list short; see [Operations](operations.md#scheduler-options).

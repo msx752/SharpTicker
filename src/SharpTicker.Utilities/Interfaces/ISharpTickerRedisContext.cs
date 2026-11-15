@@ -14,7 +14,7 @@ internal interface ISharpTickerRedisContext
     /// Whether the node has a heartbeat entry now, that is, it wrote one within the heartbeat TTL. Null when there is no
     /// heartbeat to look at (no Redis).
     /// </summary>
-    Task<bool?> HasHeartbeatAsync(string node);
+    Task<bool?> HasHeartbeatAsync(string node, CancellationToken cancellationToken = default);
     Task<TResult[]> GetOrSetArrayAsync<TResult>(
         string cacheKey,
         Func<CancellationToken, Task<TResult[]>> factory,
