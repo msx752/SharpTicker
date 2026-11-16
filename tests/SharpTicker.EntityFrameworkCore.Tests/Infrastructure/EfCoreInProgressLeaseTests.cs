@@ -8,12 +8,13 @@ using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
+using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Tests.Infrastructure;
 
 /// <summary>
 /// The lease on InProgress rows (#24), on the store: the node that holds a row renews its <c>LockedAt</c>, and a node
-/// releases the rows of other node identifiers whose <c>LockedAt</c> is older than the lease. Provider instances with
+/// records the rows of other node identifiers whose <c>LockedAt</c> is older than the lease as Cancelled (#211). Provider instances with
 /// their own node identifier over one store and a fake clock; the same bodies run on SQLite and on a real PostgreSQL.
 /// </summary>
 public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
@@ -80,82 +81,93 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         return await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().SingleAsync(x => x.Id == id);
     }
 
-    private static void AssertReleased(TickerStatus status, string? lockHolder, DateTime? lockedAt, DateTime updatedAt)
+    private const string LeaseEndedReason = "The lock of the instance that ran the job was not renewed for the lease.";
+
+    // What a graceful stop stores for a job it records as Cancelled, with the time of the pass: Cancelled, ExecutedAt and
+    // UpdatedAt now, the reason in ExceptionMessage, no lock. Nothing else of the row changes.
+    private static void AssertCancelled(TickerStatus status, DateTime? executedAt, string? exceptionMessage, string? skippedReason, long elapsedTime,
+        string? lockHolder, DateTime? lockedAt, DateTime updatedAt)
     {
-        Assert.Equal(TickerStatus.Idle, status);
+        Assert.Equal(TickerStatus.Cancelled, status);
+        Assert.Equal(T0, executedAt);
+        Assert.Equal(LeaseEndedReason, exceptionMessage);
+        Assert.Null(skippedReason);
+        Assert.Equal(0, elapsedTime);
         Assert.Null(lockHolder);
         Assert.Null(lockedAt);
         Assert.Equal(T0, updatedAt);
     }
 
-    #region Release of other nodes' rows (T1, T4)
+    #region Cancel of other nodes' rows (T1, T4)
 
-    // T1: a row of another node whose lock is older than the lease is released with the dead-node write; one whose lock
-    // is younger stays.
+    // T1: a row of another node whose lock is older than the lease is recorded as Cancelled (#211; up to 1.6.1 it was
+    // released to Idle and ran again); one whose lock is younger stays.
     [Fact]
-    public async Task Release_TimeJobOfAnotherNodeLockedLongerThanTheLease_IsReleased_AndAYoungerOneStays()
+    public async Task Cancel_TimeJobOfAnotherNodeLockedLongerThanTheLease_IsRecordedCancelled_AndAYoungerOneStays()
     {
         var expired = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", T0 - Lease - TimeSpan.FromSeconds(1));
         var young = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", T0 - Lease + TimeSpan.FromSeconds(10));
 
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
-        var released = await TimeTickerAsync(expired);
-        AssertReleased(released.Status, released.LockHolder, released.LockedAt, released.UpdatedAt);
+        var cancelled = await TimeTickerAsync(expired);
+        AssertCancelled(cancelled.Status, cancelled.ExecutedAt, cancelled.ExceptionMessage, cancelled.SkippedReason, cancelled.ElapsedTime,
+            cancelled.LockHolder, cancelled.LockedAt, cancelled.UpdatedAt);
         var kept = await TimeTickerAsync(young);
         Assert.Equal(TickerStatus.InProgress, kept.Status);
         Assert.Equal("pod-a", kept.LockHolder);
         Assert.Equal(T0 - Lease + TimeSpan.FromSeconds(10), kept.LockedAt);
-        Assert.Equal(1, result.Released);
+        Assert.Equal(1, result.Cancelled);
         Assert.Equal(("pod-a", 1), Assert.Single(result.Nodes));
     }
 
     [Fact]
-    public async Task Release_OccurrenceOfAnotherNodeLockedLongerThanTheLease_IsReleased_AndAYoungerOneStays()
+    public async Task Cancel_OccurrenceOfAnotherNodeLockedLongerThanTheLease_IsRecordedCancelled_AndAYoungerOneStays()
     {
         var expired = await SeedOccurrenceAsync(TickerStatus.InProgress, "pod-a", T0 - Lease - TimeSpan.FromSeconds(1));
         var young = await SeedOccurrenceAsync(TickerStatus.InProgress, "pod-a", T0 - Lease + TimeSpan.FromSeconds(10));
 
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
-        var released = await OccurrenceAsync(expired);
-        AssertReleased(released.Status, released.LockHolder, released.LockedAt, released.UpdatedAt);
+        var cancelled = await OccurrenceAsync(expired);
+        AssertCancelled(cancelled.Status, cancelled.ExecutedAt, cancelled.ExceptionMessage, cancelled.SkippedReason, cancelled.ElapsedTime,
+            cancelled.LockHolder, cancelled.LockedAt, cancelled.UpdatedAt);
         var kept = await OccurrenceAsync(young);
         Assert.Equal(TickerStatus.InProgress, kept.Status);
         Assert.Equal("pod-a", kept.LockHolder);
-        Assert.Equal(1, result.Released);
+        Assert.Equal(1, result.Cancelled);
         Assert.Equal(("pod-a", 1), Assert.Single(result.Nodes));
     }
 
     // Only InProgress rows: a row of another node that is Queued, or that ended and kept its lock holder, is not changed.
     [Fact]
-    public async Task Release_RowsOfAnotherNodeThatAreNotInProgress_AreNotTouched()
+    public async Task Cancel_RowsOfAnotherNodeThatAreNotInProgress_AreNotTouched()
     {
         var old = T0 - Lease - TimeSpan.FromHours(1);
         var queued = await SeedTimeTickerAsync(TickerStatus.Queued, "pod-a", old);
         var done = await SeedTimeTickerAsync(TickerStatus.Done, "pod-a", old);
         var doneOccurrence = await SeedOccurrenceAsync(TickerStatus.Done, "pod-a", old);
 
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
         Assert.Equal(TickerStatus.Queued, (await TimeTickerAsync(queued)).Status);
         Assert.Equal("pod-a", (await TimeTickerAsync(queued)).LockHolder);
         Assert.Equal(TickerStatus.Done, (await TimeTickerAsync(done)).Status);
         Assert.Equal(T0.AddHours(-1), (await TimeTickerAsync(done)).UpdatedAt);
         Assert.Equal(TickerStatus.Done, (await OccurrenceAsync(doneOccurrence)).Status);
-        Assert.Equal(0, result.Released);
+        Assert.Equal(0, result.Cancelled);
         Assert.Empty(result.Nodes);
     }
 
-    // T4: the release pass of a node leaves the rows of that node alone, however old their lock is.
+    // T4: the pass of a node leaves the rows of that node alone, however old their lock is.
     [Fact]
-    public async Task Release_OwnRowsWithAnOldLock_AreNotTouched()
+    public async Task Cancel_OwnRowsWithAnOldLock_AreNotTouched()
     {
         var old = T0 - Lease - TimeSpan.FromHours(1);
         var own = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-b", old);
         var ownOccurrence = await SeedOccurrenceAsync(TickerStatus.InProgress, "pod-b", old);
 
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
         var row = await TimeTickerAsync(own);
         Assert.Equal(TickerStatus.InProgress, row.Status);
@@ -164,22 +176,57 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         var occurrence = await OccurrenceAsync(ownOccurrence);
         Assert.Equal(TickerStatus.InProgress, occurrence.Status);
         Assert.Equal("pod-b", occurrence.LockHolder);
-        Assert.Equal(0, result.Released);
+        Assert.Equal(0, result.Cancelled);
     }
 
-    // Two nodes run the pass on the same rows: the second finds nothing left.
+    // Two nodes run the pass on the same rows: the second finds nothing left, and the row keeps the first one's write.
     [Fact]
-    public async Task Release_RunByTwoNodes_ReleasesEachRowOnce()
+    public async Task Cancel_RunByTwoNodes_CancelsEachRowOnce()
     {
         var expired = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", T0 - Lease - TimeSpan.FromMinutes(1));
 
-        var first = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var first = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
         _clock.Advance(TimeSpan.FromSeconds(1));
-        var second = await Node("pod-c").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var second = await Node("pod-c").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
-        Assert.Equal(1, first.Released);
-        Assert.Equal(0, second.Released);
-        Assert.Equal(T0, (await TimeTickerAsync(expired)).UpdatedAt);
+        Assert.Equal(1, first.Cancelled);
+        Assert.Equal(0, second.Cancelled);
+        var row = await TimeTickerAsync(expired);
+        Assert.Equal(TickerStatus.Cancelled, row.Status);
+        Assert.Equal(T0, row.ExecutedAt);
+        Assert.Equal(T0, row.UpdatedAt);
+    }
+
+    // The run that still goes on at pod-a after its rows were cancelled: its fenced outcome write, with the claim marker of
+    // that run, matches no row (the lock and the marker are gone), so the rows keep the cancel. This pins the fencing the
+    // cancel relies on; it is not new behaviour of #211.
+    [Fact]
+    public async Task Cancel_TheLateFencedOutcomeOfTheRunThatHeldTheRows_WritesNothing()
+    {
+        var marker = T0.AddMinutes(-20).AddMilliseconds(-3);
+        var lockedAt = T0 - Lease - TimeSpan.FromMinutes(1);
+        var timeJob = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", lockedAt, marker);
+        var occurrence = await SeedOccurrenceAsync(TickerStatus.InProgress, "pod-a", lockedAt, marker);
+
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
+        _clock.Advance(TimeSpan.FromSeconds(1));
+
+        IFencedRunWriter podA = CreateProvider("pod-a", _clock);
+        InternalFunctionContext Outcome(Guid id, TickerType type) => new InternalFunctionContext { TickerId = id, Type = type, RunMarker = marker }
+            .SetProperty(x => x.Status, TickerStatus.Done)
+            .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
+            .SetProperty(x => x.ElapsedTime, 1234L)
+            .SetProperty(x => x.ReleaseLock, true);
+        var timeJobWritten = await podA.UpdateTimeTickerFencedAsync(Outcome(timeJob, TickerType.TimeTicker), marker, onlyWhileRunning: false);
+        var occurrenceWritten = await podA.UpdateCronOccurrenceFencedAsync(Outcome(occurrence, TickerType.CronTickerOccurrence), marker, onlyWhileRunning: false);
+
+        Assert.Equal(2, result.Cancelled);
+        Assert.Equal(0, timeJobWritten);
+        Assert.Equal(0, occurrenceWritten);
+        var row = await TimeTickerAsync(timeJob);
+        AssertCancelled(row.Status, row.ExecutedAt, row.ExceptionMessage, row.SkippedReason, row.ElapsedTime, row.LockHolder, row.LockedAt, row.UpdatedAt);
+        var cronRow = await OccurrenceAsync(occurrence);
+        AssertCancelled(cronRow.Status, cronRow.ExecutedAt, cronRow.ExceptionMessage, cronRow.SkippedReason, cronRow.ElapsedTime, cronRow.LockHolder, cronRow.LockedAt, cronRow.UpdatedAt);
     }
 
     #endregion
@@ -187,9 +234,9 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
     #region Renewal (T3, T5)
 
     // A running job of this run: renewal moves LockedAt to now and leaves UpdatedAt (the claim marker) as it is. So the
-    // release pass of another node one lease after the claim does not take it.
+    // pass of another node one lease after the claim does not cancel it.
     [Fact]
-    public async Task Renew_OwnTimeJobOfThisRun_MovesLockedAt_KeepsUpdatedAt_AndAnotherNodeDoesNotReleaseIt()
+    public async Task Renew_OwnTimeJobOfThisRun_MovesLockedAt_KeepsUpdatedAt_AndAnotherNodeDoesNotCancelIt()
     {
         var runStartedAt = T0.AddMinutes(-10);
         var marker = T0.AddMilliseconds(-3);
@@ -197,7 +244,7 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
 
         var renewed = await Node("pod-a").RenewInProgressLeaseAsync(runStartedAt);
         _clock.Advance(Lease - TimeSpan.FromSeconds(1));
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
         var row = await TimeTickerAsync(id);
         Assert.Equal(1, renewed);
@@ -205,11 +252,11 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         Assert.Equal("pod-a", row.LockHolder);
         Assert.Equal(T0, row.LockedAt);
         Assert.Equal(marker, row.UpdatedAt);
-        Assert.Equal(0, result.Released);
+        Assert.Equal(0, result.Cancelled);
     }
 
     [Fact]
-    public async Task Renew_OwnOccurrenceOfThisRun_MovesLockedAt_KeepsUpdatedAt_AndAnotherNodeDoesNotReleaseIt()
+    public async Task Renew_OwnOccurrenceOfThisRun_MovesLockedAt_KeepsUpdatedAt_AndAnotherNodeDoesNotCancelIt()
     {
         var runStartedAt = T0.AddMinutes(-10);
         var marker = T0.AddMilliseconds(-3);
@@ -217,7 +264,7 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
 
         var renewed = await Node("pod-a").RenewInProgressLeaseAsync(runStartedAt);
         _clock.Advance(Lease - TimeSpan.FromSeconds(1));
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
         var row = await OccurrenceAsync(id);
         Assert.Equal(1, renewed);
@@ -225,20 +272,20 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         Assert.Equal("pod-a", row.LockHolder);
         Assert.Equal(T0, row.LockedAt);
         Assert.Equal(marker, row.UpdatedAt);
-        Assert.Equal(0, result.Released);
+        Assert.Equal(0, result.Cancelled);
     }
 
-    // The same row without the renewal: the other node releases it. The control for the two tests above.
+    // The same row without the renewal: the other node records it as Cancelled. The control for the two tests above.
     [Fact]
-    public async Task WithoutRenewal_OwnRowOfThisRun_IsReleasedByAnotherNodeAfterTheLease()
+    public async Task WithoutRenewal_OwnRowOfThisRun_IsRecordedCancelledByAnotherNodeAfterTheLease()
     {
         var id = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", T0.AddMinutes(-4));
 
         _clock.Advance(Lease - TimeSpan.FromSeconds(1));
-        var result = await Node("pod-b").ReleaseExpiredInProgressOfOtherNodesAsync(Lease);
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
 
-        Assert.Equal(1, result.Released);
-        Assert.Equal(TickerStatus.Idle, (await TimeTickerAsync(id)).Status);
+        Assert.Equal(1, result.Cancelled);
+        Assert.Equal(TickerStatus.Cancelled, (await TimeTickerAsync(id)).Status);
     }
 
     // T3: a row an earlier run of this node left (locked before this run started) is not renewed, so the startup release,
@@ -265,7 +312,7 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Idle, (await OccurrenceAsync(occurrence)).Status);
     }
 
-    // T5: renewal does not take back a row that another node released or claimed since, and renews no row of another
+    // T5: renewal does not take back a row that another node released, cancelled or claimed since, and renews no row of another
     // node.
     [Fact]
     public async Task Renew_LeavesRowsThatAnotherNodeReleasedOrHolds_AsTheyAre()

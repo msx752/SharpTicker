@@ -47,8 +47,8 @@ public class InProgressLeaseStopTests
     {
         { "renew", new ObjectDisposedException("DbContextPool") },
         { "renew", new InvalidOperationException("the command was cancelled") },
-        { "release", new ObjectDisposedException("DbContextPool") },
-        { "release", new InvalidOperationException("the command was cancelled") }
+        { "cancel", new ObjectDisposedException("DbContextPool") },
+        { "cancel", new InvalidOperationException("the command was cancelled") }
     };
 
     [Theory]
@@ -73,7 +73,7 @@ public class InProgressLeaseStopTests
         else
         {
             lease.RenewInProgressLeaseAsync(Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(1);
-            lease.ReleaseExpiredInProgressOfOtherNodesAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            lease.CancelExpiredInProgressOfOtherNodesAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
                 .Returns(_ => FailOnceTheStopBegan<(int, IReadOnlyList<(string, int)>)>());
         }
 

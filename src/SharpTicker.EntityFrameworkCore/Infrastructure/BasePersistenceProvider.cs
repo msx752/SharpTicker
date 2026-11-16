@@ -514,9 +514,14 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         return timeTickers + occurrences;
     }
 
-    // The write of the running branch of ReleaseDeadNode*ResourcesCore, for every other node at once. The names are read
-    // first for the log only; a row that changes in between is counted by the write, not by the names.
-    public async Task<(int Released, IReadOnlyList<(string NodeIdentifier, int Jobs)> Nodes)> ReleaseExpiredInProgressOfOtherNodesAsync(TimeSpan lease, CancellationToken cancellationToken = default)
+    internal const string LeaseEndedReason = "The lock of the instance that ran the job was not renewed for the lease.";
+
+    // What a graceful stop stores for a run it records as Cancelled (Cancelled, ExecutedAt, the reason in ExceptionMessage,
+    // no lock), for every other node at once (#211). The row does not run again: a Cancelled row is not claimed, and the
+    // chain children waiting for it follow their run condition. The late outcome of a run that still goes on does not land,
+    // as its fenced write needs the lock. The names are read first for the log only; a row that changes in between is
+    // counted by the write, not by the names.
+    public async Task<(int Cancelled, IReadOnlyList<(string NodeIdentifier, int Jobs)> Nodes)> CancelExpiredInProgressOfOtherNodesAsync(TimeSpan lease, CancellationToken cancellationToken = default)
     {
         var now = _clock.UtcNow;
         var lockedBefore = now - lease;
@@ -538,19 +543,23 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         if (timeTickerNodes.Count == 0 && occurrenceNodes.Count == 0)
             return (0, []);
 
-        var released = await timeTickers
+        var cancelled = await timeTickers
             .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Cancelled)
+                .SetProperty(x => x.ExecutedAt, now)
+                .SetProperty(x => x.ExceptionMessage, LeaseEndedReason)
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
-                .SetProperty(x => x.Status, TickerStatus.Idle)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
 
-        released += await occurrences
+        cancelled += await occurrences
             .ExecuteUpdateAsync(setter => setter
+                .SetProperty(x => x.Status, TickerStatus.Cancelled)
+                .SetProperty(x => x.ExecutedAt, now)
+                .SetProperty(x => x.ExceptionMessage, LeaseEndedReason)
                 .SetProperty(x => x.LockHolder, _ => null)
                 .SetProperty(x => x.LockedAt, _ => null)
-                .SetProperty(x => x.Status, TickerStatus.Idle)
                 .SetProperty(x => x.UpdatedAt, now), cancellationToken)
             .ConfigureAwait(false);
 
@@ -558,7 +567,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .GroupBy(x => x.NodeIdentifier, StringComparer.Ordinal)
             .Select(g => (g.Key, g.Sum(x => x.Jobs)))
             .ToList();
-        return (released, nodes);
+        return (cancelled, nodes);
     }
 
     #endregion

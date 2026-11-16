@@ -21,7 +21,8 @@ public class InProgressLeaseDbContext(DbContextOptions<InProgressLeaseDbContext>
 /// <summary>
 /// The lease on InProgress jobs (#24) in an application on the EF Core store alone: started hosts (<c>AddSharpTicker</c>,
 /// <c>AddOperationalStore</c>, the scheduler and the fallback) over one SQLite file per test, with a short lease. A job
-/// left InProgress under a node identifier that does not come back runs again, and the chain after it follows; a job
+/// or cron occurrence left InProgress under a node identifier that does not come back is recorded as Cancelled and does
+/// not run again (#211), the chain after it follows its run condition, and the next occurrences of the cron run; a job
 /// that runs longer than the lease on a live instance is not taken from it. Every test also fails on a log entry at
 /// Warning or above and on a call to the application's exception handler.
 /// </summary>
@@ -153,7 +154,7 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
             options.ConfigureScheduler(scheduler =>
             {
                 scheduler.NodeIdentifier = node;
-                // Short, so that a released job is taken again within the wait below.
+                // Short, so that a waiting job or chain child is taken within the wait below.
                 scheduler.FallbackIntervalChecker = TimeSpan.FromSeconds(1);
             });
             options.SetExceptionHandler<RecordingExceptionHandler>();
@@ -230,23 +231,51 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
         return (parent, child);
     }
 
-    // T7: the parent left InProgress under pod-a is released after the lease by pod-b, runs again, and its child follows.
+    private static TimeTickerEntity ADelayedChildOf(TimeTickerEntity parent, RunCondition condition) => new()
+    {
+        Id = Guid.NewGuid(), Function = Quick, ExecutionTime = parent.ExecutionTime, ParentId = parent.Id, RunCondition = condition,
+        Status = TickerStatus.Idle, CreatedAt = parent.CreatedAt, UpdatedAt = parent.UpdatedAt, Request = []
+    };
+
+    // T7 (#211): the parent left InProgress under pod-a is recorded as Cancelled by pod-b after the lease and does not run
+    // again; its delayed children follow their run condition on a Cancelled parent. Up to 1.6.1 the parent ran again.
     [Fact]
-    public async Task AJobLeftInProgressUnderANameThatDoesNotComeBack_RunsAgainAfterTheLease_AndItsChildFollows()
+    public async Task AJobLeftInProgressUnderANameThatDoesNotComeBack_IsRecordedCancelledAfterTheLease_AndItsChildrenFollowTheirRunCondition()
     {
         var application = Application("pod-b", ShortLease);
-        var (parent, child) = AStuckParentWithAChild();
-        await SeedAsync(application, parent, child);
+        var (parent, onSuccess) = AStuckParentWithAChild();
+        var onCancelled = ADelayedChildOf(parent, RunCondition.OnCancelled);
+        var onFailureOrCancelled = ADelayedChildOf(parent, RunCondition.OnFailureOrCancelled);
+        var onFailure = ADelayedChildOf(parent, RunCondition.OnFailure);
+        await SeedAsync(application, parent, onSuccess, onCancelled, onFailureOrCancelled, onFailure);
 
         await StartAsync(application);
 
-        var childRan = await WaitUntilAsync(() => Task.FromResult(Runs.GetValueOrDefault(child.Id) > 0), WaitLimit);
-        Assert.True(childRan, $"The child did not run; the parent ran {Runs.GetValueOrDefault(parent.Id)} time(s) and is {(await StoredAsync(application, parent.Id)).Status}.");
-        // A few more passes: neither runs a second time.
+        var settled = await WaitUntilAsync(async () =>
+            Runs.GetValueOrDefault(onCancelled.Id) > 0 && Runs.GetValueOrDefault(onFailureOrCancelled.Id) > 0
+            && (await StoredAsync(application, onSuccess.Id)).Status == TickerStatus.Skipped
+            && (await StoredAsync(application, onFailure.Id)).Status == TickerStatus.Skipped, WaitLimit);
+        Assert.True(settled, $"The parent is {(await StoredAsync(application, parent.Id)).Status} and ran {Runs.GetValueOrDefault(parent.Id)} time(s); " +
+                             $"OnCancelled ran {Runs.GetValueOrDefault(onCancelled.Id)}, OnFailureOrCancelled ran {Runs.GetValueOrDefault(onFailureOrCancelled.Id)}, " +
+                             $"OnSuccess is {(await StoredAsync(application, onSuccess.Id)).Status}, OnFailure is {(await StoredAsync(application, onFailure.Id)).Status}.");
+        // A few more passes of the lease and the fallback: the parent never runs, each child that runs runs once.
         await Task.Delay(3 * ShortLease);
-        Assert.Equal(1, Runs.GetValueOrDefault(parent.Id));
-        Assert.Equal(1, Runs.GetValueOrDefault(child.Id));
-        Assert.Equal(TickerStatus.DueDone, (await StoredAsync(application, parent.Id)).Status);
+
+        var stored = await StoredAsync(application, parent.Id);
+        Assert.Equal(0, Runs.GetValueOrDefault(parent.Id));
+        Assert.Equal(TickerStatus.Cancelled, stored.Status);
+        Assert.NotNull(stored.ExecutedAt);
+        Assert.Equal("The lock of the instance that ran the job was not renewed for the lease.", stored.ExceptionMessage);
+        Assert.Null(stored.LockHolder);
+        Assert.Null(stored.LockedAt);
+        Assert.Equal(1, Runs.GetValueOrDefault(onCancelled.Id));
+        Assert.Equal(1, Runs.GetValueOrDefault(onFailureOrCancelled.Id));
+        Assert.Equal(0, Runs.GetValueOrDefault(onSuccess.Id));
+        Assert.Equal(0, Runs.GetValueOrDefault(onFailure.Id));
+        Assert.Contains((await StoredAsync(application, onCancelled.Id)).Status, new[] { TickerStatus.Done, TickerStatus.DueDone });
+        Assert.Contains((await StoredAsync(application, onFailureOrCancelled.Id)).Status, new[] { TickerStatus.Done, TickerStatus.DueDone });
+        Assert.Equal(TickerStatus.Skipped, (await StoredAsync(application, onSuccess.Id)).Status);
+        Assert.Equal(TickerStatus.Skipped, (await StoredAsync(application, onFailure.Id)).Status);
         AssertNoWarningAndNoHandlerCall();
     }
 
@@ -302,7 +331,7 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
         return (podA, ids.ToArray());
     }
 
-    // T2: a job that runs three leases long on a live instance is not released by the other one; it runs once and ends
+    // T2: a job that runs three leases long on a live instance is not cancelled by the other one; it runs once and ends
     // Done by the instance that ran it.
     [Fact]
     public async Task AJobThatRunsLongerThanTheLease_OnALiveInstance_IsNotTakenByAnother_AndRunsOnce()
@@ -320,7 +349,7 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
     }
 
     // T9: a job claimed by pod-a that waits for the one slot of its function (maxConcurrency 1) for longer than the lease
-    // is not released by pod-b; each job runs once.
+    // is not cancelled by pod-b; each job runs once.
     [Fact]
     public async Task AClaimThatWaitsForASlotLongerThanTheLease_IsNotTakenByAnother_AndEachJobRunsOnce()
     {
@@ -341,7 +370,7 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
     }
 
     // T6 (a precondition, true before the lease): a cron occurrence left InProgress under a name that does not come back
-    // does not hold back the next occurrences of its cron. The default lease, so the old occurrence is not released here.
+    // does not hold back the next occurrences of its cron. The default lease, so the old occurrence is not cancelled here.
     [Fact]
     public async Task ACronOccurrenceLeftInProgress_DoesNotHoldBackTheNextOccurrences()
     {
@@ -368,6 +397,51 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
             .Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().SingleAsync(x => x.Id == stuck.Id);
         Assert.Equal(TickerStatus.InProgress, occurrence.Status);
         Assert.Equal("pod-a", occurrence.LockHolder);
+        AssertNoWarningAndNoHandlerCall();
+    }
+
+    // #211: with a short lease the occurrence left InProgress under pod-a is recorded as Cancelled and does not run; the
+    // next occurrences of its cron are planned and run as usual, after the cancel too.
+    [Fact]
+    public async Task ACronOccurrenceLeftInProgressUnderANameThatDoesNotComeBack_IsRecordedCancelledAfterTheLease_AndTheNextOccurrencesRun()
+    {
+        var application = Application("pod-b", ShortLease);
+        var earlier = DateTime.UtcNow.AddMinutes(-1);
+        var cron = new CronTickerEntity
+        {
+            Id = Guid.NewGuid(), Function = Cron, Expression = "* * * * * *", CreatedAt = earlier, UpdatedAt = earlier, Request = []
+        };
+        var stuck = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = cron.Id, ExecutionTime = earlier, Status = TickerStatus.InProgress,
+            LockHolder = "pod-a", LockedAt = earlier, CreatedAt = earlier, UpdatedAt = earlier
+        };
+        await SeedAsync(application, cron, stuck);
+
+        async Task<CronTickerOccurrenceEntity<CronTickerEntity>> StuckAsync()
+        {
+            using var scope = application.Services.CreateScope();
+            return await scope.ServiceProvider.GetRequiredService<InProgressLeaseDbContext>()
+                .Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().SingleAsync(x => x.Id == stuck.Id);
+        }
+
+        await StartAsync(application);
+
+        var cancelled = await WaitUntilAsync(async () => (await StuckAsync()).Status == TickerStatus.Cancelled, WaitLimit);
+        Assert.True(cancelled, $"The occurrence is {(await StuckAsync()).Status}.");
+        var ranBefore = CronRuns.Count;
+        var ranAfter = await WaitUntilAsync(() => Task.FromResult(CronRuns.Count >= ranBefore + 2), WaitLimit);
+        Assert.True(ranAfter, $"{CronRuns.Count - ranBefore} occurrence(s) of the cron ran after the cancel.");
+        await Task.Delay(2 * ShortLease);
+
+        Assert.False(CronRuns.ContainsKey(stuck.Id));
+        Assert.All(CronRuns.Values, runs => Assert.Equal(1, runs));
+        var occurrence = await StuckAsync();
+        Assert.Equal(TickerStatus.Cancelled, occurrence.Status);
+        Assert.NotNull(occurrence.ExecutedAt);
+        Assert.Equal("The lock of the instance that ran the job was not renewed for the lease.", occurrence.ExceptionMessage);
+        Assert.Null(occurrence.LockHolder);
+        Assert.Null(occurrence.LockedAt);
         AssertNoWarningAndNoHandlerCall();
     }
 }

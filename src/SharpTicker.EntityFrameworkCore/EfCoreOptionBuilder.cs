@@ -50,14 +50,15 @@ namespace SharpTicker.EntityFrameworkCore
 
         /// <summary>
         /// How long a job that is <c>InProgress</c> stays locked to an instance that no longer renews its lock. A running
-        /// instance renews the lock of the jobs it holds every fifth of this time, and releases the jobs of other instances
-        /// whose lock was not renewed for this time, so that they run again. The default is 5 minutes, which is the
+        /// instance renews the lock of the jobs it holds every fifth of this time, and records the jobs of other instances
+        /// whose lock was not renewed for this time as <c>Cancelled</c>; they do not run again (up to 1.6.1 they were
+        /// released and ran again). The default is 5 minutes, which is the
         /// recommended value; <see cref="TimeSpan.Zero"/> turns this off, and a job left <c>InProgress</c> is then released
         /// only when an instance starts under the name that holds it.
         /// <para>
         /// Accepted: <see cref="TimeSpan.Zero"/>, or a value from 1 second up to 30 days; any other value throws
         /// <see cref="ArgumentOutOfRangeException"/>. Keep the lease well above the time a renewal pass can take on your
-        /// database, or the jobs of a live instance can be released. Set the same lease on every instance that runs the
+        /// database, or the jobs of a live instance can be recorded as <c>Cancelled</c>. Set the same lease on every instance that runs the
         /// background services, and turn it off on all of them or on none.
         /// </para>
         /// </summary>

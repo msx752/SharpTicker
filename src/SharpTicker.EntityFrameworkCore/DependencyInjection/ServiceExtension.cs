@@ -134,7 +134,7 @@ public static class ServiceExtension
             var nodes = string.Join(", ", listed) + (others.Count > MaxNodesInLog ? $" and {others.Count - MaxNodesInLog} more" : "");
             if (inProgressLease > TimeSpan.Zero)
                 logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. A job of a node that is still running ends as usual. " +
-                                      "A job whose lock is not renewed for {Lease}, because no node runs under that identifier, is released by a running node and runs again.",
+                                      "A job whose lock is not renewed for {Lease}, because no node runs under that identifier, is recorded as Cancelled by a running node and does not run again.",
                     others.Sum(x => x.Jobs), nodes, inProgressLease);
             else
                 logger.LogInformation("{JobCount} job(s) are InProgress under other node identifiers: {Nodes}. With the EF Core store, no Redis heartbeat and the lease turned off, " +

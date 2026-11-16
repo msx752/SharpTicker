@@ -617,7 +617,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             try
             {
                 if (!await _internalTickerManager.RecordStoppedRunAsync(context, CancellationToken.None).ConfigureAwait(false))
-                    _logger?.LogInformation("Job {FunctionName} ({TickerId}) had already stored its outcome, or its row was taken by another run; it was not recorded as Cancelled.",
+                    _logger?.LogInformation("Job {FunctionName} ({TickerId}) had already stored its outcome, or its row was taken by another run or recorded as Cancelled by the EF Core lease; it was not recorded as Cancelled by this stop.",
                         job.FunctionName, job.TickerId);
             }
             catch (Exception ex)
