@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
 using SharpTicker.Caching.StackExchangeRedis.Helpers;
 using SharpTicker.Caching.StackExchangeRedis.Infrastructure;
@@ -13,6 +15,7 @@ using SharpTicker.Utilities.Interfaces.Managers;
 using SharpTicker.Utilities.Managers;
 using SharpTicker.Utilities.Models;
 using StackExchange.Redis;
+using static SharpTicker.Caching.StackExchangeRedis.DependencyInjection.ServiceExtension;
 
 namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 
@@ -365,6 +368,183 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
 
     #endregion
 
+    #region The fallback or run-now of the node whose loop is writing the rows (#154)
+
+    // The loop of node A has queued the parent and is writing its children as rows; it stops after the first child's row.
+    // The fallback or run-now of the same node reads the children then (only the first child has a row), and claims the
+    // parent after the loop has taken the children out of the parent's row. The parent is handed out with all its children.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    public async Task TheClaimOfTheNodeWhoseLoopIsWritingTheRows_HandsTheParentOutWithAllItsChildren(ClaimPath path)
+    {
+        var chain = await SeedForAsync(ClaimPath.Loop);
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loop = fixture.CreateProvider(NodeA, _clock,
+            PausingDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerKey(chain.Child0), paused, resume.Task));
+        var other = fixture.CreateProvider(NodeA, _clock);
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var loopTask = Task.Run(async () =>
+            await Drain(loop.QueueTimeTickers(await loop.GetEarliestTimeTickers(CancellationToken.None), CancellationToken.None)));
+        await paused.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        // The parent is overdue for the fallback now; the loop holds it Queued.
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var resumed = false;
+        other.BeforeCompareAndSetHook = async key =>
+        {
+            // The first write of the parent's row is this claim: the children were read before it.
+            if (key != parentKey || resumed) return;
+            resumed = true;
+            resume.SetResult();
+            await loopTask.WaitAsync(TimeSpan.FromSeconds(30));
+        };
+
+        var handedOut = await ClaimAsync(other, path, chain.Parent);
+
+        Assert.True(resumed, "the claim of the parent was not reached");
+        Assert.Single(await loopTask);
+        AssertHandedOutAsRows(chain, Assert.Single(handedOut), T0.AddSeconds(30));
+        await AssertStoredAsRowsAsync(chain);
+        var parent = await StoredAsync(chain.Parent);
+        Assert.Equal(TickerStatus.InProgress, (TickerStatus)parent.GetProperty("Status").GetInt32());
+        Assert.Equal(NodeA, Text(parent, "LockHolder"));
+        // The loop's Queued hand-out does not start the job: its mark is refused once the row is InProgress, so the parent runs once.
+        Assert.False(await loop.TryMarkTimeTickerInProgress(chain.Parent, _clock.NextClaimMarker(), CancellationToken.None));
+    }
+
+    // The same, and the read of the children after the claim fails: the parent is not handed out, its claim is put back,
+    // and the next claim hands it out with all its children.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    public async Task WhenTheReadOfTheChildrenAfterTheClaimFails_TheClaimIsPutBack_AndTheNextClaimHandsOutAllChildren(ClaimPath path)
+    {
+        var chain = await SeedForAsync(ClaimPath.Loop);
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var loop = fixture.CreateProvider(NodeA, _clock,
+            PausingDatabase.Create(fixture.Database, RedisKeyBuilder.TimeTickerKey(chain.Child0), paused, resume.Task));
+        var failing = FailingWhenArmedDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync));
+        var other = fixture.CreateProvider(NodeA, _clock, failing);
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var loopTask = Task.Run(async () =>
+            await Drain(loop.QueueTimeTickers(await loop.GetEarliestTimeTickers(CancellationToken.None), CancellationToken.None)));
+        await paused.Task.WaitAsync(TimeSpan.FromSeconds(30));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var resumed = false;
+        other.BeforeCompareAndSetHook = async key =>
+        {
+            if (key != parentKey || resumed) return;
+            resumed = true;
+            resume.SetResult();
+            await loopTask.WaitAsync(TimeSpan.FromSeconds(30));
+            ((FailingWhenArmedDatabase)(object)failing).Armed = true;
+        };
+
+        var handedOut = await ClaimAsync(other, path, chain.Parent);
+
+        Assert.True(resumed, "the claim of the parent was not reached");
+        Assert.True(((FailingWhenArmedDatabase)(object)failing).Failed, "the read after the claim did not fail");
+        Assert.Single(await loopTask);
+        Assert.Empty(handedOut);
+        var parent = await StoredAsync(chain.Parent);
+        Assert.Equal(TickerStatus.Idle, (TickerStatus)parent.GetProperty("Status").GetInt32());
+        Assert.Null(Text(parent, "LockHolder"));
+        Assert.True(await IsPendingAsync(chain.Parent));
+
+        _clock.Advance(TimeSpan.FromSeconds(2));
+        var again = await ClaimAsync(fixture.CreateProvider(NodeA, _clock), path, chain.Parent);
+        AssertHandedOutAsRows(chain, Assert.Single(again), T0.AddSeconds(30));
+        await AssertStoredAsRowsAsync(chain);
+    }
+
+    // Once armed, the first call of one method throws.
+    public class FailingWhenArmedDatabase : System.Reflection.DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _method = "";
+
+        public bool Armed { get; set; }
+        public bool Failed { get; private set; }
+
+        public static IDatabase Create(IDatabase inner, string method)
+        {
+            var proxy = Create<IDatabase, FailingWhenArmedDatabase>();
+            var failing = (FailingWhenArmedDatabase)(object)proxy;
+            failing._inner = inner;
+            failing._method = method;
+            return proxy;
+        }
+
+        protected override object? Invoke(System.Reflection.MethodInfo? targetMethod, object?[]? args)
+        {
+            if (Armed && !Failed && targetMethod!.Name == _method)
+            {
+                Failed = true;
+                throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed");
+            }
+
+            try
+            {
+                return targetMethod!.Invoke(_inner, args);
+            }
+            catch (System.Reflection.TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
+    }
+
+    // Stops after the write of one key has landed, until resume completes.
+    public class PausingDatabase : System.Reflection.DispatchProxy
+    {
+        private IDatabase _inner = null!;
+        private string _key = "";
+        private TaskCompletionSource _paused = null!;
+        private Task _resume = null!;
+
+        public static IDatabase Create(IDatabase inner, string key, TaskCompletionSource paused, Task resume)
+        {
+            var proxy = Create<IDatabase, PausingDatabase>();
+            var pausing = (PausingDatabase)(object)proxy;
+            pausing._inner = inner;
+            pausing._key = key;
+            pausing._paused = paused;
+            pausing._resume = resume;
+            return proxy;
+        }
+
+        private async Task<bool> LandThenPause(Task<bool> call)
+        {
+            var result = await call.ConfigureAwait(false);
+            _paused.TrySetResult();
+            await _resume.ConfigureAwait(false);
+            return result;
+        }
+
+        protected override object? Invoke(System.Reflection.MethodInfo? targetMethod, object?[]? args)
+        {
+            try
+            {
+                var result = targetMethod!.Invoke(_inner, args);
+                if (targetMethod.Name == nameof(IDatabase.StringSetAsync) && args is [RedisKey key, ..] && key == _key)
+                    return LandThenPause((Task<bool>)result!);
+                return result;
+            }
+            catch (System.Reflection.TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
+    }
+
+    #endregion
+
     #region A chain that was written as rows only in part
 
     public enum HalfWay
@@ -629,6 +809,348 @@ public class RedisChainHeldInParentTests(RedisTestFixture fixture) : IAsyncLifet
         Assert.Equal(afterB, await RawAsync(chain.Parent));
         Assert.Equal(laterHolder, Text(await StoredAsync(chain.Parent), "LockHolder"));
         await AssertStoredAsRowsAsync(chain);
+    }
+
+    #endregion
+
+    #region A parent deleted while its children are written as rows (#153)
+
+    public enum DeletedWhen
+    {
+        // After the first link is written (the parent's link to its first child), before any row of a child.
+        AfterTheFirstLink,
+        // After every row of a child is written, between the read and the set of the write that takes the children out
+        // of the parent's row.
+        BeforeTheParentsRowIsWritten
+    }
+
+    // The parent is deleted while the node that claimed it writes its children as rows. The delete removes what the
+    // parent's children set held at that moment; the rows written after it are removed by the node that wrote them, so
+    // no row, link or index entry of the chain is left, and the parent is not handed out.
+    [Theory]
+    [InlineData(ClaimPath.Fallback, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.RunNow, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.Loop, DeletedWhen.AfterTheFirstLink)]
+    [InlineData(ClaimPath.Fallback, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    [InlineData(ClaimPath.RunNow, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    [InlineData(ClaimPath.Loop, DeletedWhen.BeforeTheParentsRowIsWritten)]
+    public async Task AParentDeletedWhileItsChildrenAreWrittenAsRows_LeavesNoRowOfItsChain(ClaimPath path, DeletedWhen when)
+    {
+        var chain = await SeedForAsync(path);
+        var deleted = false;
+        async Task DeleteTheParentAsync()
+        {
+            Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+            deleted = true;
+        }
+
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var database = when == DeletedWhen.AfterTheFirstLink
+            // The second link is the first child's link to its own child: the first link has landed.
+            ? BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync)
+            : null;
+        var a = fixture.CreateProvider(NodeA, _clock, database);
+        var writesOfTheParent = 0;
+        if (when == DeletedWhen.BeforeTheParentsRowIsWritten)
+            a.BeforeCompareAndSetHook = async key =>
+            {
+                // The first write of the parent's row is the claim; the one after it takes the children out.
+                if (key == parentKey && ++writesOfTheParent == 2)
+                    await DeleteTheParentAsync();
+            };
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+
+        Assert.True(deleted, "the parent was not deleted during the split");
+        Assert.Empty(handedOut);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // The control: a delete after the claim returned finds every child through the children sets.
+    [Fact]
+    public async Task AParentDeletedAfterItsChildrenWereWrittenAsRows_LeavesNoRowOfItsChain()
+    {
+        var chain = await SeedOverdueAsync();
+        Assert.Single(await ClaimAsync(fixture.CreateProvider(NodeA, _clock), ClaimPath.Fallback, chain.Parent));
+
+        Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    private async Task AssertNothingOfTheChainIsLeftAsync(Chain chain)
+    {
+        var ids = new[] { chain.Parent }.Concat(chain.Descendants).Select(id => id.ToString()).ToArray();
+        Assert.DoesNotContain(Keys(), key => ids.Any(key.Contains));
+        var db = fixture.Database;
+        var indexed = (await db.SetMembersAsync(RedisKeyBuilder.TimeTickerIdsKey)).Select(m => (string)m!)
+            .Concat((await db.SortedSetRangeByRankAsync(RedisKeyBuilder.TimeTickerPendingKey)).Select(m => (string)m!))
+            .Concat((await db.HashGetAllAsync(RedisKeyBuilder.TimeTickerWaitingChildrenKey)).SelectMany(e => new[] { (string)e.Name!, (string)e.Value! }))
+            .ToArray();
+        Assert.Empty(indexed.Intersect(ids));
+    }
+
+    // The delete starts while the split writes (after its first link) and is held before it removes the parent's row; the
+    // split finishes in that pause, so its last write of the parent's row lands. The delete then finds every row the split
+    // wrote, and the parent was handed out with all its children: it was not deleted yet when it was claimed.
+    [Theory]
+    [InlineData(ClaimPath.Fallback)]
+    [InlineData(ClaimPath.RunNow)]
+    [InlineData(ClaimPath.Loop)]
+    public async Task ADeleteThatStartsDuringTheSplit_AndRemovesTheParentsRowAfterIt_LeavesNoRowOfItsChain(ClaimPath path)
+    {
+        var chain = await SeedForAsync(path);
+        var parentKey = RedisKeyBuilder.TimeTickerKey(chain.Parent);
+        var deleteHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b = fixture.CreateProvider(NodeB, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.KeyDeleteAsync), parentKey,
+            async () =>
+            {
+                deleteHeld.SetResult();
+                await resumeDelete.Task;
+            }));
+        Task<int>? delete = null;
+        var a = fixture.CreateProvider(NodeA, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0),
+            async () =>
+            {
+                delete = Task.Run(() => b.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+                await deleteHeld.Task;
+            }));
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+        resumeDelete.SetResult();
+
+        Assert.True(delete != null, "the delete was not started during the split");
+        Assert.Equal(1, await delete!);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+        AssertHandedOutAsRows(chain, Assert.Single(handedOut), DelayedTimeFor(path));
+    }
+
+    // The parent was deleted during the split and the check that finds the delete fails: the parent is not handed out, and
+    // what is logged says so; it does not say that the claim is put back and the next pass tries again.
+    [Fact]
+    public async Task WhenTheCheckForADeletedParentFails_TheWarningSaysWhatHappened()
+    {
+        var chain = await SeedOverdueAsync();
+        var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        async Task DeleteTheParentAsync()
+            => Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+        var database = RedisClaimMultiNodeTests.FailingDatabase.Create(
+            BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync),
+            nameof(IDatabase.KeyExistsAsync), 1);
+        var a = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(database, _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = NodeA },
+            new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);
+
+        Assert.Empty(await ClaimAsync(a, ClaimPath.RunNow, chain.Parent));
+
+        var warning = Assert.Single(log.Entries, e => e.Level >= LogLevel.Warning);
+        Assert.Contains(chain.Parent.ToString(), warning.Message);
+        Assert.Contains("deleted", warning.Message);
+        Assert.DoesNotContain("put back", warning.Message);
+        Assert.IsType<RedisConnectionException>(warning.Exception);
+    }
+
+    // The parent is deleted during the split (after its first link), and a later write of the split fails. The node finds
+    // the parent gone and removes the rows it wrote, as it does when only its last write of the parent's row fails; it does
+    // not log that the claim is put back and the next pass tries again, since no pass ever takes a deleted parent.
+    // failAt 1 fails the grandchild's row (only links are written after the delete); 2 fails the first child's row, after
+    // the grandchild's row and its index entries were written.
+    [Theory]
+    [InlineData(ClaimPath.Fallback, 1)]
+    [InlineData(ClaimPath.RunNow, 1)]
+    [InlineData(ClaimPath.Loop, 1)]
+    [InlineData(ClaimPath.Fallback, 2)]
+    [InlineData(ClaimPath.RunNow, 2)]
+    [InlineData(ClaimPath.Loop, 2)]
+    public async Task AParentDeletedDuringTheSplit_WhoseLaterWriteFails_LeavesNoRowOfItsChain(ClaimPath path, int failAt)
+    {
+        var chain = await SeedForAsync(path);
+        var log = new ListLogger<TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
+        var deleted = false;
+        async Task DeleteTheParentAsync()
+        {
+            Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+            deleted = true;
+        }
+        // A row the split writes fails, after the delete read the parent's children.
+        var database = RedisClaimMultiNodeTests.FailingDatabase.Create(
+            BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0), DeleteTheParentAsync),
+            nameof(IDatabase.StringSetAsync), failAt);
+        var a = new TickerRedisPersistenceProvider<TimeTickerEntity, CronTickerEntity>(database, _clock,
+            new SchedulerOptionsBuilder { NodeIdentifier = NodeA },
+            new SharpTickerRedisOptionBuilder { JsonSerializerContext = TestJsonSerializerContext.Default }, log);
+
+        var handedOut = await ClaimAsync(a, path, chain.Parent);
+
+        Assert.True(deleted, "the parent was not deleted during the split");
+        Assert.Empty(handedOut);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+        Assert.DoesNotContain(log.Entries, e => e.Level >= LogLevel.Warning);
+    }
+
+    public enum HeldAfterReading
+    {
+        TheParentsChildren,
+        TheFirstChildsChildren
+    }
+
+    // The delete reads a children set (the parent's, or its first child's) and is held right after that read, while the
+    // split finishes. A link the split writes into that set after the read is still found: the children sets stay until
+    // the parent's row is gone.
+    [Theory]
+    [InlineData(ClaimPath.Fallback, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.RunNow, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.Loop, HeldAfterReading.TheParentsChildren)]
+    [InlineData(ClaimPath.Fallback, HeldAfterReading.TheFirstChildsChildren)]
+    [InlineData(ClaimPath.RunNow, HeldAfterReading.TheFirstChildsChildren)]
+    [InlineData(ClaimPath.Loop, HeldAfterReading.TheFirstChildsChildren)]
+    public async Task ADeleteHeldRightAfterItReadAChildrenSet_WhileTheSplitFinishes_LeavesNoRowOfItsChain(ClaimPath path, HeldAfterReading held)
+    {
+        var chain = await SeedForAsync(path);
+        var deleteHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumeDelete = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var b = fixture.CreateProvider(NodeB, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(held == HeldAfterReading.TheParentsChildren ? chain.Parent : chain.Child0),
+            async () =>
+            {
+                deleteHeld.SetResult();
+                await resumeDelete.Task;
+            },
+            after: true));
+        Task<int>? delete = null;
+        var a = fixture.CreateProvider(NodeA, _clock, BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetAddAsync),
+            RedisKeyBuilder.TimeTickerChildrenKey(chain.Child0),
+            async () =>
+            {
+                delete = Task.Run(() => b.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+                await deleteHeld.Task;
+            }));
+
+        await ClaimAsync(a, path, chain.Parent);
+        resumeDelete.SetResult();
+
+        Assert.True(delete != null, "the delete was not started during the split");
+        Assert.Equal(1, await delete!);
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // A chain stored as rows (1.3.0 and later), as AddTimeTickers writes it.
+    private async Task<Chain> AddChainAsRowsAsync()
+    {
+        TimeTickerEntity Node(string function, DateTime? time, RunCondition? condition = null) => new()
+        {
+            Id = Guid.NewGuid(), Function = function, ExecutionTime = time, RunCondition = condition, Status = TickerStatus.Idle, Request = []
+        };
+        var grand = Node("grand", null, RunCondition.OnSuccess);
+        var child0 = Node("child0", null, RunCondition.OnSuccess);
+        child0.Children = [grand];
+        var child1 = Node("child1", null, RunCondition.OnFailure);
+        var delayed = Node("delayed", T0.AddHours(2), RunCondition.OnSuccess);
+        var parent = Node("parent", T0.AddHours(1));
+        parent.Children = [child0, child1, delayed];
+        await fixture.CreateProvider("seed", _clock).AddTimeTickers([parent], CancellationToken.None);
+        return new Chain(parent.Id, child0.Id, grand.Id, child1.Id, delayed.Id);
+    }
+
+    // The control: a chain stored as rows is deleted with every row, link and index entry.
+    [Fact]
+    public async Task AChainStoredAsRows_IsDeletedWithEveryRow()
+    {
+        var chain = await AddChainAsRowsAsync();
+
+        Assert.Equal(1, await fixture.CreateProvider(NodeB, _clock).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    public enum DeleteStops
+    {
+        // Before anything is removed: the first read of the parent's children.
+        AtTheFirstReadOfTheChildren,
+        // After the children's rows are removed, before the parent's row is.
+        AtTheParentsRow
+    }
+
+    // A delete of a chain stored as rows stops on a store failure. The parent's row is still there and listed, so the
+    // chain can be deleted again, and that second delete removes all of it: no child row is left behind a parent that is
+    // gone.
+    [Theory]
+    [InlineData(DeleteStops.AtTheFirstReadOfTheChildren)]
+    [InlineData(DeleteStops.AtTheParentsRow)]
+    public async Task ADeleteThatStops_LeavesTheParentListed_AndASecondDeleteRemovesTheChain(DeleteStops stop)
+    {
+        var chain = await AddChainAsRowsAsync();
+        var failing = stop == DeleteStops.AtTheFirstReadOfTheChildren
+            ? BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.SortedSetRangeByRankAsync), RedisKeyBuilder.TimeTickerChildrenKey(chain.Parent),
+                () => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed"))
+            : BeforeCallDatabase.Create(fixture.Database, nameof(IDatabase.KeyDeleteAsync), RedisKeyBuilder.TimeTickerKey(chain.Parent),
+                () => throw new RedisConnectionException(ConnectionFailureType.SocketFailure, "store failed"));
+
+        await Assert.ThrowsAsync<RedisConnectionException>(() => fixture.CreateProvider(NodeB, _clock, failing).RemoveTimeTickers([chain.Parent], CancellationToken.None));
+
+        var provider = fixture.CreateProvider(NodeB, _clock);
+        Assert.Contains(chain.Parent, (await provider.GetTimeTickers(null!, CancellationToken.None)).Select(t => t.Id));
+        Assert.Equal(1, await provider.RemoveTimeTickers([chain.Parent], CancellationToken.None));
+        await AssertNothingOfTheChainIsLeftAsync(chain);
+    }
+
+    // Runs an action once, before (or, with after, after) the first call of the given method on the given key, and waits
+    // for it. An action that throws fails that call.
+    public class BeforeCallDatabase : DispatchProxy
+    {
+        private static readonly MethodInfo AroundMethod = typeof(BeforeCallDatabase).GetMethod(nameof(Around), BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        private IDatabase _inner = null!;
+        private string _method = "";
+        private string _key = "";
+        private Func<Task> _action = null!;
+        private bool _after;
+        private int _fired;
+
+        public static IDatabase Create(IDatabase inner, string method, string key, Func<Task> action, bool after = false)
+        {
+            var proxy = DispatchProxy.Create<IDatabase, BeforeCallDatabase>();
+            var hooked = (BeforeCallDatabase)(object)proxy;
+            hooked._inner = inner;
+            hooked._method = method;
+            hooked._key = key;
+            hooked._action = action;
+            hooked._after = after;
+            return proxy;
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+        {
+            var returnType = targetMethod!.ReturnType;
+            if (targetMethod.Name == _method && returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(Task<>)
+                && args!.Length > 0 && args[0] is RedisKey key && key == _key && Interlocked.Exchange(ref _fired, 1) == 0)
+                return AroundMethod.MakeGenericMethod(returnType.GetGenericArguments()[0]).Invoke(this, [targetMethod, args]);
+            return Call(targetMethod, args);
+        }
+
+        private async Task<T> Around<T>(MethodInfo targetMethod, object?[]? args)
+        {
+            if (!_after)
+                await _action();
+            var result = await (Task<T>)Call(targetMethod, args)!;
+            if (_after)
+                await _action();
+            return result;
+        }
+
+        private object? Call(MethodInfo targetMethod, object?[]? args)
+        {
+            try
+            {
+                return targetMethod.Invoke(_inner, args);
+            }
+            catch (TargetInvocationException e) when (e.InnerException is not null)
+            {
+                throw e.InnerException;
+            }
+        }
     }
 
     #endregion
