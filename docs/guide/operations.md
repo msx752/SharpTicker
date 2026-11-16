@@ -30,11 +30,11 @@ The name is the lock holder on a job, and a starting instance treats every job h
 
 An instance that stops while it holds jobs leaves them locked. What happens to them depends on the store:
 
-| Store | The jobs are released |
+| Store | What happens to the jobs |
 |---|---|
-| EF Core | When an instance starts again under the same name. With Redis next to the store, also by another running instance once the heartbeat of the stopped one has ended. A released job runs again. Once the lease of a job has ended (5 minutes without a renewal by default), another running instance records it as `Cancelled` instead, and it does not run again (from 1.6.2; up to 1.6.1 the lease released it and it ran again). |
-| Redis | When the instance starts again, or by another running instance once the heartbeat of the stopped one has ended. |
-| MongoDB | Not at all. MongoDB has no release step, so a job left `InProgress` by a process that ended stays so until you change it. |
+| EF Core | Released when an instance starts again under the same name. With Redis next to the store, also by another running instance once the heartbeat of the stopped one has ended. A released job runs again. Once the lease of a job has ended (5 minutes without a renewal by default), another running instance records it as `Cancelled` instead, and it does not run again (from 1.6.2; up to 1.6.1 the lease released it and it ran again). |
+| Redis | Released when the instance starts again, or by another running instance once the heartbeat of the stopped one has ended. A released job runs again. |
+| MongoDB | Not released. MongoDB has no release step, so a job left `InProgress` by a process that ended stays so until you change it. |
 
 **By another instance (EF Core lease).** Every instance that runs the background services renews the lock of the jobs it holds every fifth of the lease, and records the `InProgress` jobs of other instance names whose lock was not renewed for the whole lease as `Cancelled`, the way a graceful stop records a job that had not finished. Such a job does not run again. So a job of an instance that ended without a signal (killed, out of memory, a lost machine) ends as `Cancelled` whatever name the next instance has, also when that instance has been gone for days. From 1.6.2 the lease records these jobs as `Cancelled`; up to 1.6.1 it released them to `Idle`, and the fallback ran them again. The lease is set with `SetInProgressLease` (see [Storage](storage.md#lease-on-running-jobs)). With the default of 5 minutes:
 
@@ -43,7 +43,7 @@ An instance that stops while it holds jobs leaves them locked. What happens to t
 | 0 | The instance that holds the job renews its lock for the last time, and stops. |
 | 5 min | The lock is older than the lease. |
 | up to 6 min | The next pass of another instance (every minute) records the job as `Cancelled`. For a cron, only that occurrence is cancelled; its next occurrences run at their own time. |
-| up to 6.5 min | The fallback of an instance (every `FallbackIntervalChecker`, 30 seconds by default) runs or skips a delayed chain child waiting for that job, by its run condition on a `Cancelled` parent: an `OnCancelled`, `OnFailureOrCancelled` or `OnAnyCompletedStatus` child runs, an `OnSuccess` or `OnFailure` child is skipped. A child without a time of its own is decided this way 30 seconds after the cancel at the earliest. |
+| up to 6.5 min | The fallback of an instance (every `FallbackIntervalChecker`, 30 seconds by default) runs or skips a delayed chain child waiting for that job, by its run condition on a `Cancelled` parent: an `OnCancelled`, `OnFailureOrCancelled`, `OnAnyCompletedStatus` or `InProgress` child runs, an `OnSuccess` or `OnFailure` child is skipped. A child without a time of its own is decided this way 30 seconds after the cancel at the earliest. |
 
 What this does not cover:
 
@@ -312,7 +312,7 @@ A job reports its own failure through the exception handler above. These entries
 | `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | The fallback took a job but the dashboard could not be told. The job runs. |
 | `SharpTicker.Utilities.Managers.InternalTickerManager` | Warning | At the startup of each instance, once per enabled cron ticker: its stored expression has no next occurrence (it does not parse, or it matches no date), so it does not run. The entry names the cron ticker, its function and the expression. Correct the expression on the dashboard or in code, or remove the cron ticker. Another entry at the same level says that the cron tickers could not be read for this check; the startup goes on. |
 | `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Warning | The application is stopping with jobs running. The first entry says that the scheduler waits for them and names them (the first ten); the second says that some were still running when the wait ended (a little before the host's shutdown timeout) and were recorded as `Cancelled`. |
-| `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Information | A job still running when the stop's wait ended had stored its outcome meanwhile, or its row was taken by another run, so it was not recorded as `Cancelled`. |
+| `SharpTicker.BackgroundServices.SharpTickerSchedulerBackgroundService` | Information | A job still running when the stop's wait ended had stored its outcome meanwhile, or its row was taken by another run or recorded as `Cancelled` by the EF Core lease, so the stop did not record it as `Cancelled`. |
 | `SharpTicker.TickerExecutionTaskHandler` | Error | A job's outcome could not be stored, so its row stays `InProgress` for now. The entry names the job and the lost outcome and says what happens next: the scheduler writes it again, or (with a custom provider, without the background services, or while the scheduler stops) it is not written again and the job can run again after its row is released. |
 | `SharpTicker.BackgroundServices.LostOutcomeDrain` | Information | An outcome that could not be stored was written again and is stored. The attempts that failed before it are written at `Debug`. |
 | `SharpTicker.BackgroundServices.LostOutcomeDrain` | Warning | An outcome that could not be stored was not written again because its row was released or taken by another run meanwhile; the job may run again. A second entry at the same level says that the chain children of a stored outcome could not be followed up; the fallback runs the delayed ones the outcome lets run, and an inline one that is still `Idle` is not run. |

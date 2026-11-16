@@ -8,6 +8,7 @@ using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Interfaces;
+using SharpTicker.Utilities.Models;
 
 namespace SharpTicker.EntityFrameworkCore.Tests.Infrastructure;
 
@@ -194,6 +195,38 @@ public abstract class EfCoreInProgressLeaseTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Cancelled, row.Status);
         Assert.Equal(T0, row.ExecutedAt);
         Assert.Equal(T0, row.UpdatedAt);
+    }
+
+    // The run that still goes on at pod-a after its rows were cancelled: its fenced outcome write, with the claim marker of
+    // that run, matches no row (the lock and the marker are gone), so the rows keep the cancel. This pins the fencing the
+    // cancel relies on; it is not new behaviour of #211.
+    [Fact]
+    public async Task Cancel_TheLateFencedOutcomeOfTheRunThatHeldTheRows_WritesNothing()
+    {
+        var marker = T0.AddMinutes(-20).AddMilliseconds(-3);
+        var lockedAt = T0 - Lease - TimeSpan.FromMinutes(1);
+        var timeJob = await SeedTimeTickerAsync(TickerStatus.InProgress, "pod-a", lockedAt, marker);
+        var occurrence = await SeedOccurrenceAsync(TickerStatus.InProgress, "pod-a", lockedAt, marker);
+
+        var result = await Node("pod-b").CancelExpiredInProgressOfOtherNodesAsync(Lease);
+        _clock.Advance(TimeSpan.FromSeconds(1));
+
+        IFencedRunWriter podA = CreateProvider("pod-a", _clock);
+        InternalFunctionContext Outcome(Guid id, TickerType type) => new InternalFunctionContext { TickerId = id, Type = type, RunMarker = marker }
+            .SetProperty(x => x.Status, TickerStatus.Done)
+            .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
+            .SetProperty(x => x.ElapsedTime, 1234L)
+            .SetProperty(x => x.ReleaseLock, true);
+        var timeJobWritten = await podA.UpdateTimeTickerFencedAsync(Outcome(timeJob, TickerType.TimeTicker), marker, onlyWhileRunning: false);
+        var occurrenceWritten = await podA.UpdateCronOccurrenceFencedAsync(Outcome(occurrence, TickerType.CronTickerOccurrence), marker, onlyWhileRunning: false);
+
+        Assert.Equal(2, result.Cancelled);
+        Assert.Equal(0, timeJobWritten);
+        Assert.Equal(0, occurrenceWritten);
+        var row = await TimeTickerAsync(timeJob);
+        AssertCancelled(row.Status, row.ExecutedAt, row.ExceptionMessage, row.SkippedReason, row.ElapsedTime, row.LockHolder, row.LockedAt, row.UpdatedAt);
+        var cronRow = await OccurrenceAsync(occurrence);
+        AssertCancelled(cronRow.Status, cronRow.ExecutedAt, cronRow.ExceptionMessage, cronRow.SkippedReason, cronRow.ElapsedTime, cronRow.LockHolder, cronRow.LockedAt, cronRow.UpdatedAt);
     }
 
     #endregion
