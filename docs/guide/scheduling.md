@@ -143,7 +143,7 @@ A chain has up to five children per parent and up to five grandchildren per chil
 
 A child stored without a condition runs as `OnAnyCompletedStatus`. A skipped parent runs none of its children, and a child that does not run is recorded as `Skipped` together with everything below it.
 
-When the application stops while a parent runs, the parent is recorded as `Cancelled`. Its `OnCancelled`, `OnFailureOrCancelled` and `OnAnyCompletedStatus` children then run, and its `OnSuccess` children are skipped. A deploy can therefore start the chains you set up for cancellations.
+When the application stops while a parent runs, the parent is recorded as `Cancelled`. Its `OnCancelled`, `OnFailureOrCancelled` and `OnAnyCompletedStatus` children then run, and its `OnSuccess` and `OnFailure` children are skipped. A deploy can therefore start the chains you set up for cancellations. From 1.6.2 the same holds for a parent that the EF Core lease records as `Cancelled` because the instance that ran it stopped renewing its lock (see [Lease on running jobs](storage.md#lease-on-running-jobs)).
 
 ### Delayed children
 

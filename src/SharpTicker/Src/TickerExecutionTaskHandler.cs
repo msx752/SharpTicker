@@ -578,7 +578,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 return true;
 
             Logger?.LogWarning(
-                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: no stored row matched, as the row was deleted while the job ran, or released and taken by another run. Any chain children are neither run nor skipped.",
+                "The {Status} outcome of {FunctionName} ({TickerId}) was not stored: no stored row matched, as the row was deleted while the job ran, released and taken by another run, or recorded as Cancelled by the EF Core lease. This run does not run or skip its chain children.",
                 context.Status, context.FunctionName, context.TickerId);
             return false;
         }

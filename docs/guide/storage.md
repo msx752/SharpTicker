@@ -58,7 +58,7 @@ Other options: `SetDbContextPoolSize(int)` (default 1024).
 
 ### Lease on running jobs
 
-`SetInProgressLease(TimeSpan)` sets how long a job that is `InProgress` stays locked to an instance that no longer renews its lock. The default is 5 minutes, which is the recommended value; `TimeSpan.Zero` turns the lease off. Other values are accepted from 1 second up to 30 days, and anything else is refused with an `ArgumentOutOfRangeException`. Keep the lease well above the time a renewal pass can take on your database: a pass that takes longer than the lease lets the other instances release jobs that are still running.
+`SetInProgressLease(TimeSpan)` sets how long a job that is `InProgress` stays locked to an instance that no longer renews its lock. The default is 5 minutes, which is the recommended value; `TimeSpan.Zero` turns the lease off. Other values are accepted from 1 second up to 30 days, and anything else is refused with an `ArgumentOutOfRangeException`. Keep the lease well above the time a renewal pass can take on your database: a pass that takes longer than the lease lets the other instances record jobs that are still running as `Cancelled`.
 
 ```csharp
 options.AddOperationalStore(ef =>
@@ -71,14 +71,16 @@ options.AddOperationalStore(ef =>
 With the lease on, every instance that runs the background services does this every fifth of the lease (every minute by default):
 
 - It sets `LockedAt` to now on the jobs and cron occurrences it holds `InProgress` since it started. This includes a job that waits for a free slot of its function and a job whose outcome waits to be written again. `UpdatedAt` is not changed. A job that another instance released or took meanwhile is not taken back.
-- It releases the jobs and cron occurrences that are `InProgress` under another instance name and whose `LockedAt` is older than the lease. A row with no `LockedAt` or no lock holder is not released this way. The release writes what the startup release writes: `Idle`, no lock holder, no `LockedAt`. The fallback then runs them again. The log has one entry at `Information` with their number and the names that held them, in the category `SharpTicker.EntityFrameworkCore.InProgressLease`.
+- It records the jobs and cron occurrences that are `InProgress` under another instance name and whose `LockedAt` is older than the lease as `Cancelled`, the way a graceful stop records a job that had not finished: `ExecutedAt` is the time of the pass, the exception message is "The lock of the instance that ran the job was not renewed for the lease.", and the lock holder and `LockedAt` are cleared. Such a job does not run again. A chain child that waits for it follows its run condition on a `Cancelled` parent: an `OnSuccess` or `OnFailure` child is skipped, an `OnCancelled`, `OnFailureOrCancelled` or `OnAnyCompletedStatus` child runs, and so does an `InProgress` child that had not started yet; an `InProgress` child that had started with its parent on that instance is `InProgress` under the same name and is recorded as `Cancelled` with it. For a cron, only that occurrence is cancelled; its next occurrences run at their own time. A row with no `LockedAt` or no lock holder is not changed this way. The log has one entry at `Information` with their number and the names that held them, in the category `SharpTicker.EntityFrameworkCore.InProgressLease`.
+
+From 1.6.2 these jobs are recorded as `Cancelled`. Up to 1.6.1 the lease released them to `Idle`, as the startup release does, and the fallback ran them again, also when the instance that held them had been gone for days.
 
 Set the same lease on every instance that runs the background services, and turn it off on all of them or on none:
 
-- An instance with the lease off does not renew its locks, so an instance with the lease on releases the jobs it runs for longer than the lease, and they run twice.
-- With different values, an instance with a shorter lease releases the jobs of the others earlier than their longer lease expects.
+- An instance with the lease off does not renew its locks, so an instance with the lease on records the jobs it runs for longer than the lease as `Cancelled` while they still run there, and their outcome is not stored.
+- With different values, an instance with a shorter lease records the jobs of the others as `Cancelled` earlier than their longer lease expects.
 
-An instance does not release its own jobs this way, and jobs an earlier run under its own name left are released by the startup release, as before. A host that does not run the background services (`DisableBackgroundServices()`) neither renews nor releases. The lease runs with Redis next to the store too; see [When an instance stops](operations.md#when-an-instance-stops) for how it works with the heartbeat release, and for its limits.
+An instance does not cancel its own jobs this way, and jobs an earlier run under its own name left are released by the startup release, as before, and run again. A host that does not run the background services (`DisableBackgroundServices()`) neither renews nor cancels. The lease runs with Redis next to the store too; see [When an instance stops](operations.md#when-an-instance-stops) for how it works with the heartbeat release, and for its limits.
 
 For a job that is `InProgress`, the dashboard's "Locked At" shows when the lock was last renewed, not when the job was claimed.
 

@@ -14,13 +14,14 @@ namespace SharpTicker.EntityFrameworkCore.DependencyInjection;
 
 /// <summary>
 /// The lease on the jobs that are InProgress (#24). Every fifth of the lease this node renews the lock of the jobs it
-/// holds in this run, then releases the jobs of other node identifiers whose lock was not renewed for the whole lease, so
-/// that the fallback runs them again. The first pass comes one fifth of the lease after the start. Registered only when
-/// the background services run and the lease is not zero.
+/// holds in this run, then records the jobs of other node identifiers whose lock was not renewed for the whole lease as
+/// Cancelled, so that they do not run again (#211; up to 1.6.1 they were released and the fallback ran them again). The
+/// first pass comes one fifth of the lease after the start. Registered only when the background services run and the
+/// lease is not zero.
 /// <para>
-/// It runs with Redis next to the store too. The heartbeat release frees the nodes Redis knows of; this one also frees rows
-/// under names that never wrote a heartbeat there (rows from before Redis was added, for one). Both write the same thing,
-/// so a row one of them released does not match the other.
+/// It runs with Redis next to the store too. The heartbeat release frees the nodes Redis knows of, to Idle, so that their
+/// jobs run again; this one also takes rows under names that never wrote a heartbeat there (rows from before Redis was
+/// added, for one). A row one of them wrote is no longer InProgress, so it does not match the other.
 /// </para>
 /// </summary>
 internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker> : BackgroundService
@@ -85,20 +86,20 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Renewing the lease of the jobs this node runs failed; it is tried again in {Interval}. If it fails for {Lease}, " +
-                                   "other instances release these jobs and run them again.", _interval, _lease);
+                                   "other instances record these jobs as Cancelled.", _interval, _lease);
         }
 
         try
         {
-            var (released, nodes) = await _store.ReleaseExpiredInProgressOfOtherNodesAsync(_lease, stoppingToken).ConfigureAwait(false);
-            if (released == 0)
+            var (cancelled, nodes) = await _store.CancelExpiredInProgressOfOtherNodesAsync(_lease, stoppingToken).ConfigureAwait(false);
+            if (cancelled == 0)
                 return;
 
             var listed = nodes.OrderByDescending(x => x.Jobs).ThenBy(x => x.NodeIdentifier, StringComparer.Ordinal).Take(MaxNodesInLog)
                 .Select(x => $"{x.NodeIdentifier} ({x.Jobs})");
             var names = string.Join(", ", listed) + (nodes.Count > MaxNodesInLog ? $" and {nodes.Count - MaxNodesInLog} more" : "");
-            _logger.LogInformation("{Released} job(s) that were InProgress under other node identifiers, with a lock not renewed for {Lease}, were released; the fallback runs them again: {Nodes}.",
-                released, _lease, names);
+            _logger.LogInformation("{Cancelled} job(s) that were InProgress under other node identifiers, with a lock not renewed for {Lease}, were recorded as Cancelled; they do not run again: {Nodes}.",
+                cancelled, _lease, names);
         }
         catch (Exception ex) when (stoppingToken.IsCancellationRequested)
         {
@@ -106,7 +107,7 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Releasing the jobs of other nodes whose lease ended failed; it is tried again in {Interval}.", _interval);
+            _logger.LogWarning(ex, "Recording the jobs of other nodes whose lease ended as Cancelled failed; it is tried again in {Interval}.", _interval);
         }
     }
 
