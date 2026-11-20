@@ -42,8 +42,8 @@ An instance that stops while it holds jobs leaves them locked. What happens to t
 |---|---|
 | 0 | The instance that holds the job renews its lock for the last time, and stops. |
 | 5 min | The lock is older than the lease. |
-| up to 6 min | The next pass of another instance (every minute) records the job as `Cancelled`. For a cron, only that occurrence is cancelled; its next occurrences run at their own time. |
-| up to 6.5 min | The fallback of an instance (every `FallbackIntervalChecker`, 30 seconds by default) runs or skips a delayed chain child waiting for that job, once its own time has come, by its run condition on a `Cancelled` parent: an `OnCancelled`, `OnFailureOrCancelled` or `OnAnyCompletedStatus` child runs, and so does an `InProgress` child that had not started yet; an `InProgress` child that had started with its parent on that instance is `InProgress` under the same name and is recorded as `Cancelled` with it, an `OnSuccess` or `OnFailure` child is skipped. A child without a time of its own is decided this way 30 seconds after the cancel at the earliest. |
+| up to 6 min | The next pass of another instance (every minute) records the job as `Cancelled`, and with it an `InProgress` chain child that had started with it on that instance. For a cron, only that occurrence is cancelled; its next occurrences run at their own time. |
+| up to 6.5 min | The fallback of an instance (every `FallbackIntervalChecker`, 30 seconds by default) runs or skips a delayed chain child waiting for that job, once its own time has come, by its run condition on a `Cancelled` parent: an `OnCancelled`, `OnFailureOrCancelled` or `OnAnyCompletedStatus` child runs, and so does an `InProgress` child that had not started yet, an `OnSuccess` or `OnFailure` child is skipped. A child without a time of its own is decided this way 30 seconds after the cancel at the earliest. |
 
 What this does not cover:
 
