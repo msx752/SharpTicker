@@ -1,0 +1,18 @@
+# Dependabot for the dashboard UI (npm). Security updates are raised against the default branch (main) by GitHub;
+# they are grouped into one pull request per run. Version updates are off (open-pull-requests-limit: 0); security
+# updates are not affected by that limit. Every pull request runs ci.yml, which builds the UI (npm ci, type check,
+# vite build) and runs its tests before the .NET build and tests.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /src/SharpTicker.Dashboard/wwwroot
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+    groups:
+      dashboard-npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
