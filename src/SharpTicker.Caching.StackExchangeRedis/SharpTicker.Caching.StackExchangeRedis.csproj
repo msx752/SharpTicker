@@ -7,7 +7,12 @@
         <Description>Redis caching and distributed synchronization provider for SharpTicker job scheduler using StackExchange.Redis</Description>
         <PackageTags>$(PackageTags);Redis;Caching;Distributed;StackExchange</PackageTags>
         <IsAotCompatible>true</IsAotCompatible>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="README.md" Pack="true" PackagePath="" />
+    </ItemGroup>
 
     <ItemGroup>
       <EmbeddedResource Include="Scripts\*.lua" />

@@ -6,7 +6,12 @@
     <Title>SharpTicker OpenTelemetry Instrumentation</Title>
     <Description>OpenTelemetry instrumentation package for SharpTicker job scheduler with distributed tracing support</Description>
     <PackageTags>$(PackageTags);OpenTelemetry;Tracing;Instrumentation;Distributed</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="OpenTelemetry" Version="[1.15.3,)" />
