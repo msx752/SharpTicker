@@ -56,6 +56,10 @@ public static class ServiceExtension
                 Enabled: options.StopJobsWhenHeartbeatIsLost && sp.GetRequiredService<EarlierRunRelease>().StoreIsRedis,
                 Fence: sp.GetService<NodeFence>(),
                 Owner: sp.GetService<ITickerExecutionTaskHandler>()));
+            // The same condition again: a Redis Cluster breaks the job store, not the heartbeat next to another store (#225).
+            services.AddSingleton(sp => new RedisClusterCheck(
+                StoreIsRedis: sp.GetRequiredService<EarlierRunRelease>().StoreIsRedis,
+                Connection: () => sp.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker")));
             services.AddSingleton<SharpTickerRedisContext>();
             services.AddSingleton<ISharpTickerRedisContext>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
             services.AddSingleton<INodeHeartbeatRegistry>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
@@ -86,8 +90,7 @@ public static class ServiceExtension
         /// and the job runs again from the start, so it has to be safe to run twice. Jobs start again with the next
         /// heartbeat that is written.
         /// <para>
-        /// Not asked to stop: a job that ignores its cancellation token, and a chain child that started together with its
-        /// parent (<c>RunCondition.InProgress</c>).
+        /// A job that ignores its cancellation token runs on.
         /// </para>
         /// <para>
         /// The default is true. With it, a Redis outage longer than one TTL stops the running jobs of every node that sees
