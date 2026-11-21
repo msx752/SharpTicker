@@ -16,8 +16,7 @@ namespace SharpTicker.Utilities
 
         // Returns the entry of this run. When another run of the same id is still registered, that one stays the registered
         // entry and the returned one is not in the registry.
-        internal static TickerCancellationTokenDetails AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue, object owner = null,
-            bool startsWithParent = false)
+        internal static TickerCancellationTokenDetails AddTickerCancellationToken(CancellationTokenSource cancellationSource, InternalFunctionContext context, bool isDue, object owner = null)
         {
             var details = new TickerCancellationTokenDetails
             {
@@ -27,8 +26,7 @@ namespace SharpTicker.Utilities
                 IsDue = isDue,
                 ParentId = context.ParentId ?? Guid.Empty,
                 Owner = owner,
-                RunMarker = context.RunMarker,
-                StartsWithParent = startsWithParent
+                RunMarker = context.RunMarker
             };
             
             TickerCancellationTokens.TryAdd(context.TickerId, details);
@@ -49,9 +47,11 @@ namespace SharpTicker.Utilities
         /// <see cref="NodeFence"/>), and marks each of those runs as fenced before its token is cancelled, so the run can
         /// tell this stop from a cancellation someone asked for. The entries stay registered until their runs end: the stop
         /// of the host still waits for them. Left alone: a run whose writes are not fenced by a marker (nothing could put
-        /// its row back), and a chain child that started with its parent. Since #158 such a child, put back, would be run
-        /// again like any other; leaving it alone is kept as it is until that is decided (it can then run twice at once).
-        /// Each token is cancelled on a thread of the pool, not here and not one after another: a cancel runs what the job
+        /// its row back). A chain child that started with its parent (RunCondition.InProgress) is asked to stop like any
+        /// other run (#221): it was started under a marker of its own, and once its row is put back or released it waits
+        /// for its start again (its parent's next run, or the fallback once its parent has ended). As for any other job, a
+        /// child that stops when asked does not run on another node at the same time; one that ignores its token, or takes
+        /// longer than about one heartbeat TTL to stop, can. Each token is cancelled on a thread of the pool, not here and not one after another: a cancel runs what the job
         /// hung on its token, which can be the rest of the job's run, and a job that blocks there must hold back neither the
         /// caller nor the request to the other jobs. A cancellation callback of a job that throws is handed to
         /// <paramref name="onCancelFailure"/> with the job's id. Returns how many runs were marked and are being asked.
@@ -62,7 +62,7 @@ namespace SharpTicker.Utilities
             foreach (var entry in TickerCancellationTokens)
             {
                 var details = entry.Value;
-                if (!ReferenceEquals(details.Owner, owner) || details.RunMarker is null || details.StartsWithParent)
+                if (!ReferenceEquals(details.Owner, owner) || details.RunMarker is null)
                     continue;
 
                 details.Fenced = true;
@@ -265,8 +265,6 @@ namespace SharpTicker.Utilities
         internal object Owner { get; set; }
         // The marker that fences the run's writes (InternalFunctionContext.RunMarker), for the stop's write of a job still running.
         internal DateTime? RunMarker { get; set; }
-        // A chain child without a time of its own that started together with its parent (RunCondition.InProgress).
-        internal bool StartsWithParent { get; set; }
         // Set by CancelForFence before the token is cancelled, and never cleared: this run was stopped by the node's fence.
         internal bool Fenced
         {

@@ -356,10 +356,11 @@ public class NodeFenceRunTests : IAsyncLifetime
         Assert.True(_putBacks.IsEmpty);
     }
 
-    // The parent is stopped by the fence; its child that started with it (RunCondition.InProgress) is not asked to stop,
-    // ends on its own and stores its outcome. The child that follows the parent's outcome is neither run nor skipped.
+    // #221: the parent and its child that started with it (RunCondition.InProgress) are both asked to stop; each is listed
+    // under its own marker and stores nothing. The child that follows the parent's outcome is neither run nor skipped.
+    // Once both rows are put back, the parent's next run starts the child again, and it runs once.
     [Fact]
-    public async Task WhenAParentIsFenced_TheChildThatStartedWithIt_RunsOn_AndNothingBelowTheParentIsRunOrSkipped()
+    public async Task WhenAParentIsFenced_TheChildThatStartedWithIt_IsAskedToStopToo_AndTheParentsNextRunStartsItOnce()
     {
         var marker = NextMarker();
         var withParent = WaitingChild(RunCondition.InProgress);
@@ -377,32 +378,35 @@ public class NodeFenceRunTests : IAsyncLifetime
         var run = _handler.ExecuteTaskAsync(parentContext, isDue: false);
         await parentGate.Started.Task.WaitAsync(Limit);
         await childGate.Started.Task.WaitAsync(Limit);
-        Assert.Equal(1, _fence.Raise(_handler));
-
-        // The parent's run has ended; the chain's run waits for the child, which was not asked to stop.
-        await WaitUntilAsync(() => !_putBacks.IsEmpty, "the parent's claim is listed");
-        Assert.False(run.IsCompleted);
-        Assert.Equal(TickerStatus.InProgress, (await StoredAsync(withParent.Id)).Status);
-        childGate.Release.TrySetResult();
+        var childMarker = (await StoredAsync(withParent.Id)).UpdatedAt;
+        Assert.Equal(2, _fence.Raise(_handler));
         await run.WaitAsync(Limit);
 
-        Assert.Equal(TickerStatus.Done, (await StoredAsync(withParent.Id)).Status);
+        AssertNothingWasReportedOrStored(await StoredAsync(withParent.Id), childMarker);
         Assert.Equal(1, childGate.Starts);
         Assert.Equal(TickerStatus.Idle, (await StoredAsync(afterParent.Id)).Status);
         Assert.Equal(0, afterGate.Starts);
-        Assert.Equal(parent.Id, Assert.Single(_putBacks.TakeAll()).Id);
-        Assert.Empty(_exceptionHandler.Calls);
+        var claims = _putBacks.TakeAll().OrderBy(c => c.ClaimMarker).ToArray();
+        Assert.Equal([new NotPutBackClaim(parent.Id, marker, TickerType.TimeTicker, "fn"), new NotPutBackClaim(withParent.Id, childMarker, TickerType.TimeTicker, "fn")], claims);
 
-        // The parent runs again (here: the same contexts, a new claim): the child that already ran is not started again.
-        Assert.True(await PutBackAsync(new NotPutBackClaim(parent.Id, marker, TickerType.TimeTicker)));
+        foreach (var claim in claims)
+            Assert.True(await PutBackAsync(claim));
+        var childPutBack = await StoredAsync(withParent.Id);
+        Assert.Equal(TickerStatus.Idle, childPutBack.Status);
+        Assert.Null(childPutBack.LockHolder);
+        Assert.Null(childPutBack.ExecutionTime);
+
+        // The parent runs again (here: the same contexts, a new claim): it starts the child again, which now runs to its end.
         var again = Assert.Single(await _store.AcquireImmediateTimeTickersAsync([parent.Id], CancellationToken.None)).UpdatedAt;
         _fence.Clear();
-        var secondChildGate = new Gate();
+        var secondChildRuns = 0;
         var rerun = Context(parent.Id, (_, _, _) => Task.CompletedTask, again);
-        rerun.TimeTickerChildren.Add(Context(withParent.Id, Cooperative(secondChildGate), condition: RunCondition.InProgress));
+        rerun.TimeTickerChildren.Add(Context(withParent.Id, (_, _, _) => { Interlocked.Increment(ref secondChildRuns); return Task.CompletedTask; },
+            condition: RunCondition.InProgress));
         await _handler.ExecuteTaskAsync(rerun, isDue: false).WaitAsync(Limit);
 
-        Assert.Equal(0, secondChildGate.Starts);
+        Assert.Equal(1, secondChildRuns);
+        Assert.Equal(TickerStatus.Done, (await StoredAsync(withParent.Id)).Status);
         Assert.Equal(TickerStatus.Done, (await StoredAsync(parent.Id)).Status);
     }
 
