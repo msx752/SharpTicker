@@ -10,10 +10,14 @@
     href: storage.md
   - name: Dashboard
     href: dashboard.md
-- name: Operations
+- name: Running in production
   items:
-  - name: Running in production
-    href: operations.md
+  - name: Deploying
+    href: deploying.md
+  - name: Failure handling
+    href: failure-modes.md
+  - name: Tracing and logs
+    href: observability.md
 - name: Upgrading
   href: upgrading.md
 - name: Migration guide

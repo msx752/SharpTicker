@@ -36,7 +36,7 @@ dotnet add package SharpTicker
 - [Defining jobs](guide/jobs.md): job methods, payloads, dependency injection and code-first registration.
 - [Scheduling](guide/scheduling.md): time jobs, cron jobs, retries and chains.
 - [Storage](guide/storage.md) and [Dashboard](guide/dashboard.md) for persistence and the UI.
-- [Running in production](guide/operations.md): several nodes, start modes, error handling and tracing.
+- [Deploying](guide/deploying.md), [Failure handling](guide/failure-modes.md) and [Tracing and logs](guide/observability.md): several nodes, start modes, what happens when an instance stops, error handling and tracing.
 - [API reference](api/index.md), generated from the source.
 
 Moving an existing application to SharpTicker? See the [migration guide](guide/migrating.md).
