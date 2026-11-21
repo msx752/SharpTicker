@@ -327,8 +327,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
         // IMPORTANT: Register the ticker FIRST, before creating the SkipIfAlreadyRunningAction callback
         // This ensures the current occurrence is properly tracked when the callback checks for siblings
-        var run = TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this,
-            startsWithParent: isChild && context.RunCondition == RunCondition.InProgress);
+        var run = TickerCancellationTokenManager.AddTickerCancellationToken(cancellationTokenSource, context, isDue, this);
         var stoppedByFence = false;
 
         // The job leaves the registry of running jobs on every path, a failed outcome write included: a job left listed
@@ -369,7 +368,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
             // The fence may have been raised after this run was let start and before it was registered above; the fence's
             // cancel did not find it then. It does not start: its claim is put back like that of a run that was stopped.
-            if (context.RunMarker != null && !run.StartsWithParent && Fence is { IsRaised: true })
+            if (context.RunMarker != null && Fence is { IsRaised: true })
             {
                 stoppedByFence = true;
                 jobActivity?.SetTag("sharpticker.job.stopped_by_node_fence", true);
