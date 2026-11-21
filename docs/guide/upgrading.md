@@ -29,7 +29,7 @@ With the EF Core store, the lease of 1.6.0 and the change of 1.6.2 meet. At the 
 - After the upgrade, add again the time jobs that should still run. For a cron, the next occurrence runs at its time.
 - Or upgrade with `SetInProgressLease(TimeSpan.Zero)`, and turn the lease on once they are dealt with.
 
-A chain child that waits for such a job follows its run condition on a `Cancelled` parent; see [Lease on running jobs](storage.md#lease-on-running-jobs).
+A chain child that waits for such a job follows its run condition on a `Cancelled` parent; see [When an instance stops](failure-modes.md#when-an-instance-stops).
 
 <a id="release-by-release"></a>
 
@@ -58,7 +58,7 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.2)
 
-- EF Core: a job whose lease ran out is recorded as `Cancelled` and does not run again ([#211](https://github.com/msx752/SharpTicker/issues/211)). 1.6.0 and 1.6.1 released it to `Idle`, and the fallback ran it again. Its chain children follow their run condition on a `Cancelled` parent, and for a cron only the stuck occurrence is cancelled; see [Lease on running jobs](storage.md#lease-on-running-jobs).
+- EF Core: a job whose lease ran out is recorded as `Cancelled` and does not run again ([#211](https://github.com/msx752/SharpTicker/issues/211)). 1.6.0 and 1.6.1 released it to `Idle`, and the fallback ran it again. Its chain children follow their run condition on a `Cancelled` parent, and for a cron only the stuck occurrence is cancelled; see [When an instance stops](failure-modes.md#when-an-instance-stops).
 - Coming from a version before 1.6.0, this changes the advice of 1.6.0; see [From 1.5.x or earlier straight to 1.6.2 or later](#from-15x-or-earlier-straight-to-162-or-later).
 - With a mix of versions:
   - An instance on 1.6.0 or 1.6.1 still releases such jobs to `Idle`, and they run again. On those versions this also happens to an instance that is still running but cannot renew its lease (cut off from the database alone, or a process paused for longer than the lease): the other instances of those versions release its `InProgress` jobs while they may still run on it, and they run again.

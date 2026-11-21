@@ -10,7 +10,15 @@ An instance that stops while it holds jobs leaves them locked. What happens to t
 | Redis | Released when the instance starts again, or by another running instance once the heartbeat of the stopped one has ended. A released job runs again. |
 | MongoDB | Not released when MongoDB is used alone: it has no release step, so a job left `InProgress` by a process that ended stays so until you change it. With Redis next to it for the heartbeat, another running instance releases the jobs of a node once its heartbeat has ended, and a released job runs again; the self-fence does not apply to MongoDB, so a node that is only cut off from Redis runs on, and the job can run twice at the same time ([#223](https://github.com/msx752/SharpTicker/issues/223)). |
 
-**By another instance (EF Core lease).** Every instance that runs the background services renews the lock of the jobs it holds every fifth of the lease, and records the `InProgress` jobs of other instance names whose lock was not renewed for the whole lease as `Cancelled`, the way a graceful stop records a job that had not finished. Such a job does not run again. So a job of an instance that ended without a signal (killed, out of memory, a lost machine) ends as `Cancelled` whatever name the next instance has, also when that instance has been gone for days. The lease is set with `SetInProgressLease` (see [Storage](storage.md#lease-on-running-jobs)). With the default of 5 minutes:
+**By another instance (EF Core lease).** Every instance that runs the background services renews the lock of the jobs it holds every fifth of the lease, and records the `InProgress` jobs of other instance names whose lock was not renewed for the whole lease as `Cancelled`, the way a graceful stop records a job that had not finished. Such a job does not run again. So a job of an instance that ended without a signal (killed, out of memory, a lost machine) ends as `Cancelled` whatever name the next instance has, also when that instance has been gone for days. The lease is set with `SetInProgressLease` (see [Storage](storage.md#lease-on-running-jobs)).
+
+What a pass of the lease changes:
+
+- The renewal sets `LockedAt` to now on the jobs and cron occurrences the instance holds `InProgress` since it started. This includes a job that waits for a free slot of its function and a job whose outcome waits to be written again. `UpdatedAt` is not changed. A job that another instance released or took meanwhile is not taken back.
+- A job recorded as `Cancelled` gets the time of the pass as `ExecutedAt` and the exception message "The lock of the instance that ran the job was not renewed for the lease.", and its lock holder and `LockedAt` are cleared. The log has one entry at `Information` with their number and the names that held them, in the category `SharpTicker.EntityFrameworkCore.InProgressLease`.
+- An instance does not cancel its own jobs this way: jobs an earlier run under its own name left are released by the startup release and run again. A host that does not run the background services (`DisableBackgroundServices()`) neither renews nor cancels.
+
+With the default of 5 minutes:
 
 | Time | What happens |
 |---|---|
@@ -25,7 +33,7 @@ What this does not cover:
 - When the database cannot be reached by any instance, no instance renews and no instance cancels. After an outage longer than the lease, the next pass may record jobs that are still running as `Cancelled`, before their instance renews them.
 - `LockedAt` is written with the clock of the instance that renews and compared with the clock of the instance that cancels, so a difference between the clocks shortens or lengthens the lease by that much (see [Clocks](deploying.md#clocks)).
 - A job that is `InProgress` with no `LockedAt` or no lock holder (not written by SharpTicker) is not changed by the lease.
-- An instance with the lease off does not renew its locks, and an instance with a different lease cancels at its own lease. Set the same lease on every instance, or turn it off on all of them (see [Storage](storage.md#lease-on-running-jobs)).
+- An instance with the lease off does not renew its locks, and an instance with a different lease cancels at its own lease; see [Lease on running jobs](storage.md#lease-on-running-jobs) for the setting.
 - With Redis next to the store, the heartbeat release of a node Redis knows of comes about two heartbeat TTLs after the node stopped (see below), which with the default settings is before its lease ends. That release puts the jobs back to `Idle`, and they run again. The lease records as `Cancelled` what is left, such as the jobs under names that never wrote a heartbeat.
 - With the lease turned off (`TimeSpan.Zero`) and no Redis, a job that is `InProgress` under a name no instance starts with again stays `InProgress`. To get such a job released, start an instance under that name. A time job can also be removed on the dashboard: Cancel is refused for a job no instance runs, and then offers Force delete.
 
@@ -104,6 +112,8 @@ Which rows a claim can take depends on where the claim comes from:
 | Fallback for missed jobs | `Idle` or `Queued`. With EF Core and MongoDB the row can be held by any node; with Redis it is unlocked or held by this node. |
 | "Run now" | `Idle` or `Queued`, unlocked or held by this node. |
 
+"Run now" on several jobs or cron occurrences at once writes one row at a time, so a large selection costs one round trip for each.
+
 A cron also gets one stored occurrence per time slot when several instances create it at the same time: EF Core and MongoDB through a unique index on the cron and the time, Redis through a key made from them. This is per stored cron; see the last entry of [When a job can run more than once](#when-a-job-can-run-more-than-once) for a cron that is stored twice.
 
 ## A claim whose job does not start
@@ -122,8 +132,8 @@ When the store cannot be reached, the instance tries the put-back again while it
 
 The put-back has these limits:
 
-- A job whose put-back had not succeeded when the process ended stays `InProgress` until its store releases it: EF Core when an instance starts again under the same name (once the job's lease ends, another instance records it as `Cancelled` instead), Redis when the instance starts again or another instance sees its heartbeat stop, MongoDB only when Redis is next to it for the heartbeat and another instance sees the heartbeat stop.
-- The marker is the instance's clock in whole milliseconds. An `UpdatedAt` column that keeps less than that, such as SQL Server `datetime` or MySQL `datetime` without fractional seconds, cannot hold it exactly, so a put-back may not find its claim. The default mappings (`datetime2`, `datetime(6)`) keep enough.
+- A job whose put-back had not succeeded when the process ended stays `InProgress` until its store releases it (see [When an instance stops](#when-an-instance-stops)).
+- The marker is the instance's clock in whole milliseconds; an instance does not reuse a value. An `UpdatedAt` column that keeps less than that, such as SQL Server `datetime` or MySQL `datetime` without fractional seconds, cannot hold it exactly, so a put-back may not find its claim. The default mappings (`datetime2`, `datetime(6)`) keep enough.
 - A cron occurrence that was put back keeps its time slot, so it counts as missed: with `SkipStaleCronOccurrencesOnStartup` it is skipped when an instance starts later than the threshold.
 - With a [custom persistence provider](storage.md#custom-persistence-providers) that keeps the default put-back methods, nothing is put back.
 
