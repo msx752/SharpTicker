@@ -32,7 +32,7 @@
 - **Pluggable persistence**: in-memory, Entity Framework Core (SQL Server, PostgreSQL, SQLite, MySQL, ...), MongoDB or Redis.
 - **Built-in dashboard**: a real-time UI over SignalR to monitor, inspect, run and manage jobs.
 - **Retries**: per-job retry counts and intervals.
-- **Multiple nodes**: lock-based coordination so several instances can share one store.
+- **Multiple nodes**: several instances can share one store, and each job is claimed by one of them. In some failure cases a job can run more than once, so write jobs that tolerate a second run; see [When a job can run more than once](https://msx752.github.io/SharpTicker/guide/failure-modes.html#when-a-job-can-run-more-than-once).
 - **OpenTelemetry**: optional tracing for job execution.
 - **.NET 8, 9 and 10 in one package**: every package contains a separate build for each target, and NuGet picks the one that matches your project.
 
@@ -45,6 +45,8 @@ dotnet add package SharpTicker
 ### 1. Register the scheduler
 
 ```csharp
+using SharpTicker.DependencyInjection;
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSharpTicker();
@@ -73,6 +75,9 @@ public class MyJobs
 ### 3. Schedule it
 
 ```csharp
+using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Interfaces.Managers;
+
 public class MyService(ITimeTickerManager<TimeTickerEntity> manager)
 {
     public Task ScheduleAsync() =>
@@ -84,7 +89,7 @@ public class MyService(ITimeTickerManager<TimeTickerEntity> manager)
 }
 ```
 
-More complete setups are in [`samples/`](samples).
+The [Getting started](https://msx752.github.io/SharpTicker/guide/getting-started.html) guide walks through these steps. More complete setups are in [`samples/`](samples).
 
 ## Packages
 

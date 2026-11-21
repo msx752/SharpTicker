@@ -61,6 +61,9 @@ namespace SharpTicker.Utilities
         internal Action<IServiceCollection> DashboardServiceAction { get; set; }
         internal Type TickerExceptionHandlerType { get; private set; }
 
+        /// <summary>
+        /// Configures the scheduler of this instance; see <see cref="SchedulerOptionsBuilder"/> for the options and their defaults.
+        /// </summary>
         public TickerOptionsBuilder<TTimeTicker, TCronTicker> ConfigureScheduler(Action<SchedulerOptionsBuilder> schedulerOptionsBuilder)
         {
             schedulerOptionsBuilder?.Invoke(_schedulerOptions);
@@ -230,11 +233,32 @@ namespace SharpTicker.Utilities
             => _tickerExecutionContext.DashboardApplicationAction = action;
     }
 
+    /// <summary>
+    /// Scheduler options of one instance, set through <c>ConfigureScheduler</c>.
+    /// </summary>
     public class SchedulerOptionsBuilder
     {
+        /// <summary>
+        /// The name of this instance. Jobs it claims are locked under this name, and the dashboard shows it. The default
+        /// is <see cref="Environment.MachineName"/>, which in a container usually changes with every new container; give
+        /// each instance a stable name of its own.
+        /// </summary>
         public string NodeIdentifier { get; set; } = Environment.MachineName;
+        /// <summary>
+        /// The number of worker threads that start jobs on this instance. The default is <see cref="Environment.ProcessorCount"/>.
+        /// It limits how many jobs start at once, not how many asynchronous jobs are in progress: the asynchronous part of
+        /// a job runs on the .NET thread pool. A value of 0 or less makes the scheduler throw <see cref="ArgumentOutOfRangeException"/> when it is created.
+        /// </summary>
         public int MaxConcurrency { get; set; } = Environment.ProcessorCount;
+        /// <summary>
+        /// How long a worker thread with no work stays alive before it ends. The default is 1 minute.
+        /// </summary>
         public TimeSpan IdleWorkerTimeOut { get; set; } = TimeSpan.FromMinutes(1);
+        /// <summary>
+        /// How long the fallback waits between two looks for jobs that are past their time and were not started, such
+        /// as jobs missed while no instance ran. The default is 30 seconds. While a look finds jobs, the next one follows
+        /// without this wait.
+        /// </summary>
         public TimeSpan FallbackIntervalChecker { get; set; } = TimeSpan.FromSeconds(30);
         /// <summary>
         /// Gets or sets the minimum interval between database polls.
@@ -252,6 +276,10 @@ namespace SharpTicker.Utilities
         /// </para>
         /// </summary>
         public TimeSpan StaleCronOccurrenceThreshold { get; set; } = TimeSpan.Zero;
+        /// <summary>
+        /// The time zone in which cron expressions are evaluated. The default is <see cref="TimeZoneInfo.Local"/>.
+        /// The value is taken when <c>AddSharpTicker</c> runs and is shared by the whole process. This is a field, not a property.
+        /// </summary>
         public TimeZoneInfo SchedulerTimeZone = TimeZoneInfo.Local;
     }
 }

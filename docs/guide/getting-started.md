@@ -6,7 +6,7 @@
 dotnet add package SharpTicker
 ```
 
-`SharpTicker` contains the scheduler and the source generator. Add other packages only for the features you use; see [Storage](storage.md), [Dashboard](dashboard.md) and [Running in production](operations.md). Keep every SharpTicker package on the same version.
+`SharpTicker` contains the scheduler and the source generator. Add other packages only for the features you use; see [Storage](storage.md), [Dashboard](dashboard.md) and [Tracing and logs](observability.md). Keep every SharpTicker package on the same version.
 
 ## Register the scheduler
 
