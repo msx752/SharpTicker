@@ -47,7 +47,8 @@ public sealed class RedisClusterFixture : IAsyncLifetime
                 listener.Start();
                 listeners.Add(listener);
                 var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
-                if (port < 55536)
+                // The bus port of a node (its port + 10000) must not be the port of another node.
+                if (port < 55536 && !ports.Any(other => other == port + 10000 || port == other + 10000))
                     ports.Add(port);
             }
         }
@@ -68,13 +69,15 @@ public sealed class RedisClusterFixture : IAsyncLifetime
             "--cluster-node-timeout 5000 --appendonly no --save '' --daemonize yes;"));
         var create = "redis-cli --cluster create " + string.Join(" ", Ports.Select(p => $"127.0.0.1:{p}")) +
                      " --cluster-replicas 0 --cluster-yes";
-        var script = $"{start} sleep 1; {create}; tail -f /dev/null";
+        // A create that fails ends the container, so the start fails instead of waiting for a cluster that never comes.
+        var script = $"{start} sleep 1; {create} || exit 1; tail -f /dev/null";
 
         var builder = new ContainerBuilder("redis:7")
             .WithEntrypoint("sh", "-c", script)
             // Every node, not only the first: right after the create a node can still answer CLUSTERDOWN.
             .WithWaitStrategy(Wait.ForUnixContainer().UntilCommandIsCompleted(
-                "sh", "-c", string.Join(" && ", Ports.Select(p => $"redis-cli -p {p} cluster info | grep -q cluster_state:ok"))));
+                ["sh", "-c", string.Join(" && ", Ports.Select(p => $"redis-cli -p {p} cluster info | grep -q cluster_state:ok"))],
+                wait => wait.WithTimeout(TimeSpan.FromSeconds(60))));
         foreach (var port in Ports)
             builder = builder.WithPortBinding(port, port);
         _container = builder.Build();
@@ -235,7 +238,7 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
     }
 
     // The application with Redis as the job store.
-    protected async Task<WebApplication> StartAsync(bool backgroundServices)
+    protected async Task<WebApplication> StartAsync(bool backgroundServices, TimeSpan? heartbeatInterval = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
@@ -248,7 +251,12 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
                 options.DisableBackgroundServices();
             options.ConfigureScheduler(scheduler => scheduler.NodeIdentifier = Node);
             options.SetExceptionHandler<RecordingExceptionHandler>();
-            options.AddStackExchangeRedis(redis => redis.Configuration = ConnectionString);
+            options.AddStackExchangeRedis(redis =>
+            {
+                redis.Configuration = ConnectionString;
+                if (heartbeatInterval is { } interval)
+                    redis.NodeHeartbeatInterval = interval;
+            });
             options.AddDashboard(dashboard => dashboard.WithNoAuth());
         });
 
@@ -278,14 +286,22 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
     protected (LogLevel Level, string Category, string Text)[] ClusterErrors()
         => Log.Entries.Where(e => e.Text.Contains(ClusterErrorText, StringComparison.Ordinal)).ToArray();
 
-    // The heartbeat service has written this node's heartbeat, so the startup check, which follows that write, is done.
-    protected async Task WaitForTheFirstHeartbeatAsync(WebApplication app)
+    // Waits until the heartbeat service has written this node's heartbeat the given number of times (each write stores a
+    // new timestamp), so the check after each write has had its chance to log.
+    protected async Task WaitForHeartbeatWritesAsync(WebApplication app, int writes)
     {
-        var connection = app.Services.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker");
-        await WaitUntilAsync(async () => await connection.GetDatabase().KeyExistsAsync($"sharpticker:hb:{Node}"),
-            "the heartbeat of this node is written");
+        var cache = app.Services.GetRequiredKeyedService<Microsoft.Extensions.Caching.Distributed.IDistributedCache>("sharpticker");
+        var seen = new HashSet<long>();
+        await WaitUntilAsync(async () =>
+        {
+            var entry = await Microsoft.Extensions.Caching.Distributed.DistributedCacheExtensions.GetStringAsync(cache, $"hb:{Node}");
+            if (!string.IsNullOrEmpty(entry))
+                seen.Add(JsonDocument.Parse(entry).RootElement.EnumerateObject()
+                    .Single(p => string.Equals(p.Name, "ts", StringComparison.OrdinalIgnoreCase)).Value.GetInt64());
+            return seen.Count >= writes;
+        }, $"{writes} heartbeat writes of this node");
         // The check runs right after the write; give it a moment to log.
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
     }
 
     private void AssertNothingWentWrong()
@@ -425,15 +441,14 @@ public sealed class RedisClusterEndToEndTests(RedisClusterFixture fixture) : Red
 
     protected override Task ResetAsync() => fixture.ResetAsync();
 
-    // One Error, in the heartbeat service's category, after the first heartbeat; nothing else at Warning or above while
-    // the store holds no job (with jobs, the scheduler loop and the fallback fail as well; see the skipped test).
+    // One Error, in the heartbeat service's category, after the first heartbeat, and not again after the heartbeats that
+    // follow (a 1 second interval, three writes); nothing else at Warning or above while the store holds no job (with
+    // jobs, the scheduler loop and the fallback fail as well; see the skipped test).
     [Fact]
     public async Task OnACluster_TheStartupWritesOneError_ThatTheClusterIsNotSupported()
     {
-        var app = await StartAsync(backgroundServices: true);
-        await WaitForTheFirstHeartbeatAsync(app);
-        // Long enough for a second heartbeat write and check loop pass.
-        await Task.Delay(TimeSpan.FromSeconds(2));
+        var app = await StartAsync(backgroundServices: true, heartbeatInterval: TimeSpan.FromSeconds(1));
+        await WaitForHeartbeatWritesAsync(app, writes: 3);
 
         var entry = Assert.Single(ClusterErrors());
         Assert.Equal(LogLevel.Error, entry.Level);
@@ -463,8 +478,8 @@ public sealed class RedisStandaloneControlEndToEndTests(RedisTestFixture fixture
     [Fact]
     public async Task OnAStandaloneRedis_TheStartupWritesNoClusterError()
     {
-        var app = await StartAsync(backgroundServices: true);
-        await WaitForTheFirstHeartbeatAsync(app);
+        var app = await StartAsync(backgroundServices: true, heartbeatInterval: TimeSpan.FromSeconds(1));
+        await WaitForHeartbeatWritesAsync(app, writes: 2);
         Assert.Empty(ClusterErrors());
     }
 
