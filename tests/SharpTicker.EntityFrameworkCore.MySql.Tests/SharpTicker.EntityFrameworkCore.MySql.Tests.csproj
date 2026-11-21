@@ -25,6 +25,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\CancelledStoreCallProbe.cs" Link="Shared\CancelledStoreCallProbe.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\SharpTicker\SharpTicker.csproj" />
     <ProjectReference Include="..\..\src\SharpTicker.Utilities\SharpTicker.Utilities.csproj" />
     <ProjectReference Include="..\..\src\SharpTicker.EntityFrameworkCore\SharpTicker.EntityFrameworkCore.csproj" />
