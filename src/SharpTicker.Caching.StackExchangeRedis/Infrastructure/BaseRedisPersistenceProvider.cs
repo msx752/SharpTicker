@@ -97,7 +97,8 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // The claims, releases and skips below change a row in C#, through CompareAndSetAsync: the row is read and written by
     // the serializer that wrote it, so every value of an application's own ticker type comes back as it was stored. Up to
     // 1.5.1 these were Lua scripts that decoded and encoded the row with the JSON library of Redis, which keeps 14
-    // significant digits (#151). A row that does not deserialize is not changed by them.
+    // significant digits (#151). A row that does not deserialize is not changed by them, nor is one that reads but cannot
+    // be serialized again (#246): such a row is left as it is and the other rows go on.
 
     // The claim fields of a time ticker row or an occurrence row: the two types share no base type that holds them.
     private static (TickerStatus Status, string LockHolder, DateTime UpdatedAt) ClaimFieldsOf<T>(T row) => row switch
@@ -140,7 +141,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             if (expectedUpdatedAt != null && updatedAt != expectedUpdatedAt.Value) return null;
             SetClaimFields(row, targetStatus, LockHolder, now, now);
             return row;
-        });
+        }, leaveUnwritableRow: true);
     }
 
     protected Task<T> TryReleaseAsync<T>(string key) where T : class
@@ -153,7 +154,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             if (!IsClaimable(status, holder)) return null;
             SetClaimFields(row, TickerStatus.Idle, null, null, now);
             return row;
-        });
+        }, leaveUnwritableRow: true);
     }
 
     protected Task<T> TryRecoverDeadNodeAsync<T>(string key, string deadNodeId) where T : class
@@ -166,7 +167,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             if (holder != deadNodeId || status is not (TickerStatus.Idle or TickerStatus.Queued or TickerStatus.InProgress)) return null;
             SetClaimFields(row, TickerStatus.Idle, null, null, now);
             return row;
-        });
+        }, leaveUnwritableRow: true);
     }
 
     // The claim is written, so an index failure must not turn into a failed claim: the caller would not run a row that is
@@ -257,7 +258,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     // does not exist (SET NX); without it a missing key writes nothing.
     // Returns the row as written, or null when nothing was written: the key is missing, or change refused the row. Rounds
     // that keep conflicting throw: null means the row is gone or does not match, which a caller may act on.
-    protected async Task<T> CompareAndSetAsync<T>(string key, Func<T, T> change, Func<T> create = null) where T : class
+    // leaveUnwritableRow: for the claims, releases and skips that go over many rows (the loop, the fallback, run-now, the
+    // releases). A row that reads but that the serializer cannot write again (a converter of the application's own type
+    // that reads a value it does not write, #246) is then left as it is, with a warning that names its key, and null is
+    // returned, so the other rows of the pass go on. Only the serializer's failure is taken: a failure of Redis still
+    // fails the call.
+    protected async Task<T> CompareAndSetAsync<T>(string key, Func<T, T> change, Func<T> create = null, bool leaveUnwritableRow = false)
+        where T : class
     {
         for (var round = 0; round < MaxCompareAndSetRounds; round++)
         {
@@ -273,7 +280,18 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             var raw = (string)read;
             var row = change(Serializer.DeserializeOrNull<T>(raw, key));
             if (row == null) return null;
-            var payload = Serializer.Serialize(row);
+
+            string payload;
+            try
+            {
+                payload = Serializer.Serialize(row);
+            }
+            catch (Exception ex) when (leaveUnwritableRow && ex is JsonException or NotSupportedException or InvalidOperationException)
+            {
+                _logger.LogWarning(ex, "Redis key '{Key}' cannot be written as {Type}: the serializer fails on a value it holds. The row is left as it is.",
+                    key, typeof(T).Name);
+                return null;
+            }
 
             if (BeforeCompareAndSetHook != null)
                 await BeforeCompareAndSetHook(key).ConfigureAwait(false);
@@ -666,7 +684,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             row.LockedAt = null;
             row.UpdatedAt = now;
             return row;
-        }).ConfigureAwait(false);
+        }, leaveUnwritableRow: true).ConfigureAwait(false);
 
         // The row key and the index keys live in different hash slots; a stale pending entry is harmless, a claim refuses
         // a skipped row.
@@ -916,7 +934,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             row.LockedAt = now;
             row.UpdatedAt = claimMarker;
             return row;
-        });
+        }, leaveUnwritableRow: true);
 
     private const int FallbackPage = 256;
 

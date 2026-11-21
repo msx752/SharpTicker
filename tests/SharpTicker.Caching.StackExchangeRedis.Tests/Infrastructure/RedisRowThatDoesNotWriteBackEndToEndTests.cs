@@ -50,7 +50,8 @@ public sealed class LabelledTimeTicker : TimeTickerEntity<LabelledTimeTicker>
 /// see go wrong: a log entry at Warning or above that is not about that one row, or a call to its exception handler.
 /// The control (<c>olderForm: false</c>) keeps the label in the current form, so that row is an ordinary job.
 /// On 1.6.4 the <c>olderForm: true</c> cases fail: the claim's serialize throws (CompareAndSetAsync), the scheduler loop
-/// and every fallback pass end at that row, and the jobs behind it in the same pass do not run.
+/// and every fallback pass end at that row, and the jobs behind it in the same pass do not run (#246). From 1.6.5 that
+/// row is left as it is, with a warning that names its key, and it does not run.
 /// </summary>
 [Collection(RedisTestFixture.CollectionName)]
 public class RedisRowThatDoesNotWriteBackEndToEndTests(RedisTestFixture fixture) : IAsyncLifetime
@@ -189,8 +190,12 @@ public class RedisRowThatDoesNotWriteBackEndToEndTests(RedisTestFixture fixture)
 
     // What the application may see about that one row: warnings that name its key. Nothing above Warning, no warning
     // about anything else, nothing given to its handler.
-    private void AssertOnlyThisRowIsReported(Guid row)
+    private void AssertOnlyThisRowIsReported(Guid row, bool olderForm)
     {
+        if (olderForm)
+            Assert.Contains(_log.Entries, e => e.Level == LogLevel.Warning
+                && e.Text.Contains($"Redis key '{RedisKeyBuilder.TimeTickerKey(row)}' cannot be written as {nameof(LabelledTimeTicker)}"));
+
         var others = _log.Entries
             .Where(e => e.Level >= LogLevel.Warning)
             .Where(e => e.Level != LogLevel.Warning || !e.Text.Contains(RedisKeyBuilder.TimeTickerKey(row)))
@@ -259,7 +264,9 @@ public class RedisRowThatDoesNotWriteBackEndToEndTests(RedisTestFixture fixture)
         Assert.All(others, id => Assert.True(Runs.TryGetValue(id, out var runs) && runs.Count == 1, Report()));
         if (!olderForm)
             Assert.True(Runs.TryGetValue(first, out var runs) && runs.Count == 1, Report());
-        AssertOnlyThisRowIsReported(first);
+        else
+            Assert.False(Runs.ContainsKey(first), Report());
+        AssertOnlyThisRowIsReported(first, olderForm);
     }
 
     // Jobs that became overdue while the application was stopped, behind the job whose row cannot be written back (it is
@@ -288,6 +295,52 @@ public class RedisRowThatDoesNotWriteBackEndToEndTests(RedisTestFixture fixture)
         Assert.All(others, id => Assert.True(Runs.TryGetValue(id, out var runs) && runs.Count == 1, Report()));
         if (!olderForm)
             Assert.True(Runs.TryGetValue(FirstId, out var runs) && runs.Count == 1, Report());
-        AssertOnlyThisRowIsReported(FirstId);
+        else
+            Assert.False(Runs.ContainsKey(FirstId), Report());
+        AssertOnlyThisRowIsReported(FirstId, olderForm);
+    }
+
+    // A cron occurrence that became overdue while the application was stopped: the fallback takes the overdue cron
+    // occurrences after the overdue time tickers in the same pass, so the job whose row cannot be written back is in
+    // front of it. After the start the occurrence runs one time.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AnOverdueCronOccurrenceBehindOneThatCannotBeWrittenBack_RunsOnce_AfterTheApplicationStarts(bool olderForm)
+    {
+        var host = Build();
+        var overdue = DateTime.UtcNow.AddMinutes(-5);
+        var first = Job(overdue, FirstId);
+        first.CreatedAt = first.UpdatedAt = overdue.AddMinutes(-1);
+        await Store(host).AddTimeTickers([first], CancellationToken.None);
+        if (olderForm)
+            await WriteLabelInTheOlderFormAsync(FirstId);
+
+        // Due only once a year, so the scheduler loop does not make an occurrence of its own during the test.
+        var cron = new CronTickerEntity
+        {
+            Id = Guid.NewGuid(), Function = Function, Expression = "0 0 0 1 1 *", IsEnabled = true, RetryIntervals = [],
+            CreatedAt = overdue.AddMinutes(-1), UpdatedAt = overdue.AddMinutes(-1)
+        };
+        await Store(host).InsertCronTickers([cron], CancellationToken.None);
+        var occurrence = new CronTickerOccurrenceEntity<CronTickerEntity>
+        {
+            Id = Guid.NewGuid(), CronTickerId = cron.Id, ExecutionTime = overdue, Status = TickerStatus.Idle,
+            CreatedAt = overdue.AddMinutes(-1), UpdatedAt = overdue.AddMinutes(-1), CronTicker = cron
+        };
+        await Store(host).InsertCronTickerOccurrences([occurrence], CancellationToken.None);
+
+        await host.StartAsync();
+        await WaitUntilAsync(() => Task.FromResult(Runs.ContainsKey(occurrence.Id)), "the overdue cron occurrence ran");
+
+        await Task.Delay(TimeSpan.FromSeconds(3));
+        await StopAsync();
+
+        Assert.True(Runs.TryGetValue(occurrence.Id, out var occurrenceRuns) && occurrenceRuns.Count == 1, Report());
+        if (!olderForm)
+            Assert.True(Runs.TryGetValue(FirstId, out var runs) && runs.Count == 1, Report());
+        else
+            Assert.False(Runs.ContainsKey(FirstId), Report());
+        AssertOnlyThisRowIsReported(FirstId, olderForm);
     }
 }
