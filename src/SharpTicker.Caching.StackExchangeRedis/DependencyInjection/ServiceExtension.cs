@@ -77,8 +77,19 @@ public static class ServiceExtension
         return tickerConfiguration;
     }
 
+    /// <summary>
+    /// Configures the Redis connection and the node heartbeat, given to <c>AddStackExchangeRedis</c>. Set one of
+    /// <see cref="RedisCacheOptions.Configuration"/>, <see cref="RedisCacheOptions.ConfigurationOptions"/>,
+    /// <see cref="ConnectionMultiplexer"/> or <see cref="RedisCacheOptions.ConnectionMultiplexerFactory"/>; the
+    /// application fails to start otherwise. <see cref="RedisCacheOptions.InstanceName"/> defaults to <c>sharpticker:</c>.
+    /// </summary>
     public class SharpTickerRedisOptionBuilder : RedisCacheOptions
     {
+        /// <summary>
+        /// How often this node writes its heartbeat to Redis. The default is 1 minute. A heartbeat stays in Redis for one
+        /// TTL, this interval plus 20 seconds. The other nodes may release the jobs of a node whose heartbeat is missing
+        /// for about two TTLs; with Redis as the job store, <see cref="StopJobsWhenHeartbeatIsLost"/> acts after one.
+        /// </summary>
         public TimeSpan NodeHeartbeatInterval { get; set; } = TimeSpan.FromMinutes(1);
 
         /// <summary>
