@@ -90,7 +90,7 @@ public static class ServiceExtension
         /// and the job runs again from the start, so it has to be safe to run twice. Jobs start again with the next
         /// heartbeat that is written.
         /// <para>
-        /// Not asked to stop: a job that ignores its cancellation token.
+        /// A job that ignores its cancellation token runs on.
         /// </para>
         /// <para>
         /// The default is true. With it, a Redis outage longer than one TTL stops the running jobs of every node that sees
