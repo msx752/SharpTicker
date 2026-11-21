@@ -39,7 +39,7 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.5)
 
-- Redis as the job store, a ticker type of your own: a record that reads but cannot be written back (a converter that reads a value it does not write) no longer stops the scheduler loop and the fallback ([#246](https://github.com/msx752/SharpTicker/issues/246)). Since 1.5.2 the claims, releases and skips write a record with the serializer, and up to 1.6.4 such a record made them throw: the loop and every fallback pass stopped at it, and the jobs behind it in the same pass did not run, overdue cron occurrences among them. Now the record is left as it is and named in a warning with its key, and the other jobs run; see [Redis](storage.md#redis).
+- Redis as the job store, a ticker type of your own: a record that reads but cannot be written back (a converter that reads a value it does not write) no longer stops the scheduler loop and the fallback ([#246](https://github.com/msx752/SharpTicker/issues/246)). From 1.5.2 up to 1.6.4 the claims, releases and skips write a record with the serializer, and such a record made them throw: the scheduler loop failed while the record was in its window, every fallback pass stopped at it, and the jobs behind it in the same pass did not run, overdue cron occurrences among them; when a stopped node held such a record, the release of that node's jobs failed at each heartbeat check. Now the record is left as it is and named in a warning with its key, and the other jobs run; see [Redis](storage.md#redis).
 
 **Steps:** none.
 
