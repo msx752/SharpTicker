@@ -193,6 +193,6 @@ public class SchedulerRestartDuringStoreCallEndToEndTests : IAsyncLifetime
         Assert.DoesNotContain(_logs.Entries, e => e.Level >= LogLevel.Warning);
         Assert.DoesNotContain(_logs.Entries, e => e.Message.StartsWith("The scheduler loop recovered"));
         Assert.Contains(_logs.Entries, e => e.Level == LogLevel.Debug && e.Exception == thrown
-            && e.Message.StartsWith("The scheduler loop restarted; the store reported the cancel of its command as"));
+            && e.Message.StartsWith("The scheduler loop restarted; the pass it cut off ended in"));
     }
 }

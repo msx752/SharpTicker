@@ -97,13 +97,15 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             {
                 await RunSharpTickerSchedulerAsync(stoppingToken, _schedulerLoopCancellationTokenSource.Token);
             }
-            catch (Exception ex) when (_schedulerLoopCancellationTokenSource.Token.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+            catch (Exception ex) when (_schedulerLoopCancellationTokenSource.Token.IsCancellationRequested && !stoppingToken.IsCancellationRequested && !_handOverFailed)
             {
                 // This is a restart request - release resources and continue loop. It is told by the loop's token, not by the
                 // exception: a store call the restart cut off can end in the provider's own exception instead of an
                 // OperationCanceledException (Microsoft.Data.SqlClient throws SqlException "Operation cancelled by user.").
+                // A failure of the hand-over is not one of them: it runs on the application's token, so a restart did not
+                // cut it off, and it stays a failure.
                 if (ex is not OperationCanceledException)
-                    _logger?.LogDebug(ex, "The scheduler loop restarted; the store reported the cancel of its command as {ExceptionType}.", ex.GetType().FullName);
+                    _logger?.LogDebug(ex, "The scheduler loop restarted; the pass it cut off ended in {ExceptionType}.", ex.GetType().FullName);
 
                 await TryReleaseAcquiredResourcesAsync(_executionContext.Functions, stoppingToken);
                 // Small delay to allow resources to be released
@@ -128,6 +130,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
             finally
             {
+                _handOverFailed = false;
                 _executionContext.SetFunctions(null);
                 _schedulerLoopCancellationTokenSource?.Dispose();
                 _schedulerLoopCancellationTokenSource = null;
@@ -211,6 +214,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         Failed
     }
 
+    // Set when the pass ended in a failure of the hand-over, which runs on the application's token: a restart asked for
+    // meanwhile did not cause it. Only the loop's own thread uses it.
+    private bool _handOverFailed;
+
     // Hands won claims to the workers and puts back those whose job does not start; shared with the fallback and run-now.
     private readonly ClaimedWorkQueue _work;
 
@@ -243,7 +250,15 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             }
 
             waiting.RemoveRange(0, due.Length);
-            await HandOverBatchAsync(due, stoppingToken).ConfigureAwait(false);
+            try
+            {
+                await HandOverBatchAsync(due, stoppingToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                _handOverFailed = true;
+                throw;
+            }
         }
     }
 
