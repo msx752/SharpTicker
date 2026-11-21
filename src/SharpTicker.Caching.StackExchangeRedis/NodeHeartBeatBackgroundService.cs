@@ -44,6 +44,7 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     private int _started;
     private readonly EarlierRunRelease _earlierRunRelease;
     private readonly NodeSelfFence _selfFence;
+    private readonly RedisClusterCheck _clusterCheck;
     private readonly INodeHeartbeatRegistry _registry;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly ISharpTickerNotificationHubSender _notificationHubSender;
@@ -64,8 +65,8 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
 
     public NodeHeartBeatBackgroundService(ServiceExtension.SharpTickerRedisOptionBuilder redisOptions, INodeHeartbeatRegistry registry,
         IInternalTickerManager internalTickerManager, ISharpTickerNotificationHubSender notificationHubSender, ILogger<NodeHeartBeatBackgroundService> logger,
-        EarlierRunRelease earlierRunRelease, NodeSelfFence selfFence)
-        : this(redisOptions, registry, internalTickerManager, notificationHubSender, logger, TimeProvider.System, earlierRunRelease, selfFence)
+        EarlierRunRelease earlierRunRelease, NodeSelfFence selfFence, RedisClusterCheck clusterCheck)
+        : this(redisOptions, registry, internalTickerManager, notificationHubSender, logger, TimeProvider.System, earlierRunRelease, selfFence, clusterCheck)
     {
     }
 
@@ -73,8 +74,9 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     // never picks up a TimeProvider the application registered.
     internal NodeHeartBeatBackgroundService(ServiceExtension.SharpTickerRedisOptionBuilder redisOptions, INodeHeartbeatRegistry registry,
         IInternalTickerManager internalTickerManager, ISharpTickerNotificationHubSender notificationHubSender, ILogger<NodeHeartBeatBackgroundService> logger,
-        TimeProvider timeProvider, EarlierRunRelease earlierRunRelease = null, NodeSelfFence selfFence = null)
+        TimeProvider timeProvider, EarlierRunRelease earlierRunRelease = null, NodeSelfFence selfFence = null, RedisClusterCheck clusterCheck = null)
     {
+        _clusterCheck = clusterCheck;
         _selfFence = selfFence is { Enabled: true, Fence: not null, Owner: not null } ? selfFence : null;
         _registry = registry;
         _internalTickerManager = internalTickerManager;
@@ -257,6 +259,8 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
                     // which follows at once (its tick is due), decides.
                     if (_timeProvider.GetElapsedTime(sentAt) < _ttl)
                         ClearFence();
+                    // Once, after the first heartbeat that was written: the connection is up then (#225).
+                    _clusterCheck?.RunOnce(_logger);
 
                     if (!await timer.WaitForNextTickAsync(stoppingToken))
                         return;

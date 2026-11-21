@@ -56,6 +56,10 @@ public static class ServiceExtension
                 Enabled: options.StopJobsWhenHeartbeatIsLost && sp.GetRequiredService<EarlierRunRelease>().StoreIsRedis,
                 Fence: sp.GetService<NodeFence>(),
                 Owner: sp.GetService<ITickerExecutionTaskHandler>()));
+            // The same condition again: a Redis Cluster breaks the job store, not the heartbeat next to another store (#225).
+            services.AddSingleton(sp => new RedisClusterCheck(
+                StoreIsRedis: sp.GetRequiredService<EarlierRunRelease>().StoreIsRedis,
+                Connection: () => sp.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker")));
             services.AddSingleton<SharpTickerRedisContext>();
             services.AddSingleton<ISharpTickerRedisContext>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
             services.AddSingleton<INodeHeartbeatRegistry>(sp => sp.GetRequiredService<SharpTickerRedisContext>());
