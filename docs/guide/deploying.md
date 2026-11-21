@@ -66,6 +66,48 @@ app.UseSharpTicker(SharpTickerStartMode.Manual);
 
 The store must be reachable when the application starts. At startup SharpTicker reads the store, also when no cron is defined in code. If that read fails, the host fails to start (`Hosting failed to start`) and the process ends; it does not wait for the store. Start the instance again once the store answers, for example through the restart policy of your orchestrator. An outage while the instance runs does not stop it.
 
+## Kubernetes
+
+SharpTicker has no Kubernetes integration of its own. These notes apply what the sections above and [Failure handling](failure-modes.md) describe to a cluster.
+
+### Node names
+
+Run the scheduling pods as a StatefulSet and pass the pod name in, so that a replaced pod keeps its name (see [Instance names](#instance-names)):
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+```
+
+- A StatefulSet starts the replacement of a pod after the old pod with that name has gone, so two running pods do not share a name. A pod that is force-deleted while its process still runs breaks that: with EF Core or Redis, the new pod's startup release frees the jobs the old one is still running (see [When a job can run more than once](failure-modes.md#when-a-job-can-run-more-than-once)).
+- A pod that comes back under its name releases what its earlier run left at its start, and those jobs run again (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
+- With a Deployment every pod has a new name. The jobs of a pod that was killed are then released by the EF Core lease or the Redis heartbeat release, or not at all with MongoDB alone, or with EF Core when its lease is off and Redis is not used.
+- Pods that only add jobs, such as an API, can run as a Deployment with `DisableBackgroundServices()` (see [Start modes](#start-modes)).
+
+### Stopping a pod
+
+When a pod is stopped, the host stops and the scheduler waits for the running jobs for a little less than `HostOptions.ShutdownTimeout` (30 seconds by default); see [Cancellation](jobs.md#cancellation). Kubernetes kills the process when `terminationGracePeriodSeconds` (also 30 seconds by default) ends. Keep the grace period above the shutdown timeout. A process that is killed before the scheduler has recorded its running jobs leaves them `InProgress`, and they are handled as for an instance that stopped without a signal.
+
+### Probes
+
+SharpTicker registers no health check. Points to consider for your own probes:
+
+- When the store cannot be reached at startup, the host fails to start and the process ends (see [Start modes](#start-modes)). The restart policy of the pod then starts it again.
+- An outage of the store while the instance runs does not stop it. A liveness probe that restarts the pod during such an outage ends the jobs that are still running, and a pod that restarts while the store cannot be reached does not start.
+
+### Lease and heartbeat settings
+
+- With EF Core, set the same `SetInProgressLease` on every pod that runs the background services, or turn it off on all of them (see [Lease on running jobs](storage.md#lease-on-running-jobs)). A pod that is paused, or cut off from the database, for longer than the lease has its jobs recorded as `Cancelled` by the others.
+- With Redis, `NodeHeartbeatInterval` sets how soon the others release the jobs of a pod that stopped: about two heartbeat TTLs (each the interval plus 20 seconds). With Redis as the job store, a pod that cannot write its heartbeat for one TTL asks its jobs to stop; `StopJobsWhenHeartbeatIsLost` turns that off (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
+- Keep the clocks of the nodes in sync (see [Clocks](#clocks)).
+
+### Rolling upgrades
+
+A rolling update runs pods of the old and the new version side by side for a while. An instance of an earlier version behaves as that version did, and [Upgrading](upgrading.md) names the version mixes in which a job can run twice, or not at all. Upgrade all pods together where you can, for example by scaling the scheduling pods down to zero and up again.
+
 ## While older instances still run
 
 While instances from before a switch to SharpTicker still run against the store (see [Migrating](https://github.com/msx752/SharpTicker/blob/main/MIGRATING.md#switching-instances)), the sections above do not describe them: a job can run twice until the last of them is gone. An instance of an earlier SharpTicker version behaves as that version did; see [Upgrading](upgrading.md) for what to check.

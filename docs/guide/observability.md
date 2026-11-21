@@ -14,7 +14,75 @@ builder.Services.AddOpenTelemetry()
     .WithTracing(tracing => tracing.AddSource("SharpTicker"));
 ```
 
-Activities are named `sharpticker.job.execute.<type>`, `sharpticker.job.enqueued`, `.completed`, `.failed`, `.cancelled` and `.skipped`, plus `sharpticker.seeding.started` and `.completed`. Tags use the prefix `sharpticker.job.`, for example `sharpticker.job.function`, `sharpticker.job.id`, `sharpticker.job.priority` and `sharpticker.job.retry_count`.
+Activities are created only while a listener, such as the OpenTelemetry SDK, listens to the `SharpTicker` source. SharpTicker has no `Meter`; it reports traces and log entries, not metrics. Exporters (console, OTLP and others) come from their own OpenTelemetry packages.
+
+### Activities
+
+| Activity | When |
+|---|---|
+| `sharpticker.job.execute.timeticker`, `sharpticker.job.execute.crontickeroccurrence` | One per run of a time job or a cron occurrence, around all of its attempts. |
+| `sharpticker.job.enqueued` | When the run starts. |
+| `sharpticker.job.completed` | When the run ends with success or failure. Its status is `Ok` or `Error`. |
+| `sharpticker.job.failed` | When the last attempt failed. Its status is `Error`. |
+| `sharpticker.job.cancelled` | When the run was cancelled. Its status is `Error`. |
+| `sharpticker.job.skipped` | When the job ended itself as skipped, or a chain child was skipped because its parent's outcome does not let it run. |
+| `sharpticker.job_request_serialization.failed` | When the request of a job could not be read. |
+
+`enqueued`, `completed`, `failed` and `cancelled` are started while the `execute` activity of the run is current, so they show as its children.
+
+### Tags
+
+On the `execute` activity:
+
+| Tag | Value |
+|---|---|
+| `sharpticker.job.id` | The ticker id. |
+| `sharpticker.job.type` | `TimeTicker` or `CronTickerOccurrence`. |
+| `sharpticker.job.function` | The function name. |
+| `sharpticker.job.priority` | `LongRunning`, `High`, `Normal` or `Low`. |
+| `sharpticker.job.machine` | The `NodeIdentifier` of the instance. |
+| `sharpticker.job.retries` | The number of retries the job allows. |
+| `sharpticker.job.parent_id` | The parent's id, for a chain child. |
+| `sharpticker.job.run_condition` | The run condition, for a chain child that is a time job. |
+| `sharpticker.job.is_due` | Whether the run was picked up as overdue; such a run ends `DueDone` on success. |
+| `sharpticker.job.is_child` | Whether the run is a chain child that runs inside its parent's run. |
+| `sharpticker.job.current_attempt` | The attempt, from 1. |
+| `sharpticker.job.final_status` | The status the run ended with, such as `Done`, `DueDone`, `Failed`, `Cancelled` or `Skipped`. |
+| `sharpticker.job.final_retry_count` | The retry count at the end, on success or failure. |
+| `sharpticker.job.error_type` | The exception type of the last attempt, on failure. |
+| `sharpticker.job.cancellation_reason` | `Task was cancelled`, on cancellation. |
+| `sharpticker.job.skip_reason` | The reason the job gave, when it ended itself as skipped. |
+| `sharpticker.job.stopped_by_node_fence` | `true` when the run was stopped because its node could not write its heartbeat (see [When an instance stops](failure-modes.md#when-an-instance-stops)). |
+
+On the other activities:
+
+| Activity | Tags |
+|---|---|
+| `enqueued` | `sharpticker.job.id`, `sharpticker.job.type` (lower case, for example `timeticker`), `sharpticker.job.function`, `sharpticker.job.enqueued_from` |
+| `completed` | `sharpticker.job.id`, `sharpticker.job.function`, `sharpticker.job.execution_time_ms` (the whole run, with the waits between attempts), `sharpticker.job.success` |
+| `failed` | `sharpticker.job.id`, `sharpticker.job.function`, `sharpticker.job.retry_count`, `sharpticker.job.error_type`, `sharpticker.job.error_message`, `sharpticker.job.error_stack_trace` |
+| `cancelled` | `sharpticker.job.id`, `sharpticker.job.function`, `sharpticker.job.cancellation_reason` |
+| `skipped` | `sharpticker.job.id`, `sharpticker.job.function`, `sharpticker.job.skip_reason` |
+| `job_request_serialization.failed` | `sharpticker.job.id`, `sharpticker.job.function`, `sharpticker.job.cancellation_reason` (the exception message) |
+
+`sharpticker.job.error_message` and `sharpticker.job.error_stack_trace` carry the exception's message and stack trace as they are; keep that in mind when traces leave your systems.
+
+## Job log entries
+
+Every run writes these entries through `ILogger`, also without tracing, so they reach the logging provider of the application (Serilog, NLog or another). The category is `SharpTicker.Utilities.Instrumentation.LoggerInstrumentation`, `SharpTicker.Utilities.Instrumentation.ActivitySourceInstrumentation` with `EnableActivitySource()`, or `SharpTicker.Instrumentation.OpenTelemetry.OpenTelemetryInstrumentation` with `AddOpenTelemetryInstrumentation()`.
+
+| Level | Message |
+|---|---|
+| Information | `SharpTicker Job enqueued: {JobType} - {Function} ({JobId}) from {EnqueuedFrom}`, when a run starts. |
+| Error | `Attempt of {Function} failed in {ElapsedMs}ms — {Error}`, or `Retry {Attempt} of {MaxRetries} for {Function} failed in {ElapsedMs}ms — {Error}`, for an attempt that is followed by a retry. |
+| Warning | `Retrying in {IntervalSeconds}s (retry {NextAttempt} of {MaxRetries})…` |
+| Error | `SharpTicker Job failed: {Function} ({JobId}) - Retry {RetryCount} - {Error}`, when the last attempt failed. |
+| Information | `SharpTicker Job completed: {Function} ({JobId}) in {ExecutionTime}ms - Success: {Success}`, when a run ends with success or failure. |
+| Warning | `SharpTicker Job cancelled: {Function} ({JobId}) - {Reason}` |
+| Information | `SharpTicker Job skipped: {Function} ({JobId}) - {Reason}` |
+| Error | `Failed to deserialize request to {RequestType} - {TickerId} - {TickerType}: {Exception}` |
+
+To keep only problems, set the level of that category to `Warning` in your logging configuration.
 
 ## Scheduler log entries
 
