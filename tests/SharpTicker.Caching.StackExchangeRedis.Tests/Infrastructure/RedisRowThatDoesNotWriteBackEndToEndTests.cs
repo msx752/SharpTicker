@@ -229,20 +229,25 @@ public class RedisRowThatDoesNotWriteBackEndToEndTests(RedisTestFixture fixture)
         }, what);
 
     // Jobs added to a running application, due in the same second as the job whose row cannot be written back and
-    // after it: each runs one time, on time (well inside the 30 s the test waits).
+    // after it: each runs one time, on time (well inside the 30 s the test waits). The first job is stored, in the older
+    // form, before the application starts: the loop claims a job of its next second as soon as it reads it, so a job
+    // added to the running application could be claimed before its row is changed.
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task JobsDueWithOrAfterOneThatCannotBeWrittenBack_RunOnceEach(bool olderForm)
     {
         var host = Build();
-        await host.StartAsync();
-        var manager = host.Services.GetRequiredService<ITimeTickerManager<LabelledTimeTicker>>();
-
-        var due = DateTime.UtcNow.AddSeconds(3);
-        var first = (await manager.AddAsync(Job(due, FirstId))).Result.Id;
+        var due = DateTime.UtcNow.AddSeconds(4);
+        var firstJob = Job(due, FirstId);
+        firstJob.CreatedAt = firstJob.UpdatedAt = DateTime.UtcNow;
+        await Store(host).AddTimeTickers([firstJob], CancellationToken.None);
+        var first = firstJob.Id;
         if (olderForm)
             await WriteLabelInTheOlderFormAsync(first);
+
+        await host.StartAsync();
+        var manager = host.Services.GetRequiredService<ITimeTickerManager<LabelledTimeTicker>>();
 
         var others = new List<Guid>();
         for (var i = 0; i < 3; i++)

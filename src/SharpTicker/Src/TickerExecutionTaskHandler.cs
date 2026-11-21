@@ -789,7 +789,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             if (await _internalTickerManager.RecordChildStartedAsync(child, cancellationToken))
                 return true;
 
-            Logger?.LogDebug("Chain child {FunctionName} ({TickerId}) is not started here: its row no longer waits for its start (it runs or ran elsewhere, or it has a time of its own now).",
+            Logger?.LogDebug("Chain child {FunctionName} ({TickerId}) is not started here: its row no longer waits for its start (it runs or ran elsewhere, or it has a time of its own now), or the store could not write it (a warning of the store names it).",
                 child.FunctionName, child.TickerId);
             return false;
         }
