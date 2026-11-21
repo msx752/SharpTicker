@@ -1,8 +1,6 @@
 # SharpTicker.MongoDB
 
-MongoDB persistence provider for [SharpTicker](https://github.com/msx752/SharpTicker). Drop-in alternative to `SharpTicker.EntityFrameworkCore` — use one or the other, not both.
-
-Uses the official `MongoDB.Driver` directly. No EF Core, no ODM.
+A MongoDB store for [SharpTicker](https://github.com/msx752/SharpTicker), a background job scheduler for .NET. It keeps time jobs, cron jobs and their runs in MongoDB through the official `MongoDB.Driver`.
 
 ## Install
 
@@ -10,36 +8,27 @@ Uses the official `MongoDB.Driver` directly. No EF Core, no ODM.
 dotnet add package SharpTicker.MongoDB
 ```
 
-## Usage
+## Setup
 
 ```csharp
+using SharpTicker.DependencyInjection;
+using SharpTicker.MongoDB.DependencyInjection;
+
 builder.Services.AddSharpTicker(options =>
 {
-    options.AddOperationalStore(mongoOptions =>
+    options.AddOperationalStore(mongo =>
     {
-        mongoOptions.UseSharpTickerMongoClient(
+        mongo.UseSharpTickerMongoClient(
             connectionString: "mongodb://localhost:27017",
             databaseName: "sharpticker");
     });
 });
 ```
 
-Or reuse an `IMongoClient` already registered in DI:
+To reuse an `IMongoClient` that is already registered in dependency injection, call `mongo.UseExistingMongoClient(databaseName: "sharpticker")` instead. One of the two is required; startup fails otherwise.
 
-```csharp
-services.AddSingleton<IMongoClient>(_ => new MongoClient("mongodb://localhost:27017"));
+Collections use the prefix `ticker_` (`ticker_TimeTickers`, `ticker_CronTickers`, `ticker_CronTickerOccurrences`); change it with `mongo.SetCollectionPrefix("...")`. Indexes are created at startup.
 
-builder.Services.AddSharpTicker(options =>
-{
-    options.AddOperationalStore(mongoOptions =>
-    {
-        mongoOptions.UseExistingMongoClient(databaseName: "sharpticker");
-    });
-});
-```
+## Documentation
 
-## Notes
-
-- Concurrency uses single-document atomic `findAndModify` with an `UpdatedAt` CAS guard. No MongoDB transactions needed — works on standalone Mongo, replica sets, and Atlas free tier.
-- Indexes are created idempotently on startup, including a unique index on `(CronTickerId, ExecutionTime)` for cron occurrence deduplication.
-- Collection names default to `ticker_TimeTickers`, `ticker_CronTickers`, `ticker_CronTickerOccurrences`. Override with `SetCollectionPrefix`.
+[Storage guide](https://msx752.github.io/SharpTicker/guide/storage.html): the MongoDB options, the other stores, and what happens when an instance stops.
