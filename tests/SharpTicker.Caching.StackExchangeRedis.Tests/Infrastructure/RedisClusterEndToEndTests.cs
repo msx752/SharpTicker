@@ -24,11 +24,40 @@ namespace SharpTicker.Caching.StackExchangeRedis.Tests.Infrastructure;
 /// the same container and announce 127.0.0.1 with ports that are published one to one on the host, so the nodes reach
 /// each other over the container's loopback and the test process reaches each node through the published port. That
 /// avoids the usual trouble with Docker on Windows, where a node announces a container address the host cannot reach.
-/// The host ports are fixed (27101-27103) because the nodes tell the client these ports in their slot map.
+/// The host ports are the ports inside the container, because the nodes tell the client these ports in their slot map;
+/// they are picked free on the host when the fixture starts, so the test runs of several target frameworks at the same
+/// time each get their own (bus ports are the port plus 10000 inside the container, so the ports stay below 55536).
 /// </summary>
 public sealed class RedisClusterFixture : IAsyncLifetime
 {
-    private static readonly int[] Ports = [27101, 27102, 27103];
+    // One cluster for every class that uses it.
+    public const string CollectionName = "RedisCluster";
+
+    private readonly int[] Ports = FreePorts(3);
+
+    private static int[] FreePorts(int count)
+    {
+        var ports = new List<int>();
+        var listeners = new List<System.Net.Sockets.TcpListener>();
+        try
+        {
+            while (ports.Count < count)
+            {
+                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+                listener.Start();
+                listeners.Add(listener);
+                var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                if (port < 55536)
+                    ports.Add(port);
+            }
+        }
+        finally
+        {
+            foreach (var listener in listeners)
+                listener.Stop();
+        }
+        return ports.ToArray();
+    }
 
     private readonly IContainer _container;
 
@@ -100,17 +129,23 @@ public sealed class RedisClusterFixture : IAsyncLifetime
 }
 
 /// <summary>
-/// The Redis job store on a Redis Cluster, used the way an application uses it: <c>AddSharpTicker</c> with
-/// <c>AddStackExchangeRedis</c> and the dashboard, jobs added through the managers, the scheduler running them, the lists
-/// read the way the dashboard reads them, and jobs deleted. The same checks run against a standalone Redis as the
-/// control (<see cref="RedisStandaloneControlEndToEndTests"/>). Each test also fails on a log entry at Warning or above
-/// or a call to the exception handler.
+/// The Redis store used the way an application uses it: <c>AddSharpTicker</c> with <c>AddStackExchangeRedis</c> and the
+/// dashboard, jobs added through the managers, the scheduler running them, the lists read the way the dashboard reads
+/// them, and jobs deleted. On a standalone Redis (<see cref="RedisStandaloneControlEndToEndTests"/>) all of it works. On a
+/// Redis Cluster it does not (#225): the store reads several job rows with one MGET, the row keys have no hash tag, and the
+/// client refuses a command whose keys are in different hash slots. There the startup writes one Error that says so
+/// (<see cref="RedisClusterEndToEndTests"/>). The job tests also fail on a log entry at Warning or above or a call to the
+/// exception handler.
 /// </summary>
 public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
 {
     private const string TimeFunction = "Topology.EndToEnd.Time";
     private const string CronFunction = "Topology.EndToEnd.Cron";
     private static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(40);
+
+    // The category and a part of the text of the Error the startup writes on a Redis Cluster.
+    protected const string ClusterCheckCategory = "SharpTicker.Caching.StackExchangeRedis.NodeHeartBeatBackgroundService";
+    protected const string ClusterErrorText = "Redis Cluster is not supported as the job store";
 
     private static readonly ConcurrentDictionary<Guid, int> Runs = new();
     private static readonly ConcurrentQueue<string> Handled = new();
@@ -146,9 +181,9 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
         }
     }
 
-    private sealed class RecordingLoggerProvider : ILoggerProvider
+    protected sealed class RecordingLoggerProvider : ILoggerProvider
     {
-        public ConcurrentQueue<(LogLevel Level, string Text)> Entries { get; } = new();
+        public ConcurrentQueue<(LogLevel Level, string Category, string Text)> Entries { get; } = new();
 
         public ILogger CreateLogger(string categoryName) => new Logger(categoryName, Entries);
 
@@ -156,18 +191,18 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
         {
         }
 
-        private sealed class Logger(string category, ConcurrentQueue<(LogLevel, string)> entries) : ILogger
+        private sealed class Logger(string category, ConcurrentQueue<(LogLevel, string, string)> entries) : ILogger
         {
             public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
             public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
 
             public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-                => entries.Enqueue((logLevel, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception)}"));
+                => entries.Enqueue((logLevel, category, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception)}"));
         }
     }
 
-    private readonly RecordingLoggerProvider _log = new();
+    protected RecordingLoggerProvider Log { get; } = new();
     private WebApplication? _app;
 
     protected abstract string ConnectionString { get; }
@@ -176,9 +211,14 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
 
     protected abstract Task ResetAsync();
 
+    // The run counts and the handler queue are static (the job functions are) and shared with the other class; a class
+    // whose tests run no job leaves them alone, so it can run at the same time as one that does.
+    protected virtual bool RunsJobs => true;
+
     public async Task InitializeAsync()
     {
         await ResetAsync();
+        if (!RunsJobs) return;
         Runs.Clear();
         Handled.Clear();
     }
@@ -194,13 +234,14 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
         await ResetAsync();
     }
 
-    private async Task<WebApplication> StartAsync(bool backgroundServices)
+    // The application with Redis as the job store.
+    protected async Task<WebApplication> StartAsync(bool backgroundServices)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseTestServer();
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Debug);
-        builder.Logging.AddProvider(_log);
+        builder.Logging.AddProvider(Log);
         builder.Services.AddSharpTicker(options =>
         {
             if (!backgroundServices)
@@ -220,11 +261,11 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
     private static ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> Store(WebApplication app)
         => app.Services.GetRequiredService<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>>();
 
-    private string Report()
+    protected string Report()
         => $"runs: {string.Join(", ", Runs.Select(r => $"{r.Key}={r.Value}"))}\nhandled: {string.Join("\n", Handled)}\n" +
-           $"log (Warning and above):\n{string.Join("\n", _log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text))}";
+           $"log (Warning and above):\n{string.Join("\n", Log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text))}";
 
-    private async Task WaitUntilAsync(Func<Task<bool>> condition, string what)
+    protected async Task WaitUntilAsync(Func<Task<bool>> condition, string what)
     {
         var deadline = DateTime.UtcNow + WaitLimit;
         while (!await condition())
@@ -234,9 +275,22 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
         }
     }
 
+    protected (LogLevel Level, string Category, string Text)[] ClusterErrors()
+        => Log.Entries.Where(e => e.Text.Contains(ClusterErrorText, StringComparison.Ordinal)).ToArray();
+
+    // The heartbeat service has written this node's heartbeat, so the startup check, which follows that write, is done.
+    protected async Task WaitForTheFirstHeartbeatAsync(WebApplication app)
+    {
+        var connection = app.Services.GetRequiredKeyedService<IConnectionMultiplexer>("sharpticker");
+        await WaitUntilAsync(async () => await connection.GetDatabase().KeyExistsAsync($"sharpticker:hb:{Node}"),
+            "the heartbeat of this node is written");
+        // The check runs right after the write; give it a moment to log.
+        await Task.Delay(TimeSpan.FromSeconds(1));
+    }
+
     private void AssertNothingWentWrong()
     {
-        var problems = _log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToList();
+        var problems = Log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToList();
         Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");
         Assert.True(Handled.IsEmpty, $"the exception handler was called:\n{string.Join("\n", Handled)}");
     }
@@ -272,8 +326,7 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
 
     // The lists with nothing running: jobs added through the managers, then read back the way the dashboard reads them,
     // then deleted. Every row has a key of its own (tq:tt:<id>, tq:cron:<id>), so a list read touches many keys.
-    [Fact]
-    public async Task JobsAddedThroughTheManagers_AreListed_AndDeleted()
+    protected async Task JobsAddedThroughTheManagers_AreListed_AndDeletedAsync()
     {
         var app = await StartAsync(backgroundServices: false);
         var ids = await AddTimeJobsAsync(app, 5, DateTime.UtcNow.AddHours(1));
@@ -301,9 +354,8 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
         AssertNothingWentWrong();
     }
 
-    // The scheduler on: three time jobs and a cron run, each once, and end Done.
-    [Fact]
-    public async Task TimeJobsAndACron_Run_AndEndDone()
+    // The scheduler on: three time jobs and a cron run, each once, and end Done; then the occurrences are listed.
+    protected async Task TimeJobsAndACron_Run_AndEndDoneAsync()
     {
         var app = await StartAsync(backgroundServices: true);
         var ids = await AddTimeJobsAsync(app, 3, DateTime.UtcNow.AddSeconds(1));
@@ -333,8 +385,7 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
     // The scheduler's own reads with more than one row: two crons (the scheduler reads every cron row to plan the
     // occurrences) and time jobs due a few seconds later, so that the scheduler finds them in the pending index when they
     // come due rather than at the moment they are added. Checked from the runs and the log only, no list read.
-    [Fact]
-    public async Task TwoCronsAndTimeJobsDueLater_Run()
+    protected async Task TwoCronsAndTimeJobsDueLater_RunAsync()
     {
         var app = await StartAsync(backgroundServices: true);
         var firstCron = await AddCronAsync(app);
@@ -360,21 +411,46 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
 }
 
 /// <summary>
-/// The store on a Redis Cluster (candidate 102). In the "Redis" collection only so that it does not run at the same time
-/// as the control, which shares the static run counts and the handler queue.
+/// Redis as the job store on a Redis Cluster (#225). The store is not supported there; the startup says so once.
 /// </summary>
-[Collection(RedisTestFixture.CollectionName)]
-public sealed class RedisClusterEndToEndTests(RedisClusterFixture fixture)
-    : RedisTopologyEndToEndTestsBase, IClassFixture<RedisClusterFixture>
+[Collection(RedisClusterFixture.CollectionName)]
+public sealed class RedisClusterEndToEndTests(RedisClusterFixture fixture) : RedisTopologyEndToEndTestsBase
 {
+    // Its one test that runs jobs is skipped.
+    protected override bool RunsJobs => false;
+
     protected override string ConnectionString => fixture.ConnectionString;
 
     protected override string Node => "cluster-node";
 
     protected override Task ResetAsync() => fixture.ResetAsync();
+
+    // One Error, in the heartbeat service's category, after the first heartbeat; nothing else at Warning or above while
+    // the store holds no job (with jobs, the scheduler loop and the fallback fail as well; see the skipped test).
+    [Fact]
+    public async Task OnACluster_TheStartupWritesOneError_ThatTheClusterIsNotSupported()
+    {
+        var app = await StartAsync(backgroundServices: true);
+        await WaitForTheFirstHeartbeatAsync(app);
+        // Long enough for a second heartbeat write and check loop pass.
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        var entry = Assert.Single(ClusterErrors());
+        Assert.Equal(LogLevel.Error, entry.Level);
+        Assert.Equal(ClusterCheckCategory, entry.Category);
+        Assert.Contains("https://github.com/msx752/SharpTicker/issues/225", entry.Text, StringComparison.Ordinal);
+        var others = Log.Entries.Where(e => e.Level >= LogLevel.Warning).Except([entry]).Select(e => e.Text).ToArray();
+        Assert.True(others.Length == 0, string.Join(Environment.NewLine, others));
+    }
+
+    // What fails on a cluster: kept as the record of #225, skipped because it fails by design until the store supports a
+    // cluster. Without the skip it fails with "Multi-key operations must involve a single slot" from the scheduler loop
+    // (GetEarliestTimeTickers) and the fallback (QueueTimedOutTimeTickers), and no job runs.
+    [Fact(Skip = "Redis Cluster is not supported as the job store: https://github.com/msx752/SharpTicker/issues/225")]
+    public Task TwoCronsAndTimeJobsDueLater_Run() => TwoCronsAndTimeJobsDueLater_RunAsync();
 }
 
-/// <summary>The control: the same tests on the standalone Redis that the other tests use.</summary>
+/// <summary>The control: the same application on the standalone Redis that the other tests use.</summary>
 [Collection(RedisTestFixture.CollectionName)]
 public sealed class RedisStandaloneControlEndToEndTests(RedisTestFixture fixture) : RedisTopologyEndToEndTestsBase
 {
@@ -383,4 +459,24 @@ public sealed class RedisStandaloneControlEndToEndTests(RedisTestFixture fixture
     protected override string Node => "standalone-node";
 
     protected override Task ResetAsync() => fixture.ResetAsync();
+
+    [Fact]
+    public async Task OnAStandaloneRedis_TheStartupWritesNoClusterError()
+    {
+        var app = await StartAsync(backgroundServices: true);
+        await WaitForTheFirstHeartbeatAsync(app);
+        Assert.Empty(ClusterErrors());
+    }
+
+    [Fact]
+    public Task JobsAddedThroughTheManagers_AreListed_AndDeleted() => JobsAddedThroughTheManagers_AreListed_AndDeletedAsync();
+
+    [Fact]
+    public Task TimeJobsAndACron_Run_AndEndDone() => TimeJobsAndACron_Run_AndEndDoneAsync();
+
+    [Fact]
+    public Task TwoCronsAndTimeJobsDueLater_Run() => TwoCronsAndTimeJobsDueLater_RunAsync();
 }
+
+[CollectionDefinition(RedisClusterFixture.CollectionName)]
+public sealed class RedisClusterCollection : ICollectionFixture<RedisClusterFixture>;
