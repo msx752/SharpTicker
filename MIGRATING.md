@@ -55,7 +55,7 @@ In the three runs:
 
 Three things to act on:
 
-- **Start the new version under the `NodeIdentifier` the old one used.** A job that was `InProgress` when the old application ended without a stop was released and started a second time when the new one started under the same name. Under another name it stayed `InProgress`. The default name is the machine name, which changes with every new container; see [Instance names](docs/guide/operations.md#instance-names).
+- **Start the new version under the `NodeIdentifier` the old one used.** A job that was `InProgress` when the old application ended without a stop was released and started a second time when the new one started under the same name. Under another name it stayed `InProgress`. The default name is the machine name, which changes with every new container; see [Instance names](docs/guide/deploying.md#instance-names).
 - **Chain children that were left `Idle`.** A child without a time of its own whose parent has ended is run or skipped by the first fallback pass of the new version, however old it is. In two runs, a child that was running when the old application ended, with its row still `Idle`, was started a second time by the new version. Delete the ones you do not want to run before you switch.
 - **Copies of a cron seeded from code.** When the store holds the cron of one `[TickerFunction]` more than once, the first start removes the copies with their occurrence history and keeps the oldest; only rows that carry the seed's `InitIdentifier` count. It logs a warning that names the function. This was run once, with a copy inserted by hand.
 
@@ -65,7 +65,7 @@ In the four runs, crons kept their ids and went on, and time jobs that were stil
 
 - **Time jobs the old version had already picked up.** In these runs, with the 10.4.0 packages, every time job that became due was set to `InProgress` and had not run when the old application ended, between 15 and 36 seconds later; its log has `Failed to deserialize JSON payload as TimeTickerEntity` for them. In the run with a stop, the stop did not release them. 1.4.0 logs the same warning for these rows and cannot read them as they are:
   - Started under the same `NodeIdentifier` (with the default `InstanceName`), it left them `InProgress`. In the run with the fix for #144 the new version read these rows: it released them when it started, logged no such warning, and each of them ran once, late.
-  - Started under another `NodeIdentifier` with the old `InstanceName` (`tickerq:`), it released them once the heartbeat of the old instance had been missing for its confirmation time, about a minute after its start with the 5-second heartbeat of the run, and each of them ran once, about two and a half minutes late. With the default heartbeat of one minute the release takes about two heartbeat TTLs; see [When an instance stops](docs/guide/operations.md#when-an-instance-stops). This way was run once, after the old application had ended without a stop.
+  - Started under another `NodeIdentifier` with the old `InstanceName` (`tickerq:`), it released them once the heartbeat of the old instance had been missing for its confirmation time, about a minute after its start with the 5-second heartbeat of the run, and each of them ran once, about two and a half minutes late. With the default heartbeat of one minute the release takes about two heartbeat TTLs; see [When an instance stops](docs/guide/failure-modes.md#when-an-instance-stops). This way was run once, after the old application had ended without a stop.
   - Started under another `NodeIdentifier` with the default `InstanceName`, it left them `InProgress`.
 - **Children of chains the old version stored.** Their parents ran under the new version; the children and grandchildren stayed `Idle` and did not run, in all four runs. The fix for #145, which comes after 1.4.0, writes the children of such a chain as records of their own when the new version takes the parent to run it. It was run from SharpTicker 1.2.3, which stores chains the same way, not from the 10.4.0 packages: the children and grandchildren of the three stored chains ran once each after their parents, by their run conditions. A chain whose parent had already ended is left as it is, and a child with a time of its own waits for that time; see [Upgrading](docs/guide/upgrading.md#before-you-upgrade).
 
@@ -82,7 +82,7 @@ They read and write the same tables and keys, but they do not guard each other's
 - With Redis, an old instance leaves rows that 1.4.0 cannot read, as the runs above showed.
 - With Redis, an old instance does not run the children of a chain that a new instance added. With EF Core, an old instance hands out a delayed child without waiting for its parent.
 
-What [Running in production](docs/guide/operations.md#several-instances) describes applies once the last old instance is gone.
+What [Deploying](docs/guide/deploying.md#several-instances) describes applies once the last old instance is gone.
 
 **Redis `InstanceName`.** Redis keeps which instances are alive under this prefix, and that is how jobs held by an instance that ended are released by another one. Its default changed from `tickerq:` to `sharpticker:`, so with the default a new instance does not see what the old ones wrote there. To keep the old prefix:
 

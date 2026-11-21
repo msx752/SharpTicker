@@ -117,4 +117,4 @@ The **Lock holders** panel lists the node identifiers that locked the jobs in th
 - With Redis, each name also shows whether that node has a heartbeat: `heartbeat` when it wrote one within the heartbeat TTL (`NodeHeartbeatInterval` plus 20 seconds), `no heartbeat` otherwise. An instance with the background services off (`DisableBackgroundServices`), one that serves only the dashboard for example, writes its heartbeat too, so `heartbeat` says that the instance runs, not that it runs jobs.
 - The EF Core, MongoDB and in-memory stores keep no record of which nodes run, so there the panel shows the names and their latest lock only. With the EF Core lease on, a node renews the lock of the jobs it runs, so a name that runs a long job keeps a recent latest lock.
 
-A stable `NodeIdentifier` keeps the list short; see [Operations](operations.md#scheduler-options).
+A stable `NodeIdentifier` keeps the list short; see [Deploying](deploying.md#scheduler-options).

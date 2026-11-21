@@ -32,7 +32,7 @@
 - **Pluggable persistence**: in-memory, Entity Framework Core (SQL Server, PostgreSQL, SQLite, MySQL, ...), MongoDB or Redis.
 - **Built-in dashboard**: a real-time UI over SignalR to monitor, inspect, run and manage jobs.
 - **Retries**: per-job retry counts and intervals.
-- **Multiple nodes**: several instances can share one store, and each job is claimed by one of them. In some failure cases a job can run more than once, so write jobs that tolerate a second run; see [When a job can run more than once](https://msx752.github.io/SharpTicker/guide/operations.html#when-a-job-can-run-more-than-once).
+- **Multiple nodes**: several instances can share one store, and each job is claimed by one of them. In some failure cases a job can run more than once, so write jobs that tolerate a second run; see [When a job can run more than once](https://msx752.github.io/SharpTicker/guide/failure-modes.html#when-a-job-can-run-more-than-once).
 - **OpenTelemetry**: optional tracing for job execution.
 - **.NET 8, 9 and 10 in one package**: every package contains a separate build for each target, and NuGet picks the one that matches your project.
 

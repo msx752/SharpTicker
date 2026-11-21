@@ -32,4 +32,4 @@ Activities are created only while a listener, such as the OpenTelemetry SDK, lis
 
 ## Documentation
 
-[Tracing](https://msx752.github.io/SharpTicker/guide/operations.html#tracing): activity names, tags and the log entries.
+[Tracing](https://msx752.github.io/SharpTicker/guide/observability.html#tracing): activity names, tags and the log entries.
