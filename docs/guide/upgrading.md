@@ -35,6 +35,14 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 <!-- Add the next version here, above 1.6.4, in the same shape: what changed, then the steps. -->
 
+## 1.6.5
+
+[Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.5)
+
+- Redis as the job store, a ticker type of your own: a record that reads but cannot be written back (a converter that reads a value it does not write) no longer stops the scheduler loop and the fallback ([#246](https://github.com/msx752/SharpTicker/issues/246)). Since 1.5.2 the claims, releases and skips write a record with the serializer, and up to 1.6.4 such a record made them throw: the loop and every fallback pass stopped at it, and the jobs behind it in the same pass did not run, overdue cron occurrences among them. Now the record is left as it is and named in a warning with its key, and the other jobs run; see [Redis](storage.md#redis).
+
+**Steps:** none.
+
 ## 1.6.4
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.4)
