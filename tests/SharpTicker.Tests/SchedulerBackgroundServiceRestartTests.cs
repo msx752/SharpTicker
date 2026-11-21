@@ -424,6 +424,142 @@ public class SchedulerBackgroundServiceRestartTests : IAsyncLifetime
         Assert.Matches(@"^The scheduler loop is still failing: \d+ attempts in 00:05:01\. No job is picked up until it recovers\.$", reports[2].Message);
     }
 
+    /// <summary>Stands in for SqlException: a provider's own exception for a command it cancelled.</summary>
+    private sealed class ProviderCancelledException : System.Data.Common.DbException
+    {
+        public ProviderCancelledException() : base("Operation cancelled by user.") { }
+    }
+
+    // A restart cancels the loop's token while a store call of the pass may run. Microsoft.Data.SqlClient reports the cancel
+    // of a running command as SqlException ("Operation cancelled by user."), in some timings as InvalidOperationException,
+    // not as OperationCanceledException (#214). The pass still ended because the loop asked for it: a restart, not a failure.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ARestartThatCutsOffAStoreCall_IsARestart_WhateverExceptionTheProviderReportsForTheCancel(bool invalidOperation)
+    {
+        var cancelReport = invalidOperation
+            ? new InvalidOperationException("Operation cancelled by user.")
+            : (Exception)new ProviderCancelledException();
+        var reported = new System.Collections.Concurrent.ConcurrentBag<CoreNotifyActionType>();
+        _executionContext.NotifyCoreAction = (_, type) => reported.Add(type);
+        var calls = 0;
+        _manager.GetNextTickers(Arg.Any<CancellationToken>()).Returns(ci => Interlocked.Increment(ref calls) == 1
+            ? FailWhenCancelled(ci.Arg<CancellationToken>(), () => cancelReport)
+            : Task.FromResult((TimeSpan.FromHours(1), Array.Empty<InternalFunctionContext>())));
+        var logs = new CapturedLogs();
+        var service = CreateWithLogs(logs);
+        try
+        {
+            await service.StartAsync(CancellationToken.None);
+            Assert.True(await WaitUntilAsync(() => PollCount() >= 1), "the loop never polled");
+
+            service.Restart();
+            Assert.True(await WaitUntilAsync(() => PollCount() >= 2, seconds: 8), "the loop did not poll again after the restart");
+
+            // The loop goes on as after any restart: the next restart is taken and it polls again.
+            service.Restart();
+            Assert.True(await WaitUntilAsync(() => PollCount() >= 3, seconds: 8), "the loop did not take the next restart");
+            Assert.False(service.ExecuteTask!.IsFaulted, service.ExecuteTask.Exception?.ToString());
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            service.Dispose();
+        }
+
+        Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Warning);
+        Assert.DoesNotContain(logs.Entries, e => e.Message.StartsWith("The scheduler loop failed"));
+        Assert.DoesNotContain(logs.Entries, e => e.Message.StartsWith("The scheduler loop recovered"));
+        Assert.DoesNotContain(CoreNotifyActionType.NotifyHostExceptionMessage, reported);
+        await _manager.DidNotReceive().ReleaseAcquiredResources(null, Arg.Any<CancellationToken>());
+        // Not silent: the exception the store reported is written at Debug.
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Debug && e.Exception == cancelReport
+            && e.Message == $"The scheduler loop restarted; the pass it cut off ended in {cancelReport.GetType().FullName}.");
+    }
+
+    // The control: the same exception while nobody cancelled the loop's token is a failure of the store, and is reported.
+    [Fact]
+    public async Task TheSameExceptionWithoutARestart_IsStillALoopFailure()
+    {
+        var failure = new ProviderCancelledException();
+        var reported = new System.Collections.Concurrent.ConcurrentBag<CoreNotifyActionType>();
+        _executionContext.NotifyCoreAction = (_, type) => reported.Add(type);
+        var calls = 0;
+        _manager.GetNextTickers(Arg.Any<CancellationToken>()).Returns(_ => Interlocked.Increment(ref calls) == 1
+            ? Task.FromException<(TimeSpan, InternalFunctionContext[])>(failure)
+            : Task.FromResult((TimeSpan.FromHours(1), Array.Empty<InternalFunctionContext>())));
+        var logs = new CapturedLogs();
+        var service = CreateWithLogs(logs);
+        try
+        {
+            await service.StartAsync(CancellationToken.None);
+            Assert.True(await WaitUntilAsync(() => logs.Entries.Any(e => e.Message.StartsWith("The scheduler loop recovered")), seconds: 8),
+                "the loop did not recover after the failure");
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            service.Dispose();
+        }
+
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Error && e.Message.StartsWith("The scheduler loop failed.") && e.Exception == failure);
+        Assert.Contains(CoreNotifyActionType.NotifyHostExceptionMessage, reported);
+        await _manager.Received().ReleaseAcquiredResources(null, Arg.Any<CancellationToken>());
+    }
+
+    // The hand-over claims on the application's token, so a claim that fails was not cut off by a restart. A restart asked for
+    // while the failed claim is handled does not turn that failure into a restart: it is still reported.
+    [Fact]
+    public async Task AClaimThatFailsDuringTheHandOver_IsStillALoopFailure_WhenARestartComesBeforeItIsRethrown()
+    {
+        var failure = new InvalidOperationException("the store is down");
+        var due = new InternalFunctionContext
+        {
+            FunctionName = "HandOverFailure.Job", TickerId = Guid.NewGuid(), Type = TickerType.TimeTicker,
+            ExecutionTime = DateTime.UtcNow.AddSeconds(-1)
+        };
+        var reported = new System.Collections.Concurrent.ConcurrentBag<CoreNotifyActionType>();
+        _executionContext.NotifyCoreAction = (_, type) => reported.Add(type);
+        var calls = 0;
+        _manager.GetNextTickers(Arg.Any<CancellationToken>()).Returns(_ => Interlocked.Increment(ref calls) == 1
+            ? Task.FromResult((TimeSpan.Zero, new[] { due }))
+            : Task.FromResult((TimeSpan.FromHours(1), Array.Empty<InternalFunctionContext>())));
+        var logs = new CapturedLogs();
+        SharpTickerSchedulerBackgroundService service = null!;
+        var restarted = false;
+        // The restart comes while the claim runs; the claim then fails on its own. The restart has cancelled the loop's token
+        // (its debounce is 50 ms) before the failure is rethrown.
+        _manager.TryClaimDueTicker(Arg.Any<InternalFunctionContext>(), Arg.Any<DateTime>(), Arg.Any<CancellationToken>())
+            .Returns(async _ =>
+            {
+                service.Restart();
+                await Task.Delay(300);
+                Volatile.Write(ref restarted, true);
+                throw failure;
+#pragma warning disable CS0162
+                return false;
+#pragma warning restore CS0162
+            });
+        service = CreateWithLogs(logs);
+        try
+        {
+            await service.StartAsync(CancellationToken.None);
+            Assert.True(await WaitUntilAsync(() => Volatile.Read(ref restarted) && PollCount() >= 2, seconds: 8),
+                "the loop did not claim the due job and poll again");
+            await Task.Delay(200);
+        }
+        finally
+        {
+            await service.StopAsync(CancellationToken.None);
+            service.Dispose();
+        }
+
+        Assert.Contains(logs.Entries, e => e.Level == LogLevel.Error && e.Message.StartsWith("The scheduler loop failed.") && e.Exception == failure);
+        Assert.Contains(CoreNotifyActionType.NotifyHostExceptionMessage, reported);
+        Assert.DoesNotContain(logs.Entries, e => e.Message.StartsWith("The scheduler loop restarted"));
+    }
+
     // A normal stop is not an error. A store call that the stop cuts off can end in an exception other than
     // OperationCanceledException, and a release that fails while stopping only leaves this node's own locks behind.
     [Fact]
