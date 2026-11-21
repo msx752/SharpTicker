@@ -97,9 +97,14 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
             {
                 await RunSharpTickerSchedulerAsync(stoppingToken, _schedulerLoopCancellationTokenSource.Token);
             }
-            catch (OperationCanceledException) when (_schedulerLoopCancellationTokenSource.Token.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+            catch (Exception ex) when (_schedulerLoopCancellationTokenSource.Token.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
             {
-                // This is a restart request - release resources and continue loop
+                // This is a restart request - release resources and continue loop. It is told by the loop's token, not by the
+                // exception: a store call the restart cut off can end in the provider's own exception instead of an
+                // OperationCanceledException (Microsoft.Data.SqlClient throws SqlException "Operation cancelled by user.").
+                if (ex is not OperationCanceledException)
+                    _logger?.LogDebug(ex, "The scheduler loop restarted; the store reported the cancel of its command as {ExceptionType}.", ex.GetType().FullName);
+
                 await TryReleaseAcquiredResourcesAsync(_executionContext.Functions, stoppingToken);
                 // Small delay to allow resources to be released
                 await Task.Delay(100, stoppingToken);
