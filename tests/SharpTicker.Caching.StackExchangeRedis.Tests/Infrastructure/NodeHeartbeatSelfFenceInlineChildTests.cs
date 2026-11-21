@@ -244,7 +244,8 @@ public class NodeHeartbeatSelfFenceInlineChildTests(RedisTestFixture fixture) : 
     private async Task RunChainOnACutOffNodeAsync(RunCondition childCondition)
     {
         var (a, parent, _) = await StartChainOnAAsync(childCondition);
-        Assert.True((await StoredAsync(a, parent))?.Status is TickerStatus.Done or TickerStatus.DueDone, Report());
+        // The parent and an InProgress child run at the same time: the parent's outcome may still be on its way.
+        await WaitUntilAsync(async () => (await StoredAsync(a, parent))?.Status is TickerStatus.Done or TickerStatus.DueDone, "the parent ended");
 
         await StartAsync(NodeB);
         _heartbeatOfA.Fails = true;
