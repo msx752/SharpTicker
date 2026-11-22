@@ -35,6 +35,8 @@ builder.Services.AddSharpTicker(options =>
 
 The EF Core tools (`dotnet ef migrations add`, `dotnet ef dbcontext info`) find this context in the application's services and create it with the options given here, so the first migration can be added without a design-time factory. `SharpTickerDbContext` is in the SharpTicker assembly, so name the project that holds the migrations, for example `db.UseNpgsql(connectionString, b => b.MigrationsAssembly("MyApp"))`; without it the tools stop with `Your target project 'MyApp' doesn't match your migrations assembly 'SharpTicker.EntityFrameworkCore'`. When the application also registers a context of its own, the tools find both and stop with `More than one DbContext was found`, so each command names the one it is for: `--context AppDbContext` or `--context SharpTickerDbContext`.
 
+For that lookup the options of this context are in the application's services as the non-generic `DbContextOptions` too. A context of your own whose constructor takes the non-generic `DbContextOptions`, and that you register by hand (`AddScoped<AppDbContext>()` instead of `AddDbContext`), is then given these options, and EF Core stops with `The DbContextOptions passed to the AppDbContext constructor must be a DbContextOptions<AppDbContext>`. Give that constructor a `DbContextOptions<AppDbContext>` parameter, or register the context with `AddDbContext`.
+
 ### Your own DbContext
 
 To keep the tables in your application's database and migrations, map them into your own context:
