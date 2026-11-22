@@ -103,8 +103,9 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public TaskCompletionSource Released { get; private set; } = NewSignal();
 
     /// <summary>
-    /// A connection other than the held one was closed after the hold began: a call that runs beside the held one (the
-    /// scheduler loop reads the cron and the time jobs at once) has ended, so a cancel after it cannot land inside it.
+    /// Once the hold began, no connection but the held call's is open: a call that runs beside the held one (the scheduler
+    /// loop reads the cron and the time jobs at once) has ended or has not opened yet. The tests wait a little after it, so
+    /// such a call ends before the cancel instead of having it land inside it.
     /// </summary>
     public TaskCompletionSource OtherCallEnded { get; private set; } = NewSignal();
     public bool ReleasedByCancel { get; private set; }
@@ -123,6 +124,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         _releaseAfter = releaseAfter;
         _inFlight = null;
         _closing = null;
+        _heldConnection = null;
         _skip = nth - 1;
         Held = NewSignal();
         Released = NewSignal();
@@ -142,12 +144,12 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         return Interlocked.CompareExchange(ref _armed, 0, 1) == 1;
     }
 
-    private async Task HoldAsync(StoreCallHold what, CancellationToken cancellationToken)
+    private async Task HoldAsync(StoreCallHold what, DbConnection? connection, CancellationToken cancellationToken)
     {
         if (!Take(what, cancellationToken))
             return;
 
-        Held.TrySetResult();
+        MarkHeld(connection);
         try
         {
             await Task.Delay(_releaseAfter ?? TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
@@ -167,7 +169,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
         _inFlight = command;
         command.CommandText = InFlightPrefix + command.CommandText;
-        Held.TrySetResult();
+        MarkHeld(command.Connection);
     }
 
     private void EndInFlight(DbCommand command, bool cancelled)
@@ -194,23 +196,51 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
             Volatile.Write(ref _closing, connection);
         }
 
-        await HoldAsync(StoreCallHold.Open, cancellationToken).ConfigureAwait(false);
+        await HoldAsync(StoreCallHold.Open, connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
     private DbConnection? _closing;
     private CancellationToken _closeToken;
 
+    // The connections that are open now, and the one the held call uses (a held command's).
+    private readonly ConcurrentDictionary<DbConnection, byte> _open = new();
+    private DbConnection? _heldConnection;
+
+    public override Task ConnectionOpenedAsync(DbConnection connection, ConnectionEndEventData eventData, CancellationToken cancellationToken = default)
+    {
+        _open[connection] = 0;
+        return Task.CompletedTask;
+    }
+
+    // Called once the hold began and after each close: no connection but the held call's is open.
+    private void SignalWhenNoOtherCallIsOpen()
+    {
+        if (!Held.Task.IsCompleted)
+            return;
+
+        var held = Volatile.Read(ref _heldConnection);
+        if (_open.Keys.All(c => ReferenceEquals(c, held)))
+            OtherCallEnded.TrySetResult();
+    }
+
+    private void MarkHeld(DbConnection? connection)
+    {
+        Volatile.Write(ref _heldConnection, connection);
+        Held.TrySetResult();
+        SignalWhenNoOtherCallIsOpen();
+    }
+
     public override async Task ConnectionClosedAsync(DbConnection connection, ConnectionEndEventData eventData)
     {
+        _open.TryRemove(connection, out _);
         if (!ReferenceEquals(Interlocked.CompareExchange(ref _closing, null, connection), connection))
         {
-            if (Held.Task.IsCompleted)
-                OtherCallEnded.TrySetResult();
+            SignalWhenNoOtherCallIsOpen();
             return;
         }
 
-        Held.TrySetResult();
+        MarkHeld(null);
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(30), _closeToken).ConfigureAwait(false);
@@ -227,7 +257,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
     {
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, cancellationToken).ConfigureAwait(false);
+        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -235,7 +265,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         InterceptionResult<int> result, CancellationToken cancellationToken = default)
     {
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, cancellationToken).ConfigureAwait(false);
+        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
