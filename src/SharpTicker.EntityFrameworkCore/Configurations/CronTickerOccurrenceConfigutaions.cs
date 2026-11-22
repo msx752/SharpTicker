@@ -21,6 +21,12 @@ namespace SharpTicker.EntityFrameworkCore.Configurations
             
             builder.Property(x => x.LockHolder)
                 .IsRequired(false);
+
+            builder.Property(x => x.ExecutionTime).ReadAsUtc();
+            builder.Property(x => x.LockedAt).ReadAsUtc();
+            builder.Property(x => x.ExecutedAt).ReadAsUtc();
+            builder.Property(x => x.CreatedAt).ReadAsUtc();
+            builder.Property(x => x.UpdatedAt).ReadAsUtc();
             
             builder.HasIndex("CronTickerId")
                 .HasDatabaseName("IX_CronTickerOccurrence_CronTickerId");

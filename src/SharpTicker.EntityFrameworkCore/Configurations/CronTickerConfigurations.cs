@@ -29,6 +29,9 @@ namespace SharpTicker.EntityFrameworkCore.Configurations
             builder.Property(e => e.IsEnabled)
                 .IsRequired();
 
+            builder.Property(e => e.CreatedAt).ReadAsUtc();
+            builder.Property(e => e.UpdatedAt).ReadAsUtc();
+
             // Deprecated column, no longer used by the scheduler. Still mapped
             // so existing databases need no migration.
 #pragma warning disable CS0618

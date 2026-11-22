@@ -29,11 +29,13 @@ public class OrderService(ITimeTickerManager<TimeTickerEntity> tickers)
 }
 ```
 
-`ExecutionTime` rules:
+`ExecutionTime` rules, on add and on update (`UpdateAsync`, `UpdateBatchAsync`):
 
 - Empty means "as soon as possible".
 - A UTC value is used as it is, and a `DateTimeKind.Local` value is converted to UTC.
 - A value with `DateTimeKind.Unspecified` is read in the scheduler time zone (see [Time zone](#time-zone)). Prefer UTC values to avoid surprises.
+
+The built-in stores return the times they hold as UTC values (with the EF Core store too; see [Schema and tables](storage.md#schema-and-tables)), so a job read from the store and given back to `UpdateAsync` keeps its time.
 
 ## Cron jobs
 
@@ -155,7 +157,7 @@ A child or grandchild can have an execution time of its own (`SetExecutionTime` 
 - A delayed grandchild depends on its own parent (the child), not on the root of the chain.
 - It is claimed like any other job, also with several nodes, and once it has ended a restart does not start it again. The cases in [When a job can run more than once](failure-modes.md#when-a-job-can-run-more-than-once) apply to it as to any job. A child that is given a time while its parent runs becomes a delayed child: the parent's run does not start it any more. A child that has already started keeps the status of its own run.
 
-A child's or grandchild's time follows the same `ExecutionTime` rules as the root's: a UTC value is used as it is, a `DateTimeKind.Local` value is converted to UTC, and an `Unspecified` one is read in the scheduler time zone. Through the dashboard API, a `timeZoneId` applies to every time in the chain.
+A child's or grandchild's time follows the same `ExecutionTime` rules as the root's, on add and when the update of the root carries it: a UTC value is used as it is, a `DateTimeKind.Local` value is converted to UTC, and an `Unspecified` one is read in the scheduler time zone. Through the dashboard API, a `timeZoneId` applies to every time in the chain.
 
 When a parent ends, the node that ran it at once starts the delayed children that may run and whose time has come, and wakes its scheduler for the next one due later. An `InProgress` delayed child is handled the same way when its parent starts. If that node stops before this, for example when the application stops while the parent runs, the fallback starts them after the restart, up to `FallbackIntervalChecker` later. A delayed child started right after its parent ends as `Done`, one started by the fallback as `DueDone`; a `RunCondition` treats both as success.
 

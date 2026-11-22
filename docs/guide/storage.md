@@ -54,6 +54,8 @@ With `ConfigurationType.UseModelCustomizer` the tables are added to your model a
 
 Tables are created in the `ticker` schema: `TimeTickers`, `CronTickers` and `CronTickerOccurrences`. Change the schema with `ef.SetSchema("...")`. Create the tables with EF Core migrations, or with `EnsureCreated()` / `GenerateCreateScript()` when you do not use migrations.
 
+The times of these tables (`ExecutionTime`, `LockedAt`, `ExecutedAt`, `CreatedAt`, `UpdatedAt`) are stored in UTC and read back as `DateTimeKind.Utc`, through the store and through your own queries on a context that has the tables. The column type is the one your provider gives a `DateTime`. When your context converts every `DateTime` itself (a convention in `ConfigureConventions`), these columns keep your conversion, and what Kind they read back as is up to it.
+
 Other options: `SetDbContextPoolSize(int)` (default 1024).
 
 ### Lease on running jobs

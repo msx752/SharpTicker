@@ -270,6 +270,7 @@ namespace SharpTicker.Utilities.Managers
             timeTicker.UpdatedAt = _clock.UtcNow;
             if (timeTicker.ExecutionTime is { } executionTime)
                 timeTicker.ExecutionTime = ConvertToUtcIfNeeded(executionTime);
+            ConvertChildTimesToUtcIfNeeded(timeTicker);
 
             try {
                 var stored = await _persistenceProvider.GetTimeTickerById(timeTicker.Id, cancellationToken).ConfigureAwait(false);
@@ -396,7 +397,7 @@ namespace SharpTicker.Utilities.Managers
             };
         }
 
-        // The times of delayed children and grandchildren are read the same way as the root's (#81).
+        // The times of delayed children and grandchildren are read the same way as the root's, on add (#81) and on update (#257).
         private static void ConvertChildTimesToUtcIfNeeded(TTimeTicker parent)
         {
             if (parent.Children == null)
@@ -579,7 +580,8 @@ namespace SharpTicker.Utilities.Managers
                 
                 timeTicker.UpdatedAt = _clock.UtcNow;
                 timeTicker.ExecutionTime = ConvertToUtcIfNeeded(timeTicker.ExecutionTime.Value);
-                
+                ConvertChildTimesToUtcIfNeeded(timeTicker);
+
                 if (_executionContext.Functions.Any(x => x.TickerId == timeTicker.Id))
                     needsRestart = true;
                     

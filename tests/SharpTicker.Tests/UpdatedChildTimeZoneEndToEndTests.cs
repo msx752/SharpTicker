@@ -17,10 +17,11 @@ using SharpTicker.Utilities.Interfaces.Managers;
 namespace SharpTicker.Tests;
 
 /// <summary>
-/// Candidate 104: #81 converts the times of delayed chain children given as Local or Unspecified to UTC on add
-/// (Unspecified read in the scheduler time zone), as the root's. These tests check the same on
-/// <see cref="ITimeTickerManager{TTimeTicker}.UpdateAsync"/> and <c>UpdateBatchAsync</c> of the root, through the public
-/// API of a real host, on the in-memory store and on EF Core with SQLite. The scheduler time zone is Tokyo (UTC+9, no
+/// #257: the times of delayed chain children given as Local or Unspecified are converted to UTC on
+/// <see cref="ITimeTickerManager{TTimeTicker}.UpdateAsync"/> and <c>UpdateBatchAsync</c> of the root, as on add (#81),
+/// with Unspecified read in the scheduler time zone; and a chain read back from the store keeps its times when it is
+/// updated, because every store returns them as UTC (EF Core through its converter). Through the public API of a real
+/// host, on the in-memory store and on EF Core with SQLite. The scheduler time zone is Tokyo (UTC+9, no
 /// daylight saving), so the Unspecified case does not depend on the zone of the machine. The Local case is converted with
 /// the zone of the machine (DateTime.ToUniversalTime) and can only show a difference on a machine that is not on UTC.
 /// The control updates with the times as the store returns them, which must not move.
@@ -196,8 +197,8 @@ public class UpdatedChildTimeZoneEndToEndTests : IAsyncLifetime
         Assert.True(Problems().Length == 0, Problems());
     }
 
-    // The same read-back update, looking at the root, whose time the update converts already (TickerManager.cs:272, :581).
-    // It shows what converting a time read back from the store does for each Kind a store returns.
+    // The same read-back update, looking at the root, whose time the update converts too. Before #257 the EF Core store
+    // returned Unspecified, which the update read in the scheduler time zone and moved by its offset.
     [Theory]
     [InlineData("InMemory", false)]
     [InlineData("InMemory", true)]
