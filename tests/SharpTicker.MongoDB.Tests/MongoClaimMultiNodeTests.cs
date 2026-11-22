@@ -1317,6 +1317,38 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
     }
 
+    // Candidate 97: the fallback reads the waiting child and then claims it. Between the two, another node edits the
+    // child's request and leaves it waiting (Idle, no time, no lock holder). The row the fallback read is no longer the
+    // row in the store: it is not claimed, so it does not run with the request that was read. That holds whichever way
+    // the other node's clock is off: behind, so the UpdatedAt it writes is earlier than the one the fallback read, or
+    // ahead, so it is later.
+    [Theory]
+    [InlineData(-3)]
+    [InlineData(3)]
+    public async Task TheFallback_AChildWithoutATimeEditedBetweenTheReadAndTheClaim_IsNotClaimed_WhicheverWayTheOtherNodesClockIsOff(int hoursOff)
+    {
+        var childId = await SeedLeftWaiting(TickerStatus.Done, T0.AddSeconds(-30));
+        var edited = new byte[] { 1, 2, 3 };
+        var stamp = T0.AddHours(hoursOff);
+        var other = CreateProvider("node-B", new FakeClock(stamp));
+        var fallback = CreateNodeWithHook("update", 1, () =>
+        {
+            // What the manager of that node writes: the child with its new request, stamped with that node's clock.
+            var row = ReadTimeTicker(childId).GetAwaiter().GetResult();
+            row.Request = edited;
+            row.UpdatedAt = stamp;
+            Assert.Equal(1, other.UpdateTimeTickers([row], CancellationToken.None).GetAwaiter().GetResult());
+        });
+
+        var claimed = await Drain(fallback.QueueTimedOutTimeTickers(CancellationToken.None));
+
+        Assert.Empty(claimed);
+        var stored = await ReadTimeTicker(childId);
+        Assert.Equal(TickerStatus.Idle, stored.Status);
+        Assert.Null(stored.LockHolder);
+        Assert.Equal(edited, stored.Request);
+    }
+
     // Within the grace time the parent's run may still be about to start the child; a parent that has not ended starts
     // it itself.
     [Theory]
