@@ -1,5 +1,4 @@
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Jobs;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
 using SharpTicker.Utilities.Managers;
@@ -8,10 +7,9 @@ namespace SharpTicker.Benchmarks;
 
 /// <summary>
 /// Benchmarks for FluentChainTickerBuilder — building job chains with parent/child/grandchild relationships.
-/// Measures allocation and speed of constructing complex job DAGs.
+/// Measures the time and allocations of building a chain; each SetRequest serializes its request through TickerHelper.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.HostProcess)]
 public class ChainBuilderBenchmarks
 {
     [Benchmark(Description = "Build: Single job (no chain)")]
