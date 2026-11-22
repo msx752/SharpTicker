@@ -219,5 +219,6 @@ public class UpdatedChildTimeZoneEndToEndTests : IAsyncLifetime
         Assert.True(stored.Ticks == rootBefore.Ticks,
             $"{store}, batch {batch}: the root read back as {rootBefore:yyyy-MM-dd HH:mm} ({rootBefore.Kind}) is stored as {stored:yyyy-MM-dd HH:mm} ({stored.Kind}) after the update, "
             + $"off by {(stored - rootBefore).TotalHours} h");
+        Assert.True(Problems().Length == 0, Problems());
     }
 }

@@ -54,7 +54,9 @@ With `ConfigurationType.UseModelCustomizer` the tables are added to your model a
 
 Tables are created in the `ticker` schema: `TimeTickers`, `CronTickers` and `CronTickerOccurrences`. Change the schema with `ef.SetSchema("...")`. Create the tables with EF Core migrations, or with `EnsureCreated()` / `GenerateCreateScript()` when you do not use migrations.
 
-The times of these tables (`ExecutionTime`, `LockedAt`, `ExecutedAt`, `CreatedAt`, `UpdatedAt`) are stored in UTC and read back as `DateTimeKind.Utc`, through the store and through your own queries on a context that has the tables. The column type is the one your provider gives a `DateTime`. When your context converts every `DateTime` itself (a convention in `ConfigureConventions`), these columns keep your conversion, and what Kind they read back as is up to it.
+SharpTicker writes the times of these tables (`ExecutionTime`, `LockedAt`, `ExecutedAt`, `CreatedAt`, `UpdatedAt`) in UTC; they are read back as `DateTimeKind.Utc`, through the store and through your own queries on a context that has the tables. The column type is the one your provider gives a `DateTime`.
+
+When your context converts every `DateTime` itself, these columns follow your conversion instead: a convention in `ConfigureConventions` is kept, and a loop in `OnModelCreating` that sets a converter on every `DateTime` property after the tables are added (with `UseModelCustomizer` they are added before your `OnModelCreating` runs) replaces SharpTicker's. If your conversion reads these times back as `Unspecified`, an update (`UpdateAsync`) of a job read back from the store reads them in the scheduler time zone, so the job and its children move by that zone's offset. With a compiled EF Core model (`dotnet ef dbcontext optimize`), generate it again after upgrading SharpTicker; until then the times read back as before.
 
 Other options: `SetDbContextPoolSize(int)` (default 1024).
 
