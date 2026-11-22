@@ -17,6 +17,27 @@ public class NonGenericOptionsDbContext : DbContext
     }
 }
 
+// An application context with a parameterless constructor that configures itself in OnConfiguring, and a constructor
+// that takes the non-generic DbContextOptions; the application registers it by hand, without AddDbContext.
+public class SelfConfiguredDbContext : DbContext
+{
+    public const string ConnectionString = "Data Source=self-configured-109.db";
+
+    public SelfConfiguredDbContext()
+    {
+    }
+
+    public SelfConfiguredDbContext(DbContextOptions options) : base(options)
+    {
+    }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        if (!optionsBuilder.IsConfigured)
+            optionsBuilder.UseSqlite(ConnectionString);
+    }
+}
+
 /// <summary>
 /// The EF Core tools (dotnet ef migrations add, dbcontext info) build the application's host and look for a context in its
 /// services: every registered DbContextOptions names a context type they can create, and they create it through the
@@ -93,5 +114,24 @@ public class DesignTimeDiscoveryTests
 
         Assert.Equal("Data Source=application-89.db", context.Database.GetConnectionString());
         Assert.Contains(typeof(SharpTickerDbContext), ContextTypesTheToolsFind(app.Services));
+    }
+
+    // A context registered by hand (AddScoped, no AddDbContext) has no DbContextOptions of its own in the container. The
+    // container takes the constructor with the most parameters it can fill, so the store's options must not make it pick
+    // the DbContextOptions constructor over the parameterless one.
+    [Fact]
+    public void UseSharpTickerDbContext_AnApplicationContextRegisteredByHandStillConfiguresItself()
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.Services.AddScoped<SelfConfiguredDbContext>();
+        builder.Services.AddSharpTicker(options =>
+            options.AddOperationalStore(ef => ef.UseSharpTickerDbContext<SharpTickerDbContext>(db => db.UseSqlite("Data Source=scheduler-109.db"))));
+
+        using var app = builder.Build();
+        using var scope = app.Services.CreateScope();
+
+        var context = scope.ServiceProvider.GetRequiredService<SelfConfiguredDbContext>();
+
+        Assert.Equal(SelfConfiguredDbContext.ConnectionString, context.Database.GetConnectionString());
     }
 }
