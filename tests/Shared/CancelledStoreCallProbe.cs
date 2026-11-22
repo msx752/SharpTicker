@@ -21,7 +21,13 @@ public enum StoreCallHold
     /// A command that is on its way on the database when its token is cancelled: it is sent with a wait in front of it
     /// (<see cref="CancelledStoreCallProbe.InFlightPrefix"/>), so the cancel reaches the provider while the database runs it.
     /// </summary>
-    CommandInFlight
+    CommandInFlight,
+
+    /// <summary>
+    /// The close of a connection whose call has ended: held until the token the connection was opened with is cancelled,
+    /// then the call returns its result. The caller's next store call starts after the cancel.
+    /// </summary>
+    AfterClose
 }
 
 public sealed record LogEntry(string Category, LogLevel Level, EventId EventId, string Text)
@@ -38,6 +44,18 @@ public sealed class RecordingLoggerProvider : ILoggerProvider
     public void Dispose()
     {
     }
+
+    /// <summary>
+    /// EF Core 8 and 9 log an open whose token is cancelled as ConnectionError (20004) at Error; EF Core 10 does not log it
+    /// at Error.
+    /// </summary>
+    public static bool EfCoreLogsACancelledOpenAtError
+        => typeof(RelationalEventId).Assembly.GetName().Version!.Major < 10;
+
+    /// <summary>The entries from SharpTicker above Debug.</summary>
+    public LogEntry[] SharpTickerAboveDebug() => Entries
+        .Where(e => e.Level > LogLevel.Debug && e.Category.StartsWith("SharpTicker", StringComparison.Ordinal))
+        .ToArray();
 
     /// <summary>The entries at Error or above from EF Core and from SharpTicker.</summary>
     public LogEntry[] Errors() => Entries
@@ -83,6 +101,12 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
     public TaskCompletionSource Held { get; private set; } = NewSignal();
     public TaskCompletionSource Released { get; private set; } = NewSignal();
+
+    /// <summary>
+    /// A connection other than the held one was closed after the hold began: a call that runs beside the held one (the
+    /// scheduler loop reads the cron and the time jobs at once) has ended, so a cancel after it cannot land inside it.
+    /// </summary>
+    public TaskCompletionSource OtherCallEnded { get; private set; } = NewSignal();
     public bool ReleasedByCancel { get; private set; }
 
     /// <summary>What the provider threw for each failed open or command, as EF Core hands it to the interceptors.</summary>
@@ -90,20 +114,33 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null)
+    /// <param name="what">Where the call is held.</param>
+    /// <param name="releaseAfter">Set: the call goes on after this time without a cancel (the control).</param>
+    /// <param name="nth">The how-many-th call with a token that can be cancelled is held (1: the first one).</param>
+    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, int nth = 1)
     {
         _what = what;
         _releaseAfter = releaseAfter;
         _inFlight = null;
+        _closing = null;
+        _skip = nth - 1;
         Held = NewSignal();
         Released = NewSignal();
+        OtherCallEnded = NewSignal();
         ReleasedByCancel = false;
         Volatile.Write(ref _armed, 1);
     }
 
+    private int _skip;
+
     private bool Take(StoreCallHold what, CancellationToken cancellationToken)
-        => _what == what && cancellationToken.CanBeCanceled && !cancellationToken.IsCancellationRequested
-           && Interlocked.CompareExchange(ref _armed, 0, 1) == 1;
+    {
+        if (_what != what || !cancellationToken.CanBeCanceled || cancellationToken.IsCancellationRequested || Volatile.Read(ref _armed) != 1)
+            return false;
+        if (Interlocked.Decrement(ref _skip) >= 0)
+            return false;
+        return Interlocked.CompareExchange(ref _armed, 0, 1) == 1;
+    }
 
     private async Task HoldAsync(StoreCallHold what, CancellationToken cancellationToken)
     {
@@ -151,8 +188,39 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public override async ValueTask<InterceptionResult> ConnectionOpeningAsync(DbConnection connection, ConnectionEventData eventData,
         InterceptionResult result, CancellationToken cancellationToken = default)
     {
+        if (Take(StoreCallHold.AfterClose, cancellationToken))
+        {
+            _closeToken = cancellationToken;
+            Volatile.Write(ref _closing, connection);
+        }
+
         await HoldAsync(StoreCallHold.Open, cancellationToken).ConfigureAwait(false);
         return result;
+    }
+
+    private DbConnection? _closing;
+    private CancellationToken _closeToken;
+
+    public override async Task ConnectionClosedAsync(DbConnection connection, ConnectionEndEventData eventData)
+    {
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _closing, null, connection), connection))
+        {
+            if (Held.Task.IsCompleted)
+                OtherCallEnded.TrySetResult();
+            return;
+        }
+
+        Held.TrySetResult();
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(30), _closeToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        ReleasedByCancel = _closeToken.IsCancellationRequested;
+        Released.TrySetResult();
     }
 
     public async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(DbCommand command, CommandEventData eventData,

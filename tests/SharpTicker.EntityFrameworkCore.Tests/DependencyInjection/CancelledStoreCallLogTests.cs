@@ -16,11 +16,16 @@ namespace SharpTicker.EntityFrameworkCore.Tests.DependencyInjection;
 public class CancelledStoreCallDbContext(DbContextOptions<CancelledStoreCallDbContext> options) : DbContext(options);
 
 /// <summary>
-/// Candidate 98: the scheduler loop hands its token (linked to the application's stopping token, and cancelled by every
-/// restart of the loop) to the store, so a stop or a restart can cancel a connection the loop is opening or a command it
-/// runs. That is a normal stop or restart and must not reach the application's log at Error. A started host on SQLite; an
-/// EF Core interceptor holds the loop's open (or command) until its token is cancelled, then lets the real call go on
-/// with the cancelled token, so the cancel lands on the call every time instead of by chance.
+/// #255: the scheduler loop hands its token (linked to the application's stopping token, and cancelled by every restart
+/// of the loop) to the store, and the lease service its stopping token. A stop or a restart is normal and must not reach the
+/// application's log at Error. A started host on SQLite; an EF Core interceptor makes the cancel land at a chosen point every
+/// time instead of by chance:
+/// <list type="bullet">
+/// <item>between two store calls (<see cref="StoreCallHold.AfterClose"/>) or on a command (<see cref="StoreCallHold.Command"/>):
+/// no store call is started after the cancel, so nothing is logged at Error;</item>
+/// <item>on an open that is already running (<see cref="StoreCallHold.Open"/>): EF Core 8 and 9 log that open as ConnectionError
+/// at Error, which SharpTicker cannot prevent; SharpTicker logs nothing above Debug. EF Core 10 does not log it at Error.</item>
+/// </list>
 /// </summary>
 public class CancelledStoreCallLogTests : IAsyncLifetime
 {
@@ -60,9 +65,10 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
             File.Delete(_databaseFile);
     }
 
-    // A started application whose startup step has ended; nothing else of SharpTicker calls the store with a token that
-    // can be cancelled then, apart from the scheduler loop (the lease is off, the fallback waits ten minutes).
-    private async Task<IHost> StartAsync(Context context)
+    // A started application whose startup step has ended. Without a lease, nothing else of SharpTicker calls the store with
+    // a token that can be cancelled then, apart from the scheduler loop (the fallback waits ten minutes); with one, the loop
+    // sleeps (no jobs) and the lease service renews every fifth of it.
+    private async Task<IHost> StartAsync(Context context, TimeSpan? lease = null)
     {
         var builder = Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
@@ -85,7 +91,7 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
                     ef.UseApplicationDbContext<CancelledStoreCallDbContext>(ConfigurationType.UseModelCustomizer);
                 else
                     ef.UseSharpTickerDbContext<SharpTickerDbContext>(db => db.UseSqlite(connection).AddInterceptors(_probe));
-                ef.SetInProgressLease(TimeSpan.Zero);
+                ef.SetInProgressLease(lease ?? TimeSpan.Zero);
             });
         });
 
@@ -108,33 +114,27 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
             await startup.WaitAsync(WaitLimit);
         // The restart the startup step asks for, and the pass after it.
         await Task.Delay(500);
+        Assert.True(_log.Errors().Length == 0, $"precondition: an Error before the test began:\n{string.Join("\n", _log.Errors().AsEnumerable())}");
+        // From here on, the log is the test's.
+        _log.Entries.Clear();
         return _application;
     }
 
-    private string Failure(LogEntry[] errors)
-        => $"the log has entries at Error or above:\n{string.Join("\n", errors.AsEnumerable())}\n"
-           + $"provider failures: {string.Join("; ", _probe.Failures)}\n--- log ---\n{_log.Report()}";
+    private string Failure(string what, IEnumerable<LogEntry> entries)
+        => $"{what}:\n{string.Join("\n", entries)}\nprovider failures: {string.Join("; ", _probe.Failures)}\n--- log ---\n{_log.Report()}";
 
-    // The loop's next pass is held at the store call; then the application stops, or the loop is restarted, which cancels
-    // the token of that call. Neither may leave an entry at Error from EF Core or from SharpTicker.
-    [Theory]
-    [InlineData(Context.Owned, StoreCallHold.Open, Cancel.Stop)]
-    [InlineData(Context.Owned, StoreCallHold.Open, Cancel.Restart)]
-    [InlineData(Context.Owned, StoreCallHold.Command, Cancel.Stop)]
-    [InlineData(Context.Owned, StoreCallHold.Command, Cancel.Restart)]
-    [InlineData(Context.Application, StoreCallHold.Open, Cancel.Stop)]
-    [InlineData(Context.Application, StoreCallHold.Open, Cancel.Restart)]
-    [InlineData(Context.Application, StoreCallHold.Command, Cancel.Stop)]
-    [InlineData(Context.Application, StoreCallHold.Command, Cancel.Restart)]
-    public async Task AStopOrARestartThatCancelsTheLoopsStoreCall_LogsNoError(Context context, StoreCallHold hold, Cancel cancel)
+    // The loop's pass is held at the chosen point; then the application stops, or the loop is restarted, which cancels the
+    // token of that pass.
+    private async Task CutOffALoopPassAsync(IHost application, StoreCallHold hold, Cancel cancel)
     {
-        var application = await StartAsync(context);
         var scheduler = application.Services.GetRequiredService<ISharpTickerHostScheduler>();
-        Assert.True(_log.Errors().Length == 0, $"precondition: an Error before the test began:\n{string.Join("\n", _log.Errors().AsEnumerable())}");
-
         _probe.Arm(hold);
         scheduler.Restart();
         await _probe.Held.Task.WaitAsync(WaitLimit);
+        // The loop reads the cron and the time jobs at once. The read beside the held one ends first, so the cancel lands at
+        // the held point and not inside the other read, where it would be an open that is already under way.
+        await _probe.OtherCallEnded.Task.WaitAsync(WaitLimit);
+        await Task.Delay(300);
 
         if (cancel == Cancel.Stop)
         {
@@ -148,9 +148,77 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
         Assert.True(_probe.ReleasedByCancel, "precondition: the held call was not released by a cancel of its token");
         // The pass that was cut off ends and the loop goes on (restart) or ends (stop).
         await Task.Delay(1000);
+    }
+
+    // The cancel comes between two store calls of the pass, or on a command: the store call after it is not started.
+    [Theory]
+    [InlineData(Context.Owned, StoreCallHold.AfterClose, Cancel.Stop)]
+    [InlineData(Context.Owned, StoreCallHold.AfterClose, Cancel.Restart)]
+    [InlineData(Context.Owned, StoreCallHold.Command, Cancel.Stop)]
+    [InlineData(Context.Owned, StoreCallHold.Command, Cancel.Restart)]
+    [InlineData(Context.Application, StoreCallHold.AfterClose, Cancel.Stop)]
+    [InlineData(Context.Application, StoreCallHold.AfterClose, Cancel.Restart)]
+    [InlineData(Context.Application, StoreCallHold.Command, Cancel.Stop)]
+    [InlineData(Context.Application, StoreCallHold.Command, Cancel.Restart)]
+    public async Task AStopOrARestartBetweenTheLoopsStoreCalls_LogsNoError(Context context, StoreCallHold hold, Cancel cancel)
+    {
+        var application = await StartAsync(context);
+
+        await CutOffALoopPassAsync(application, hold, cancel);
 
         var errors = _log.Errors();
-        Assert.True(errors.Length == 0, Failure(errors));
+        Assert.True(errors.Length == 0, Failure("the log has entries at Error or above", errors));
+    }
+
+    // The lease pass renews the lock of this node's jobs, then records the expired jobs of other nodes: a stop between the
+    // two does not start the second. The renewal is two statements, so the close of the second open is held.
+    [Theory]
+    [InlineData(Context.Owned)]
+    [InlineData(Context.Application)]
+    public async Task AStopBetweenTheLeasePassesStoreCalls_LogsNoError(Context context)
+    {
+        var application = await StartAsync(context, lease: TimeSpan.FromSeconds(1));
+
+        _probe.Arm(StoreCallHold.AfterClose, nth: 2);
+        await _probe.Held.Task.WaitAsync(WaitLimit);
+        await application.StopAsync();
+        _stopped = true;
+        await _probe.Released.Task.WaitAsync(WaitLimit);
+        Assert.True(_probe.ReleasedByCancel, "precondition: the held call was not released by a cancel of its token");
+        await Task.Delay(500);
+
+        var errors = _log.Errors();
+        Assert.True(errors.Length == 0, Failure("the log has entries at Error or above", errors));
+    }
+
+    // The cancel comes while the loop's open is running. EF Core 8 and 9 log it as ConnectionError at Error, with the
+    // TaskCanceledException the provider throws; nothing else is at Error and SharpTicker logs nothing above Debug. EF Core 10
+    // does not log it at Error.
+    [Theory]
+    [InlineData(Context.Owned, Cancel.Stop)]
+    [InlineData(Context.Owned, Cancel.Restart)]
+    [InlineData(Context.Application, Cancel.Stop)]
+    [InlineData(Context.Application, Cancel.Restart)]
+    public async Task AStopOrARestartDuringTheLoopsOpen_IsLoggedByEfCoreOnly_AsDocumented(Context context, Cancel cancel)
+    {
+        var application = await StartAsync(context);
+
+        await CutOffALoopPassAsync(application, StoreCallHold.Open, cancel);
+
+        var errors = _log.Errors();
+        if (RecordingLoggerProvider.EfCoreLogsACancelledOpenAtError)
+        {
+            Assert.True(errors.Length > 0, Failure("EF Core 8/9: the cancelled open was not logged at Error", errors));
+            Assert.True(errors.All(e => e.Category == "Microsoft.EntityFrameworkCore.Database.Connection" && e.EventId.Id == 20004),
+                Failure("EF Core 8/9: an entry at Error other than ConnectionError (20004)", errors));
+            Assert.True(_probe.Failures.Any(f => f.StartsWith("open: System.Threading.Tasks.TaskCanceledException", StringComparison.Ordinal)),
+                Failure("EF Core 8/9: the open did not fail with a TaskCanceledException", errors));
+        }
+        else
+            Assert.True(errors.Length == 0, Failure("the log has entries at Error or above", errors));
+
+        var sharpTicker = _log.SharpTickerAboveDebug();
+        Assert.True(sharpTicker.Length == 0, Failure("SharpTicker logged above Debug", sharpTicker));
     }
 
     // Control: the same hold, let go after a moment without any cancel. The hold alone logs nothing at Error.
@@ -172,6 +240,6 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
         await Task.Delay(1000);
 
         var errors = _log.Errors();
-        Assert.True(errors.Length == 0, Failure(errors));
+        Assert.True(errors.Length == 0, Failure("the log has entries at Error or above", errors));
     }
 }
