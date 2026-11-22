@@ -13,6 +13,7 @@
   </Folder>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/SharpTicker.Benchmarks/SharpTicker.Benchmarks.csproj" />
+    <Project Path="benchmarks/SharpTicker.Benchmarks.Comparisons/SharpTicker.Benchmarks.Comparisons.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/SharpTicker.Sample.ApplicationDbContext/SharpTicker.Sample.ApplicationDbContext.csproj" />
