@@ -194,6 +194,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => x.ExecutionTime <= fallbackThreshold)  // Only tasks older than 1 second
             .WhereChainGateOpen()
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
         foreach (var timeTicker in timeTickersToUpdate)
@@ -259,6 +260,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .AsNoTracking()
             .Where(x => runs.Contains(x.Id))
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
         foreach (var child in childrenToClaim)
@@ -449,6 +451,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => x.ExecutionTime >= minSecond && x.ExecutionTime < maxExecutionTime)
             .OrderBy(x => x.ExecutionTime)
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
     }
     
@@ -688,6 +691,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .AsNoTracking()
                 .Where(x => wonIds.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
                 .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+                .AsSingleQuery()
                 .ToArrayAsync(CancellationToken.None)
                 .ConfigureAwait(false);
 
