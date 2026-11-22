@@ -117,15 +117,18 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
     /// <param name="what">Where the call is held.</param>
     /// <param name="releaseAfter">Set: the call goes on after this time without a cancel (the control).</param>
-    /// <param name="nth">The how-many-th call with a token that can be cancelled is held (1: the first one).</param>
-    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, int nth = 1)
+    /// <param name="closeAfterCommand">
+    /// With <see cref="StoreCallHold.AfterClose"/>: the close that is held is the one after the first command whose text
+    /// this accepts, instead of the close of the first connection opened.
+    /// </param>
+    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, Func<string, bool>? closeAfterCommand = null)
     {
         _what = what;
         _releaseAfter = releaseAfter;
+        _closeAfterCommand = closeAfterCommand;
         _inFlight = null;
         _closing = null;
         _heldConnection = null;
-        _skip = nth - 1;
         Held = NewSignal();
         Released = NewSignal();
         OtherCallEnded = NewSignal();
@@ -133,15 +136,24 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         Volatile.Write(ref _armed, 1);
     }
 
-    private int _skip;
+    private Func<string, bool>? _closeAfterCommand;
 
     private bool Take(StoreCallHold what, CancellationToken cancellationToken)
+        => _what == what && cancellationToken.CanBeCanceled && !cancellationToken.IsCancellationRequested
+           && Interlocked.CompareExchange(ref _armed, 0, 1) == 1;
+
+    // AfterClose: the connection whose close is held, and the token it is held until.
+    private void HoldTheCloseOf(DbConnection connection, CancellationToken cancellationToken)
     {
-        if (_what != what || !cancellationToken.CanBeCanceled || cancellationToken.IsCancellationRequested || Volatile.Read(ref _armed) != 1)
-            return false;
-        if (Interlocked.Decrement(ref _skip) >= 0)
-            return false;
-        return Interlocked.CompareExchange(ref _armed, 0, 1) == 1;
+        _closeToken = cancellationToken;
+        Volatile.Write(ref _closing, connection);
+    }
+
+    private void HoldTheCloseAfter(DbCommand command, CancellationToken cancellationToken)
+    {
+        var accepts = _closeAfterCommand;
+        if (accepts != null && command.Connection != null && accepts(command.CommandText) && Take(StoreCallHold.AfterClose, cancellationToken))
+            HoldTheCloseOf(command.Connection, cancellationToken);
     }
 
     private async Task HoldAsync(StoreCallHold what, DbConnection? connection, CancellationToken cancellationToken)
@@ -190,11 +202,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public override async ValueTask<InterceptionResult> ConnectionOpeningAsync(DbConnection connection, ConnectionEventData eventData,
         InterceptionResult result, CancellationToken cancellationToken = default)
     {
-        if (Take(StoreCallHold.AfterClose, cancellationToken))
-        {
-            _closeToken = cancellationToken;
-            Volatile.Write(ref _closing, connection);
-        }
+        if (_closeAfterCommand == null && Take(StoreCallHold.AfterClose, cancellationToken))
+            HoldTheCloseOf(connection, cancellationToken);
 
         await HoldAsync(StoreCallHold.Open, connection, cancellationToken).ConfigureAwait(false);
         return result;
@@ -256,6 +265,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(DbCommand command, CommandEventData eventData,
         InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
     {
+        HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
         await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
@@ -264,6 +274,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(DbCommand command, CommandEventData eventData,
         InterceptionResult<int> result, CancellationToken cancellationToken = default)
     {
+        HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
         await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;

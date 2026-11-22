@@ -97,9 +97,11 @@ public class MySqlCancelledStoreCallLogTests(MySqlContainerFixture fixture) : IC
 
         _application.UseSharpTicker();
         await _application.StartAsync();
-        // The startup step of the store (internal here) and the restart it asks for end well within this.
+        // The startup step of the store and the restart it asks for end well within this; the task that tells when the step
+        // ended (TickerExecutionContext.ExternalProviderStartup) is internal, and this project does not see it.
         await Task.Delay(3000);
-        // What EnsureCreated logs on a database that is not there yet is not part of the test.
+        Assert.True(_log.Errors().Length == 0, $"precondition: an Error before the test began:\n{string.Join("\n", _log.Errors().AsEnumerable())}");
+        // From here on, the log is the test's.
         _log.Entries.Clear();
         return _application;
     }

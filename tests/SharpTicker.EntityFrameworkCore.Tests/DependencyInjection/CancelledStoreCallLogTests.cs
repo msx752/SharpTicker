@@ -170,8 +170,16 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
         Assert.True(errors.Length == 0, Failure("the log has entries at Error or above", errors));
     }
 
+    // The renewal's last statement: the update of the lock of this node's cron occurrences. Its SET begins with LockedAt;
+    // the update of the lease's second step begins with the status.
+    private static bool IsTheRenewalsLastStatement(string sql)
+        => sql.StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase)
+           && sql.Contains("CronTickerOccurrences", StringComparison.Ordinal)
+           && sql.Contains("SET \"LockedAt\"", StringComparison.Ordinal);
+
     // The lease pass renews the lock of this node's jobs, then records the expired jobs of other nodes: a stop between the
-    // two does not start the second. The renewal is two statements, so the close of the second open is held.
+    // two does not start the second. The renewal is two statements; the close after its last one is held, whichever pass
+    // the test begins in.
     [Theory]
     [InlineData(Context.Owned)]
     [InlineData(Context.Application)]
@@ -179,7 +187,7 @@ public class CancelledStoreCallLogTests : IAsyncLifetime
     {
         var application = await StartAsync(context, lease: TimeSpan.FromSeconds(1));
 
-        _probe.Arm(StoreCallHold.AfterClose, nth: 2);
+        _probe.Arm(StoreCallHold.AfterClose, closeAfterCommand: IsTheRenewalsLastStatement);
         await _probe.Held.Task.WaitAsync(WaitLimit);
         await application.StopAsync();
         _stopped = true;

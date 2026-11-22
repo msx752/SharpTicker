@@ -128,11 +128,13 @@ A job reports its own failure through the [exception handler](failure-modes.md#h
 
 ### EF Core entries at a stop or a restart
 
-With the EF Core store on EF Core 8 or 9, a stop of the application or a restart of the scheduler loop can come while a store call of SharpTicker is opening its connection. EF Core then logs `ConnectionError` (event id 20004, category `Microsoft.EntityFrameworkCore.Database.Connection`) at `Error`, "An error occurred using the connection to database ...", and the provider's exception is a `TaskCanceledException`. Nothing went wrong: the open was cut off by the stop or the restart. SharpTicker writes its own entry for that pass at `Debug`. SharpTicker starts no further store call of the scheduler loop, the fallback or the lease once their pass is cancelled ([#255](https://github.com/msx752/SharpTicker/issues/255)), so the entry comes from an open that was already under way, or from one of the statements a single store call runs one after another. With EF Core 10 we have not seen this entry at `Error`.
+With the EF Core store on EF Core 8 or 9, a stop of the application or a restart of the scheduler loop can come while a store call of SharpTicker is opening its connection. EF Core then logs `ConnectionError` (event id 20004, category `Microsoft.EntityFrameworkCore.Database.Connection`) at `Error`, "An error occurred using the connection to database ...", and the provider's exception is a `TaskCanceledException`. Nothing went wrong: the open was cut off by the stop or the restart. SharpTicker itself logs nothing above `Debug` for that pass. SharpTicker does not start a further store call of the scheduler loop, the fallback or the lease once their pass is cancelled ([#255](https://github.com/msx752/SharpTicker/issues/255)), so the entry comes from an open that was already under way, or from one of the statements a single store call runs one after another. With EF Core 10 we have not seen this entry at `Error`.
 
 If you alert on `Error` entries, you can lower that event in the options of the context the store uses (your own context with `UseApplicationDbContext`, or the options given to `UseSharpTickerDbContext`):
 
 ```csharp
+using Microsoft.EntityFrameworkCore.Diagnostics;
+
 builder.Services.AddDbContext<AppDbContext>(options => options
     .UseSqlite("Data Source=app.db")
     .ConfigureWarnings(warnings => warnings.Log((RelationalEventId.ConnectionError, LogLevel.Debug))));
