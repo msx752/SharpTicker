@@ -145,10 +145,9 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Debug);
         builder.Logging.AddProvider(_log);
-        // Two EF Core warnings that are not about the lease are turned off as an application would: SQLite has no schemas,
-        // and the store reads a chain's children and grandchildren in one query.
+        // An EF Core warning that is not about the lease is turned off as an application would: SQLite has no schemas.
         builder.Services.AddDbContext<InProgressLeaseDbContext>(options => options.UseSqlite($"Data Source={_databaseFile}")
-            .ConfigureWarnings(w => w.Ignore(SqliteEventId.SchemaConfiguredWarning, RelationalEventId.MultipleCollectionIncludeWarning)));
+            .ConfigureWarnings(w => w.Ignore(SqliteEventId.SchemaConfiguredWarning)));
         builder.Services.AddSharpTicker(options =>
         {
             options.ConfigureScheduler(scheduler =>
