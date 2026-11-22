@@ -276,6 +276,20 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal([keptId], stored.Select(x => x.CronTickerId));
     }
 
+    // #262: only a cron that is gone is left out. When the insert fails while the cron still exists, the failure ends the
+    // call as before, so the loop reports it and tries again.
+    [Fact]
+    public async Task QueueOccurrences_TheInsertFailsWhileTheCronExists_Throws()
+    {
+        var node = CreateProvider("node-A", Clock, FailOnce.NonQuery(1));
+        var cronId = await SeedCronTicker();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => Drain(node.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        await using var context = CreateContext();
+        Assert.Empty(await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().ToListAsync());
+    }
+
     // Finished rows keep the lock holder, so even the owning node must not move them back to InProgress.
     [Theory]
     [MemberData(nameof(NonQueuedStatuses))]

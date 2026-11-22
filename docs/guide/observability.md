@@ -142,6 +142,10 @@ builder.Services.AddDbContext<AppDbContext>(options => options
 
 This lowers every `ConnectionError` of that context, also one for a database that cannot be reached. A store failure that ends a pass of the scheduler loop or of the fallback is still reported by SharpTicker itself (see the table above). A logging filter on the whole category, `builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Connection", LogLevel.Critical)`, hides more than this event.
 
+### EF Core entry when a cron is deleted
+
+The scheduler loop reads the crons that are due, then adds an occurrence for each. When a cron is deleted in between, on this node or another, the insert of its occurrence fails on the foreign key to the cron. EF Core logs that command at `Error` (category `Microsoft.EntityFrameworkCore.Database.Command`, "Failed executing DbCommand", with an `INSERT INTO` the `CronTickerOccurrences` table). SharpTicker then finds that the cron is gone, adds no occurrence for it and queues the other crons of that pass; it logs this at `Debug` only ([#262](https://github.com/msx752/SharpTicker/issues/262)). If the cron still exists, the failure ends the pass and is reported as in the table above.
+
 ## Dashboard failures
 
 When the dashboard refuses an add or update, for example for an invalid cron expression, it logs a warning with the reason. A failure of the store is logged as an error with the exception. Both use the `SharpTicker.Dashboard.Endpoints.DashboardEndpoints` logger category. The browser gets the reason only for a refusal; for a failure of the store it gets a short message, so table and constraint names stay out of the page.
