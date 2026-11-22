@@ -1317,7 +1317,7 @@ public class MongoClaimMultiNodeTests : IClassFixture<MongoTestFixture>, IAsyncL
         Assert.Equal([childId], (await Fallback()).Select(x => x.Id));
     }
 
-    // Candidate 97: the fallback reads the waiting child and then claims it. Between the two, another node edits the
+    // #260: the fallback reads the waiting child and then claims it. Between the two, another node edits the
     // child's request and leaves it waiting (Idle, no time, no lock holder). The row the fallback read is no longer the
     // row in the store: it is not claimed, so it does not run with the request that was read. That holds whichever way
     // the other node's clock is off: behind, so the UpdatedAt it writes is earlier than the one the fallback read, or
