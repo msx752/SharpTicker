@@ -15,3 +15,17 @@ public class EfCoreDashboardStatusCountTests(PostgresTestFixture fixture) : IAsy
     public Task StatusCountsAndJobsPerMachine_AreTheSameAsCountingTheRows()
         => DashboardStatusCountCheck.SeedAndCheckAsync(fixture.CreateProvider("node-A", new FakeTickerClock(Now)), Now);
 }
+
+/// <summary>The same check on SQL Server (#247).</summary>
+[Collection(SqlServerTestFixture.CollectionName)]
+public class EfCoreDashboardStatusCountSqlServerTests(SqlServerTestFixture fixture) : IAsyncLifetime
+{
+    private static readonly DateTime Now = new(2025, 6, 15, 12, 0, 0, DateTimeKind.Utc);
+
+    public Task InitializeAsync() => fixture.ResetAsync();
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    [Fact]
+    public Task StatusCountsAndJobsPerMachine_AreTheSameAsCountingTheRows()
+        => DashboardStatusCountCheck.SeedAndCheckAsync(fixture.CreateProvider("node-A", new FakeTickerClock(Now)), Now);
+}
