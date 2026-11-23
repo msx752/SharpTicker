@@ -22,7 +22,7 @@ builder.Services.AddSharpTicker(options =>
 
 The default is the machine name, which is not unique when several containers share a host name pattern or run on one machine.
 
-Stable means that the instance has the same name after it is replaced. The pod name of a Kubernetes StatefulSet and a fixed name per replica are; the pod name of a Deployment is new for every pod, and so is the container id, which is the machine name inside a container. With the EF Core store and its lease turned off, and no Redis, the name decides whether the jobs of a stopped instance are released at all (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
+Stable means that the instance has the same name after it is replaced. The pod name of a Kubernetes StatefulSet and a fixed name per replica are; the pod name of a Deployment is new for every pod, and so is the container id, which is the machine name inside a container. With the EF Core store and its lease turned off, the name decides whether the jobs of a stopped instance are released at all (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
 
 The name is the lock holder on a job, and a starting instance treats every job held under its own name as left behind by an earlier run (see [When an instance stops](failure-modes.md#when-an-instance-stops)). So two running instances with one name release each other's running jobs.
 
@@ -84,7 +84,7 @@ env:
 
 - A StatefulSet starts the replacement of a pod after the old pod with that name has gone, so two running pods do not share a name. A pod that is force-deleted while its process still runs breaks that: with EF Core or Redis, the new pod's startup release frees the jobs the old one is still running (see [When a job can run more than once](failure-modes.md#when-a-job-can-run-more-than-once)).
 - A pod that comes back under its name releases what its earlier run left at its start, and those jobs run again (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
-- With a Deployment every pod has a new name. The jobs of a pod that was killed are then released by the EF Core lease or the Redis heartbeat release, or not at all with MongoDB alone, or with EF Core when its lease is off and Redis is not used.
+- With a Deployment every pod has a new name. The jobs of a pod that was killed are then recorded as `Cancelled` by the EF Core lease, or released by the Redis heartbeat release with Redis as the job store. With MongoDB, and with EF Core when its lease is off, they are not released.
 - Pods that only add jobs, such as an API, can run as a Deployment with `DisableBackgroundServices()` (see [Start modes](#start-modes)).
 
 ### Stopping a pod
@@ -101,7 +101,7 @@ SharpTicker registers no health check. Points to consider for your own probes:
 ### Lease and heartbeat settings
 
 - With EF Core, set the same `SetInProgressLease` on every pod that runs the background services, or turn it off on all of them (see [Lease on running jobs](storage.md#lease-on-running-jobs)). A pod that is paused, or cut off from the database, for longer than the lease has its jobs recorded as `Cancelled` by the others.
-- With Redis, `NodeHeartbeatInterval` sets how soon the others release the jobs of a pod that stopped: about two heartbeat TTLs (each the interval plus 20 seconds). With Redis as the job store, a pod that cannot write its heartbeat for one TTL asks its jobs to stop; `StopJobsWhenHeartbeatIsLost` turns that off (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
+- With Redis as the job store, `NodeHeartbeatInterval` sets how soon the others release the jobs of a pod that stopped: about two heartbeat TTLs (each the interval plus 20 seconds). With Redis as the job store, a pod that cannot write its heartbeat for one TTL asks its jobs to stop; `StopJobsWhenHeartbeatIsLost` turns that off (see [When an instance stops](failure-modes.md#when-an-instance-stops)).
 - Keep the clocks of the nodes in sync (see [Clocks](#clocks)).
 
 ### Rolling upgrades
