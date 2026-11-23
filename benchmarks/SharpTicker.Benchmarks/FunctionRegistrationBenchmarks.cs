@@ -1,18 +1,16 @@
 using System.Collections.Frozen;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Jobs;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Enums;
 
 namespace SharpTicker.Benchmarks;
 
 /// <summary>
-/// Benchmarks for function registration and FrozenDictionary creation.
-/// Measures the one-time startup cost of building the function registry.
-/// SharpTicker pays this cost once at startup to get O(1) lookups at runtime.
+/// Cost of building a function registry of the same shape as TickerFunctionProvider.TickerFunctions:
+/// ToFrozenDictionary against copying into a plain Dictionary. This measures the collection types only, not the
+/// whole registration that TickerFunctionProvider does at startup.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.HostProcess)]
 public class FunctionRegistrationBenchmarks
 {
     private Dictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)> _functions = null!;

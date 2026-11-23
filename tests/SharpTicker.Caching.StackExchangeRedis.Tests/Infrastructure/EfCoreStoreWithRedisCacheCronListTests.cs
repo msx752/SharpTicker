@@ -270,10 +270,8 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
 
         await WaitUntilAsync(() => Task.FromResult(Volatile.Read(ref _hostRuns) >= 2), "the job ran twice on its new schedule");
 
-        // Left out: EF Core's own warning about a query of the store that loads more than one collection, which has
-        // nothing to do with the list of cron expressions.
         var problems = _log.Entries.Skip(loggedByTheFirstRun)
-            .Where(e => e.Level >= LogLevel.Warning && !e.Text.Contains("QuerySplittingBehavior"))
+            .Where(e => e.Level >= LogLevel.Warning)
             .Select(e => e.Text).ToList();
         await second.StopAsync();
         Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");

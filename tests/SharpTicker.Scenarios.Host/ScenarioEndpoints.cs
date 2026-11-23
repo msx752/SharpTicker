@@ -1,6 +1,7 @@
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
 using SharpTicker.Utilities.Enums;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
 
 namespace SharpTicker.Scenarios.Host;
@@ -15,6 +16,14 @@ public sealed class TickerSeed
     public WaitRequest? Request { get; set; }
     public RunCondition? RunCondition { get; set; }
     public List<TickerSeed> Children { get; set; } = new();
+}
+
+/// <summary>New wall-clock times, without a zone ("yyyy-MM-ddTHH:mm:ss"), for a chain of a root and one child.</summary>
+public sealed class RescheduleSeed
+{
+    public string RootTime { get; set; } = "";
+    public string ChildTime { get; set; } = "";
+    public bool Batch { get; set; }
 }
 
 public sealed class CronSeed
@@ -102,12 +111,37 @@ public static class ScenarioEndpoints
             return Results.Ok(new { cap, from, until });
         });
 
+        // Reads a chain of a root and one child back from the store, gives both the new times as DateTimeKind.Unspecified
+        // (the manager reads them in the scheduler time zone) and updates the root through the manager: UpdateAsync, or
+        // UpdateBatchAsync with batch=true.
+        group.MapPost("/chains/{id:guid}/reschedule", async (Guid id, RescheduleSeed seed, ITimeTickerManager<TimeTickerEntity> manager,
+            ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> store, CancellationToken ct) =>
+        {
+            var root = await store.GetTimeTickerById(id, ct);
+            if (root == null)
+                return Results.NotFound();
+            root.ExecutionTime = WallClock(seed.RootTime);
+            root.Children.Single().ExecutionTime = WallClock(seed.ChildTime);
+
+            if (seed.Batch)
+            {
+                var batch = await manager.UpdateBatchAsync([root], ct);
+                return batch.IsSucceeded ? Results.Ok() : Results.Problem(batch.Exception?.ToString());
+            }
+
+            var one = await manager.UpdateAsync(root, ct);
+            return one.IsSucceeded ? Results.Ok() : Results.Problem(one.Exception?.ToString());
+        });
+
         group.MapDelete("/time-tickers/{id:guid}", async (Guid id, ITimeTickerManager<TimeTickerEntity> manager, CancellationToken ct) =>
         {
             var result = await manager.DeleteAsync(id, ct);
             return result.IsSucceeded ? Results.Ok() : Results.Problem(result.Exception?.ToString());
         });
     }
+
+    private static DateTime WallClock(string text)
+        => DateTime.ParseExact(text, "yyyy-MM-ddTHH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
 
     private static TimeTickerEntity ToEntity(TickerSeed seed)
     {

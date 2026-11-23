@@ -220,11 +220,13 @@ namespace SharpTicker.MongoDB.Infrastructure
                     .Set(x => x.UpdatedAt, claimMarker)
                     .Set(x => x.Status, TickerStatus.InProgress);
 
+                // As for the rows with a time above: the row has to be the one that was read, also after a write by a node
+                // whose clock is behind (#260).
                 UpdateResult result;
                 try
                 {
                     result = await coll.UpdateOneAsync(
-                        fb.And(fb.Eq(x => x.Id, child.Id), fb.Lte(x => x.UpdatedAt, child.UpdatedAt), waitsForItsInlineStart),
+                        fb.And(fb.Eq(x => x.Id, child.Id), fb.Eq(x => x.UpdatedAt, child.UpdatedAt), waitsForItsInlineStart),
                         update, cancellationToken: cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception failure)

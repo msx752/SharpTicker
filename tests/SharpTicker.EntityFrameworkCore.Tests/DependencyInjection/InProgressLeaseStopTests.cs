@@ -92,4 +92,37 @@ public class InProgressLeaseStopTests
         lock (log.Entries)
             Assert.Empty(log.Entries.Where(e => e.Level > LogLevel.Debug).Select(e => $"{e.Level}: {e.Text}"));
     }
+
+    // #255: the renewal ends after the host began to stop; the second step of the pass is not started with the cancelled
+    // token (the EF Core store would open a connection with it, which EF Core 8 and 9 log at Error).
+    [Fact]
+    public async Task AStopAfterTheRenewal_DoesNotStartTheSecondStepOfThePass()
+    {
+        var store = Substitute.For<ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity>, IInProgressLease>();
+        var lease = (IInProgressLease)store;
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopping = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lease.RenewInProgressLeaseAsync(Arg.Any<DateTime>(), Arg.Any<CancellationToken>()).Returns(async _ =>
+        {
+            reached.TrySetResult();
+            await stopping.Task;
+            return 1;
+        });
+
+        var options = new SharpTickerEfCoreOptionBuilder<TimeTickerEntity, CronTickerEntity>().SetInProgressLease(TimeSpan.FromSeconds(1));
+        var context = new TickerExecutionContext { RunStartedAt = DateTime.UtcNow };
+        var log = new RecordingLoggerFactory();
+        var service = new InProgressLeaseBackgroundService<TimeTickerEntity, CronTickerEntity>(store, options, context, log);
+
+        await service.StartAsync(CancellationToken.None);
+        await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var stop = service.StopAsync(CancellationToken.None);
+        stopping.SetResult();
+        await stop.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await lease.DidNotReceive().CancelExpiredInProgressOfOtherNodesAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
+        Assert.True(service.ExecuteTask!.IsCompletedSuccessfully, $"The service ended {service.ExecuteTask.Status}: {service.ExecuteTask.Exception}");
+        lock (log.Entries)
+            Assert.Empty(log.Entries.Where(e => e.Level > LogLevel.Debug).Select(e => $"{e.Level}: {e.Text}"));
+    }
 }

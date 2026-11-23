@@ -35,6 +35,8 @@ builder.Services.AddSharpTicker(options =>
 
 The EF Core tools (`dotnet ef migrations add`, `dotnet ef dbcontext info`) find this context in the application's services and create it with the options given here, so the first migration can be added without a design-time factory. `SharpTickerDbContext` is in the SharpTicker assembly, so name the project that holds the migrations, for example `db.UseNpgsql(connectionString, b => b.MigrationsAssembly("MyApp"))`; without it the tools stop with `Your target project 'MyApp' doesn't match your migrations assembly 'SharpTicker.EntityFrameworkCore'`. When the application also registers a context of its own, the tools find both and stop with `More than one DbContext was found`, so each command names the one it is for: `--context AppDbContext` or `--context SharpTickerDbContext`.
 
+For that lookup the options of this context are in the application's services as the non-generic `DbContextOptions` too. This affects a context of your own that configures itself in `OnConfiguring`, has a constructor that takes the non-generic `DbContextOptions` next to its parameterless one, and is registered by hand (`AddScoped<AppDbContext>()` instead of `AddDbContext`): the container now creates it with these options, and EF Core stops with `The DbContextOptions passed to the AppDbContext constructor must be a DbContextOptions<AppDbContext>`. Change that constructor to take `DbContextOptions<AppDbContext>`, so the parameterless one is used again, or register the context with `AddDbContext`.
+
 ### Your own DbContext
 
 To keep the tables in your application's database and migrations, map them into your own context:
@@ -53,6 +55,10 @@ With `ConfigurationType.UseModelCustomizer` the tables are added to your model a
 ### Schema and tables
 
 Tables are created in the `ticker` schema: `TimeTickers`, `CronTickers` and `CronTickerOccurrences`. Change the schema with `ef.SetSchema("...")`. Create the tables with EF Core migrations, or with `EnsureCreated()` / `GenerateCreateScript()` when you do not use migrations.
+
+SharpTicker writes the times of these tables (`ExecutionTime`, `LockedAt`, `ExecutedAt`, `CreatedAt`, `UpdatedAt`) in UTC; they are read back as `DateTimeKind.Utc`, through the store and through your own queries on a context that has the tables. The column type is the one your provider gives a `DateTime`.
+
+When your context converts every `DateTime` itself, these columns follow your conversion instead: a convention in `ConfigureConventions` is kept, and a loop in `OnModelCreating` that sets a converter on every `DateTime` property after the tables are added (with `UseModelCustomizer` they are added before your `OnModelCreating` runs) replaces SharpTicker's. If your conversion reads these times back as `Unspecified`, an update (`UpdateAsync`) of a job read back from the store reads them in the scheduler time zone, so the job and its children move by that zone's offset. With a compiled EF Core model (`dotnet ef dbcontext optimize`), generate it again after upgrading SharpTicker; until then the times read back as before.
 
 Other options: `SetDbContextPoolSize(int)` (default 1024).
 

@@ -52,6 +52,56 @@ public class ChainScenarios
         }
     }
 
+    // #257: a node whose scheduler time zone is UTC+9 updates a chain read back from the store with new times given as
+    // Unspecified (wall clock in that zone): the root 6 s ahead, its delayed child 16 s ahead. Before the fix the update
+    // converted only the root, so the child's wall-clock time was stored as UTC, 9 hours late, and it did not run. The
+    // root is converted on both sides of the fix: its start shows the update itself went through.
+    [Theory]
+    [InlineData(Store.EfCorePostgres, false)]
+    [InlineData(Store.EfCorePostgres, true)]
+    [InlineData(Store.MongoDb, false)]
+    [InlineData(Store.MongoDb, true)]
+    [InlineData(Store.Redis, false)]
+    [InlineData(Store.Redis, true)]
+    public async Task AChainUpdatedWithTimesInTheSchedulerZone_RunsItsDelayedChildAtThatTime(Store store, bool batch)
+    {
+        const int offsetHours = 9;
+        await using var env = await ScenarioEnvironment.StartAsync($"chain-update-zone-{(batch ? "batch" : "one")}", store, nodes: 1,
+            nodeEnvironment: _ => new Dictionary<string, string> { ["SCENARIO_SCHEDULER_UTC_OFFSET"] = offsetHours.ToString() });
+        var node = env.Nodes[0];
+
+        // Added in UTC, far ahead: only the update makes them due.
+        var now = DateTime.UtcNow;
+        var (rootId, tree) = await node.Api.AddChainAsync(new TickerSeed
+        {
+            Function = Functions.Record, ExecutionTime = now.AddHours(1),
+            Children = [new TickerSeed { Function = Functions.Record, RunCondition = RunCondition.OnSuccess, ExecutionTime = now.AddHours(2) }],
+        });
+        var childId = tree[1];
+
+        var whole = new DateTime(now.Ticks - now.Ticks % TimeSpan.TicksPerSecond, DateTimeKind.Utc);
+        var (rootAt, childAt) = (whole.AddSeconds(6), whole.AddSeconds(16));
+        await node.Api.RescheduleChainAsync(rootId, rootAt.AddHours(offsetHours), childAt.AddHours(offsetHours), batch);
+
+        IReadOnlyList<TickerView> all = [];
+        await env.UntilAsync(async () =>
+        {
+            all = await node.Dashboard.GetAllTimeTickersAsync();
+            return env.Runs.Starts(childId) > 0;
+        }, () => $"the child did not start; stored: {string.Join(", ", all.Where(t => tree.Contains(t.Id)).Select(t => $"{(t.Id == rootId ? "root" : "child")} {t.ExecutionTime:O} {t.Status}, starts {env.Runs.Starts(t.Id)}"))}; expected root {rootAt:O}, child {childAt:O}",
+            TimeSpan.FromSeconds(45));
+
+        Assert.Equal(1, env.Runs.Starts(rootId));
+        Assert.Equal(1, env.Runs.Starts(childId));
+        var rootStart = env.Runs.For(rootId).Single(e => e.IsStart).At;
+        var rootEnd = env.Runs.For(rootId).Single(e => e.IsEnd).At;
+        var childStart = env.Runs.For(childId).Single(e => e.IsStart).At;
+        Assert.True(rootStart >= new DateTimeOffset(rootAt), $"the root started at {rootStart:O}, before its time {rootAt:O}");
+        Assert.True(childStart >= new DateTimeOffset(childAt), $"the child started at {childStart:O}, before its time {childAt:O}");
+        Assert.True(childStart >= rootEnd, $"the child started at {childStart:O}, before its parent ended at {rootEnd:O}");
+        Assert.Equal(childAt, DateTime.SpecifyKind(all.Single(t => t.Id == childId).ExecutionTime!.Value, DateTimeKind.Utc));
+    }
+
     // #51: grandchildren run (MongoDB never ran them before the fix). An inline child with an inline grandchild.
     [Theory]
     [InlineData(Store.EfCorePostgres)]

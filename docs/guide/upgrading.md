@@ -33,7 +33,19 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 <a id="release-by-release"></a>
 
-<!-- Add the next version here, above 1.6.4, in the same shape: what changed, then the steps. -->
+<!-- Add the next version here, above the newest one, in the same shape: what changed, then the steps. -->
+
+## 1.6.6
+
+[Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.6)
+
+- Scheduler time zone other than UTC: `UpdateAsync` and `UpdateBatchAsync` convert the times of the chain children they carry, as the add paths do ([#257](https://github.com/msx752/SharpTicker/issues/257)). From 1.5.2 up to 1.6.5 a child time given on update as `Local` or `Unspecified` was stored as given, and the child ran off by the zone's offset.
+- EF Core: the store reads its times back as `DateTimeKind.Utc`, with the same value ([#257](https://github.com/msx752/SharpTicker/issues/257)). Up to 1.6.5 a job read from the store and given back to `UpdateAsync` moved by the scheduler zone's offset. Your own queries on a context with these tables now get `Utc` values instead of `Unspecified`; a `DateTime` conversion of your own is followed instead, see [Storage](storage.md).
+- EF Core: a cron deleted while the scheduler loop queues its occurrence is left out, and the pass goes on with the other crons ([#262](https://github.com/msx752/SharpTicker/issues/262)). EF Core still logs the failed insert at `Error`; see [Tracing and logs](observability.md).
+- EF Core 8 and 9: fewer `ConnectionError` entries at a stop or a loop restart ([#255](https://github.com/msx752/SharpTicker/issues/255)); EF Core no longer logs `MultipleCollectionIncludeWarning` for the claim reads ([#264](https://github.com/msx752/SharpTicker/issues/264)). An application whose context sets `SplitQuery` now runs those four reads as one query.
+- MongoDB: the fallback no longer claims a waiting chain child that another node edited after the fallback read it ([#260](https://github.com/msx752/SharpTicker/issues/260)).
+
+**Steps:** with the EF Core store and a compiled model, generate the model again (`dotnet ef dbcontext optimize`); until then the times are read back as before.
 
 ## 1.6.5
 

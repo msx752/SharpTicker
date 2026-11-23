@@ -252,6 +252,44 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
         Assert.Equal(TickerStatus.InProgress, (await ReadOccurrence(id)).Status);
     }
 
+    // The scheduler loop reads the crons due in a slot, then adds an occurrence for each. A cron deleted in between
+    // (through the manager or the dashboard, on this node or another) has no row left for its occurrence to point to.
+    // That cron is left out; the other crons of the slot are still queued.
+    [Fact]
+    public async Task QueueOccurrences_ACronDeletedAfterTheLoopReadIt_IsLeftOut_AndTheOthersAreQueued()
+    {
+        var node = CreateProvider("node-A");
+        var deletedId = await SeedCronTicker();
+        var keptId = await SeedCronTicker();
+        (DateTime Key, InternalManagerContext[] Items) slot = (T0,
+        [
+            new InternalManagerContext(deletedId) { FunctionName = "claim-cron-fn", Expression = "* * * * *" },
+            new InternalManagerContext(keptId) { FunctionName = "claim-cron-fn", Expression = "* * * * *" }
+        ]);
+        Assert.Equal(1, await CreateProvider("node-B").RemoveCronTickers([deletedId], CancellationToken.None));
+
+        var queued = await Drain(node.QueueCronTickerOccurrences(slot, CancellationToken.None));
+
+        Assert.Equal([keptId], queued.Select(x => x.CronTickerId));
+        await using var context = CreateContext();
+        var stored = await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().ToListAsync();
+        Assert.Equal([keptId], stored.Select(x => x.CronTickerId));
+    }
+
+    // #262: only a cron that is gone is left out. When the insert fails while the cron still exists, the failure ends the
+    // call as before, so the loop reports it and tries again.
+    [Fact]
+    public async Task QueueOccurrences_TheInsertFailsWhileTheCronExists_Throws()
+    {
+        var node = CreateProvider("node-A", Clock, FailOnce.NonQuery(1));
+        var cronId = await SeedCronTicker();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => Drain(node.QueueCronTickerOccurrences(Slot(cronId), CancellationToken.None)));
+
+        await using var context = CreateContext();
+        Assert.Empty(await context.Set<CronTickerOccurrenceEntity<CronTickerEntity>>().AsNoTracking().ToListAsync());
+    }
+
     // Finished rows keep the lock holder, so even the owning node must not move them back to InProgress.
     [Theory]
     [MemberData(nameof(NonQueuedStatuses))]

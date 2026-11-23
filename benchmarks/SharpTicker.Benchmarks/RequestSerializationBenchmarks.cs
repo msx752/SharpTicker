@@ -1,17 +1,23 @@
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Jobs;
 using SharpTicker.Utilities;
 
 namespace SharpTicker.Benchmarks;
 
 /// <summary>
 /// Benchmarks for TickerHelper request serialization/deserialization.
-/// Measures the overhead of creating and reading ticker requests (JSON + optional GZip).
+/// Measures the overhead of creating and reading ticker requests, as plain UTF-8 JSON (the default) and with GZip
+/// compression on (TickerHelper.UseGZipCompression).
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.HostProcess)]
 public class RequestSerializationBenchmarks
 {
+    /// <summary>
+    /// TickerHelper.UseGZipCompression for this run. It is a static setting: it is set in setup, before the payloads
+    /// are created, and put back to the default in cleanup.
+    /// </summary>
+    [Params(false, true)]
+    public bool GZip { get; set; }
+
     private byte[] _smallPayload = null!;
     private byte[] _mediumPayload = null!;
     private byte[] _largePayload = null!;
@@ -34,6 +40,8 @@ public class RequestSerializationBenchmarks
     [GlobalSetup]
     public void Setup()
     {
+        TickerHelper.UseGZipCompression = GZip;
+
         _largeRequest = new LargeRequest
         {
             Items = Enumerable.Range(0, 1000).Select(i => new LargeRequest.Item
@@ -50,12 +58,15 @@ public class RequestSerializationBenchmarks
         _largePayload = TickerHelper.CreateTickerRequest(_largeRequest);
     }
 
+    [GlobalCleanup]
+    public void Cleanup() => TickerHelper.UseGZipCompression = false;
+
     // ── Serialization ──
 
     [Benchmark(Description = "Serialize: Small (2 fields)")]
     public byte[] Serialize_Small() => TickerHelper.CreateTickerRequest(_smallRequest);
 
-    [Benchmark(Description = "Serialize: Medium (5 fields + collections)")]
+    [Benchmark(Description = "Serialize: Medium (4 fields, 2 of them collections)")]
     public byte[] Serialize_Medium() => TickerHelper.CreateTickerRequest(_mediumRequest);
 
     [Benchmark(Description = "Serialize: Large (1000 items)")]

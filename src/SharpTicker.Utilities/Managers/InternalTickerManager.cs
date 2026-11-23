@@ -62,8 +62,12 @@ namespace SharpTicker.Utilities.Managers
         {
             var now = _clock.UtcNow;
 
+            // A store call is not started once the token is cancelled (#255): the EF Core store would open a connection with
+            // it, and EF Core 8 and 9 log that open at Error. The same OperationCanceledException ends the pass as before.
+            cancellationToken.ThrowIfCancellationRequested();
             var minCronGroupTask = GetEarliestCronTickerGroupAsync(cancellationToken);
-            var minTimeTickersTask = _persistenceProvider.GetEarliestTimeTickers(cancellationToken);
+            // Started when the cron read yields, which can be after a cancel; it checks the token first.
+            var minTimeTickersTask = GetEarliestTimeTickersAsync(cancellationToken);
 
             await Task.WhenAll(minCronGroupTask, minTimeTickersTask).ConfigureAwait(false);
 
@@ -146,6 +150,12 @@ namespace SharpTicker.Utilities.Managers
             return (timeRemaining, merged);
         }
 
+        private async Task<TimeTickerEntity[]> GetEarliestTimeTickersAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return await _persistenceProvider.GetEarliestTimeTickers(cancellationToken).ConfigureAwait(false);
+        }
+
         private static TimeSpan SafeRemaining(DateTime target, DateTime now)
         {
             var remaining = target - now;
@@ -156,6 +166,7 @@ namespace SharpTicker.Utilities.Managers
         {
             var results = new List<InternalFunctionContext>();
             
+            cancellationToken.ThrowIfCancellationRequested();
             await foreach(var updatedTimeTicker in _persistenceProvider.QueueTimeTickers(minTimeTickers, cancellationToken))
             {
                 results.Add(new InternalFunctionContext
@@ -203,6 +214,7 @@ namespace SharpTicker.Utilities.Managers
         {
             var results = new List<InternalFunctionContext>();
             
+            cancellationToken.ThrowIfCancellationRequested();
             await foreach (var occurrence in _persistenceProvider.QueueCronTickerOccurrences(minCronTicker, cancellationToken).ConfigureAwait(false))
             {
                 results.Add(new InternalFunctionContext
@@ -229,12 +241,14 @@ namespace SharpTicker.Utilities.Managers
         {
             var now = _clock.UtcNow;
 
+            cancellationToken.ThrowIfCancellationRequested();
             var cronTickers = await _persistenceProvider
                 .GetAllCronTickerExpressions(cancellationToken)
                 .ConfigureAwait(false);
 
             var cronTickerIds = cronTickers.Select(x => x.Id).ToArray();
 
+            cancellationToken.ThrowIfCancellationRequested();
             var earliestAvailableCronOccurrence = await _persistenceProvider
                 .GetEarliestAvailableCronOccurrence(cronTickerIds, cancellationToken)
                 .ConfigureAwait(false);
@@ -327,6 +341,7 @@ namespace SharpTicker.Utilities.Managers
         // A node whose loop woke late finds the row taken by the fallback, or cancelled, and gets false.
         public async Task<bool> TryClaimDueTicker(InternalFunctionContext function, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var won = function.Type == TickerType.TimeTicker
                 ? await _persistenceProvider.TryMarkTimeTickerInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false)
                 : await _persistenceProvider.TryMarkCronOccurrenceInProgress(function.TickerId, claimMarker, cancellationToken).ConfigureAwait(false);
@@ -356,9 +371,13 @@ namespace SharpTicker.Utilities.Managers
         public DateTime NextClaimMarker() => _clock.NextClaimMarker();
 
         public async Task<int> GetMaxConcurrentClaims(CancellationToken cancellationToken = default)
-            => _persistenceProvider is IClaimFanOut fanOut
-                ? Math.Max(1, await fanOut.GetMaxConcurrentClaimsAsync(cancellationToken).ConfigureAwait(false))
-                : ClaimFanOut.Sequential;
+        {
+            if (_persistenceProvider is not IClaimFanOut fanOut)
+                return ClaimFanOut.Sequential;
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return Math.Max(1, await fanOut.GetMaxConcurrentClaimsAsync(cancellationToken).ConfigureAwait(false));
+        }
 
         public Task NotifyStatusChanged(InternalFunctionContext function) => NotifyInProgress(function);
 
@@ -664,6 +683,7 @@ namespace SharpTicker.Utilities.Managers
 
         private async Task ClaimTimedOutTickersAsync(List<InternalFunctionContext> results, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             await foreach(var timedOutTimeTicker in _persistenceProvider.QueueTimedOutTimeTickers(cancellationToken).ConfigureAwait(false))
             {
                 results.Add(new InternalFunctionContext
@@ -705,6 +725,7 @@ namespace SharpTicker.Utilities.Managers
                 await NotifyClaimedAsync(() => _notificationHubSender.UpdateTimeTickerNotifyAsync(timedOutTimeTicker), results[^1]).ConfigureAwait(false);
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             await foreach (var timedOutCronTicker in _persistenceProvider.QueueTimedOutCronTickerOccurrences(cancellationToken).ConfigureAwait(false))
             {
                 var functionContext = new InternalFunctionContext

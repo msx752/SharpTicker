@@ -33,6 +33,7 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DashboardStatusCountCheck.cs" Link="Shared\DashboardStatusCountCheck.cs" />
+    <Compile Include="..\Shared\CancelledStoreCallProbe.cs" Link="Shared\CancelledStoreCallProbe.cs" />
   </ItemGroup>
 
 </Project>

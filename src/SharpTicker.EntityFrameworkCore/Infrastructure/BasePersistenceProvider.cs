@@ -194,6 +194,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => x.ExecutionTime <= fallbackThreshold)  // Only tasks older than 1 second
             .WhereChainGateOpen()
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
         foreach (var timeTicker in timeTickersToUpdate)
@@ -259,6 +260,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .AsNoTracking()
             .Where(x => runs.Contains(x.Id))
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
         foreach (var child in childrenToClaim)
@@ -449,6 +451,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
             .Where(x => x.ExecutionTime >= minSecond && x.ExecutionTime < maxExecutionTime)
             .OrderBy(x => x.ExecutionTime)
             .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+            .AsSingleQuery()
             .ToArrayAsync(cancellationToken).ConfigureAwait(false);
     }
     
@@ -688,6 +691,7 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                 .AsNoTracking()
                 .Where(x => wonIds.Contains(x.Id) && x.LockHolder == _lockHolder && x.Status == TickerStatus.InProgress)
                 .Select(MappingExtensions.ForQueueTimeTickers<TTimeTicker>())
+                .AsSingleQuery()
                 .ToArrayAsync(CancellationToken.None)
                 .ConfigureAwait(false);
 
@@ -1074,10 +1078,35 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
                     UpdatedAt = now
                 };
                 
-                var affectAdded = await context.Upsert(itemToAdd)
-                    .On(x => new { x.ExecutionTime, x.CronTickerId })
-                    .NoUpdate()
-                    .RunAsync(cancellationToken).ConfigureAwait(false);;
+                int affectAdded;
+                try
+                {
+                    affectAdded = await context.Upsert(itemToAdd)
+                        .On(x => new { x.ExecutionTime, x.CronTickerId })
+                        .NoUpdate()
+                        .RunAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    // The cron was read by this pass and deleted since (#262): its occurrence has no row left to point to.
+                    // It is left out and the other crons of the slot are queued. Any other failure is thrown as before, also
+                    // when the check itself fails: the failure of the insert is the one to report.
+                    bool exists;
+                    try
+                    {
+                        exists = await CronTickerExistsAsync(dbContext, item.Id, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        exists = true;
+                    }
+
+                    if (exists)
+                        throw;
+
+                    _logger.LogDebug(ex, "The cron {CronTickerId} was deleted after the scheduler read it; no occurrence is added for it.", item.Id);
+                    continue;
+                }
 
                 if (affectAdded <= 0)
                     continue;
@@ -1134,6 +1163,9 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
         }
     }
     
+    private static Task<bool> CronTickerExistsAsync(DbContext dbContext, Guid cronTickerId, CancellationToken cancellationToken)
+        => dbContext.Set<TCronTicker>().AsNoTracking().AnyAsync(x => x.Id == cronTickerId, cancellationToken);
+
     public async Task<CronTickerOccurrenceEntity<TCronTicker>> GetEarliestAvailableCronOccurrence(Guid[] ids, CancellationToken cancellationToken = default)
     {
         var now = _clock.UtcNow;

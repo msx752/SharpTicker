@@ -27,6 +27,8 @@ using MongoStore = SharpTicker.MongoDB.DependencyInjection.ServiceExtension;
 //                            a node that cannot write its heartbeat goes on running its jobs, as before #46
 //   SCENARIO_MAX_CONCURRENCY      optional: the scheduler's MaxConcurrency
 //   SCENARIO_IDLE_WORKER_TIMEOUT  optional: the scheduler's IdleWorkerTimeOut, in seconds
+//   SCENARIO_SCHEDULER_UTC_OFFSET optional: the scheduler time zone, as a fixed offset from UTC in whole hours (a zone
+//                            of its own without daylight saving, so the image needs no time zone data)
 //   SCENARIO_MIGRATIONS      optional, EF Core: documented | unedited = use that context and its migrations (the migration scenarios);
 //                            the node applies them at every start
 //   SCENARIO_MIGRATE_TO      optional, with SCENARIO_MIGRATIONS: apply the migrations up to this one, then exit
@@ -63,6 +65,11 @@ builder.Services.AddSharpTicker(options =>
             s.MaxConcurrency = maxConcurrency;
         if (double.TryParse(Environment.GetEnvironmentVariable("SCENARIO_IDLE_WORKER_TIMEOUT"), System.Globalization.CultureInfo.InvariantCulture, out var idleSeconds))
             s.IdleWorkerTimeOut = TimeSpan.FromSeconds(idleSeconds);
+        if (int.TryParse(Environment.GetEnvironmentVariable("SCENARIO_SCHEDULER_UTC_OFFSET"), out var offsetHours))
+        {
+            var name = $"UTC{offsetHours:+0;-0}";
+            s.SchedulerTimeZone = TimeZoneInfo.CreateCustomTimeZone("Scenario " + name, TimeSpan.FromHours(offsetHours), name, name);
+        }
     });
 
     switch (store)

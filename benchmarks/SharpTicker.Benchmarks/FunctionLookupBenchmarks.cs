@@ -1,18 +1,16 @@
 using System.Collections.Frozen;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Jobs;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Enums;
 
 namespace SharpTicker.Benchmarks;
 
 /// <summary>
-/// Benchmarks for TickerFunctionProvider's FrozenDictionary-based function lookup.
-/// Compares FrozenDictionary (SharpTicker's approach) vs standard Dictionary lookup performance.
-/// This demonstrates why source-generated + FrozenDictionary is faster than reflection-based lookup.
+/// Lookup cost of a function registry with the same key and value shape as TickerFunctionProvider.TickerFunctions:
+/// FrozenDictionary (what TickerFunctionProvider builds) against a plain Dictionary. This measures the collection types,
+/// not TickerFunctionProvider itself.
 /// </summary>
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.HostProcess)]
 public class FunctionLookupBenchmarks
 {
     private FrozenDictionary<string, (string, TickerTaskPriority, TickerFunctionDelegate, int)> _frozenDict = null!;

@@ -76,6 +76,9 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
 
         try
         {
+            // A store call is not started once the host stops (#255): EF Core 8 and 9 log an open with a cancelled token at
+            // Error. The exception is the stop's, as when the call itself is cut off.
+            stoppingToken.ThrowIfCancellationRequested();
             await _store.RenewInProgressLeaseAsync(runStartedAt, stoppingToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (stoppingToken.IsCancellationRequested)
@@ -91,6 +94,7 @@ internal sealed class InProgressLeaseBackgroundService<TTimeTicker, TCronTicker>
 
         try
         {
+            stoppingToken.ThrowIfCancellationRequested();
             var (cancelled, nodes) = await _store.CancelExpiredInProgressOfOtherNodesAsync(_lease, stoppingToken).ConfigureAwait(false);
             if (cancelled == 0)
                 return;

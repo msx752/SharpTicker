@@ -19,7 +19,12 @@ namespace SharpTicker.EntityFrameworkCore.Configurations
                 .IsRequired(false);
             
             builder.Property(x => x.ExecutionTime)
-                .IsRequired(false);
+                .IsRequired(false)
+                .ReadAsUtc();
+            builder.Property(x => x.LockedAt).ReadAsUtc();
+            builder.Property(x => x.ExecutedAt).ReadAsUtc();
+            builder.Property(x => x.CreatedAt).ReadAsUtc();
+            builder.Property(x => x.UpdatedAt).ReadAsUtc();
 
             builder.HasOne(x => x.Parent)
                 .WithMany(x => x.Children)
