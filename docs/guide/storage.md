@@ -11,7 +11,7 @@ The store holds tickers, cron occurrences, run history and locks. Without config
 
 ## Entity Framework Core
 
-Written for relational EF Core providers. Our tests run it on SQLite, on PostgreSQL (Npgsql) and on MySQL through the official provider, `MySql.EntityFrameworkCore`. Each occurrence of a cron is written through [FlexLabs.EntityFrameworkCore.Upsert](https://github.com/artiomchi/FlexLabs.Upsert), so the provider has to be one that library knows; see its documentation for the list. Providers other than the three above are not part of our test runs. With a provider that library does not know, the scheduler loop fails with `Database provider not supported yet!` and no cron runs. On MySQL a schema is a database: the store's `ticker` schema is a database named `ticker`, which the application's user has to be allowed to create and use. There are two ways to use it.
+Written for relational EF Core providers. Our tests run it on SQLite, on PostgreSQL (Npgsql), on SQL Server (`Microsoft.EntityFrameworkCore.SqlServer`) and on MySQL through the official provider, `MySql.EntityFrameworkCore`. Each occurrence of a cron is written through [FlexLabs.EntityFrameworkCore.Upsert](https://github.com/artiomchi/FlexLabs.Upsert), so the provider has to be one that library knows; see its documentation for the list. Providers other than the four above are not part of our test runs. With a provider that library does not know, the scheduler loop fails with `Database provider not supported yet!` and no cron runs. On MySQL a schema is a database: the store's `ticker` schema is a database named `ticker`, which the application's user has to be allowed to create and use. There are two ways to use it.
 
 ### A separate DbContext
 
