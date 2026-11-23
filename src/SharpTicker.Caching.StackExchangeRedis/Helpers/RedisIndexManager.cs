@@ -86,6 +86,24 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return Task.WhenAll(t1, t2);
     }
 
+    // Before an update writes its row (#94): a pending entry later than the new time is moved to it, so an index write
+    // that fails after the row write does not leave the job to start late. An entry that is earlier stays: the readers
+    // do not take a row before its own time and move its entry to that time. Only an entry that is there is moved (XX): a row
+    // without one is not pending now, and an entry a claim removed in the meantime is not brought back.
+    internal async Task MovePendingEntryEarlierAsync(Guid id, DateTime executionTime)
+    {
+        var idStr = (RedisValue)id.ToString();
+        var score = await _db.SortedSetScoreAsync(TimeTickerPendingKey, idStr).ConfigureAwait(false);
+        var newScore = ToScore(executionTime);
+        if (score != null && newScore < score.Value)
+            await _db.SortedSetAddAsync(TimeTickerPendingKey, idStr, newScore, When.Exists).ConfigureAwait(false);
+    }
+
+    // A reader found the entry earlier than its row's time (#94): the entry is moved to that time. Only moved (XX), never
+    // added or removed: whether the row is pending is decided by whoever writes the row, also for a row another node holds.
+    internal Task MovePendingEntryAsync(Guid id, DateTime executionTime)
+        => _db.SortedSetAddAsync(TimeTickerPendingKey, id.ToString(), ToScore(executionTime), When.Exists);
+
     // Scored by the child's position in its chain, so children read back in the order the chain was built. A child
     // already linked keeps its place.
     internal Task AddTimeTickerChildAsync(Guid parentId, Guid childId, int position)
@@ -175,19 +193,23 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
         return addedToIds || addedToCron || addedToPending;
     }
 
-    internal Task RemoveCronOccurrenceIndexesAsync(Guid id, Guid cronTickerId)
+    // Without the cron's id (a row that is already gone) its entry in the cron's own set is left; that set is removed
+    // with the cron.
+    internal Task RemoveCronOccurrenceIndexesAsync(Guid id, Guid? cronTickerId)
     {
         var batch = _db.CreateBatch();
         var idStr = (RedisValue)id.ToString();
 
         var t1 = batch.SetRemoveAsync(CronOccurrenceIdsKey, idStr);
         var t2 = batch.SortedSetRemoveAsync(CronOccurrencePendingKey, idStr);
-        var t3 = batch.SetRemoveAsync(CronOccurrencesByCronKey(cronTickerId), idStr);
+        var t3 = cronTickerId.HasValue ? batch.SetRemoveAsync(CronOccurrencesByCronKey(cronTickerId.Value), idStr) : Task.CompletedTask;
 
         batch.Execute();
         return Task.WhenAll(t1, t2, t3);
     }
 
+    // Each occurrence's row before its index entries, and the cron's set of occurrences last, so a failure leaves every
+    // occurrence either listed or gone, and running this again finds the rest (#94).
     internal async Task RemoveCronOccurrencesByParentAsync(Guid cronId)
     {
         var reverseKey = CronOccurrencesByCronKey(cronId);
@@ -196,8 +218,8 @@ internal sealed class RedisIndexManager<TTimeTicker, TCronTicker>
 
         foreach (var occId in occurrenceIds)
         {
-            await RemoveCronOccurrenceIndexesAsync(occId, cronId).ConfigureAwait(false);
             await _db.KeyDeleteAsync(CronOccurrenceKey(occId)).ConfigureAwait(false);
+            await RemoveCronOccurrenceIndexesAsync(occId, cronId).ConfigureAwait(false);
         }
 
         await _db.KeyDeleteAsync(reverseKey).ConfigureAwait(false);
