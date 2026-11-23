@@ -112,7 +112,7 @@ public class MySqlCancelledStoreCallLogTests(MySqlContainerFixture fixture) : IC
     private async Task CutOffALoopPassAsync(IHost application, StoreCallHold hold, Cancel cancel)
     {
         var scheduler = application.Services.GetRequiredService<ISharpTickerHostScheduler>();
-        _probe.Arm(hold);
+        _probe.Arm(hold, holdCommand: CancelledStoreCallProbe.IsTheLoopsCronRead);
         scheduler.Restart();
         await _probe.Held.Task.WaitAsync(WaitLimit);
         // The loop reads the cron and the time jobs at once. The read beside the held one ends first, so the cancel lands at
