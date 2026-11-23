@@ -156,28 +156,33 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         ticker.CreatedAt = ticker.CreatedAt == default ? now : ticker.CreatedAt;
         ticker.UpdatedAt = adding && ticker.UpdatedAt != default ? ticker.UpdatedAt : now;
 
+        // The row and its index entries are written by separate commands, in an order that leaves, when one of them fails,
+        // only states the readers handle (#94). An add writes the entries first: a failure leaves entries without a row,
+        // which are skipped, not a row nobody lists. An update first moves an entry that is later than the new time to it,
+        // then writes the row and its entries: a failed entry write then leaves an entry that is not later than the row,
+        // and the readers take a row only at its own time and move its entry to that time.
         // The row is stored without its children; they are rows of their own. The caller's entity keeps them.
         var carried = ticker.Children;
         ticker.Children = keptNested ?? new List<TTimeTicker>();
-        TTimeTicker written;
         try
         {
             if (adding)
             {
+                await IndexManager.AddTimeTickerIndexesAsync(ticker).ConfigureAwait(false);
                 await Serializer.SetAsync(TimeTickerKey(ticker.Id), ticker).ConfigureAwait(false);
-                written = ticker;
+                return;
             }
-            else
-            {
-                written = await UpdateChainRowAsync(ticker).ConfigureAwait(false);
-                KeepStoredState(ticker, written);
-            }
+
+            if (ticker.ExecutionTime is { } executionTime)
+                await IndexManager.MovePendingEntryEarlierAsync(ticker.Id, executionTime).ConfigureAwait(false);
+            var written = await UpdateChainRowAsync(ticker).ConfigureAwait(false);
+            KeepStoredState(ticker, written);
+            await IndexManager.AddTimeTickerIndexesAsync(written).ConfigureAwait(false);
         }
         finally
         {
             ticker.Children = carried;
         }
-        await IndexManager.AddTimeTickerIndexesAsync(written).ConfigureAwait(false);
     }
 
     // Writes the update's row (without its children) over the stored one through the compare-and-set: each round starts
@@ -308,6 +313,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return new PaginationResult<TCronTicker>(items, total, pageNumber, pageSize);
     }
 
+    // The id before the row, so a failure leaves an id without a row, which is skipped, not a row nobody lists (#94).
     public async Task<int> InsertCronTickers(TCronTicker[] tickers, CancellationToken cancellationToken)
     {
         var now = Clock.UtcNow;
@@ -316,8 +322,8 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             cancellationToken.ThrowIfCancellationRequested();
             ticker.CreatedAt = ticker.CreatedAt == default ? now : ticker.CreatedAt;
             ticker.UpdatedAt = ticker.UpdatedAt == default ? now : ticker.UpdatedAt;
-            await Serializer.SetAsync(CronKey(ticker.Id), ticker).ConfigureAwait(false);
             await IndexManager.AddCronIndexesAsync(ticker).ConfigureAwait(false);
+            await Serializer.SetAsync(CronKey(ticker.Id), ticker).ConfigureAwait(false);
         }
         return tickers.Length;
     }
@@ -329,8 +335,8 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             cancellationToken.ThrowIfCancellationRequested();
             ticker.UpdatedAt = now;
-            await Serializer.SetAsync(CronKey(ticker.Id), ticker).ConfigureAwait(false);
             await IndexManager.AddCronIndexesAsync(ticker).ConfigureAwait(false);
+            await Serializer.SetAsync(CronKey(ticker.Id), ticker).ConfigureAwait(false);
         }
         return cronTicker.Length;
     }
@@ -341,9 +347,7 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         foreach (var id in cronTickerIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await IndexManager.RemoveCronIndexesAsync(id).ConfigureAwait(false);
-            await IndexManager.RemoveCronOccurrencesByParentAsync(id).ConfigureAwait(false);
-            if (await Db.KeyDeleteAsync(CronKey(id)).ConfigureAwait(false))
+            if (await RemoveCronTickerWithOccurrencesAsync(id).ConfigureAwait(false))
                 removed++;
         }
         return removed;
@@ -367,17 +371,22 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         return new PaginationResult<CronTickerOccurrenceEntity<TCronTicker>>(items, total, pageNumber, pageSize);
     }
 
+    // The index entries before the row, so a failure leaves entries without a row, which are skipped, not a row nobody
+    // lists (#94).
     public async Task<int> InsertCronTickerOccurrences(CronTickerOccurrenceEntity<TCronTicker>[] cronTickerOccurrences, CancellationToken cancellationToken)
     {
         foreach (var occurrence in cronTickerOccurrences)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await Serializer.SetAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false);
             await IndexManager.AddCronOccurrenceIndexesAsync(occurrence).ConfigureAwait(false);
+            await Serializer.SetAsync(CronOccurrenceKey(occurrence.Id), occurrence).ConfigureAwait(false);
         }
         return cronTickerOccurrences.Length;
     }
 
+    // The row before its index entries (#94): a row left without them would not be listed, and the scheduler, which
+    // repairs the entries of a slot's row it cannot create, would bring the removed occurrence back. Entries left without
+    // a row are skipped, and removing the occurrence again removes them.
     public async Task<int> RemoveCronTickerOccurrences(Guid[] cronTickerOccurrences, CancellationToken cancellationToken)
     {
         var removed = 0;
@@ -385,10 +394,9 @@ internal sealed class TickerRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         {
             cancellationToken.ThrowIfCancellationRequested();
             var occurrence = await Serializer.GetAsync<CronTickerOccurrenceEntity<TCronTicker>>(CronOccurrenceKey(id)).ConfigureAwait(false);
-            if (occurrence != null)
-                await IndexManager.RemoveCronOccurrenceIndexesAsync(id, occurrence.CronTickerId).ConfigureAwait(false);
             if (await Db.KeyDeleteAsync(CronOccurrenceKey(id)).ConfigureAwait(false))
                 removed++;
+            await IndexManager.RemoveCronOccurrenceIndexesAsync(id, occurrence?.CronTickerId).ConfigureAwait(false);
         }
         return removed;
     }

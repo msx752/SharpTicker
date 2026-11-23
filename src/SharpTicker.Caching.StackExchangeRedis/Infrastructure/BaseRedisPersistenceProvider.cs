@@ -184,6 +184,37 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         }
     }
 
+    // A row is taken at its own time, not at the time of its pending entry (#94). An update that moves a job later writes
+    // the row before its entries; when that entry write fails, the entry stays at the old, earlier time. A row whose time
+    // is more than a second after its entry's is not taken there: its entry is moved to the row's time. Times are
+    // compared as times; the score is a double and slightly coarser than a tick.
+    private static bool IsLaterThanItsEntry(TTimeTicker row, DateTime entryTime)
+        => row.ExecutionTime is { } time && time.ToUniversalTime() > entryTime.AddSeconds(1);
+
+    private async Task MovePendingEntryToRowTimeAsync(TTimeTicker row)
+    {
+        try
+        {
+            await IndexManager.MovePendingEntryAsync(row.Id, row.ExecutionTime!.Value).ConfigureAwait(false);
+            _logger.LogDebug("The pending entry of row {Id} was earlier than the row's time {ExecutionTime:O}; it was moved to that time.", row.Id, row.ExecutionTime);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "The pending entry of row {Id} is earlier than the row's time {ExecutionTime:O} and could not be moved; the row is not taken before its time, and the next read tries again.", row.Id, row.ExecutionTime);
+        }
+    }
+
+    // Removes a cron with its occurrences (#94). Its row first: the cron is no longer read, so no occurrence is planned for
+    // it from then on. Then each occurrence, its row before its index entries, and the cron's id last. A failure leaves
+    // every row either listed or gone, with index entries the readers skip, and removing the cron again removes the rest.
+    protected async Task<bool> RemoveCronTickerWithOccurrencesAsync(Guid id)
+    {
+        var removed = await Db.KeyDeleteAsync(CronKey(id)).ConfigureAwait(false);
+        await IndexManager.RemoveCronOccurrencesByParentAsync(id).ConfigureAwait(false);
+        await IndexManager.RemoveCronIndexesAsync(id).ConfigureAwait(false);
+        return removed;
+    }
+
     // Fenced Queued -> InProgress claim: only while the row is still Queued and held by this node.
     protected async Task<(bool Claimed, T Row)> TryMarkInProgressAsync<T>(string key, DateTime claimMarker) where T : class
     {
@@ -804,6 +835,13 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 // became readable since this read has its gate checked on the row the claim returns.
                 if (rows.TryGetValue(id, out var row) && !ChainGateOpen(row, parentStatuses)) continue;
 
+                // Its entry is due by the threshold; a row whose own time is still to come is not overdue.
+                if (row != null && IsLaterThanItsEntry(row, threshold))
+                {
+                    await MovePendingEntryToRowTimeAsync(row).ConfigureAwait(false);
+                    continue;
+                }
+
                 var children = await LoadChildrenAsync(id, cancellationToken).ConfigureAwait(false);
                 var acquired = await TryClaimInProgressAsync<TTimeTicker>(TimeTickerKey(id), id, TryReleaseTimeTickerClaim).ConfigureAwait(false);
 
@@ -1037,7 +1075,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 Exclude.None, Order.Ascending, offset, WindowScanPage).ConfigureAwait(false);
             if (page.Length == 0) return [];
 
-            var pageRows = await LoadGatedAsync(page.Select(e => e.Element), cancellationToken).ConfigureAwait(false);
+            var pageRows = await LoadGatedAsync(page, cancellationToken).ConfigureAwait(false);
             foreach (var entry in page)
             {
                 if (Guid.TryParse(entry.Element.ToString(), out var id) && pageRows.ContainsKey(id))
@@ -1052,7 +1090,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
         var minSecond = new DateTime((long)earliestScore.Value, DateTimeKind.Utc);
         var maxScore = ToScore(minSecond.AddSeconds(1));
 
-        var entries = await Db.SortedSetRangeByScoreAsync(TimeTickerPendingKey, earliestScore.Value, maxScore).ConfigureAwait(false);
+        var entries = await Db.SortedSetRangeByScoreWithScoresAsync(TimeTickerPendingKey, earliestScore.Value, maxScore).ConfigureAwait(false);
         var open = (await LoadGatedAsync(entries, cancellationToken).ConfigureAwait(false)).Values.ToList();
 
         var nested = open.Where(HoldsNestedChildren).Select(r => r.Id).ToHashSet();
@@ -1064,12 +1102,28 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
     private const int WindowScanPage = 64;
     private const int WindowScanLimit = 1024;
 
-    // The rows of these pending entries that this node may claim and whose chain gate is open.
-    private async Task<Dictionary<Guid, TTimeTicker>> LoadGatedAsync(IEnumerable<RedisValue> entries, CancellationToken cancellationToken)
+    // The rows of these pending entries that this node may claim, whose own time is their entry's, and whose chain gate is
+    // open. A row whose time is later than its entry's has its entry moved to that time and is read then.
+    private async Task<Dictionary<Guid, TTimeTicker>> LoadGatedAsync(SortedSetEntry[] entries, CancellationToken cancellationToken)
     {
-        var rows = (await Serializer.LoadByIdsAsync<TTimeTicker>(ParseGuidSet(entries.ToArray()), TimeTickerKey, cancellationToken).ConfigureAwait(false))
-            .Where(t => CanAcquire(t.Status, t.LockHolder, LockHolder))
-            .ToList();
+        var entryTimes = new Dictionary<Guid, DateTime>(entries.Length);
+        foreach (var entry in entries)
+        {
+            if (Guid.TryParse(entry.Element.ToString(), out var id))
+                entryTimes[id] = new DateTime((long)entry.Score, DateTimeKind.Utc);
+        }
+
+        var rows = new List<TTimeTicker>(entryTimes.Count);
+        foreach (var row in await Serializer.LoadByIdsAsync<TTimeTicker>(entryTimes.Keys.ToArray(), TimeTickerKey, cancellationToken).ConfigureAwait(false))
+        {
+            if (!CanAcquire(row.Status, row.LockHolder, LockHolder)) continue;
+            if (entryTimes.TryGetValue(row.Id, out var entryTime) && IsLaterThanItsEntry(row, entryTime))
+            {
+                await MovePendingEntryToRowTimeAsync(row).ConfigureAwait(false);
+                continue;
+            }
+            rows.Add(row);
+        }
         var parentStatuses = await LoadParentStatusesAsync(rows, cancellationToken).ConfigureAwait(false);
         return rows.Where(r => ChainGateOpen(r, parentStatuses)).ToDictionary(r => r.Id);
     }
@@ -1280,11 +1334,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
             .Select(c => c.Id).ToArray();
 
         foreach (var id in orphanedToDelete)
-        {
-            await IndexManager.RemoveCronIndexesAsync(id).ConfigureAwait(false);
-            await IndexManager.RemoveCronOccurrencesByParentAsync(id).ConfigureAwait(false);
-            await Db.KeyDeleteAsync(CronKey(id)).ConfigureAwait(false);
-        }
+            await RemoveCronTickerWithOccurrencesAsync(id).ConfigureAwait(false);
 
         var orphanedSet = orphanedToDelete.ToHashSet();
         // A function can have several crons (a user's next to the seeded one, or a seeded copy from two nodes starting
@@ -1303,11 +1353,7 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
                 if (copies.Count > 0)
                 {
                     foreach (var copy in copies)
-                    {
-                        await IndexManager.RemoveCronIndexesAsync(copy.Id).ConfigureAwait(false);
-                        await IndexManager.RemoveCronOccurrencesByParentAsync(copy.Id).ConfigureAwait(false);
-                        await Db.KeyDeleteAsync(CronKey(copy.Id)).ConfigureAwait(false);
-                    }
+                        await RemoveCronTickerWithOccurrencesAsync(copy.Id).ConfigureAwait(false);
 
                     rows = rows.Except(copies).ToList();
                     _logger.LogWarning(SeededCronTickers.CopiesRemovedWarning, copies.Count, function);

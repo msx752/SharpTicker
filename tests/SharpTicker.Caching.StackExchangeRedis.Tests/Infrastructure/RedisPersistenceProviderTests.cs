@@ -174,8 +174,9 @@ public class RedisPersistenceProviderTests : IAsyncLifetime
                 var skip = callInfo.ArgAt<long>(5);
                 var take = callInfo.ArgAt<long>(6);
                 if (!_sortedSets.TryGetValue(key, out var ss)) return Array.Empty<SortedSetEntry>();
-                return ss.Where(kv => kv.Key >= min && kv.Key <= max)
-                    .Skip((int)skip).Take((int)take)
+                // As Redis: a take of -1 (the default) reads to the end.
+                var inRange = ss.Where(kv => kv.Key >= min && kv.Key <= max).Skip((int)skip);
+                return (take < 0 ? inRange : inRange.Take((int)take))
                     .Select(kv => new SortedSetEntry(kv.Value, kv.Key)).ToArray();
             });
 
