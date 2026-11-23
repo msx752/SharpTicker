@@ -160,6 +160,24 @@ public class DesignTimeDiscoveryTests
         Assert.Equal(SelfConfiguredDbContext.ConnectionString, context.Database.GetConnectionString());
     }
 
+    // The other form the storage guide names, in the order not covered above: AddDbContext after AddSharpTicker. The
+    // application's options are registered last, so a non-generic DbContextOptions constructor gets them.
+    [Fact]
+    public void UseSharpTickerDbContext_AnApplicationContextAddedAfterTheStoreKeepsItsOwnOptions()
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.Services.AddSharpTicker(options =>
+            options.AddOperationalStore(ef => ef.UseSharpTickerDbContext<SharpTickerDbContext>(db => db.UseSqlite("Data Source=scheduler-266.db"))));
+        builder.Services.AddDbContext<NonGenericOptionsDbContext>(options => options.UseSqlite("Data Source=application-266.db"));
+
+        using var app = builder.Build();
+        using var scope = app.Services.CreateScope();
+
+        var context = scope.ServiceProvider.GetRequiredService<NonGenericOptionsDbContext>();
+
+        Assert.Equal("Data Source=application-266.db", context.Database.GetConnectionString());
+    }
+
     private static WebApplication AppWithAContextRegisteredByHand<TAppContext>() where TAppContext : DbContext
     {
         var builder = WebApplication.CreateBuilder();
