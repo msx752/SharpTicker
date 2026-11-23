@@ -196,6 +196,40 @@ public class SchedulerScenarios(ITestOutputHelper output)
             $"the second job was not planned together with the first (started {late[1].TotalMilliseconds:F0} ms after its time), so this run shows nothing");
     }
 
+    // #264: the reads of the EF Core store that claim jobs with their children (run-now, the scheduler loop, the fallback)
+    // did not say how the collections are loaded, so EF Core logged MultipleCollectionIncludeWarning in the application's
+    // log the first time each ran. A chain due now (run-now), one due a few seconds later (the loop) and the fallback,
+    // which reads every 2 s; both chains must have run, so the reads did happen.
+    [Fact]
+    public async Task TheEfCoreClaimReads_LogNoMultipleCollectionIncludeWarning()
+    {
+        const string warning = "loads related collections for more than one collection navigation";
+        await using var env = await ScenarioEnvironment.StartAsync("ef-claim-warning", Store.EfCorePostgres, nodes: 1);
+        var node = env.Nodes[0];
+
+        var now = DateTime.UtcNow;
+        var trees = new List<IReadOnlyList<Guid>>();
+        foreach (var at in new[] { now, now.AddSeconds(4) })
+        {
+            var (_, tree) = await node.Api.AddChainAsync(new TickerSeed
+            {
+                Function = Functions.Record, ExecutionTime = at,
+                Children = [new TickerSeed { Function = Functions.Record, RunCondition = RunCondition.OnSuccess, Children = [new TickerSeed { Function = Functions.Record, RunCondition = RunCondition.OnSuccess }] }],
+            });
+            trees.Add(tree);
+        }
+
+        var all = trees.SelectMany(t => t).ToList();
+        await env.UntilAsync(() => Task.FromResult(all.All(id => env.Runs.Ends(id) == 1)),
+            () => $"{all.Count(id => env.Runs.Ends(id) == 1)} of {all.Count} ended");
+        // A few more fallback passes.
+        await Task.Delay(TimeSpan.FromSeconds(5));
+
+        Assert.All(all, id => Assert.Equal(1, env.Runs.Starts(id)));
+        var lines = env.CountNodeLogLines(warning);
+        Assert.True(lines == 0, $"EF Core logged '{warning}' {lines} time(s); see {env.LogFolder}");
+    }
+
     /// <summary>"H H H L N" -> "H*3 L N".</summary>
     private static string Compress(IEnumerable<string> letters)
     {

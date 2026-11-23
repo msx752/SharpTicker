@@ -177,6 +177,17 @@ public sealed class ScenarioClient(Func<HttpClient> http)
 
     public async Task DeleteTimeTickerAsync(Guid id) => await EnsureSuccess(await http().DeleteAsync($"/scenario/time-tickers/{id}"));
 
+    /// <summary>
+    /// Reads a chain of a root and one child back from the node's store and updates both times through the manager
+    /// (UpdateAsync, or UpdateBatchAsync with <paramref name="batch"/>). The times are sent as wall-clock text without a
+    /// zone; the node sets them as DateTimeKind.Unspecified, which the manager reads in the scheduler time zone.
+    /// </summary>
+    public async Task RescheduleChainAsync(Guid rootId, DateTime rootWallClock, DateTime childWallClock, bool batch)
+    {
+        var body = new { rootTime = rootWallClock.ToString("yyyy-MM-ddTHH:mm:ss"), childTime = childWallClock.ToString("yyyy-MM-ddTHH:mm:ss"), batch };
+        await EnsureSuccess(await http().PostAsJsonAsync($"/scenario/chains/{rootId}/reschedule", body, Json.Options));
+    }
+
     /// <summary>Starves the node's .NET thread pool; returns the node-clock window of the starvation.</summary>
     public async Task<(DateTimeOffset From, DateTimeOffset Until)> StarvePoolAsync(int seconds)
     {
