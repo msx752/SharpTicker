@@ -33,6 +33,13 @@ namespace SharpTicker.Caching.StackExchangeRedis;
 /// not written a heartbeat yet counts the TTL from its own start; and a heartbeat written in the very moment the node
 /// fences itself can leave it fenced until the next one is written.
 /// </para>
+/// <para>
+/// With another job store (EF Core, MongoDB) the node is not fenced, so a node that is cut off from Redis alone goes on
+/// running its jobs and reaches its store. Its jobs are then not released when its heartbeat is missing: a job that may
+/// still run there is not run a second time (#223). The node is only removed from the registry. Its waiting jobs need no
+/// release: the fallback takes an overdue waiting job whoever holds it. With EF Core the lease records a job that is no
+/// longer renewed as <c>Cancelled</c>.
+/// </para>
 /// </summary>
 internal class NodeHeartBeatBackgroundService : BackgroundService
 {
@@ -53,6 +60,8 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
     private readonly TimeSpan _interval;
     private readonly TimeSpan _ttl;
     private readonly TimeSpan _checkInterval;
+    // Whether the jobs of a node whose heartbeat stopped are released: only where that node fences itself first.
+    private readonly bool _releasesJobsOfStoppedNodes;
 
     // Only the check loop touches these.
     private readonly Dictionary<string, long> _suspectedSince = new();
@@ -84,6 +93,9 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
         _logger = logger;
         _timeProvider = timeProvider;
         _earlierRunRelease = earlierRunRelease;
+        // The same condition as the startup release and the self-fence. Without it (tests that build the service by hand)
+        // the jobs are released, as with the Redis job store.
+        _releasesJobsOfStoppedNodes = earlierRunRelease?.StoreIsRedis ?? true;
         _interval = redisOptions.NodeHeartbeatInterval;
         _ttl = SharpTickerRedisContext.HeartbeatTtl(_interval);
         _checkInterval = _interval < MaxCheckInterval ? _interval : MaxCheckInterval;
@@ -370,15 +382,18 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
                 continue;
             }
 
-            try
+            if (_releasesJobsOfStoppedNodes)
             {
-                await _internalTickerManager.ReleaseDeadNodeResources(node, stoppingToken);
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                // The node stays registered and suspected, so a later check tries again.
-                _logger.LogError(ex, "The jobs of node {Node}, whose heartbeat stopped, could not be released; a later check tries again.", node);
-                continue;
+                try
+                {
+                    await _internalTickerManager.ReleaseDeadNodeResources(node, stoppingToken);
+                }
+                catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+                {
+                    // The node stays registered and suspected, so a later check tries again.
+                    _logger.LogError(ex, "The jobs of node {Node}, whose heartbeat stopped, could not be released; a later check tries again.", node);
+                    continue;
+                }
             }
 
             _suspectedSince.Remove(node);
@@ -388,11 +403,15 @@ internal class NodeHeartBeatBackgroundService : BackgroundService
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
-                // Harmless: the node stays registered, and a later check releases it again (nothing of it is left).
-                _logger.LogWarning(ex, "Node {Node} was released but could not be removed from the node registry.", node);
+                // Harmless: the node stays registered, and a later check handles it again (with the Redis job store, nothing
+                // of it is left to release).
+                _logger.LogWarning(ex, "Node {Node}, whose heartbeat stopped, could not be removed from the node registry; a later check tries again.", node);
             }
 
-            _logger.LogInformation("Released the jobs of node {Node}: its heartbeat was missing for {Missing}.", node, _timeProvider.GetElapsedTime(since, end));
+            if (_releasesJobsOfStoppedNodes)
+                _logger.LogInformation("Released the jobs of node {Node}: its heartbeat was missing for {Missing}.", node, _timeProvider.GetElapsedTime(since, end));
+            else
+                _logger.LogInformation("Node {Node} was removed from the node registry: its heartbeat was missing for {Missing}. Its jobs are not released, since with a job store other than Redis it may still run them.", node, _timeProvider.GetElapsedTime(since, end));
         }
     }
 

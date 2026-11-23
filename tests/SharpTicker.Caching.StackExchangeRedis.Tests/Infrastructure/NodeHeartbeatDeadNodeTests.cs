@@ -83,6 +83,23 @@ public class NodeHeartbeatDeadNodeTests
         Assert.DoesNotContain(NodeB, await cluster.RegisteredNodesAsync());
     }
 
+    // #223: with a job store other than Redis the node is not fenced, so a peer cut off from Redis alone may still run its
+    // jobs. Its jobs are not released; it is removed from the registry once its heartbeat stayed missing for a TTL.
+    // Control: the same peer with Redis as the job store is released.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ADeadPeer_IsReleasedOnlyWithRedisAsTheJobStore_AndRemovedFromTheRegistryEitherWay(bool storeIsRedis)
+    {
+        await using var cluster = await Cluster.StartAsync(storeIsRedis: storeIsRedis);
+        await cluster.AddDeadPeerAsync(NodeB);
+
+        await cluster.RunChecksAsync(Ttl + 2 * Check);
+
+        Assert.Equal(storeIsRedis ? [NodeB] : [], cluster.Released);
+        Assert.DoesNotContain(NodeB, await cluster.RegisteredNodesAsync());
+    }
+
     // While the checks fail the node cannot see whether the peer wrote; the confirmation starts again after the failure.
     [Fact]
     public async Task AFailedCheck_StartsTheConfirmationAgain()
@@ -294,7 +311,7 @@ public class NodeHeartbeatDeadNodeTests
         private readonly TimeSpan _interval;
         private readonly TimeSpan _checkStep;
 
-        private Cluster(bool hubFails, TimeSpan interval)
+        private Cluster(bool hubFails, TimeSpan interval, bool? storeIsRedis)
         {
             _interval = interval;
             _checkStep = interval < Check ? interval : Check;
@@ -315,7 +332,9 @@ public class NodeHeartbeatDeadNodeTests
                 manager,
                 hub,
                 NullLogger<NodeHeartBeatBackgroundService>.Instance,
-                Time);
+                Time,
+                // The start of the run is not known, so the startup release (Redis store only) does nothing here.
+                storeIsRedis is { } isRedis ? new EarlierRunRelease(isRedis, NodeA, () => null, new CancellationToken(canceled: true)) : null);
             _service.CheckCompleted += () => _checks.Release();
         }
 
@@ -329,9 +348,11 @@ public class NodeHeartbeatDeadNodeTests
 
         public int ReleaseAttempts => Volatile.Read(ref _releaseAttempts);
 
-        public static async Task<Cluster> StartAsync(bool hubFails = false, TimeSpan? interval = null)
+        // storeIsRedis: the job store the service is told of, as dependency injection tells it; null builds the service
+        // without it, as most tests here do.
+        public static async Task<Cluster> StartAsync(bool hubFails = false, TimeSpan? interval = null, bool? storeIsRedis = null)
         {
-            var cluster = new Cluster(hubFails, interval ?? Interval);
+            var cluster = new Cluster(hubFails, interval ?? Interval, storeIsRedis);
             await cluster._service.StartAsync(CancellationToken.None);
             // The registry is the last write of the first heartbeat; a peer registered by the test must not race it.
             await cluster.CacheA.WaitForWritesAsync(RegistryKey, 1, WaitLimit);
