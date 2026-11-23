@@ -123,11 +123,18 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     /// With <see cref="StoreCallHold.AfterClose"/>: the close that is held is the one after the first command whose text
     /// this accepts, instead of the close of the first connection opened.
     /// </param>
-    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, Func<string, bool>? closeAfterCommand = null)
+    /// <param name="holdCommand">
+    /// With <see cref="StoreCallHold.Command"/> and <see cref="StoreCallHold.CommandInFlight"/>: only a command whose text
+    /// this accepts is held, so which of two reads that run at once is held does not depend on which one reaches its
+    /// command first.
+    /// </param>
+    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, Func<string, bool>? closeAfterCommand = null,
+        Func<string, bool>? holdCommand = null)
     {
         _what = what;
         _releaseAfter = releaseAfter;
         _closeAfterCommand = closeAfterCommand;
+        _holdCommand = holdCommand;
         _inFlight = null;
         _closing = null;
         _heldConnection = null;
@@ -140,6 +147,17 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     }
 
     private Func<string, bool>? _closeAfterCommand;
+    private Func<string, bool>? _holdCommand;
+
+    /// <summary>
+    /// The scheduler loop's read of the enabled crons (the first step of its cron read). Holding this command, not the time
+    /// read beside it, leaves one call beside the held one, with one connection: the cron read's next step is not started.
+    /// </summary>
+    public static bool IsTheLoopsCronRead(string sql)
+        => sql.Contains("CronTickers", StringComparison.Ordinal) && sql.Contains("IsEnabled", StringComparison.Ordinal)
+           && !sql.Contains("CronTickerOccurrences", StringComparison.Ordinal);
+
+    private bool HoldsThisCommand(DbCommand command) => _holdCommand == null || _holdCommand(command.CommandText);
 
     private bool Take(StoreCallHold what, CancellationToken cancellationToken)
         => _what == what && cancellationToken.CanBeCanceled && !cancellationToken.IsCancellationRequested
@@ -179,7 +197,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
     private void SendInFlight(DbCommand command, CancellationToken cancellationToken)
     {
-        if (!Take(StoreCallHold.CommandInFlight, cancellationToken))
+        if (!HoldsThisCommand(command) || !Take(StoreCallHold.CommandInFlight, cancellationToken))
             return;
 
         _inFlight = command;
@@ -252,7 +270,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         if (!ReferenceEquals(Interlocked.CompareExchange(ref _closing, null, connection), connection))
         {
             if (!ReferenceEquals(connection, Volatile.Read(ref _heldConnection)))
-                Volatile.Write(ref _otherCallClosed, 1);
+                Interlocked.Exchange(ref _otherCallClosed, 1); // a full fence: MarkHeld sets Held, then reads this
             SignalWhenNoOtherCallIsOpen();
             return;
         }
@@ -275,7 +293,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     {
         HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
+        if (HoldsThisCommand(command))
+            await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -284,7 +303,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     {
         HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
+        if (HoldsThisCommand(command))
+            await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
