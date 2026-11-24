@@ -394,3 +394,15 @@ public class EfCoreInProgressLeasePostgresTests(PostgresTestFixture fixture) : E
 
     internal override TestableProvider CreateProvider(string nodeIdentifier, ITickerClock clock) => fixture.CreateProvider(nodeIdentifier, clock);
 }
+
+[Collection(SqlServerTestFixture.CollectionName)]
+public class EfCoreInProgressLeaseSqlServerTests(SqlServerTestFixture fixture) : EfCoreInProgressLeaseTests
+{
+    protected override Task InitializeStoreAsync() => fixture.ResetAsync();
+
+    protected override Task DisposeStoreAsync() => Task.CompletedTask;
+
+    protected override TestSharpTickerDbContext CreateContext() => fixture.CreateContext();
+
+    internal override TestableProvider CreateProvider(string nodeIdentifier, ITickerClock clock) => fixture.CreateProvider(nodeIdentifier, clock);
+}

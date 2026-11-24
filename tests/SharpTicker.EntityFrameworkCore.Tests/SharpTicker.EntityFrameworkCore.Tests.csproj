@@ -11,9 +11,17 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="$(DotNetVersion)" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="$(EfCoreVersion)" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="$(EfCoreVersion)" />
+    <!-- #247: the store on SQL Server -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="$(EfCoreVersion)" />
+    <PackageReference Include="Testcontainers.MsSql" Version="4.16.0" />
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.16.0" />
     <!-- Pin patched versions of vulnerable transitive dependencies -->
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.14" />
+    <!-- Microsoft.Data.SqlClient (from the SQL Server provider) brings these in at versions with known advisories: MSAL and Azure.Identity on net8.0, Pkcs on net10.0.
+         Only on the lowest versions: with LatestPatchDependencies the newest patches bring fixed versions, and a pin would be a downgrade (NU1605). -->
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.61.3" Condition="'$(TargetFramework)' == 'net8.0' And '$(LatestPatchDependencies)' != 'true'" />
+    <PackageReference Include="Azure.Identity" Version="1.11.4" Condition="'$(TargetFramework)' == 'net8.0' And '$(LatestPatchDependencies)' != 'true'" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="9.0.21" Condition="'$(TargetFramework)' == 'net10.0' And '$(LatestPatchDependencies)' != 'true'" />
     <PackageReference Include="NSubstitute" Version="5.3.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />

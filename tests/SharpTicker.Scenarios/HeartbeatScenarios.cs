@@ -157,6 +157,65 @@ public class HeartbeatScenarios(ITestOutputHelper output)
         return (firstEnd, second, cutAt, description);
     }
 
+    // #223: with EF Core or MongoDB as the job store and Redis next to it for the heartbeat, one node is cut off from that
+    // Redis alone while it runs a job; it still reaches its store. The other node saw its heartbeat stop and released its
+    // jobs, the running one too, and started it a second time while the first run went on: the self-fence that stops the
+    // cut-off node's jobs applies to the Redis job store only. Now the heartbeat releases a stopped node's jobs only with
+    // Redis as the job store; with another store the running job stays with its node.
+    // The cut lasts past the moment the old code released (entry gone after one TTL, first miss at the next check, release
+    // one TTL later, the fallback takes the row within seconds), then the job goes on to its end on the node that started it.
+    [Theory]
+    [InlineData(Store.EfCorePostgres)]
+    [InlineData(Store.MongoDb)]
+    public async Task ANodeCutOffFromTheHeartbeatRedisAlone_ItsRunningJobIsNotStartedAgain(Store store)
+    {
+        const int runner = 0, observer = 1;
+        await using var env = await ScenarioEnvironment.StartAsync("heartbeat-cut-other-store", store, nodes: 2, startedNodes: 1, heartbeatRedis: true);
+        // Not through a proxy: the heartbeat entries are read while the runner cannot reach Redis.
+        await using var redis = await ConnectionMultiplexer.ConnectAsync(env.DirectHeartbeatConnection);
+        var db = redis.GetDatabase();
+        Task<bool> HasHeartbeat(int node) => db.KeyExistsAsync($"{env.RedisInstanceName}hb:{env.Nodes[node].Identifier}");
+
+        // 150 s: still running when the cut ends, so a second start would overlap the first run.
+        var id = await env.Nodes[runner].Api.AddTimeTickerAsync(new TickerSeed
+            { Function = Functions.Slow, ExecutionTime = DateTime.UtcNow.AddSeconds(3), Request = new WaitRequest { Seconds = 150 } });
+        await env.UntilAsync(() => Task.FromResult(env.Runs.Starts(id) == 1), () => "the runner did not start the job", TimeSpan.FromSeconds(30));
+        await env.StartNodeAsync(observer);
+        await env.UntilAsync(async () => await HasHeartbeat(runner) && await HasHeartbeat(observer),
+            () => "the two nodes did not both write a heartbeat", TimeSpan.FromSeconds(30));
+
+        await env.SetHeartbeatProxyAsync(runner, false);
+        var cut = Stopwatch.StartNew();
+        try
+        {
+            // Past the release of the old code: about two TTLs after the runner's last heartbeat, plus the fallback.
+            await Eventually.UntilAsync(() => Task.FromResult(env.Runs.Starts(id) > 1 || cut.Elapsed > Ttl + Ttl + TimeSpan.FromSeconds(30)),
+                Ttl + Ttl + TimeSpan.FromSeconds(45), () => "the cut did not end", env, TimeSpan.FromMilliseconds(500));
+            Assert.True(env.Runs.Starts(id) == 1,
+                $"the running job of the cut-off node was started again {cut.Elapsed.TotalSeconds:0.0} s into the cut: {Describe(env, id)}");
+            // The fault took hold: the runner's entry had expired while the observer kept writing its own.
+            Assert.True(!await HasHeartbeat(runner) && await HasHeartbeat(observer),
+                $"inconclusive: heartbeat entries at the end of the cut: runner {await HasHeartbeat(runner)}, observer {await HasHeartbeat(observer)}");
+            Assert.True(env.Runs.Ends(id) == 0, $"inconclusive: the job ended during the cut: {Describe(env, id)}");
+        }
+        finally
+        {
+            await env.SetHeartbeatProxyAsync(runner, true);
+        }
+        var cutLasted = cut.Elapsed;
+
+        var status = TickerStatus.InProgress;
+        await env.UntilAsync(
+            async () => env.Runs.Starts(id) > 1
+                        || (status = (await env.Nodes[observer].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id).Status) is not TickerStatus.InProgress,
+            () => $"the job did not end: {status}; {Describe(env, id)}", TimeSpan.FromSeconds(150));
+        Assert.True(env.Runs.Starts(id) == 1, $"the job was started again after the cut ({env.Runs.Starts(id)} starts): {Describe(env, id)}");
+        Assert.True(status is TickerStatus.Done or TickerStatus.DueDone, $"the job ended {status}: {Describe(env, id)}");
+        Assert.True(env.Runs.For(id).Count(e => e.IsEnd && e.Node == env.Nodes[runner].Identifier) == 1,
+            $"expected one end, on the runner: {Describe(env, id)}");
+        output.WriteLine($"{store}: cut {cutLasted.TotalSeconds:0.0} s; {Describe(env, id)}");
+    }
+
     private static string Describe(ScenarioEnvironment env, Guid id)
         => string.Join("; ", env.Runs.For(id).Select(e => $"{e.Event} {e.Node} {e.At:HH:mm:ss.fff} {e.Status}"));
 }

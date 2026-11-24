@@ -67,11 +67,10 @@ public static class ServiceExtension
                                ?? serviceProvider.GetService<ITickerClock>()?.UtcNow
                                ?? DateTime.UtcNow;
 
-            // With Redis next to the store, its heartbeat releases the jobs of a node that is gone; without it nothing
-            // does, so the jobs under other identifiers are reported once (#24).
-            var jobsOfOtherNodes = serviceProvider.GetService<ISharpTickerRedisContext>()?.HasRedisConnection == true
-                ? null
-                : serviceProvider.GetService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>() as IJobsOfOtherNodes;
+            // The jobs of another node that is gone are not released here, and with Redis next to the store its heartbeat
+            // does not release them either (#223); only the lease records them as Cancelled. So the jobs under other
+            // identifiers are reported once (#24).
+            var jobsOfOtherNodes = serviceProvider.GetService<ITickerPersistenceProvider<TTimeTicker, TCronTicker>>() as IJobsOfOtherNodes;
 
             hostLifetime.ApplicationStarted.Register(() =>
             {

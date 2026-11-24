@@ -2110,10 +2110,8 @@ public class EfCoreClaimMultiNodeSqliteTests : EfCoreClaimMultiNodeTests
 }
 
 [Collection(PostgresTestFixture.CollectionName)]
-public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITestOutputHelper output) : EfCoreClaimMultiNodeTests
+public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITestOutputHelper output) : EfCoreClaimMultiNodeServerTests(output)
 {
-    protected override int ExpectedClaimFanOut => 16;
-
     protected override Task InitializeStoreAsync() => fixture.ResetAsync();
 
     protected override Task DisposeStoreAsync() => Task.CompletedTask;
@@ -2125,6 +2123,31 @@ public class EfCoreClaimMultiNodePostgresTests(PostgresTestFixture fixture, ITes
 
     protected override ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, ITickerClock clock, IInterceptor interceptor)
         => fixture.CreateProvider(nodeIdentifier, clock, interceptor);
+}
+
+[Collection(SqlServerTestFixture.CollectionName)]
+public class EfCoreClaimMultiNodeSqlServerTests(SqlServerTestFixture fixture, ITestOutputHelper output) : EfCoreClaimMultiNodeServerTests(output)
+{
+    protected override Task InitializeStoreAsync() => fixture.ResetAsync();
+
+    protected override Task DisposeStoreAsync() => Task.CompletedTask;
+
+    protected override TestSharpTickerDbContext CreateContext() => fixture.CreateContext();
+
+    protected override ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, ITickerClock clock)
+        => fixture.CreateProvider(nodeIdentifier, clock);
+
+    protected override ITickerPersistenceProvider<TimeTickerEntity, CronTickerEntity> CreateProvider(string nodeIdentifier, ITickerClock clock, IInterceptor interceptor)
+        => fixture.CreateProvider(nodeIdentifier, clock, interceptor);
+}
+
+/// <summary>
+/// The scenarios on a database server (PostgreSQL, SQL Server), where several connections run at once: the races between
+/// nodes and the scheduler path for a thousand rows.
+/// </summary>
+public abstract class EfCoreClaimMultiNodeServerTests(ITestOutputHelper output) : EfCoreClaimMultiNodeTests
+{
+    protected override int ExpectedClaimFanOut => 16;
 
     // Eight nodes run both the fenced claim and the fallback against every row at once. Whatever the interleaving,
     // each row has exactly one winner: the outcome does not depend on timing, only the winner's identity does.

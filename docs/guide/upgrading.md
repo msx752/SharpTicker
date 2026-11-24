@@ -35,6 +35,23 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 <!-- Add the next version here, above the newest one, in the same shape: what changed, then the steps. -->
 
+## 1.7.0
+
+[Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.7.0)
+
+- **Behaviour change.** With EF Core or MongoDB as the job store and Redis next to it for the heartbeat, the heartbeat no longer releases the running jobs of a node whose heartbeat ended ([#223](https://github.com/msx752/SharpTicker/issues/223)). Up to 1.6.6 these jobs ran again, and a node cut off from Redis alone could still be running them. What now happens to the job:
+  - EF Core with the lease on: it is recorded as `Cancelled` when its lease ends (5 minutes by default), and it does not run again.
+  - EF Core with the lease off: it stays `InProgress` until an instance starts under that name.
+  - MongoDB: it stays `InProgress` until you change it.
+
+  Jobs that were claimed but not started are taken by another instance's fallback once they are overdue. See [When an instance stops](failure-modes.md#when-an-instance-stops).
+- EF Core: the startup log entry that names the instances holding `InProgress` jobs is now also written with Redis next to the store.
+- Redis as the job store: a failed write no longer leaves a job at a time other than the one its record shows, and no longer leaves a record that no list shows ([#94](https://github.com/msx752/SharpTicker/issues/94)). A job updated while its index write failed now runs at the time the dashboard shows.
+
+**Steps:**
+- Upgrade all instances together. An instance on 1.6.6 with EF Core or MongoDB still releases the jobs of a node whose Redis heartbeat ended, and they run again.
+- With MongoDB and the Redis heartbeat, look for jobs left `InProgress` after a node is lost. For a time job, use Force delete on the dashboard, and add it again if it should still run.
+
 ## 1.6.6
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.6.6)

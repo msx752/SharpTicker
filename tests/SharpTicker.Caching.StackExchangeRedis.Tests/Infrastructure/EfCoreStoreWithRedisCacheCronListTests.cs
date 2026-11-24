@@ -121,7 +121,10 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Debug);
         builder.Logging.AddProvider(_log);
-        builder.Services.AddDbContext<CronListDbContext>(options => options.UseSqlite($"Data Source={_databaseFile}"));
+        // SQLite has no schemas: EF Core's warning about the store's schema is about the test's database, not the code.
+        builder.Services.AddDbContext<CronListDbContext>(options => options
+            .UseSqlite($"Data Source={_databaseFile}")
+            .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.SqliteEventId.SchemaConfiguredWarning)));
         builder.Services.AddSharpTicker(options =>
         {
             options.ConfigureScheduler(scheduler => scheduler.NodeIdentifier = node);
@@ -215,10 +218,10 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
         Assert.InRange(timeToLive.Value, TimeSpan.FromMinutes(9), TimeSpan.FromMinutes(10));
     }
 
-    // #24: with the EF Core store alone, a starting node reports the jobs that are InProgress under another node
-    // identifier, because nothing releases them. With Redis next to the store its heartbeat does, so there is no report.
+    // #24: a starting node reports the jobs that are InProgress under another node identifier, because nothing releases
+    // them. With Redis next to the store as well: its heartbeat does not release the jobs of an EF Core store (#223).
     [Fact]
-    public async Task WithRedisNextToTheStore_JobsInProgressUnderAnotherIdentifier_AreNotReportedAtStartup()
+    public async Task WithRedisNextToTheStore_JobsInProgressUnderAnotherIdentifier_AreReportedAtStartup()
     {
         var application = Application("cron-list");
         var id = Guid.NewGuid();
@@ -239,11 +242,17 @@ public class EfCoreStoreWithRedisCacheCronListTests(RedisTestFixture fixture) : 
         Assert.NotNull(startup);
         await startup.WaitAsync(WaitLimit);
 
-        Assert.DoesNotContain(_log.Entries, e => e.Text.Contains("under other node identifiers"));
-        // There was something to report: the job is still InProgress under the other identifier.
+        var report = Assert.Single(_log.Entries, e => e.Text.Contains("under other node identifiers"));
+        Assert.StartsWith(
+            "Information SharpTicker.EntityFrameworkCore.StartupRelease: 1 job(s) are InProgress under other node identifiers: a-node-that-is-gone (1).",
+            report.Text);
+        // The report changes nothing: the job is still InProgress under the other identifier.
         var stored = await Store(application).GetTimeTickerById(id, CancellationToken.None);
         Assert.Equal(TickerStatus.InProgress, stored.Status);
         Assert.Equal("a-node-that-is-gone", stored.LockHolder);
+        Assert.True(Handled.IsEmpty, $"the exception handler was called\n{Report()}");
+        var problems = _log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToList();
+        Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");
     }
 
     // As an application meets it: a cron in code that runs once a year, the application runs and stops, the cron is

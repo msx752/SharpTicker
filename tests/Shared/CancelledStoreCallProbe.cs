@@ -103,9 +103,11 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     public TaskCompletionSource Released { get; private set; } = NewSignal();
 
     /// <summary>
-    /// Once the hold began, no connection but the held call's is open: a call that runs beside the held one (the scheduler
-    /// loop reads the cron and the time jobs at once) has ended or has not opened yet. The tests wait a little after it, so
-    /// such a call ends before the cancel instead of having it land inside it.
+    /// Once the hold began, the call that runs beside the held one has ended: a connection other than the held call's was
+    /// opened and closed since the probe was armed, and no connection but the held call's is open. The scheduler loop reads
+    /// the cron and the time jobs at once; the read that is not held can start only after the hold began, so "nothing else
+    /// is open" alone does not tell that it ended. Without this, the cancel could come before that read opens its
+    /// connection, and EF Core 8 and 9 log that open at Error.
     /// </summary>
     public TaskCompletionSource OtherCallEnded { get; private set; } = NewSignal();
     public bool ReleasedByCancel { get; private set; }
@@ -121,14 +123,22 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     /// With <see cref="StoreCallHold.AfterClose"/>: the close that is held is the one after the first command whose text
     /// this accepts, instead of the close of the first connection opened.
     /// </param>
-    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, Func<string, bool>? closeAfterCommand = null)
+    /// <param name="holdCommand">
+    /// With <see cref="StoreCallHold.Command"/> and <see cref="StoreCallHold.CommandInFlight"/>: only a command whose text
+    /// this accepts is held, so which of two reads that run at once is held does not depend on which one reaches its
+    /// command first.
+    /// </param>
+    public void Arm(StoreCallHold what, TimeSpan? releaseAfter = null, Func<string, bool>? closeAfterCommand = null,
+        Func<string, bool>? holdCommand = null)
     {
         _what = what;
         _releaseAfter = releaseAfter;
         _closeAfterCommand = closeAfterCommand;
+        _holdCommand = holdCommand;
         _inFlight = null;
         _closing = null;
         _heldConnection = null;
+        Volatile.Write(ref _otherCallClosed, 0);
         Held = NewSignal();
         Released = NewSignal();
         OtherCallEnded = NewSignal();
@@ -137,6 +147,17 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     }
 
     private Func<string, bool>? _closeAfterCommand;
+    private Func<string, bool>? _holdCommand;
+
+    /// <summary>
+    /// The scheduler loop's read of the enabled crons (the first step of its cron read). Holding this command, not the time
+    /// read beside it, leaves one call beside the held one, with one connection: the cron read's next step is not started.
+    /// </summary>
+    public static bool IsTheLoopsCronRead(string sql)
+        => sql.Contains("CronTickers", StringComparison.Ordinal) && sql.Contains("IsEnabled", StringComparison.Ordinal)
+           && !sql.Contains("CronTickerOccurrences", StringComparison.Ordinal);
+
+    private bool HoldsThisCommand(DbCommand command) => _holdCommand == null || _holdCommand(command.CommandText);
 
     private bool Take(StoreCallHold what, CancellationToken cancellationToken)
         => _what == what && cancellationToken.CanBeCanceled && !cancellationToken.IsCancellationRequested
@@ -176,7 +197,7 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
 
     private void SendInFlight(DbCommand command, CancellationToken cancellationToken)
     {
-        if (!Take(StoreCallHold.CommandInFlight, cancellationToken))
+        if (!HoldsThisCommand(command) || !Take(StoreCallHold.CommandInFlight, cancellationToken))
             return;
 
         _inFlight = command;
@@ -216,16 +237,19 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     private readonly ConcurrentDictionary<DbConnection, byte> _open = new();
     private DbConnection? _heldConnection;
 
+    // 1 once a connection other than the held call's was closed since the probe was armed.
+    private int _otherCallClosed;
+
     public override Task ConnectionOpenedAsync(DbConnection connection, ConnectionEndEventData eventData, CancellationToken cancellationToken = default)
     {
         _open[connection] = 0;
         return Task.CompletedTask;
     }
 
-    // Called once the hold began and after each close: no connection but the held call's is open.
+    // Called once the hold began and after each close: another call has ended and no connection but the held call's is open.
     private void SignalWhenNoOtherCallIsOpen()
     {
-        if (!Held.Task.IsCompleted)
+        if (!Held.Task.IsCompleted || Volatile.Read(ref _otherCallClosed) == 0)
             return;
 
         var held = Volatile.Read(ref _heldConnection);
@@ -245,6 +269,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
         _open.TryRemove(connection, out _);
         if (!ReferenceEquals(Interlocked.CompareExchange(ref _closing, null, connection), connection))
         {
+            if (!ReferenceEquals(connection, Volatile.Read(ref _heldConnection)))
+                Interlocked.Exchange(ref _otherCallClosed, 1); // a full fence: MarkHeld sets Held, then reads this
             SignalWhenNoOtherCallIsOpen();
             return;
         }
@@ -267,7 +293,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     {
         HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
+        if (HoldsThisCommand(command))
+            await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -276,7 +303,8 @@ public sealed class CancelledStoreCallProbe : DbConnectionInterceptor, IDbComman
     {
         HoldTheCloseAfter(command, cancellationToken);
         SendInFlight(command, cancellationToken);
-        await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
+        if (HoldsThisCommand(command))
+            await HoldAsync(StoreCallHold.Command, command.Connection, cancellationToken).ConfigureAwait(false);
         return result;
     }
 
