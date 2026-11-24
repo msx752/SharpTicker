@@ -23,6 +23,9 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
     // Before the fix the row was written first and its entry after it: the entry stayed at the old, earlier time, and
     // after the restart the fallback took the overdue entry at once, a minute before the time the row (and the dashboard)
     // shows. Now the readers take a row only at its own time and move its entry to that time.
+    // The other job, due 5 s before the old time, holds the loop's window until the stop: a loop that reads the moved
+    // job's entry claims the job and writes its entry again from the row, which hides the fault (the case passes on the
+    // code before the fix then). After the restart the loop does not read an overdue entry, so only the fallback sees it.
     [Fact]
     public async Task AJobMovedLater_WhoseIndexWriteIsRefused_DoesNotStartAtItsOldTimeAfterARestart()
     {
@@ -31,23 +34,31 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
         var db = redis.GetDatabase();
 
         var first = DateTime.UtcNow.AddSeconds(25);
+        var other = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed { Function = Functions.Record, ExecutionTime = first.AddSeconds(-5) });
         var id = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed { Function = Functions.Record, ExecutionTime = first });
         var (row, entry) = await MoveWithRefusedIndexWriteAsync(env, db, id, first.AddSeconds(75));
         Assert.True(entry < row, $"inconclusive: the entry ({entry:HH:mm:ss.fff}) is not earlier than the row ({row:HH:mm:ss.fff})");
 
         // Down while the old time passes; started again after it.
         await env.StopNodeAsync(0);
-        Assert.True(env.Runs.Starts(id) == 0 && DateTime.UtcNow < first, $"inconclusive: the job started, or its old time passed, before the stop: {Describe(env, id)}");
+        Assert.True(env.Runs.Starts(id) == 0 && env.Runs.Starts(other) == 0 && DateTime.UtcNow < first.AddSeconds(-5),
+            $"inconclusive: a job started, or the other job's time passed, before the stop: {Describe(env, id)}; other: {Describe(env, other)}");
         await Task.Delay(first - DateTime.UtcNow + TimeSpan.FromSeconds(5));
+        // Not checked: on the fixed code the loop reads a page of entries past the other job's and may already have moved
+        // this one to the row's time; on the code before the fix it is still the one the refused update left.
+        var before = await db.SortedSetScoreAsync(Pending, id.ToString());
+        output.WriteLine($"before the restart the entry is {(before.HasValue ? new DateTime((long)before.Value, DateTimeKind.Utc) : null):HH:mm:ss.fff}");
         await env.StartNodeAsync(0);
 
         await AssertStartsAtTheRowTimeAsync(env, id, row, entry);
     }
 
     // Before the fix the row was written with the new, earlier time and the entry stayed at the old, later one. The loop's
-    // window held the other job, the fallback takes only an overdue entry, so the job started at its old time, two minutes
-    // after the time its row shows. Now the update first moves an entry that is later than the new time; that write is
-    // refused here, so nothing is written, the update reports the failure, and the job keeps the time its row shows.
+    // window held the other job and the fallback takes only an overdue entry, so nothing started the job at its new time;
+    // it started only when the loop read its window again after the other job (21 s after the row's time when the other
+    // job was due 20 s after it; here it is due 35 s after it). Now the update first moves an entry that is later than the
+    // new time; that write is refused here, so nothing is written, the update reports the failure, and the job keeps the
+    // time its row shows. On the fixed code this case checks that first step; the readers are checked by the case above.
     [Fact]
     public async Task AJobMovedEarlier_WhoseIndexWriteIsRefused_WhileAnotherJobHoldsTheWindow_StartsAtTheTimeItsRowShows()
     {
@@ -56,7 +67,7 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
         var db = redis.GetDatabase();
 
         var now = DateTime.UtcNow;
-        var other = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed { Function = Functions.Record, ExecutionTime = now.AddSeconds(30) });
+        var other = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed { Function = Functions.Record, ExecutionTime = now.AddSeconds(45) });
         var id = await env.Nodes[0].Api.AddTimeTickerAsync(new TickerSeed { Function = Functions.Record, ExecutionTime = now.AddSeconds(150) });
         var (row, entry) = await MoveWithRefusedIndexWriteAsync(env, db, id, now.AddSeconds(10));
         Assert.True(env.Runs.Starts(other) == 0, $"inconclusive: the other job ran before the update: {Describe(env, other)}");
@@ -70,6 +81,7 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
         await env.UntilAsync(async () => await db.SortedSetScoreAsync(Pending, id.ToString()) != null,
             () => "the added job has no pending entry", TimeSpan.FromSeconds(10));
         string? refused = null;
+        await db.ExecuteAsync("ACL", "LOG", "RESET");
         await db.ExecuteAsync("ACL", "SETUSER", "default", "-zadd");
         try
         {
@@ -84,6 +96,10 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
             await db.ExecuteAsync("ACL", "SETUSER", "default", "+zadd");
         }
         Assert.True(refused != null, "inconclusive: the update went through, the refused index write did not take hold");
+        // The update failed on the refused ZADD and not on something else.
+        var denied = (RedisResult[])(await db.ExecuteAsync("ACL", "LOG"))!;
+        Assert.True(denied.SelectMany(Flatten).Any(v => string.Equals(v, "zadd", StringComparison.OrdinalIgnoreCase)),
+            $"inconclusive: the update failed ({refused}), but Redis refused no ZADD");
 
         var row = (await env.Nodes[0].Dashboard.GetAllTimeTickersAsync()).Single(t => t.Id == id).ExecutionTime!.Value.ToUniversalTime();
         var score = await db.SortedSetScoreAsync(Pending, id.ToString());
@@ -111,6 +127,11 @@ public class RedisWriteOrderScenarios(ITestOutputHelper output)
             () => $"the job did not end: {status}", TimeSpan.FromSeconds(30));
         Assert.Equal(1, env.Runs.Starts(id));
     }
+
+    private static IEnumerable<string> Flatten(RedisResult result)
+        => result.Resp2Type == ResultType.Array
+            ? ((RedisResult[])result!).SelectMany(Flatten)
+            : [result.ToString() ?? ""];
 
     private static string Describe(ScenarioEnvironment env, Guid id)
         => string.Join("; ", env.Runs.For(id).Select(e => $"{e.Event} {e.Node} {e.At:HH:mm:ss.fff} {e.Status}"));
