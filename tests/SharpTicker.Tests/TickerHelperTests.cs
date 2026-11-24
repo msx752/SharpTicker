@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 using SharpTicker.Utilities;
 
 namespace SharpTicker.Tests;
@@ -279,6 +280,57 @@ public class TickerHelperTests : IDisposable
         Assert.Equal(original.Items, result.Items);
         Assert.Equal("nested", result.Nested.Name);
         Assert.Equal(10, result.Nested.Value);
+    }
+
+    #endregion
+
+    #region Type info reuse
+
+    [Fact]
+    public void ReadTickerRequest_ReadTheSameTypeAgain_AsksTheConfiguredResolverOnce()
+    {
+        TickerHelper.UseGZipCompression = false;
+        var resolver = new CountingResolver();
+        TickerHelper.RequestJsonSerializerOptions = new JsonSerializerOptions { TypeInfoResolver = resolver };
+        var bytes = TickerHelper.CreateTickerRequest(new TestPayload { Name = "again", Value = 1 });
+
+        for (var i = 0; i < 3; i++)
+            Assert.Equal("again", TickerHelper.ReadTickerRequest<TestPayload>(bytes).Name);
+
+        Assert.Equal(1, resolver.Calls(typeof(TestPayload)));
+    }
+
+    [Fact]
+    public void ReadTickerRequest_WithTheDefaultOptions_DoesNotBuildTheTypeInfoAgainOnEveryRead()
+    {
+        TickerHelper.UseGZipCompression = false;
+        TickerHelper.RequestJsonSerializerOptions = new JsonSerializerOptions();
+        var bytes = TickerHelper.CreateTickerRequest(new TestPayload { Name = "warm", Value = 2 });
+        TickerHelper.ReadTickerRequest<TestPayload>(bytes);
+        const int reads = 20;
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < reads; i++)
+            TickerHelper.ReadTickerRequest<TestPayload>(bytes);
+        var perRead = (GC.GetAllocatedBytesForCurrentThread() - before) / reads;
+
+        // A read that builds a new type info allocates several KB (about 8 KB for this type, measured 2026-11-22);
+        // one that reuses it allocates the string and the object, well under 1 KB.
+        Assert.True(perRead < 2048, $"Each read allocated {perRead} bytes.");
+    }
+
+    private sealed class CountingResolver : IJsonTypeInfoResolver
+    {
+        private readonly DefaultJsonTypeInfoResolver _inner = new();
+        private readonly Dictionary<Type, int> _calls = [];
+
+        public int Calls(Type type) => _calls.GetValueOrDefault(type);
+
+        public JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
+        {
+            _calls[type] = Calls(type) + 1;
+            return _inner.GetTypeInfo(type, options);
+        }
     }
 
     #endregion
