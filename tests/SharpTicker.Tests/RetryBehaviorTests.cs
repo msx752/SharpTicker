@@ -43,10 +43,12 @@ public class RetryBehaviorTests : IDisposable
             (attempts[3].Timestamp - attempts[2].Timestamp).TotalSeconds,
         };
 
-        // allow a small tolerance for timing, but ensure each spacing reflects the configured intervals
-        Assert.InRange(timeDiffs[0], 0.8, 1.2); // first retry uses ~1s
-        Assert.InRange(timeDiffs[1], 1.8, 2.2); // second retry uses ~2s
-        Assert.InRange(timeDiffs[2], 2.8, 3.2); // third retry uses ~3s
+        // Each spacing is at least its interval (a little less for timer resolution) and below the next interval, so a
+        // retry that took another interval of the array fails. The upper bound leaves room for a slow machine: the wait is
+        // a real Task.Delay, and a busy runner once took 1.22 s for the 1 s wait.
+        Assert.InRange(timeDiffs[0], 0.8, 1.8); // first retry uses 1 s
+        Assert.InRange(timeDiffs[1], 1.8, 2.8); // second retry uses 2 s
+        Assert.InRange(timeDiffs[2], 2.8, 3.8); // third retry uses 3 s
     }
 
     [Fact]
