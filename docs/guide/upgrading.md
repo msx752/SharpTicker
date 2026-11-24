@@ -35,6 +35,14 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 <!-- Add the next version here, above the newest one, in the same shape: what changed, then the steps. -->
 
+## 1.7.1
+
+[Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.7.1)
+
+- Performance only: a job run, the lookup of a cron's next occurrence and the function check when a ticker is added or updated allocate less and take less time. The public API, the defaults and the stored formats are those of 1.7.0.
+
+**Steps:** none.
+
 ## 1.7.0
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.7.0)
