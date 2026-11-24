@@ -83,6 +83,57 @@ namespace SharpTicker.Utilities.Models
             return this;
         }
 
+        // The setters SharpTicker itself uses. They do what SetProperty does for one property (set it and record its name for
+        // the store's write) without the expression tree that a SetProperty call builds on every call: SharpTicker sets these
+        // on every run of every job.
+        internal InternalFunctionContext SetStatus(TickerStatus value)
+        {
+            Status = value;
+            return Changed(nameof(Status));
+        }
+
+        internal InternalFunctionContext SetExecutedAt(DateTime value)
+        {
+            ExecutedAt = value;
+            return Changed(nameof(ExecutedAt));
+        }
+
+        internal InternalFunctionContext SetElapsedTime(long value)
+        {
+            ElapsedTime = value;
+            return Changed(nameof(ElapsedTime));
+        }
+
+        internal InternalFunctionContext SetExceptionDetails(string value)
+        {
+            ExceptionDetails = value;
+            return Changed(nameof(ExceptionDetails));
+        }
+
+        internal InternalFunctionContext SetRetryCount(int value)
+        {
+            RetryCount = value;
+            return Changed(nameof(RetryCount));
+        }
+
+        internal InternalFunctionContext SetReleaseLock(bool value)
+        {
+            ReleaseLock = value;
+            return Changed(nameof(ReleaseLock));
+        }
+
+        internal InternalFunctionContext SetExecutionTime(DateTime value)
+        {
+            ExecutionTime = value;
+            return Changed(nameof(ExecutionTime));
+        }
+
+        private InternalFunctionContext Changed(string name)
+        {
+            (ParametersToUpdate ??= []).Add(name);
+            return this;
+        }
+
         public InternalFunctionContext ResetUpdateProps()
         {
              ParametersToUpdate.Clear();

@@ -629,10 +629,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
                 ParentId = job.ParentId == Guid.Empty ? null : job.ParentId,
                 RunMarker = job.RunMarker
             };
-            context.SetProperty(x => x.Status, TickerStatus.Cancelled)
-                .SetProperty(x => x.ExecutedAt, now)
-                .SetProperty(x => x.ExceptionDetails, "The application stopped before the job finished.")
-                .SetProperty(x => x.ReleaseLock, true);
+            context.SetStatus(TickerStatus.Cancelled)
+                .SetExecutedAt(now)
+                .SetExceptionDetails("The application stopped before the job finished.")
+                .SetReleaseLock(true);
 
             try
             {

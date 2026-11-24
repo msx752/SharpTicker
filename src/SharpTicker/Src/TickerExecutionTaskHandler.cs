@@ -310,7 +310,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
         _sharpTickerInstrumentation.LogJobEnqueued(typeName, context.FunctionName, context.TickerId, "ExecutionTaskHandler");
         
-        context.SetProperty(x => x.Status, TickerStatus.InProgress);
+        context.SetStatus(TickerStatus.InProgress);
 
         // A claimed job's writes are fenced by the marker its claim wrote. An inline chain child got its marker when it was
         // started (TryStartInlineChildAsync); it has none with a store that does not fence runs.
@@ -426,10 +426,10 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 // timeout runs out (see IsCancellation).
                 catch (OperationCanceledException ex) when (IsCancellation(ex, cancellationTokenSource))
                 {
-                    context.SetProperty(x => x.Status, TickerStatus.Cancelled)
-                        .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                        .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds)
-                        .SetProperty(x => x.ExceptionDetails, SerializeException(ex));
+                    context.SetStatus(TickerStatus.Cancelled)
+                        .SetExecutedAt(_clock.UtcNow)
+                        .SetElapsedTime(stopWatch.ElapsedMilliseconds)
+                        .SetExceptionDetails(SerializeException(ex));
 
                     // Add cancellation tags to activity
                     jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
@@ -445,18 +445,18 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 }
                 catch (TerminateExecutionException ex)
                 {
-                    context.SetProperty(x => x.Status, ex.Status)
-                        .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                        .SetProperty(x => x.ElapsedTime, stopWatch.ElapsedMilliseconds);
+                    context.SetStatus(ex.Status)
+                        .SetExecutedAt(_clock.UtcNow)
+                        .SetElapsedTime(stopWatch.ElapsedMilliseconds);
 
                     if (ex.InnerException != null)
                     {
-                        context.SetProperty(x => x.ExceptionDetails, ex.InnerException.Message);
+                        context.SetExceptionDetails(ex.InnerException.Message);
                         jobActivity?.SetTag("sharpticker.job.skip_reason", ex.InnerException.Message);
                     }
                     else
                     {
-                        context.SetProperty(x => x.ExceptionDetails, ex.Message);
+                        context.SetExceptionDetails(ex.Message);
                         jobActivity?.SetTag("sharpticker.job.skip_reason", ex.Message);
                     }
 
@@ -472,7 +472,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 {
                     lastException = ex;
 
-                    context.SetProperty(x => x.ExceptionDetails, SerializeException(ex));
+                    context.SetExceptionDetails(SerializeException(ex));
 
                     if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
                         await handler.HandleExceptionAsync(ex, context.TickerId, context.Type);
@@ -496,12 +496,12 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
             // Persist the *total* time (first attempt start → final outcome, includes
             // retry waits). The per-attempt stopWatch is still used for instrumentation
             // ("attempt X failed in 200ms") but doesn't reflect user-lived duration.
-            context.SetProperty(x => x.ElapsedTime, totalStopWatch.ElapsedMilliseconds)
-                .SetProperty(x => x.ExecutedAt, _clock.UtcNow);
+            context.SetElapsedTime(totalStopWatch.ElapsedMilliseconds)
+                .SetExecutedAt(_clock.UtcNow);
 
             if (success)
             {
-                context.SetProperty(x => x.Status, isDue ? TickerStatus.DueDone : TickerStatus.Done);
+                context.SetStatus(isDue ? TickerStatus.DueDone : TickerStatus.Done);
 
                 // Add success tags to activity
                 jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
@@ -515,8 +515,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
             if (lastException != null)
             {
-                context.SetProperty(x => x.Status, TickerStatus.Failed)
-                    .SetProperty(x => x.ExceptionDetails, SerializeException(lastException));
+                context.SetStatus(TickerStatus.Failed)
+                    .SetExceptionDetails(SerializeException(lastException));
 
                 // Add failure tags to activity
                 jobActivity?.SetTag("sharpticker.job.final_status", context.Status.ToString());
@@ -711,7 +711,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         if (attempt > context.Retries)
             return true;
 
-        context.SetProperty(x => x.RetryCount, attempt);
+        context.SetRetryCount(attempt);
 
         await StoreAttemptAsync(context, cancellationToken);
 

@@ -163,12 +163,16 @@ namespace SharpTicker.Utilities.Managers
         Task<TickerResult<TCronTicker>> ICronTickerManager<TCronTicker>.DeleteBatchAsync(List<Guid> ids, CancellationToken cancellationToken)
             => DeleteCronTickersBatchAsync(ids, cancellationToken);
 
+        // Whether a function of this name is mapped: the lookup the scheduler makes when it runs the job. A null name is not.
+        private static bool IsMapped(string function)
+            => function != null && TickerFunctionProvider.TickerFunctions.ContainsKey(function);
+
         private async Task<TickerResult<TTimeTicker>> AddTimeTickerAsync(TTimeTicker entity, CancellationToken cancellationToken)
         {
             if (entity.Id == Guid.Empty)
                 entity.Id = Guid.NewGuid();
 
-            if (TickerFunctionProvider.TickerFunctions.All(x => x.Key != entity?.Function))
+            if (!IsMapped(entity?.Function))
                 return new TickerResult<TTimeTicker>(
                     new TickerValidatorException($"Cannot find TickerFunction with name {entity?.Function}"));
             
@@ -229,7 +233,7 @@ namespace SharpTicker.Utilities.Managers
             if (entity.Id == Guid.Empty)
                 entity.Id = Guid.NewGuid();
 
-            if (TickerFunctionProvider.TickerFunctions.All(x => x.Key != entity?.Function))
+            if (!IsMapped(entity?.Function))
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot find TickerFunction with name {entity?.Function}"));
 
@@ -306,7 +310,7 @@ namespace SharpTicker.Utilities.Managers
             if (cronTicker is null)
                 return new TickerResult<TCronTicker>(new Exception($"Cron ticker must not be null!"));
 
-            if (TickerFunctionProvider.TickerFunctions.All(x => x.Key != cronTicker?.Function))
+            if (!IsMapped(cronTicker?.Function))
                 return new TickerResult<TCronTicker>(
                     new TickerValidatorException($"Cannot find TickerFunction with name {cronTicker.Function}"));
 
@@ -352,7 +356,7 @@ namespace SharpTicker.Utilities.Managers
         private async Task MovePlannedOccurrenceAsync(Guid occurrenceId, DateTime nextOccurrence, CancellationToken cancellationToken)
         {
             var move = new InternalFunctionContext { TickerId = occurrenceId, Type = TickerType.CronTickerOccurrence }
-                .SetProperty(x => x.ExecutionTime, nextOccurrence);
+                .SetExecutionTime(nextOccurrence);
 
             if (_persistenceProvider is IFencedRunWriter fenced)
                 await fenced.UpdateNotStartedCronOccurrenceAsync(move, cancellationToken).ConfigureAwait(false);
@@ -502,7 +506,7 @@ namespace SharpTicker.Utilities.Managers
                 if (entity.Id == Guid.Empty)
                     entity.Id = Guid.NewGuid();
 
-                if (TickerFunctionProvider.TickerFunctions.All(x => x.Key != entity?.Function))
+                if (!IsMapped(entity?.Function))
                 {
                     errors.Add(new TickerValidatorException($"Cannot find TickerFunction with name {entity?.Function}"));
                     continue;
@@ -637,7 +641,7 @@ namespace SharpTicker.Utilities.Managers
                     continue;
                 }
 
-                if (TickerFunctionProvider.TickerFunctions.All(x => x.Key != cronTicker?.Function))
+                if (!IsMapped(cronTicker?.Function))
                 {
                     errors.Add(new TickerValidatorException($"Cannot find TickerFunction with name {cronTicker.Function}"));
                     continue;

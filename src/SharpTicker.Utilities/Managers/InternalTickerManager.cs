@@ -500,12 +500,12 @@ namespace SharpTicker.Utilities.Managers
                 if (await StartInlineChildOrPutBackAsync(fenced, child.TickerId, marker, cancellationToken).ConfigureAwait(false) <= 0)
                     return false;
 
-                child.SetProperty(x => x.Status, TickerStatus.InProgress);
+                child.SetStatus(TickerStatus.InProgress);
                 child.RunMarker = marker;
             }
             else
             {
-                child.SetProperty(x => x.Status, TickerStatus.InProgress);
+                child.SetStatus(TickerStatus.InProgress);
                 await _persistenceProvider.UpdateTimeTicker(child, cancellationToken).ConfigureAwait(false);
             }
 
@@ -553,9 +553,9 @@ namespace SharpTicker.Utilities.Managers
         public async Task UpdateSkipTimeTickersWithUnifiedContextAsync(InternalFunctionContext[] resources, CancellationToken cancellationToken = default)
         {
             var unifiedFunctionContext = new InternalFunctionContext()
-                .SetProperty(x => x.Status, TickerStatus.Skipped)
-                .SetProperty(x => x.ExecutedAt, _clock.UtcNow)
-                .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
+                .SetStatus(TickerStatus.Skipped)
+                .SetExecutedAt(_clock.UtcNow)
+                .SetExceptionDetails(ChainRunGate.NotMatchedReason);
             
             if (resources.Length != 0)
             {

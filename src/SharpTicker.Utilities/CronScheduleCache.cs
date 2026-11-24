@@ -19,8 +19,40 @@ internal static partial class CronScheduleCache
     private static string Normalize(string expr)
     {
         ArgumentNullException.ThrowIfNull(expr);
-        
-        return ReplaceRegex().Replace(expr.Trim(), " "); 
+
+        // The scheduler loop asks for every cron on each pass, nearly always with an expression already in this form; the
+        // replace below would build a new string for it every time.
+        if (IsNormalized(expr))
+            return expr;
+
+        return ReplaceRegex().Replace(expr.Trim(), " ");
+    }
+
+    // True when the replace would give the expression back unchanged: no white space at either end and none between the
+    // fields but single spaces. char.IsWhiteSpace is the set that Trim removes and that \s matches.
+    private static bool IsNormalized(string expr)
+    {
+        if (expr.Length == 0)
+            return true;
+
+        if (char.IsWhiteSpace(expr[0]) || char.IsWhiteSpace(expr[^1]))
+            return false;
+
+        for (var i = 1; i < expr.Length; i++)
+        {
+            var c = expr[i];
+            if (c == ' ')
+            {
+                if (expr[i - 1] == ' ')
+                    return false;
+            }
+            else if (char.IsWhiteSpace(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     public static CrontabSchedule Get(string expression)
