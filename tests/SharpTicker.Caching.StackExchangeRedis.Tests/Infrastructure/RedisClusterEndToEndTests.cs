@@ -306,7 +306,12 @@ public abstract class RedisTopologyEndToEndTestsBase : IAsyncLifetime
 
     private void AssertNothingWentWrong()
     {
-        var problems = Log.Entries.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToList();
+        // Left out: the Warning that the application is stopping while jobs run. The stop can land while an occurrence of
+        // the every-second cron runs; the scheduler then waits for it (docs/guide/jobs.md) and says so. A job that has not
+        // finished when that wait ends is logged at Warning separately ("had not finished") and still fails the test.
+        var problems = Log.Entries
+            .Where(e => e.Level >= LogLevel.Warning && !e.Text.Contains("The application is stopping and ", StringComparison.Ordinal))
+            .Select(e => e.Text).ToList();
         Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");
         Assert.True(Handled.IsEmpty, $"the exception handler was called:\n{string.Join("\n", Handled)}");
     }
