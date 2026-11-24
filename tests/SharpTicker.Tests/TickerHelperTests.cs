@@ -319,6 +319,17 @@ public class TickerHelperTests : IDisposable
         Assert.True(perRead < 2048, $"Each read allocated {perRead} bytes.");
     }
 
+    [Fact]
+    public void ReadTickerRequest_AResolverThatDoesNotKnowTheType_FailsAsTheSerializerDoes()
+    {
+        TickerHelper.UseGZipCompression = false;
+        var bytes = TickerHelper.CreateTickerRequest(new TestPayload { Name = "unknown", Value = 3 });
+        // The context lists TypedReadRequest only.
+        TickerHelper.RequestJsonSerializerOptions = new JsonSerializerOptions { TypeInfoResolver = TypedReadRequestJsonContext.Default };
+
+        Assert.Throws<NotSupportedException>(() => TickerHelper.ReadTickerRequest<TestPayload>(bytes));
+    }
+
     private sealed class CountingResolver : IJsonTypeInfoResolver
     {
         private readonly DefaultJsonTypeInfoResolver _inner = new();
