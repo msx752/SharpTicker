@@ -82,7 +82,10 @@ namespace SharpTicker.Utilities
             if (string.IsNullOrWhiteSpace(serializedObject))
                 return default;
 
-            if (RequestJsonSerializerOptions?.TypeInfoResolver?.GetTypeInfo(typeof(T), RequestJsonSerializerOptions) is JsonTypeInfo<T> typeInfo)
+            // The options keep the type info they resolved; asking the resolver itself builds a new one on every read.
+            if (RequestJsonSerializerOptions is { TypeInfoResolver: not null } options
+                && options.TryGetTypeInfo(typeof(T), out var resolved)
+                && resolved is JsonTypeInfo<T> typeInfo)
                 return JsonSerializer.Deserialize(serializedObject, typeInfo);
 
             return JsonSerializer.Deserialize<T>(serializedObject, RequestJsonSerializerOptions);
