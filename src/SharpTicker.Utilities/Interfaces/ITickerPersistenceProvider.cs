@@ -29,7 +29,7 @@ namespace SharpTicker.Utilities.Interfaces
         // Default bodies keep the unfenced behaviour for custom providers and do not write the marker.
         async Task<bool> TryMarkTimeTickerInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
-            await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            await UpdateTimeTickersWithUnifiedContext([id], new InternalFunctionContext().SetStatus(TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
 
@@ -72,7 +72,7 @@ namespace SharpTicker.Utilities.Interfaces
         // Same contract as TryMarkTimeTickerInProgress, for a cron occurrence row.
         async Task<bool> TryMarkCronOccurrenceInProgress(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)
         {
-            await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
+            await UpdateCronTickerOccurrencesWithUnifiedContext([id], new InternalFunctionContext().SetStatus(TickerStatus.InProgress), cancellationToken).ConfigureAwait(false);
             return true;
         }
 

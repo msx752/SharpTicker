@@ -352,7 +352,7 @@ namespace SharpTicker.Utilities.Managers
         private async Task MovePlannedOccurrenceAsync(Guid occurrenceId, DateTime nextOccurrence, CancellationToken cancellationToken)
         {
             var move = new InternalFunctionContext { TickerId = occurrenceId, Type = TickerType.CronTickerOccurrence }
-                .SetProperty(x => x.ExecutionTime, nextOccurrence);
+                .SetExecutionTime(nextOccurrence);
 
             if (_persistenceProvider is IFencedRunWriter fenced)
                 await fenced.UpdateNotStartedCronOccurrenceAsync(move, cancellationToken).ConfigureAwait(false);
