@@ -135,22 +135,22 @@ public abstract class StoreWithRedisHeartbeatReleaseEndToEndTests(RedisTestFixtu
         }
     }
 
-    private sealed class RecordingLoggerProvider(string node, ConcurrentQueue<(LogLevel Level, string Text)> entries) : ILoggerProvider
+    private sealed class RecordingLoggerProvider(string node, ConcurrentQueue<(LogLevel Level, string Text, string Category, int EventId)> entries) : ILoggerProvider
     {
-        public ILogger CreateLogger(string categoryName) => new Logger($"[{node}] {categoryName}", entries);
+        public ILogger CreateLogger(string categoryName) => new Logger(categoryName, $"[{node}] {categoryName}", entries);
 
         public void Dispose()
         {
         }
 
-        private sealed class Logger(string category, ConcurrentQueue<(LogLevel, string)> entries) : ILogger
+        private sealed class Logger(string categoryName, string category, ConcurrentQueue<(LogLevel, string, string, int)> entries) : ILogger
         {
             public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
             public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
 
             public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-                => entries.Enqueue((logLevel, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception.GetType().Name + ": " + exception.Message)}"));
+                => entries.Enqueue((logLevel, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception.GetType().Name + ": " + exception.Message)}", categoryName, eventId.Id));
         }
     }
 
@@ -170,7 +170,7 @@ public abstract class StoreWithRedisHeartbeatReleaseEndToEndTests(RedisTestFixtu
         public Task RemoveNodeFromRegistryAsync(string node) => inner.RemoveNodeFromRegistryAsync(node);
     }
 
-    private readonly ConcurrentQueue<(LogLevel Level, string Text)> _log = new();
+    private readonly ConcurrentQueue<(LogLevel Level, string Text, string Category, int EventId)> _log = new();
     private readonly HeartbeatSwitch _heartbeatA = new();
     private readonly List<IHost> _hosts = new();
     private bool _prepared;
@@ -350,7 +350,13 @@ public abstract class StoreWithRedisHeartbeatReleaseEndToEndTests(RedisTestFixtu
         Assert.True(Volatile.Read(ref _startCount) == 1, $"the job started again\n{Report()}");
         Assert.False(_firstRunWasAskedToStop, Report());
         Assert.True(Handled.IsEmpty, $"the exception handler was called\n{Report()}");
-        var problems = _log.Where(e => e.Level >= LogLevel.Warning).Select(e => e.Text).ToList();
+        // Left out: EF Core's own Error for a connection whose opening was cancelled (EF Core 8 and 9 log it, EF Core 10 does
+        // not). The scheduler loop is restarted when a job is added and once after startup; when that comes while the loop
+        // opens a connection, EF Core logs it (see Tracing and logs in the docs). CI run 45405706448 (net8.0) had one here.
+        // The cancel tests of the EF Core store cover the case on their own.
+        var problems = _log
+            .Where(e => e.Level >= LogLevel.Warning && !(e.Category == "Microsoft.EntityFrameworkCore.Database.Connection" && e.EventId == 20004))
+            .Select(e => e.Text).ToList();
         Assert.True(problems.Count == 0, $"the log has entries at Warning or above:\n{string.Join("\n", problems)}");
     }
 
