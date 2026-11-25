@@ -60,6 +60,8 @@ namespace SharpTicker.Utilities
         internal Action<IServiceCollection> ExternalProviderConfigServiceAction { get; set; }
         internal Action<IServiceCollection> DashboardServiceAction { get; set; }
         internal Type TickerExceptionHandlerType { get; private set; }
+        internal Type TickerLifecycleHandlerType { get; private set; }
+        internal TimeSpan LifecycleHandlerTimeout { get; private set; } = TimeSpan.FromSeconds(30);
 
         /// <summary>
         /// Configures the scheduler of this instance; see <see cref="SchedulerOptionsBuilder"/> for the options and their defaults.
@@ -223,6 +225,31 @@ namespace SharpTicker.Utilities
         public TickerOptionsBuilder<TTimeTicker, TCronTicker> SetExceptionHandler<THandler>() where THandler : ITickerExceptionHandler
         {
             TickerExceptionHandlerType = typeof(THandler);
+            return this;
+        }
+
+        /// <summary>
+        /// Registers the application's <see cref="ITickerLifecycleHandler"/>, called when a job starts and when it ends. It is
+        /// a singleton. Without one, nothing is called and nothing is added to a run.
+        /// </summary>
+        public TickerOptionsBuilder<TTimeTicker, TCronTicker> SetLifecycleHandler<THandler>() where THandler : class, ITickerLifecycleHandler
+        {
+            TickerLifecycleHandlerType = typeof(THandler);
+            return this;
+        }
+
+        /// <summary>
+        /// How long one call of the <see cref="ITickerLifecycleHandler"/> may take; 30 seconds by default. When it ends, the
+        /// call's token is cancelled, the call is logged at <c>Warning</c>, and the job goes on without waiting for it.
+        /// </summary>
+        /// <exception cref="ArgumentOutOfRangeException">The timeout is zero or negative, or longer than
+        /// <see cref="int.MaxValue"/> milliseconds (about 24.8 days).</exception>
+        public TickerOptionsBuilder<TTimeTicker, TCronTicker> SetLifecycleHandlerTimeout(TimeSpan timeout)
+        {
+            if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromMilliseconds(int.MaxValue))
+                throw new ArgumentOutOfRangeException(nameof(timeout), timeout,
+                    "The lifecycle handler timeout must be greater than zero and at most int.MaxValue milliseconds.");
+            LifecycleHandlerTimeout = timeout;
             return this;
         }
 

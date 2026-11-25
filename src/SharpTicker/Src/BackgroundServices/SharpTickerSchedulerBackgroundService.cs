@@ -23,6 +23,7 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
     private readonly Action _stopWakingOnLostOutcomes;
     // Writes again the outcomes whose final write threw; null when the service was built without it (tests).
     private readonly LostOutcomeDrain _lostOutcomes;
+    private readonly TickerLifecycleCallbacks _lifecycle;
     private readonly IInternalTickerManager _internalTickerManager;
     private readonly TickerExecutionContext _executionContext;
     private readonly TimeSpan _minPollingInterval;
@@ -49,8 +50,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         ITickerClock clock = null,
         IOptions<HostOptions> hostOptions = null,
         ClaimedWorkQueue claimedWork = null,
-        LostOutcomeDrain lostOutcomes = null)
+        LostOutcomeDrain lostOutcomes = null,
+        TickerLifecycleCallbacks lifecycle = null)
     {
+        _lifecycle = lifecycle;
         _lostOutcomes = lostOutcomes;
         _logger = logger;
         _clock = clock;
@@ -548,6 +551,10 @@ internal class SharpTickerSchedulerBackgroundService : BackgroundService, ISharp
         // After the stop no worker starts a job of this node any more: what is still pending is put back, within the time
         // the host gives the stop.
         await _work.PutBackUnstartedAsync(cancellationToken: cancellationToken);
+        // Last: the writes above (the lost outcomes, the Cancelled records) start end calls of the lifecycle handler (#1).
+        // They get what is left of the time the host gives the stop.
+        if (_lifecycle != null)
+            await _lifecycle.WaitForCompletedCallsAsync(cancellationToken);
     }
 
     // The jobs run on the scheduler's workers, not inside this service, so stopping the service did not wait for them. The
