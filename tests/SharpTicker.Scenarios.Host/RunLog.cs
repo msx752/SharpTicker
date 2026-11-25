@@ -41,6 +41,12 @@ public static class RunLog
         if (status != null)
             line["status"] = status;
 
+        WriteLine(line);
+    }
+
+    /// <summary>Writes one line under the shared lock and sequence; also used by <see cref="LifecycleLog"/>.</summary>
+    public static void WriteLine(Dictionary<string, object?> line)
+    {
         // The sequence number is taken under the lock, so the lines appear in the log in seq order.
         lock (Gate)
         {
