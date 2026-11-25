@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using NSubstitute;
 using SharpTicker.Utilities;
 using SharpTicker.Utilities.Entities;
@@ -1209,6 +1210,7 @@ public class InternalTickerManagerTests
         await ((IChildSkipWriter)persistence).Received(1).SkipNotStartedTimeTickersAsync(
             Arg.Is<Guid[]>(x => x.SequenceEqual(ids)),
             Arg.Is<InternalFunctionContext>(c => c.Status == TickerStatus.Skipped && c.ExceptionDetails == ChainRunGate.NotMatchedReason),
+            false,
             Arg.Any<CancellationToken>());
         await persistence.DidNotReceiveWithAnyArgs().UpdateTimeTickersWithUnifiedContext(default!, default!, default);
     }
@@ -1223,6 +1225,64 @@ public class InternalTickerManagerTests
 
         await _persistence.Received(1).UpdateTimeTickersWithUnifiedContext(
             Arg.Is<Guid[]>(x => x.SequenceEqual(ids)), Arg.Any<InternalFunctionContext>(), Arg.Any<CancellationToken>());
+    }
+
+    private sealed class RecordingLifecycleHandler : ITickerLifecycleHandler
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<TickerLifecycleContext> Completed { get; } = new();
+
+        public Task OnCompletedAsync(TickerLifecycleContext context, CancellationToken cancellationToken)
+        {
+            Completed.Enqueue(context);
+            return Task.CompletedTask;
+        }
+    }
+
+    private (IInternalTickerManager Manager, TickerLifecycleCallbacks Callbacks, RecordingLifecycleHandler Handler) ManagerWithHandlerOver(
+        ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker> persistence)
+    {
+        var handler = new RecordingLifecycleHandler();
+        var services = new ServiceCollection().AddSingleton<ITickerLifecycleHandler>(handler).BuildServiceProvider();
+        var callbacks = new TickerLifecycleCallbacks(services, typeof(RecordingLifecycleHandler), TimeSpan.FromMinutes(1), null);
+        var manager = new InternalTickerManager<FakeTimeTicker, FakeCronTicker>(persistence, _clock, _notificationHub, null, null, callbacks);
+        return (manager, callbacks, handler);
+    }
+
+    // With a lifecycle handler, the store skips one by one and the manager reports exactly the rows it skipped: a row that
+    // another writer already moved (claimed, ran, skipped) is not reported.
+    [Fact]
+    public async Task SkippingChildren_WithAHandler_ReportsOnlyTheRowsTheStoreSkipped()
+    {
+        var persistence = Substitute.For<ITickerPersistenceProvider<FakeTimeTicker, FakeCronTicker>, IChildSkipWriter>();
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid() };
+        ((IChildSkipWriter)persistence).SkipNotStartedTimeTickersAsync(default!, default!, default, default)
+            .ReturnsForAnyArgs(Task.FromResult(new[] { ids[1] }));
+        var (manager, callbacks, handler) = ManagerWithHandlerOver(persistence);
+
+        await manager.UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+        await callbacks.WaitForCompletedCallsAsync(CancellationToken.None);
+
+        await ((IChildSkipWriter)persistence).Received(1).SkipNotStartedTimeTickersAsync(
+            Arg.Is<Guid[]>(x => x.SequenceEqual(ids)), Arg.Any<InternalFunctionContext>(), true, Arg.Any<CancellationToken>());
+        var reported = Assert.Single(handler.Completed);
+        Assert.Equal(ids[1], reported.Id);
+        Assert.Equal(TickerStatus.Skipped, reported.Status);
+        Assert.Equal(ChainRunGate.NotMatchedReason, reported.SkippedReason);
+        Assert.Equal(0, reported.RetryCount);
+        Assert.Equal(TimeSpan.Zero, reported.Elapsed);
+    }
+
+    // A custom store without the not-started write writes every row it is given, so each of them is reported.
+    [Fact]
+    public async Task SkippingChildren_WithAHandler_OnAStoreWithoutTheNotStartedWrite_ReportsEveryRow()
+    {
+        var ids = new[] { Guid.NewGuid(), Guid.NewGuid() };
+        var (manager, callbacks, handler) = ManagerWithHandlerOver(_persistence);
+
+        await manager.UpdateSkipTimeTickersWithUnifiedContextAsync(ChildrenToSkip(ids), CancellationToken.None);
+        await callbacks.WaitForCompletedCallsAsync(CancellationToken.None);
+
+        Assert.Equal(ids.OrderBy(x => x), handler.Completed.Select(c => c.Id).OrderBy(x => x));
     }
 
     // Run-now and the hand-off after a parent build their contexts with one builder.

@@ -5,7 +5,9 @@ using SharpTicker.EntityFrameworkCore.DbContextFactory;
 using SharpTicker.EntityFrameworkCore.DependencyInjection;
 using SharpTicker.Utilities.Base;
 using SharpTicker.Utilities.Entities;
+using SharpTicker.Utilities.Interfaces;
 using SharpTicker.Utilities.Interfaces.Managers;
+using SharpTicker.Utilities.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -22,6 +24,8 @@ builder.Services.AddSharpTicker(options =>
         });
     });
     options.AddDashboard();
+    // Logs each job that ends, whatever its outcome (see JobEndLog below).
+    options.SetLifecycleHandler<JobEndLog>();
 });
 
 var app = builder.Build();
@@ -73,3 +77,14 @@ public class SampleJobs
 }
 
 public record OrderRequest(string OrderId, decimal Amount);
+
+// Called after a job's final status is stored: Done, DueDone, Failed, Cancelled or Skipped.
+public sealed class JobEndLog(ILogger<JobEndLog> logger) : ITickerLifecycleHandler
+{
+    public Task OnCompletedAsync(TickerLifecycleContext context, CancellationToken cancellationToken)
+    {
+        logger.LogInformation("{Function} ({Id}) ended as {Status} after {Elapsed}",
+            context.FunctionName, context.Id, context.Status, context.Elapsed);
+        return Task.CompletedTask;
+    }
+}

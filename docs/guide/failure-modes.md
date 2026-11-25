@@ -230,3 +230,9 @@ builder.Services.AddSharpTicker(options => options.SetExceptionHandler<AlertingE
 ```
 
 The handler is a singleton. Retries are configured per ticker; see [Scheduling](scheduling.md#retries).
+
+- `HandleExceptionAsync` is called for each failed attempt, so a job with retries can call it more than once. `HandleCanceledExceptionAsync` is called when a run is cancelled.
+- Both are called before the outcome is stored.
+- An exception thrown by the handler is logged at `Warning`, with the job's name and id, and goes no further. The run goes on as if the handler had returned: the attempt is retried or its outcome is stored, and the chain children follow. Up to 1.7.1 such an exception left the job `InProgress`.
+
+To run code when a job ends, use a lifecycle handler; see [When a job starts and ends](jobs.md#when-a-job-starts-and-ends).

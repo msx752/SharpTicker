@@ -395,16 +395,37 @@ namespace SharpTicker.MongoDB.Infrastructure
 
         // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
         // keeps the status of its run.
-        public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        // One by one: an update per row, so the rows it skipped are known without a read that another writer could race.
+        public async Task<Guid[]> SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, bool oneByOne, CancellationToken cancellationToken = default)
         {
-            if (timeTickerIds.Length == 0) return;
+            if (timeTickerIds.Length == 0) return oneByOne ? Array.Empty<Guid>() : null;
             var fb = Builders<TTimeTicker>.Filter;
-            await _context.TimeTickers
-                .UpdateManyAsync(
-                    fb.And(fb.In(x => x.Id, timeTickerIds), fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued })),
-                    MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(skip, _clock.UtcNow),
-                    cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
+            var notStarted = fb.In(x => x.Status, new[] { TickerStatus.Idle, TickerStatus.Queued });
+            if (!oneByOne)
+            {
+                await _context.TimeTickers
+                    .UpdateManyAsync(
+                        fb.And(fb.In(x => x.Id, timeTickerIds), notStarted),
+                        MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(skip, _clock.UtcNow),
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+                return null;
+            }
+
+            var skipped = new List<Guid>(timeTickerIds.Length);
+            foreach (var id in timeTickerIds)
+            {
+                var result = await _context.TimeTickers
+                    .UpdateOneAsync(
+                        fb.And(fb.Eq(x => x.Id, id), notStarted),
+                        MongoUpdateBuilders.BuildTimeTickerUpdate<TTimeTicker>(skip, _clock.UtcNow),
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+                if (result.MatchedCount > 0)
+                    skipped.Add(id);
+            }
+
+            return skipped.ToArray();
         }
 
         public async Task<bool> TryReleaseTimeTickerClaim(Guid id, DateTime claimMarker, CancellationToken cancellationToken = default)

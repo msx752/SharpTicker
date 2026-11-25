@@ -282,8 +282,10 @@ namespace SharpTicker.Provider
 
         // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out
         // keeps the status of its run. A row that changes meanwhile is read again.
-        public Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+        // Each row is decided on its own here either way, so the ids are always known.
+        public Task<Guid[]> SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, bool oneByOne, CancellationToken cancellationToken = default)
         {
+            var done = new List<Guid>(timeTickerIds.Length);
             foreach (var id in timeTickerIds)
             {
                 while (TimeTickers.TryGetValue(id, out var ticker) && (ticker.Status == TickerStatus.Idle || ticker.Status == TickerStatus.Queued))
@@ -291,11 +293,14 @@ namespace SharpTicker.Provider
                     var skipped = CloneTicker(ticker);
                     ApplyFunctionContextToTicker(skipped, skip);
                     if (TimeTickers.TryUpdate(id, skipped, ticker))
+                    {
+                        done.Add(id);
                         break;
+                    }
                 }
             }
 
-            return Task.CompletedTask;
+            return Task.FromResult(done.ToArray());
         }
 
         // Each claim is a compare-and-swap on one row.
@@ -1337,6 +1342,8 @@ namespace SharpTicker.Provider
                         Retries = ch.Retries,
                         RetryIntervals = ch.RetryIntervals,
                         RunCondition = ch.RunCondition,
+                        // The run hands it to the child's function as TickerFunctionContext.ParentId.
+                        ParentId = ch.ParentId,
                         ExecutionTime = ch.ExecutionTime,
                         Children = new List<TimeTickerEntity>()
                     };
@@ -1358,6 +1365,7 @@ namespace SharpTicker.Provider
                                 Retries = gch.Retries,
                                 RetryIntervals = gch.RetryIntervals,
                                 RunCondition = gch.RunCondition,
+                                ParentId = gch.ParentId,
                                 ExecutionTime = gch.ExecutionTime
                             });
                         }

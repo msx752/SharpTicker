@@ -29,6 +29,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     private readonly ITickerClock _clock;
     private readonly ISharpTickerInstrumentation _sharpTickerInstrumentation;
     private readonly IInternalTickerManager _internalTickerManager;
+    private readonly TickerLifecycleCallbacks _lifecycle;
 
     public TickerExecutionTaskHandler(IServiceProvider serviceProvider, ITickerClock clock, ISharpTickerInstrumentation sharpTickerInstrumentation, IInternalTickerManager internalTickerManager)
     {
@@ -36,6 +37,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         _clock = clock;
         _sharpTickerInstrumentation = sharpTickerInstrumentation;
         _internalTickerManager = internalTickerManager;
+        // Registered only with a lifecycle handler (#1); null otherwise, and a run then makes no call for it.
+        _lifecycle = serviceProvider?.GetService(typeof(TickerLifecycleCallbacks)) as TickerLifecycleCallbacks;
     }
 
     public Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
@@ -375,6 +378,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 return false;
             }
 
+            // Once per run, before the first attempt; the run waits for it up to the handler's timeout. A run with no attempt
+            // left stores no outcome (below), so it is not reported as starting either.
+            if (_lifecycle != null && context.RetryCount <= context.Retries)
+                await _lifecycle.StartingAsync(context);
+
             Exception lastException = null;
             var success = false;
 
@@ -438,8 +446,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                     // Log job cancelled
                     _sharpTickerInstrumentation.LogJobCancelled(context.TickerId, context.FunctionName, "Task was cancelled");
 
-                    if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
-                        await handler.HandleCanceledExceptionAsync(ex, context.TickerId, context.Type);
+                    await CallExceptionHandlerAsync(context, ex, cancelled: true);
 
                     return await StoreOutcomeAsync(context, isChild);
                 }
@@ -474,8 +481,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
 
                     context.SetExceptionDetails(SerializeException(ex));
 
-                    if (_serviceProvider.GetService(typeof(ITickerExceptionHandler)) is ITickerExceptionHandler handler)
-                        await handler.HandleExceptionAsync(ex, context.TickerId, context.Type);
+                    await CallExceptionHandlerAsync(context, ex, cancelled: false);
 
                     // Per-attempt failure log so retries are visible in trace/logs.
                     // The terminal failure (last attempt that exhausts retries) is logged
@@ -563,6 +569,32 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         Logger?.LogWarning(
             "{FunctionName} ({TickerId}) was asked to stop because this node could not show the other nodes that it is alive, and they may start the job again. No outcome is stored for this run; its row stays InProgress until the store releases the rows of this node, and the job runs again then.",
             context.FunctionName, context.TickerId);
+    }
+
+    // The application's handler is told of a failed attempt or a cancellation. What it throws is logged and goes no further:
+    // the run goes on as if the handler had returned, so the attempt is retried or its outcome stored, and the chain children
+    // follow.
+    // A handler that cannot be built (its constructor or a dependency throws) is treated the same way.
+    private async Task CallExceptionHandlerAsync(InternalFunctionContext context, Exception exception, bool cancelled)
+    {
+        ITickerExceptionHandler handler = null;
+        try
+        {
+            handler = _serviceProvider.GetService(typeof(ITickerExceptionHandler)) as ITickerExceptionHandler;
+            if (handler == null)
+                return;
+
+            if (cancelled)
+                await handler.HandleCanceledExceptionAsync(exception, context.TickerId, context.Type);
+            else
+                await handler.HandleExceptionAsync(exception, context.TickerId, context.Type);
+        }
+        catch (Exception handlerException)
+        {
+            Logger?.LogWarning(handlerException,
+                "The exception handler {Handler} threw while it handled the {Event} of {FunctionName} ({TickerId}). The run goes on as if the handler had returned.",
+                handler?.GetType().Name ?? nameof(ITickerExceptionHandler), cancelled ? "cancellation" : "failure", context.FunctionName, context.TickerId);
+        }
     }
 
     // The final outcome write. It never throws: the job has ended either way, and the caller still has to leave the registry

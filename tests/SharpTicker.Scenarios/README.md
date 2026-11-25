@@ -17,6 +17,8 @@ These tests are local only: they are not part of `SharpTicker.slnx` and do not r
   add a Redis next to an EF Core store for the node heartbeat. With the Redis store a node can also be started as an application
   with ticker types of its own (`SCENARIO_OWN_TYPES=1`, `OwnTypesHost.cs`); it has no dashboard, so those scenarios read
   the store.
+  With `SCENARIO_LIFECYCLE=1` a node registers `LifecycleLog.cs`, a lifecycle handler (#1) that writes each call as a
+  `SCENARIO_RUN` line with the event `lifecycle-start` or `lifecycle-end`; only `LifecycleScenarios` sets it.
 
 ## Prerequisites
 

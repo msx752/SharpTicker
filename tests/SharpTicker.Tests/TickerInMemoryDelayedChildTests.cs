@@ -209,10 +209,13 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
 
     // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
     [Theory]
-    [InlineData(TickerStatus.InProgress)]
-    [InlineData(TickerStatus.Done)]
-    [InlineData(TickerStatus.Failed)]
-    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status)
+    [InlineData(TickerStatus.InProgress, false)]
+    [InlineData(TickerStatus.InProgress, true)]
+    [InlineData(TickerStatus.Done, false)]
+    [InlineData(TickerStatus.Done, true)]
+    [InlineData(TickerStatus.Failed, false)]
+    [InlineData(TickerStatus.Failed, true)]
+    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status, bool oneByOne)
     {
         var started = Row(Now.AddSeconds(-30), status);
         var waiting = Row(Now.AddSeconds(-30));
@@ -221,7 +224,10 @@ public class TickerInMemoryDelayedChildTests : IAsyncLifetime
             .SetProperty(x => x.Status, TickerStatus.Skipped)
             .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
 
-        await ((SharpTicker.Utilities.Interfaces.IChildSkipWriter)_provider).SkipNotStartedTimeTickersAsync([started.Id, waiting.Id], skip, CancellationToken.None);
+        var skipped = await ((SharpTicker.Utilities.Interfaces.IChildSkipWriter)_provider).SkipNotStartedTimeTickersAsync([started.Id, waiting.Id], skip, oneByOne, CancellationToken.None);
+        // One by one, the write names exactly the row it skipped.
+        if (oneByOne)
+            Assert.Equal([waiting.Id], skipped);
 
         Assert.Equal(status, await StatusOf(started.Id));
         Assert.Equal(TickerStatus.Skipped, await StatusOf(waiting.Id));

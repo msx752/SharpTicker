@@ -83,6 +83,61 @@ A job that runs at once, because it was added for now, is not tied to the reques
 
 When the application stops, the scheduler waits for the jobs that are running, for a little less than the host's shutdown timeout (`HostOptions.ShutdownTimeout`, 30 seconds by default), so a job that honors its token can record that it was cancelled before the host disposes its services. A job that is still running when the wait ends is recorded as `Cancelled` and its lock is released; it is not retried. A job that ignores its token keeps running until the process ends, and it delays the stop by the whole wait, so pass the token on to what the job awaits. If your jobs need longer to wind down, raise the shutdown timeout of the host, and on Kubernetes the termination grace period with it.
 
+## When a job starts and ends
+
+To run code of your own when a job starts and when it ends, register one lifecycle handler:
+
+```csharp
+public sealed class JobEndLog(ILogger<JobEndLog> logger) : ITickerLifecycleHandler
+{
+    public Task OnCompletedAsync(TickerLifecycleContext context, CancellationToken cancellationToken)
+    {
+        logger.LogInformation("{Function} ({Id}) ended as {Status} after {Elapsed}",
+            context.FunctionName, context.Id, context.Status, context.Elapsed);
+        return Task.CompletedTask;
+    }
+}
+
+builder.Services.AddSharpTicker(options => options.SetLifecycleHandler<JobEndLog>());
+```
+
+Both methods return a completed task by default, so implement only the ones you need.
+
+- **`OnStartingAsync`** is called once per run, before its first attempt. The run waits for it, up to the timeout. A run that is put back before it ends, and runs again later, gets the call again.
+- **`OnCompletedAsync`** is called after a final status (`Done`, `DueDone`, `Failed`, `Cancelled` or `Skipped`) is stored for the job, not between retries. It is made by the instance that stored the status, and the worker that ran the job does not wait for it.
+- A chain child that is skipped because its parent's outcome does not match its run condition gets `OnCompletedAsync` with `Skipped` from the instance that ran the parent, and no `OnStartingAsync`.
+- Each call has its own timeout, 30 seconds by default (`SetLifecycleHandlerTimeout`), and its own token, which is cancelled when the timeout ends or when the application's stop has finished waiting for the calls. A call that throws or runs past its timeout is logged at `Warning`, and it does not change the job.
+- When the application stops, the scheduler waits for the `OnCompletedAsync` calls that are still running, as the last step of its stop and with what is left of the host's shutdown timeout. The calls still running when that time is up are cancelled and counted in a `Warning`.
+- The handler is a singleton. Resolve scoped services, such as a `DbContext`, through `IServiceScopeFactory`.
+- When no handler is registered, no call is made.
+
+`TickerLifecycleContext` describes the job as it was when the call was made:
+
+| Member | Description |
+|---|---|
+| `Id` | Id of the time ticker or cron occurrence. |
+| `ParentId` | As in `TickerFunctionContext`: for a cron run, the id of its cron ticker; for a chained child, the id of the parent. |
+| `Type` | `TickerType.TimeTicker` or `TickerType.CronTickerOccurrence`. |
+| `FunctionName` | The function name. |
+| `Status` | `InProgress` in `OnStartingAsync`; the stored final status in `OnCompletedAsync`. |
+| `RetryCount` | The retries the run used. |
+| `Elapsed` | The duration stored with the outcome: from the first attempt to the end, retry waits included, for `Done`, `DueDone` and `Failed`; that of the last attempt for `Cancelled` and `Skipped`. |
+| `ExceptionMessage` | The exception text stored for a `Failed` or `Cancelled` job; `null` otherwise. |
+| `SkippedReason` | Why a `Skipped` job was skipped; `null` otherwise. |
+
+`RetryCount` and `Elapsed` are zero for a job that the stop recorded as `Cancelled` while it was still running, and for a chain child that its parent's outcome skipped.
+
+The calls are made from memory, in the process that runs or records the job, so some ends are not reported:
+
+- A process that stops after it stored a status, and before it made the call, does not make it.
+- When the write of a job's outcome fails, the scheduler writes it again later. If that write finds the outcome already stored, or the application stops before it, the call is not made.
+- A status that a store records in bulk for jobs of other instances is not reported: the EF Core lease recording expired jobs as `Cancelled`, the fallback skipping the children of a parent that ended on another instance, and the startup skip of cron occurrences that are too old.
+- If the write that skips a parent's children fails or is cancelled partway, or the dashboard notification fails while they are reported, the children skipped before that point and not yet reported are not reported.
+- With `DisableBackgroundServices()`, the instance runs no jobs, so it makes no calls.
+- With a [custom persistence provider](storage.md#custom-persistence-providers) that does not derive from one of SharpTicker's stores, every child that the parent's outcome skips is reported, even one that had already run.
+
+A call can also be made more than once for the same job, for example when a run is put back and runs again. Use `Id` to recognize a job.
+
 ## Payloads
 
 A job can take a typed request. Use `TickerFunctionContext<TRequest>` and read the `Request` field:

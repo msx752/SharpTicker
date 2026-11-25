@@ -401,15 +401,33 @@ internal abstract class BasePersistenceProvider<TDbContext, TTimeTicker, TCronTi
 
     // IChildSkipWriter: only a row that has not started is skipped, so a delayed child this store already handed out keeps
     // the status of its run.
-    public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+    // One by one: an update per row, so the rows it skipped are known without a read that another writer could race.
+    public async Task<Guid[]> SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, bool oneByOne, CancellationToken cancellationToken = default)
     {
         using var session = await CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         var dbContext = session.Context;
-        var idList = timeTickerIds.ToList();
-        await dbContext.Set<TTimeTicker>()
-            .Where(x => idList.Contains(x.Id))
-            .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
-            .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(skip, _clock.UtcNow), cancellationToken).ConfigureAwait(false);
+        if (!oneByOne)
+        {
+            var idList = timeTickerIds.ToList();
+            await dbContext.Set<TTimeTicker>()
+                .Where(x => idList.Contains(x.Id))
+                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(skip, _clock.UtcNow), cancellationToken).ConfigureAwait(false);
+            return null;
+        }
+
+        var skipped = new List<Guid>(timeTickerIds.Length);
+        foreach (var id in timeTickerIds)
+        {
+            var rows = await dbContext.Set<TTimeTicker>()
+                .Where(x => x.Id == id)
+                .Where(x => x.Status == TickerStatus.Idle || x.Status == TickerStatus.Queued)
+                .ExecuteUpdateAsync(setter => setter.UpdateTimeTicker<TTimeTicker>(skip, _clock.UtcNow), cancellationToken).ConfigureAwait(false);
+            if (rows > 0)
+                skipped.Add(id);
+        }
+
+        return skipped.ToArray();
     }
         
     public async Task<TimeTickerEntity[]> GetEarliestTimeTickers(CancellationToken cancellationToken)

@@ -119,6 +119,16 @@ namespace SharpTicker.DependencyInjection
             if (optionInstance.TickerExceptionHandlerType != null)
                 services.AddSingleton(typeof(ITickerExceptionHandler), optionInstance.TickerExceptionHandlerType);
 
+            // Only with a lifecycle handler: without one, nothing resolves TickerLifecycleCallbacks and no run calls it.
+            if (optionInstance.TickerLifecycleHandlerType != null)
+            {
+                services.AddSingleton(typeof(ITickerLifecycleHandler), optionInstance.TickerLifecycleHandlerType);
+                var lifecycleHandlerType = optionInstance.TickerLifecycleHandlerType;
+                var lifecycleHandlerTimeout = optionInstance.LifecycleHandlerTimeout;
+                services.AddSingleton(sp => new TickerLifecycleCallbacks(sp, lifecycleHandlerType, lifecycleHandlerTimeout,
+                    sp.GetService<ILogger<TickerLifecycleCallbacks>>()));
+            }
+
             services.AddSingleton(_ => optionInstance);
             services.AddSingleton(_ => tickerExecutionContext);
             services.AddSingleton(_ => schedulerOptionsBuilder);

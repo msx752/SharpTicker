@@ -24,6 +24,7 @@ namespace SharpTicker.Utilities.Managers
         private readonly ISharpTickerNotificationHubSender _notificationHubSender;
         private readonly ILogger _logger;
         private readonly ClaimPutBackRetryList _putBackRetry;
+        private readonly TickerLifecycleCallbacks _lifecycle;
 
         public InternalTickerManager(
             ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
@@ -50,7 +51,21 @@ namespace SharpTicker.Utilities.Managers
             ISharpTickerNotificationHubSender notificationHubSender,
             ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger,
             ClaimPutBackRetryList putBackRetry)
+            : this(persistenceProvider, clock, notificationHubSender, logger, putBackRetry, null)
         {
+        }
+
+        // lifecycle: registered only with a lifecycle handler (#1), and then the container picks this constructor; it is told
+        // of each final status this manager stores.
+        public InternalTickerManager(
+            ITickerPersistenceProvider<TTimeTicker, TCronTicker> persistenceProvider,
+            ITickerClock clock,
+            ISharpTickerNotificationHubSender notificationHubSender,
+            ILogger<InternalTickerManager<TTimeTicker, TCronTicker>> logger,
+            ClaimPutBackRetryList putBackRetry,
+            TickerLifecycleCallbacks lifecycle)
+        {
+            _lifecycle = lifecycle;
             _persistenceProvider = persistenceProvider;
             _clock = clock ?? throw new ArgumentNullException(nameof(clock));
             _notificationHubSender = notificationHubSender;
@@ -418,6 +433,9 @@ namespace SharpTicker.Utilities.Managers
         public async Task<bool> UpdateTickerAsync(InternalFunctionContext functionContext, CancellationToken cancellationToken = default)
         {
             var stored = await WriteAsync(functionContext, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false);
+            // Told of the write itself, before the notification: a notification that fails does not hide a stored status.
+            if (stored)
+                _lifecycle?.Completed(functionContext);
             await NotifyUpdatedAsync(functionContext).ConfigureAwait(false);
             return stored;
         }
@@ -432,6 +450,7 @@ namespace SharpTicker.Utilities.Managers
 
             if (!await WriteAsync(context, onlyWhileRunning: false, cancellationToken).ConfigureAwait(false))
                 return false;
+            _lifecycle?.Completed(context);
 
             // The outcome is stored. A notification that fails must not make it look lost, which would write it again forever.
             try
@@ -451,6 +470,7 @@ namespace SharpTicker.Utilities.Managers
             var written = await WriteAsync(context, onlyWhileRunning: true, cancellationToken).ConfigureAwait(false);
             if (!written)
                 return false;
+            _lifecycle?.Completed(context);
 
             // Written: a failing notification must not make the stop log it as not recorded.
             try
@@ -557,20 +577,32 @@ namespace SharpTicker.Utilities.Managers
                 .SetExecutedAt(_clock.UtcNow)
                 .SetExceptionDetails(ChainRunGate.NotMatchedReason);
             
+            // The rows this write skipped, for the lifecycle handler (#1): asked one by one only when a handler is registered.
+            // A provider without IChildSkipWriter writes every row it is given, so each of them is skipped.
+            HashSet<Guid> skippedIds = null;
             if (resources.Length != 0)
             {
                 var ids = resources.Select(x => x.TickerId).ToArray();
                 if (_persistenceProvider is IChildSkipWriter skipWriter)
-                    await skipWriter.SkipNotStartedTimeTickersAsync(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+                {
+                    var skipped = await skipWriter.SkipNotStartedTimeTickersAsync(ids, unifiedFunctionContext, oneByOne: _lifecycle != null, cancellationToken).ConfigureAwait(false);
+                    if (skipped != null)
+                        skippedIds = new HashSet<Guid>(skipped);
+                }
                 else
+                {
                     await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+                    skippedIds = new HashSet<Guid>(ids);
+                }
             }
-            
+
             foreach (var resource in resources)
             {
                 resource.ExecutedAt = _clock.UtcNow;
                 resource.Status = TickerStatus.Skipped;
                 resource.ExceptionDetails = ChainRunGate.NotMatchedReason;
+                if (_lifecycle != null && skippedIds != null && skippedIds.Contains(resource.TickerId))
+                    _lifecycle.Completed(resource);
                 if(resource.Type == TickerType.TimeTicker)
                     await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(resource).ConfigureAwait(false);
                 else
