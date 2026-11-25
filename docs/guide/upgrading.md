@@ -39,6 +39,7 @@ A chain child that waits for such a job follows its run condition on a `Cancelle
 
 [Release notes](https://github.com/msx752/SharpTicker/releases/tag/v1.8.0)
 
+- Security: the dashboard shows a job's request data, and the request example of the chain builder, as text ([#299](https://github.com/msx752/SharpTicker/pull/299)). Up to 1.7.1 markup inside a string value of a request could run as script in the browser of the operator who opened the Request Data dialog.
 - New: a lifecycle handler, called when a job starts and when it ends ([#1](https://github.com/msx752/SharpTicker/issues/1)). Without one, jobs run as before; see [When a job starts and ends](jobs.md#when-a-job-starts-and-ends).
 - An `ITickerExceptionHandler` that throws no longer stops the job from ending. Up to 1.7.1 the exception left the job `InProgress` until the store released the rows of the instance, a failed attempt was not retried, and the chain children were neither run nor skipped. Now the exception is logged at `Warning` and the run goes on as if the handler had returned.
 - A chain child that starts with its parent or after it, and a grandchild, now see their parent's id in `TickerFunctionContext.ParentId`, as [Defining jobs](jobs.md#job-context) says. Up to 1.7.1 it was `null` for them with the in-memory, EF Core and MongoDB stores. Two other effects:

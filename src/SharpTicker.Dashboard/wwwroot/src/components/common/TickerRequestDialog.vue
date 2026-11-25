@@ -18,8 +18,8 @@ const props = defineProps({
 
 const formattedJson = computed(() => {
   try {
-    const formatted = JSON.stringify(JSON.parse(getTickerRequestData.response.value?.result!), null, 2);
-    return formatted.replace(/\n/g, "<br>").replace(/ /g, "&nbsp;");
+    // Shown as text ({{ }}), never as HTML: the request is data from the application and its users.
+    return JSON.stringify(JSON.parse(getTickerRequestData.response.value?.result!), null, 2);
   } catch (error) {
     return "Invalid JSON";
   }
@@ -52,7 +52,7 @@ const emit = defineEmits<{
         <v-card-title>Request Data</v-card-title>
         <v-card-text>
           <v-sheet v-if="getTickerRequestData.response.value?.result" class="json-container">
-            <pre v-html="formattedJson"></pre>
+            <pre>{{ formattedJson }}</pre>
           </v-sheet>
           <v-sheet v-else class="no-data">No request data is defined</v-sheet>
         </v-card-text>
