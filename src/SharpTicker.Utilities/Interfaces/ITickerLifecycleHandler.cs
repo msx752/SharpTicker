@@ -31,9 +31,9 @@ namespace SharpTicker.Utilities.Interfaces
 
         /// <summary>
         /// Called after a final status (<c>Done</c>, <c>DueDone</c>, <c>Failed</c>, <c>Cancelled</c> or <c>Skipped</c>)
-        /// was stored for the job by this process; not between retries. The worker does not wait for it. Not reported: statuses
-        /// that a store records in bulk for jobs of other instances (see the failure modes guide), and chain children that are
-        /// skipped because their parent's outcome does not match their run condition.
+        /// was stored for the job by this process; not between retries. The worker does not wait for it. A chain child that
+        /// its parent's outcome skips is reported by the process that ran the parent. Not reported: statuses that a store
+        /// records in bulk for jobs of other instances (see the failure modes guide).
         /// </summary>
         Task OnCompletedAsync(TickerLifecycleContext context, CancellationToken cancellationToken) => Task.CompletedTask;
     }

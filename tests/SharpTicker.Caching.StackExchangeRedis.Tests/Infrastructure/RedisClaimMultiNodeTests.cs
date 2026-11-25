@@ -1262,8 +1262,10 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
 
     // The handler skips a child its parent's outcome does not let run; only a row that has not started is written, so a
     // delayed child the store already handed out keeps the status of its run.
-    [Fact]
-    public async Task SkippingChildren_WritesOnlyTheRowsThatHaveNotStarted()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SkippingChildren_WritesOnlyTheRowsThatHaveNotStarted(bool oneByOne)
     {
         var nodeA = CreateProvider("node-A");
         var idle = NewTimeTicker(executionTime: T0.AddSeconds(30));
@@ -1278,7 +1280,9 @@ public class RedisClaimMultiNodeTests(RedisTestFixture fixture, Xunit.Abstractio
             .SetProperty(x => x.Status, TickerStatus.Skipped)
             .SetProperty(x => x.ExecutedAt, T0)
             .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
-        await ((IChildSkipWriter)nodeA).SkipNotStartedTimeTickersAsync([idle.Id, queued.Id, running.Id, done.Id, Guid.NewGuid()], skip);
+        var skipped = await ((IChildSkipWriter)nodeA).SkipNotStartedTimeTickersAsync([idle.Id, queued.Id, running.Id, done.Id, Guid.NewGuid()], skip, oneByOne);
+        // The store decides each row on its own, so it names exactly the rows it skipped either way.
+        Assert.Equal([idle.Id, queued.Id], skipped);
 
         foreach (var id in new[] { idle.Id, queued.Id })
         {

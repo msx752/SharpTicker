@@ -692,18 +692,24 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
     // IChildSkipWriter: only a row that has not started is skipped (SkipNotStartedAsync), so a delayed child this store
     // already handed out keeps the status of its run.
-    public async Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default)
+    // Each row is decided on its own here either way, so the ids are always known.
+    public async Task<Guid[]> SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, bool oneByOne, CancellationToken cancellationToken = default)
     {
         var now = Clock.UtcNow;
+        var skipped = new List<Guid>(timeTickerIds.Length);
         foreach (var id in timeTickerIds)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await SkipNotStartedAsync(id, skip.ExceptionDetails ?? ChainRunGate.NotMatchedReason, skip.ExecutedAt == default ? now : skip.ExecutedAt, now).ConfigureAwait(false);
+            if (await SkipNotStartedAsync(id, skip.ExceptionDetails ?? ChainRunGate.NotMatchedReason, skip.ExecutedAt == default ? now : skip.ExecutedAt, now).ConfigureAwait(false))
+                skipped.Add(id);
         }
+
+        return skipped.ToArray();
     }
 
     // Only while the row has not started (Idle or Queued), so a child that was handed out keeps the status of its run.
-    private async Task SkipNotStartedAsync(Guid id, string reason, DateTime executedAt, DateTime now)
+    // Returns whether this call skipped the row.
+    private async Task<bool> SkipNotStartedAsync(Guid id, string reason, DateTime executedAt, DateTime now)
     {
         var skipped = await CompareAndSetAsync<TTimeTicker>(TimeTickerKey(id), row =>
         {
@@ -719,8 +725,10 @@ internal abstract class BaseRedisPersistenceProvider<TTimeTicker, TCronTicker> :
 
         // The row key and the index keys live in different hash slots; a stale pending entry is harmless, a claim refuses
         // a skipped row.
-        if (skipped != null)
-            await IndexManager.AddTimeTickerIndexesAsync(skipped).ConfigureAwait(false);
+        if (skipped == null)
+            return false;
+        await IndexManager.AddTimeTickerIndexesAsync(skipped).ConfigureAwait(false);
+        return true;
     }
 
     // A child missing from the order (its link was dropped) goes last.

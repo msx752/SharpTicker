@@ -14,5 +14,10 @@ namespace SharpTicker.Utilities.Interfaces;
 /// </summary>
 internal interface IChildSkipWriter
 {
-    Task SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, CancellationToken cancellationToken = default);
+    /// <summary>
+    /// Returns the ids of the rows this call skipped. With <paramref name="oneByOne"/> false a store may skip them in one
+    /// write and return <c>null</c> (not known); with it true, each row is decided on its own, so the ids are exact: the
+    /// lifecycle handler (#1) reports exactly those rows.
+    /// </summary>
+    Task<Guid[]> SkipNotStartedTimeTickersAsync(Guid[] timeTickerIds, InternalFunctionContext skip, bool oneByOne, CancellationToken cancellationToken = default);
 }

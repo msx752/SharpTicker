@@ -1608,7 +1608,7 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
             if (change == "skipped")
             {
                 var skip = new InternalFunctionContext().SetProperty(x => x.Status, TickerStatus.Skipped).SetProperty(x => x.ExceptionDetails, "skipped elsewhere");
-                await ((IChildSkipWriter)behind).SkipNotStartedTimeTickersAsync([other], skip, CancellationToken.None);
+                await ((IChildSkipWriter)behind).SkipNotStartedTimeTickersAsync([other], skip, oneByOne: false, CancellationToken.None);
             }
             else if (change == "given a time")
             {
@@ -1633,10 +1633,13 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
 
     // The skip write only touches a row that has not started: a delayed child the store already ran keeps its status.
     [Theory]
-    [InlineData(TickerStatus.InProgress)]
-    [InlineData(TickerStatus.Done)]
-    [InlineData(TickerStatus.Failed)]
-    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status)
+    [InlineData(TickerStatus.InProgress, false)]
+    [InlineData(TickerStatus.InProgress, true)]
+    [InlineData(TickerStatus.Done, false)]
+    [InlineData(TickerStatus.Done, true)]
+    [InlineData(TickerStatus.Failed, false)]
+    [InlineData(TickerStatus.Failed, true)]
+    public async Task SkippingChildren_LeavesARowThatAlreadyStarted(TickerStatus status, bool oneByOne)
     {
         var started = await SeedTimeTicker(status, executionTime: T0.AddSeconds(-30));
         var waiting = await SeedTimeTicker(executionTime: T0.AddSeconds(-30));
@@ -1644,7 +1647,10 @@ public abstract class EfCoreClaimMultiNodeTests : IAsyncLifetime
             .SetProperty(x => x.Status, TickerStatus.Skipped)
             .SetProperty(x => x.ExceptionDetails, ChainRunGate.NotMatchedReason);
 
-        await ((IChildSkipWriter)CreateProvider("node-A")).SkipNotStartedTimeTickersAsync([started, waiting], skip, CancellationToken.None);
+        var skipped = await ((IChildSkipWriter)CreateProvider("node-A")).SkipNotStartedTimeTickersAsync([started, waiting], skip, oneByOne, CancellationToken.None);
+        // One by one, the write names exactly the row it skipped.
+        if (oneByOne)
+            Assert.Equal([waiting], skipped);
 
         Assert.Equal(status, (await ReadRow(started)).Status);
         Assert.Equal(TickerStatus.Skipped, (await ReadRow(waiting)).Status);
