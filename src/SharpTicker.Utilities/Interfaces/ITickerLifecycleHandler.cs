@@ -12,7 +12,8 @@ namespace SharpTicker.Utilities.Interfaces
     /// <remarks>
     /// <para>
     /// Each call has its own timeout (<c>SetLifecycleHandlerTimeout</c>, 30 seconds by default) and its own token, which is
-    /// cancelled when the timeout ends or the application stops. An exception or a timeout is logged at <c>Warning</c> and
+    /// cancelled when the timeout ends or when the application's stop has finished waiting for the calls. An exception or a
+    /// timeout is logged at <c>Warning</c> and
     /// does not change the job.
     /// </para>
     /// <para>
