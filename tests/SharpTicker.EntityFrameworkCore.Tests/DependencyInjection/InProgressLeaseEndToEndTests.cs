@@ -192,6 +192,20 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
         return await scope.ServiceProvider.GetRequiredService<InProgressLeaseDbContext>().Set<TimeTickerEntity>().AsNoTracking().SingleAsync(x => x.Id == id);
     }
 
+    // What a failure message needs to tell a job that pod-b cancelled from one whose end was not written.
+    private static async Task<string> DescribeAsync(IHost host, IEnumerable<Guid> ids)
+    {
+        var lines = new List<string>();
+        foreach (var id in ids)
+        {
+            var row = await StoredAsync(host, id);
+            lines.Add($"{id}: ran {Runs.GetValueOrDefault(id)} time(s), {row.Status}, holder {row.LockHolder ?? "none"}, " +
+                      $"locked at {row.LockedAt:O}, executed at {row.ExecutedAt:O}, skipped: {row.SkippedReason ?? "-"}");
+        }
+
+        return $"At {DateTime.UtcNow:O}: " + string.Join("; ", lines);
+    }
+
     private static async Task<bool> WaitUntilAsync(Func<Task<bool>> condition, TimeSpan limit)
     {
         var deadline = DateTime.UtcNow + limit;
@@ -361,7 +375,7 @@ public class InProgressLeaseEndToEndTests : IAsyncLifetime
                     return false;
             return true;
         }, WaitLimit);
-        Assert.True(ended, string.Join(", ", ids.Select(id => $"{id}: ran {Runs.GetValueOrDefault(id)} time(s)")));
+        Assert.True(ended, await DescribeAsync(podA, ids));
         await Task.Delay(3 * ShortLease);
 
         Assert.All(ids, id => Assert.Equal(1, Runs.GetValueOrDefault(id)));
