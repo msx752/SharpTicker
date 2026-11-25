@@ -100,7 +100,7 @@
                   </v-card-item>
                   <v-divider />
                   <v-card-text class="example-content">
-                    <div v-if="currentExampleData" v-html="formatJsonForDisplay(currentExampleData, true)"></div>
+                    <div v-if="currentExampleData" class="example-json-text">{{ formatJsonForDisplay(currentExampleData) }}</div>
                     <div v-else class="no-example-text">Select a function to see request example</div>
                   </v-card-text>
                 </v-card>
@@ -1029,14 +1029,13 @@ const onFunctionChange = (level: string, functionName: string, childIndex?: numb
   }
 }
 
-// Format JSON for display (similar to AddTimeTicker)
-const formatJsonForDisplay = (json: string | null, isHtml: boolean = false) => {
+// Format JSON for display (similar to AddTimeTicker). The result is text, shown with {{ }}, never as HTML.
+const formatJsonForDisplay = (json: string | null) => {
   if (!json) return ''
   try {
-    const formatted = JSON.stringify(JSON.parse(json), null, 2)
-    return isHtml ? formatted.replace(/\n/g, '<br>').replace(/ /g, '&nbsp;') : formatted
+    return JSON.stringify(JSON.parse(json), null, 2)
   } catch (error) {
-    return isHtml ? json.replace(/\n/g, '<br>').replace(/ /g, '&nbsp;') : json
+    return json
   }
 }
 
@@ -1044,7 +1043,7 @@ const formatJsonForDisplay = (json: string | null, isHtml: boolean = false) => {
 const copyExampleToRequestData = () => {
   if (!currentExampleData.value) return
   
-  const formattedData = formatJsonForDisplay(currentExampleData.value, false)
+  const formattedData = formatJsonForDisplay(currentExampleData.value)
   
   if (currentStep.value === 'parent') {
     parentJob.value.requestData = formattedData
@@ -1727,6 +1726,11 @@ onMounted(async () => {
   overflow-y: auto;
   line-height: 1.4;
   color: #ffffff;
+}
+
+.example-json-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .no-example-text {
