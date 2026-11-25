@@ -42,14 +42,15 @@ namespace SharpTicker.Utilities.Models
 
         /// <summary>
         /// The retries the job has used, as the run recorded them; 0 for a job that the stop recorded as <c>Cancelled</c>
-        /// while it was still running.
+        /// while it was still running, and for a chain child that its parent's outcome skipped.
         /// </summary>
         public int RetryCount { get; }
 
         /// <summary>
         /// In <c>OnCompletedAsync</c>, the duration the run recorded with its outcome: from the first attempt to the end, retry
         /// waits included, for <c>Done</c>, <c>DueDone</c> and <c>Failed</c>; that of the last attempt for <c>Cancelled</c>
-        /// and <c>Skipped</c>; zero for a job that the stop recorded as <c>Cancelled</c> while it was still running.
+        /// and <c>Skipped</c>; zero for a job that the stop recorded as <c>Cancelled</c> while it was still running, and for a
+        /// chain child that its parent's outcome skipped.
         /// </summary>
         public TimeSpan Elapsed { get; }
 

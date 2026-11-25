@@ -359,4 +359,54 @@ public class LifecycleHandlerEndToEndTests : IAsyncLifetime
         Assert.Equal(TickerStatus.Cancelled, completed.Context.Status);
         AssertNoWarningBut(e => e.Message.Contains(running.Result.Id.ToString()) || e.Message.Contains("stopping"));
     }
+
+    [Fact]
+    public async Task Chain_Children_That_The_Parent_Outcome_Skips_Are_Reported_As_Skipped()
+    {
+        await StartAsync();
+        var times = _app!.Services.GetRequiredService<ITimeTickerManager<TimeTickerEntity>>();
+        var added = await times.AddAsync(new TimeTickerEntity
+        {
+            Function = Fails,
+            ExecutionTime = DateTime.UtcNow.AddSeconds(1),
+            Children =
+            {
+                new TimeTickerEntity
+                {
+                    Function = Child,
+                    RunCondition = RunCondition.OnSuccess,
+                    Children = { new TimeTickerEntity { Function = Child, RunCondition = RunCondition.OnSuccess } }
+                },
+                new TimeTickerEntity { Function = Succeeds, RunCondition = RunCondition.OnFailure },
+            }
+        });
+        Assert.True(added.IsSucceeded, Report());
+        var parent = added.Result;
+        var skippedChild = parent.Children.Single(c => c.Function == Child);
+        var grandchild = skippedChild.Children.Single();
+        var ranChild = parent.Children.Single(c => c.Function == Succeeds);
+
+        await WaitUntilAsync(() => Task.FromResult(CallsOf(skippedChild.Id, "completed").Length > 0
+            && CallsOf(grandchild.Id, "completed").Length > 0 && CallsOf(ranChild.Id, "completed").Length > 0), "the children were reported");
+        // A late or second call would show up within this time.
+        await Task.Delay(1500);
+
+        foreach (var (id, parentId) in new[] { (skippedChild.Id, parent.Id), (grandchild.Id, skippedChild.Id) })
+        {
+            var completed = Assert.Single(CallsOf(id, "completed")).Context;
+            Assert.Equal(TickerStatus.Skipped, completed.Status);
+            Assert.Equal(parentId, completed.ParentId);
+            Assert.False(string.IsNullOrEmpty(completed.SkippedReason), Report());
+            Assert.Null(completed.ExceptionMessage);
+            // A skipped child never started.
+            Assert.Empty(CallsOf(id, "starting"));
+            Assert.Equal(TickerStatus.Skipped, await StatusAsync(id));
+        }
+
+        Assert.Equal(TickerStatus.Failed, Assert.Single(CallsOf(parent.Id, "completed")).Context.Status);
+        var ran = Assert.Single(CallsOf(ranChild.Id, "completed")).Context;
+        Assert.True(ran.Status is TickerStatus.Done or TickerStatus.DueDone, Report());
+        Assert.Single(CallsOf(ranChild.Id, "starting"));
+        AssertNoWarningBut(e => e.Message.Contains(parent.Id.ToString()) || e.Message.Contains(Failure));
+    }
 }

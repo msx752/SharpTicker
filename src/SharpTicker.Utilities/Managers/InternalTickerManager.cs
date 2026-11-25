@@ -577,20 +577,32 @@ namespace SharpTicker.Utilities.Managers
                 .SetExecutedAt(_clock.UtcNow)
                 .SetExceptionDetails(ChainRunGate.NotMatchedReason);
             
+            // The rows this write skipped, for the lifecycle handler (#1): asked one by one only when a handler is registered.
+            // A provider without IChildSkipWriter writes every row it is given, so each of them is skipped.
+            HashSet<Guid> skippedIds = null;
             if (resources.Length != 0)
             {
                 var ids = resources.Select(x => x.TickerId).ToArray();
                 if (_persistenceProvider is IChildSkipWriter skipWriter)
-                    await skipWriter.SkipNotStartedTimeTickersAsync(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+                {
+                    var skipped = await skipWriter.SkipNotStartedTimeTickersAsync(ids, unifiedFunctionContext, oneByOne: _lifecycle != null, cancellationToken).ConfigureAwait(false);
+                    if (skipped != null)
+                        skippedIds = new HashSet<Guid>(skipped);
+                }
                 else
+                {
                     await _persistenceProvider.UpdateTimeTickersWithUnifiedContext(ids, unifiedFunctionContext, cancellationToken).ConfigureAwait(false);
+                    skippedIds = new HashSet<Guid>(ids);
+                }
             }
-            
+
             foreach (var resource in resources)
             {
                 resource.ExecutedAt = _clock.UtcNow;
                 resource.Status = TickerStatus.Skipped;
                 resource.ExceptionDetails = ChainRunGate.NotMatchedReason;
+                if (_lifecycle != null && skippedIds != null && skippedIds.Contains(resource.TickerId))
+                    _lifecycle.Completed(resource);
                 if(resource.Type == TickerType.TimeTicker)
                     await _notificationHubSender.UpdateTimeTickerFromInternalFunctionContext<TTimeTicker>(resource).ConfigureAwait(false);
                 else
