@@ -25,6 +25,7 @@ using MongoStore = SharpTicker.MongoDB.DependencyInjection.ServiceExtension;
 //   SCENARIO_OWN_TYPES       optional, with the Redis store: 1 = the application has ticker types of its own (OwnTypesHost)
 //   SCENARIO_KEEP_JOBS_WHEN_HEARTBEAT_IS_LOST  optional, with the Redis store: 1 = StopJobsWhenHeartbeatIsLost is off, so
 //                            a node that cannot write its heartbeat goes on running its jobs, as before #46
+//   SCENARIO_LIFECYCLE       optional: 1 = register LifecycleLog, the lifecycle handler (#1); its calls are SCENARIO_RUN lines
 //   SCENARIO_MAX_CONCURRENCY      optional: the scheduler's MaxConcurrency
 //   SCENARIO_IDLE_WORKER_TIMEOUT  optional: the scheduler's IdleWorkerTimeOut, in seconds
 //   SCENARIO_SCHEDULER_UTC_OFFSET optional: the scheduler time zone, as a fixed offset from UTC in whole hours (a zone
@@ -120,6 +121,9 @@ builder.Services.AddSharpTicker(options =>
     });
 
     options.AddDashboard(dashboard => dashboard.WithNoAuth());
+
+    if (Environment.GetEnvironmentVariable("SCENARIO_LIFECYCLE") == "1")
+        options.SetLifecycleHandler<LifecycleLog>();
 });
 
 var app = builder.Build();
