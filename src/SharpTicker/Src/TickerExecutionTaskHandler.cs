@@ -29,6 +29,7 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
     private readonly ITickerClock _clock;
     private readonly ISharpTickerInstrumentation _sharpTickerInstrumentation;
     private readonly IInternalTickerManager _internalTickerManager;
+    private readonly TickerLifecycleCallbacks _lifecycle;
 
     public TickerExecutionTaskHandler(IServiceProvider serviceProvider, ITickerClock clock, ISharpTickerInstrumentation sharpTickerInstrumentation, IInternalTickerManager internalTickerManager)
     {
@@ -36,6 +37,8 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
         _clock = clock;
         _sharpTickerInstrumentation = sharpTickerInstrumentation;
         _internalTickerManager = internalTickerManager;
+        // Registered only with a lifecycle handler (#1); null otherwise, and a run then makes no call for it.
+        _lifecycle = serviceProvider?.GetService(typeof(TickerLifecycleCallbacks)) as TickerLifecycleCallbacks;
     }
 
     public Task ExecuteTaskAsync(InternalFunctionContext context, bool isDue, CancellationToken cancellationToken = default)
@@ -374,6 +377,11 @@ internal class TickerExecutionTaskHandler : ITickerExecutionTaskHandler, ILateOu
                 jobActivity?.SetTag("sharpticker.job.stopped_by_node_fence", true);
                 return false;
             }
+
+            // Once per run, before the first attempt; the run waits for it up to the handler's timeout. A run with no attempt
+            // left stores no outcome (below), so it is not reported as starting either.
+            if (_lifecycle != null && context.RetryCount <= context.Retries)
+                await _lifecycle.StartingAsync(context);
 
             Exception lastException = null;
             var success = false;
