@@ -49,7 +49,7 @@ public class ChainChildParentIdEndToEndTests : IAsyncLifetime
 
     private sealed class RecordingLoggerProvider : ILoggerProvider
     {
-        public ConcurrentQueue<(LogLevel Level, string Text)> Entries { get; } = new();
+        public ConcurrentQueue<(LogLevel Level, string Text, string Category, int EventId)> Entries { get; } = new();
 
         public ILogger CreateLogger(string categoryName) => new Logger(categoryName, Entries);
 
@@ -57,14 +57,14 @@ public class ChainChildParentIdEndToEndTests : IAsyncLifetime
         {
         }
 
-        private sealed class Logger(string category, ConcurrentQueue<(LogLevel, string)> entries) : ILogger
+        private sealed class Logger(string category, ConcurrentQueue<(LogLevel, string, string, int)> entries) : ILogger
         {
             public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
             public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
 
             public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-                => entries.Enqueue((logLevel, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception.GetType().Name + ": " + exception.Message)}"));
+                => entries.Enqueue((logLevel, $"{logLevel} {category}: {formatter(state, exception)}{(exception == null ? "" : " | " + exception.GetType().Name + ": " + exception.Message)}", category, eventId.Id));
         }
     }
 
@@ -149,6 +149,9 @@ public class ChainChildParentIdEndToEndTests : IAsyncLifetime
         Assert.True(SeenParent[afterParent.Id] == root.Id, Report());
         Assert.True(SeenParent[root.Children.Single(c => c.Function == WithItsOwnTime).Id] == root.Id, Report());
         Assert.True(SeenParent[afterParent.Children.Single().Id] == afterParent.Id, Report());
-        Assert.True(!_log.Entries.Any(e => e.Level >= LogLevel.Warning), Report());
+        // EF Core 8 and 9 log a connection open that a loop restart cancels as ConnectionError (20004) at Error; it is a
+        // documented limit (Tracing and logs), the same entry SqlServerEndToEndTests leaves out. EF Core 10 logs it at Debug.
+        Assert.True(!_log.Entries.Any(e => e.Level >= LogLevel.Warning
+            && !(e.Category == "Microsoft.EntityFrameworkCore.Database.Connection" && e.EventId == 20004)), Report());
     }
 }
