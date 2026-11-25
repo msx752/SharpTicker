@@ -1337,6 +1337,8 @@ namespace SharpTicker.Provider
                         Retries = ch.Retries,
                         RetryIntervals = ch.RetryIntervals,
                         RunCondition = ch.RunCondition,
+                        // The run hands it to the child's function as TickerFunctionContext.ParentId.
+                        ParentId = ch.ParentId,
                         ExecutionTime = ch.ExecutionTime,
                         Children = new List<TimeTickerEntity>()
                     };
@@ -1358,6 +1360,7 @@ namespace SharpTicker.Provider
                                 Retries = gch.Retries,
                                 RetryIntervals = gch.RetryIntervals,
                                 RunCondition = gch.RunCondition,
+                                ParentId = gch.ParentId,
                                 ExecutionTime = gch.ExecutionTime
                             });
                         }
