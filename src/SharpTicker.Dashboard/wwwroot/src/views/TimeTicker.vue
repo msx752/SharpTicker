@@ -57,6 +57,10 @@ const exceptionDialog = useDialog<ConfirmDialogProps>().withComponent(
   () => import('@/components/common/ConfirmDialog.vue'),
 )
 
+const bulkDeleteDialog = useDialog<ConfirmDialogProps>().withComponent(
+  () => import('@/components/common/ConfirmDialog.vue'),
+)
+
 const requestMatchType = ref(new Map<string, number>())
 const crudTimeTickerDialogRef = ref(null)
 
@@ -180,15 +184,22 @@ const loadPageData = async () => {
     )
     if (response) {
       totalCount.value = response.totalCount || 0
+      // A reload (a live update, a delete elsewhere) can move a selected row off this page or remove it: keep only
+      // the selected rows that are still shown.
+      const shown = new Set((response.items || []).map((item) => item.id as string))
+      const kept = [...selectedItems.value].filter((id) => shown.has(id))
+      if (kept.length !== selectedItems.value.size) selectedItems.value = new Set(kept)
     }
   } catch (error) {
     console.error('Failed to load paginated data:', error)
   }
 }
 
-// Handle page change
+// Handle page change. The selection belongs to the rows on screen: it is cleared when the operator shows other
+// rows, and a reload keeps only the selected rows that are still shown.
 const handlePageChange = async (page: number) => {
   currentPage.value = page
+  clearSelection()
   await loadPageData()
 }
 
@@ -196,12 +207,14 @@ const handlePageChange = async (page: number) => {
 const handlePageSizeChange = async (size: number) => {
   pageSize.value = size
   currentPage.value = 1  // Reset to first page when changing page size
+  clearSelection()
   await loadPageData()
 }
 
 const applyFilters = async () => {
   filterSearchActive.value = (filterSearchInput.value ?? '').trim()
   currentPage.value = 1
+  clearSelection()
   await loadPageData()
 }
 
@@ -220,6 +233,7 @@ const clearFilters = async () => {
   filterSearchActive.value = ''
   filterStatus.value = null
   currentPage.value = 1
+  clearSelection()
   await loadPageData()
 }
 
@@ -526,13 +540,37 @@ const selectAllVisible = () => {
   selectedItems.value = new Set(ids)
 }
 
+// Delete Selected asks first, and says how many time tickers it deletes.
+const confirmDeleteSelected = () => {
+  const count = selectedItems.value.size
+  if (count === 0) return
+  const noun = count === 1 ? 'time ticker' : 'time tickers'
+  bulkDeleteDialog.open({
+    ...new ConfirmDialogProps(),
+    title: `Delete ${count} ${noun}?`,
+    text: `The ${count} selected ${noun} on this page will be deleted. This cannot be undone.`,
+    confirmText: `Delete ${count}`,
+  })
+}
+
+const onConfirmDeleteSelected = async () => {
+  bulkDeleteDialog.close()
+  await deleteSelected()
+}
+
 const deleteSelected = async () => {
   if (selectedItems.value.size === 0) return
 
+  // Taken and cleared before the request, so a second click while it runs sends nothing; put back if it fails.
   const ids = Array.from(selectedItems.value)
+  clearSelection()
   try {
-    await deleteTimeTickersBatch.requestAsync(ids)
-    clearSelection()
+    try {
+      await deleteTimeTickersBatch.requestAsync(ids)
+    } catch (error) {
+      selectedItems.value = new Set(ids)
+      throw error
+    }
     await loadPageData()
     await loadPieChartData()
   } catch (error) {
@@ -1023,7 +1061,7 @@ const canBeForceDeleted = ref<string[]>([])
                 variant="text"
                 prepend-icon="mdi-trash-can"
                 class="utility-btn"
-                @click="deleteSelected"
+                @click="confirmDeleteSelected"
               >
                 Delete Selected ({{ selectedItems.size }})
               </v-btn>
@@ -1451,6 +1489,13 @@ const canBeForceDeleted = ref<string[]>([])
       :is-open="exceptionDialog.isOpen"
       @close="exceptionDialog.close()"
       :dialog-props="exceptionDialog.propData"
+    />
+
+    <bulkDeleteDialog.Component
+      :is-open="bulkDeleteDialog.isOpen"
+      @close="bulkDeleteDialog.close()"
+      @confirm="onConfirmDeleteSelected"
+      :dialog-props="bulkDeleteDialog.propData"
     />
 
     <!-- Chain Jobs Modal -->
