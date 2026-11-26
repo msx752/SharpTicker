@@ -184,14 +184,19 @@ const loadPageData = async () => {
     )
     if (response) {
       totalCount.value = response.totalCount || 0
+      // A reload (a live update, a delete elsewhere) can move a selected row off this page or remove it: keep only
+      // the selected rows that are still shown.
+      const shown = new Set((response.items || []).map((item) => item.id as string))
+      const kept = [...selectedItems.value].filter((id) => shown.has(id))
+      if (kept.length !== selectedItems.value.size) selectedItems.value = new Set(kept)
     }
   } catch (error) {
     console.error('Failed to load paginated data:', error)
   }
 }
 
-// Handle page change. The selection belongs to the rows on screen: it is cleared whenever other rows are shown, so
-// "Delete Selected" never deletes a row the operator can no longer see.
+// Handle page change. The selection belongs to the rows on screen: it is cleared when the operator shows other
+// rows, and a reload keeps only the selected rows that are still shown.
 const handlePageChange = async (page: number) => {
   currentPage.value = page
   clearSelection()
@@ -556,10 +561,16 @@ const onConfirmDeleteSelected = async () => {
 const deleteSelected = async () => {
   if (selectedItems.value.size === 0) return
 
+  // Taken and cleared before the request, so a second click while it runs sends nothing; put back if it fails.
   const ids = Array.from(selectedItems.value)
+  clearSelection()
   try {
-    await deleteTimeTickersBatch.requestAsync(ids)
-    clearSelection()
+    try {
+      await deleteTimeTickersBatch.requestAsync(ids)
+    } catch (error) {
+      selectedItems.value = new Set(ids)
+      throw error
+    }
     await loadPageData()
     await loadPieChartData()
   } catch (error) {
