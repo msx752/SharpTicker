@@ -252,7 +252,14 @@ const updateTimeTicker = () => {
 const addChainJobs = () => {
   const baseHttp = useBaseHttpService<AddChainJobsRequest, object>('single');
 
-  const requestAsync = async (data: AddChainJobsRequest) => (await baseHttp.sendAsync("POST", "time-ticker/add", { bodyData: data }));
+  // timeZoneId: the zone the chain's times are written in (the scheduler's), as for addTimeTicker.
+  const requestAsync = async (data: AddChainJobsRequest, timeZoneId?: string | null) => {
+    const paramData: Record<string, string> = {};
+    if (timeZoneId) {
+      paramData.timeZoneId = timeZoneId;
+    }
+    return await baseHttp.sendAsync("POST", "time-ticker/add", { bodyData: data, paramData });
+  };
 
   return {
     ...baseHttp,
