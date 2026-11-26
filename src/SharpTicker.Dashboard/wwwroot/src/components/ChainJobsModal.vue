@@ -488,7 +488,7 @@
                               </v-chip>
                             </div>
                             <div class="child-details ml-6">
-                              <div><strong>Condition:</strong> {{ child.runCondition || 'None' }}</div>
+                              <div><strong>Condition:</strong> {{ runConditionLabel(child.runCondition) }}</div>
                               <div><strong>Description:</strong> {{ child.description || 'No description' }}</div>
                               <div><strong>Retries:</strong> {{ child.retries }}</div>
                             </div>
@@ -752,6 +752,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useFunctionNameStore } from '@/stores/functionNames'
 import { tickerService } from '@/http/services/tickerService'
 import { timeTickerService } from '@/http/services/timeTickerService'
+import { RUN_CONDITIONS, runConditionLabel } from '@/utilities/runConditions'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import { toWallClockText } from '@/utilities/schedulerTime'
 
@@ -837,14 +838,7 @@ const functionNames = computed(() => {
   return functionNamesStore.data || []
 })
 
-const runConditions = computed(() => [
-  { title: 'On Success', value: 0 },
-  { title: 'On Failure', value: 1 },
-  { title: 'On Cancelled', value: 2 },
-  { title: 'On Failure or Cancelled', value: 3 },
-  { title: 'On Any Completed Status', value: 4 },
-  { title: 'In Progress (Parallel)', value: 5 }
-])
+const runConditions = computed(() => RUN_CONDITIONS)
 
 const retryIntervalItems = [
   { header: true, title: 'Select suggested intervals or create one' },
