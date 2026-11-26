@@ -158,16 +158,33 @@ class BaseHub {
         }
     }
 
+    // The start in flight, if any. A second caller waits for it and gets its result: returning at once while the
+    // connection is still Connecting made callers take a start that later failed for a success.
+    private startInFlight: Promise<void> | null = null;
+
     // Start Connection
     async startConnectionAsync(): Promise<void> {
         if (this.connection.state === signalR.HubConnectionState.Connected) {
             return;
         }
-        
+
+        if (this.startInFlight) {
+            return this.startInFlight;
+        }
+
         if (this.connection.state === signalR.HubConnectionState.Connecting) {
             return;
         }
-        
+
+        this.startInFlight = this.startCore();
+        try {
+            await this.startInFlight;
+        } finally {
+            this.startInFlight = null;
+        }
+    }
+
+    private async startCore(): Promise<void> {
         try {
             console.log('🔗 SignalR: Starting connection...');
             await this.connection.start();
