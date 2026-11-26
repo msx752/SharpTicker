@@ -10,6 +10,8 @@ import { useFunctionNameStore } from '@/stores/functionNames'
 import { useDashboardStore } from '@/stores/dashboardStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
+import { isAxiosError, isCancel } from 'axios'
+import { ActionFailedError } from '@/http/base/actionResponse'
 
 const getNextPlannedTicker = tickerService.getNextPlannedTicker()
 const getOptions = tickerService.getOptions()
@@ -27,8 +29,12 @@ const activeThreads = ref(0)
 const loadSection = async (load: () => Promise<unknown>) => {
   try {
     await load()
-  } catch {
-    // Already reported by the HTTP layer; this section keeps its placeholder.
+  } catch (error) {
+    // An HTTP error is already reported by the HTTP layer; anything else (a bug while shaping the data) is logged.
+    // Either way this section keeps its placeholder and the next one loads.
+    if (!isAxiosError(error) && !isCancel(error) && !(error instanceof ActionFailedError)) {
+      console.error('A section of the home page could not be loaded:', error)
+    }
   }
 }
 
@@ -95,12 +101,13 @@ onMounted(async () => {
   })
 
   TickerNotificationHub.onReceiveNextOccurrence((nextOccurrence: string) => {
-    getNextPlannedTicker.updateProperty('nextOccurrence', nextOccurrence)
+    // The section may have failed to load; the store still gets the new value.
+    if (getNextPlannedTicker.response.value) getNextPlannedTicker.updateProperty('nextOccurrence', nextOccurrence)
     dashboardStore.setNextOccurrence(nextOccurrence)
   })
 
   TickerNotificationHub.onReceiveHostExceptionMessage((message: string) => {
-    getOptions.updateProperty('lastHostExceptionMessage', message)
+    if (getOptions.response.value) getOptions.updateProperty('lastHostExceptionMessage', message)
   })
 })
 
