@@ -22,51 +22,73 @@ const timeZoneStore = useTimeZoneStore()
 
 const activeThreads = ref(0)
 
+// Each section loads on its own: a request that fails (its error is shown by the HTTP layer) must not leave the
+// sections after it, and the live updates registered below, without data.
+const loadSection = async (load: () => Promise<unknown>) => {
+  try {
+    await load()
+  } catch {
+    // Already reported by the HTTP layer; this section keeps its placeholder.
+  }
+}
+
 onMounted(async () => {
-  await getNextPlannedTicker.requestAsync()
-  // Initialize dashboard store with the fetched data
-  if (getNextPlannedTicker.response.value?.nextOccurrence) {
-    dashboardStore.setNextOccurrence(getNextPlannedTicker.response.value.nextOccurrence)
-  }
-  await getOptions.requestAsync()
-
-  if (getOptions.response.value?.schedulerTimeZone) {
-    timeZoneStore.setSchedulerTimeZone(getOptions.response.value.schedulerTimeZone)
-  }
-  await getJobStatusesOverall.requestAsync().then((res) => {
-    const total = res.reduce((sum, item) => sum + item.item2, 0)
-
-    res.forEach((item) => {
-      const status = statuses.value.find((x) => x.name === Status[item.item1 as any])
-
-      if (status) {
-        status.count = item.item2
-        // Calculate percentage of total
-        status.percentage = formatShare(item.item2, total)
-      }
-    })
+  await loadSection(async () => {
+    await getNextPlannedTicker.requestAsync()
+    // Initialize dashboard store with the fetched data
+    if (getNextPlannedTicker.response.value?.nextOccurrence) {
+      dashboardStore.setNextOccurrence(getNextPlannedTicker.response.value.nextOccurrence)
+    }
   })
 
-  await getJobStatusesPastWeek.requestAsync()
-
-  await getMachineJobs.requestAsync().then((res) => {
-    machineItems.value = res.map((item) => toLockHolderRow(item))
-    machinesSubtitle.value = lockHoldersSubtitle(res)
-    currentMachinesPage.value = 1
+  await loadSection(async () => {
+    await getOptions.requestAsync()
+    if (getOptions.response.value?.schedulerTimeZone) {
+      timeZoneStore.setSchedulerTimeZone(getOptions.response.value.schedulerTimeZone)
+    }
   })
-  await functionNamesStore.loadData().then((res) => {
-    functionItems.value = [] // Clear existing items
-    res.value?.forEach((item) => {
-      const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
-      functionItems.value.push({
-        function: item.functionName,
-        request: request,
-        priority: tickerTaskPriority[item.priority],
+
+  await loadSection(() =>
+    getJobStatusesOverall.requestAsync().then((res) => {
+      const total = res.reduce((sum, item) => sum + item.item2, 0)
+
+      res.forEach((item) => {
+        const status = statuses.value.find((x) => x.name === Status[item.item1 as any])
+
+        if (status) {
+          status.count = item.item2
+          // Calculate percentage of total
+          status.percentage = formatShare(item.item2, total)
+        }
       })
-    })
-    // Reset pagination to first page when data changes
-    currentFunctionsPage.value = 1
-  })
+    }),
+  )
+
+  await loadSection(() => getJobStatusesPastWeek.requestAsync())
+
+  await loadSection(() =>
+    getMachineJobs.requestAsync().then((res) => {
+      machineItems.value = res.map((item) => toLockHolderRow(item))
+      machinesSubtitle.value = lockHoldersSubtitle(res)
+      currentMachinesPage.value = 1
+    }),
+  )
+
+  await loadSection(() =>
+    functionNamesStore.loadData().then((res) => {
+      functionItems.value = [] // Clear existing items
+      res.value?.forEach((item) => {
+        const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
+        functionItems.value.push({
+          function: item.functionName,
+          request: request,
+          priority: tickerTaskPriority[item.priority],
+        })
+      })
+      // Reset pagination to first page when data changes
+      currentFunctionsPage.value = 1
+    }),
+  )
 
   TickerNotificationHub.onReceiveThreadsActive((threads: number) => {
     activeThreads.value = threads
