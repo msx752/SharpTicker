@@ -512,6 +512,14 @@ const getVisiblePageNumbers = () => {
                 />
               </div>
             </template>
+            <!-- Loaded, and no node has locked a job yet: say so instead of showing the loading placeholder. -->
+            <template v-else-if="getMachineJobs.response.value">
+              <div class="machine-item">
+                <div class="machine-info">
+                  <span class="machine-jobs">No node has locked a job yet. A node is listed here once it locks one.</span>
+                </div>
+              </div>
+            </template>
             <template v-else>
               <div v-for="i in 3" :key="i" class="machine-item">
                 <div class="machine-indicator">
