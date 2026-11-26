@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { sleep } from '../../utilities/sleep'
 import { useDialog } from '../../composables/useDialog'
@@ -205,6 +205,20 @@ async function handleRestart() {
     restartIsAnimating.value = false
   }
 }
+
+// The scheduler's status is read when the page loads. When the live connection is lost or comes back, it is read
+// again, so the header does not keep "Online" for a server that is gone (a failed read shows "Offline").
+watch(
+  () => connectionStore.isWebSocketConnected,
+  async () => {
+    try {
+      await getTickerHostStatus.requestAsync()
+      tickerHostStatus.value = getTickerHostStatus.response?.value?.isRunning ?? false
+    } catch {
+      tickerHostStatus.value = false
+    }
+  },
+)
 
 // Get WebSocket status text with backend health information
 function getWebSocketStatusText() {

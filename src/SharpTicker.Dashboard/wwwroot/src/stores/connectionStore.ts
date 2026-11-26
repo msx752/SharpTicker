@@ -2,6 +2,9 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import TickerNotificationHub from '../hub/tickerNotificationHub'
 
+// Connections whose event handlers are registered (see _registerConnectionHandlers).
+const _connectionsWithHandlers = new WeakSet<object>()
+
 export const useConnectionStore = defineStore('connection', () => {
   // State
   const _isConnecting = ref(false)
@@ -91,6 +94,7 @@ export const useConnectionStore = defineStore('connection', () => {
       _isInitialized.value = true
       setConnectionState('Connected')
       setBackendHealthy(true)
+      _registerConnectionHandlers()
       _startHealthCheck()
     } catch (error) {
       // Failed to initialize WebSocket connection
@@ -112,6 +116,7 @@ export const useConnectionStore = defineStore('connection', () => {
         _isInitialized.value = true
         setConnectionState('Connected')
         setBackendHealthy(true)
+        _registerConnectionHandlers()
         _startHealthCheck()
         return
       } catch (error) {
@@ -202,6 +207,15 @@ export const useConnectionStore = defineStore('connection', () => {
     }
   }
 
+  // The connection's own events (reconnecting, reconnected, closed) set the state as soon as they happen, instead of
+  // at the next health check. Registered once per connection object: start() reuses the same one.
+  function _registerConnectionHandlers(): void {
+    const connection = TickerNotificationHub.connection
+    if (!connection || _connectionsWithHandlers.has(connection)) return
+    _connectionsWithHandlers.add(connection)
+    _setupConnectionHandlers()
+  }
+
   function _setupConnectionHandlers(): void {
     const connection = TickerNotificationHub.connection
     
@@ -210,15 +224,16 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     // Handle connection state changes
-    connection.onclose((error) => {
+    connection.onclose(() => {
       _isInitialized.value = false
       setBackendHealthy(false)
       setConnecting(false)
       setConnectionState('Disconnected')
       _stopHealthCheck()
       
-      // Attempt to reconnect after a delay if it wasn't a manual close
-      if (error) {
+      // Attempt to reconnect after a delay unless the page closed the connection itself. A connection whose own
+      // automatic reconnect gave up closes without an error, so the error cannot tell the two apart.
+      if (!_stoppingOnPurpose) {
         setTimeout(() => {
           _attemptReconnection()
         }, 3000)
@@ -258,6 +273,18 @@ export const useConnectionStore = defineStore('connection', () => {
     })
   }
 
+  // Set while the page itself stops the connection (forced reconnection, new token, cleanup), so its close does not
+  // start a reconnection of its own.
+  let _stoppingOnPurpose = false
+  async function _stopOnPurpose(): Promise<void> {
+    _stoppingOnPurpose = true
+    try {
+      await TickerNotificationHub.stopConnection()
+    } finally {
+      _stoppingOnPurpose = false
+    }
+  }
+
   // Attempt reconnection
   async function _attemptReconnection(): Promise<void> {
     if (_isConnecting.value || _isInitialized.value) {
@@ -283,7 +310,7 @@ export const useConnectionStore = defineStore('connection', () => {
   async function forceReconnection(): Promise<void> {
     // Stop current connection if it exists
     try {
-      await TickerNotificationHub.stopConnection()
+      await _stopOnPurpose()
     } catch (error) {
       // Error stopping connection during force reconnection
     }
@@ -326,7 +353,7 @@ export const useConnectionStore = defineStore('connection', () => {
   async function updateAuthToken(newAuthToken: string): Promise<void> {
     // Stop current connection
     if (_isInitialized.value) {
-      await TickerNotificationHub.stopConnection()
+      await _stopOnPurpose()
       _isInitialized.value = false
     }
     
@@ -523,7 +550,7 @@ export const useConnectionStore = defineStore('connection', () => {
   async function cleanup(): Promise<void> {
     _stopHealthCheck()
     if (_isInitialized.value) {
-      await TickerNotificationHub.stopConnection()
+      await _stopOnPurpose()
       _isInitialized.value = false
     }
   }
