@@ -170,6 +170,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/authStore'
 import { getAuthMode } from '@/utilities/pathResolver'
+import { canSubmitLogin, loginRules } from '@/utilities/loginRules'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -181,34 +182,11 @@ const showPassword = ref(false)
 // Auth mode detection
 const authMode = computed(() => getAuthMode())
 
-// Validation rules
-const rules = {
-  username: [
-    (v: string) => !!v || 'Username is required',
-    (v: string) => v.length >= 3 || 'Username must be at least 3 characters'
-  ],
-  password: [
-    (v: string) => !!v || 'Password is required',
-    (v: string) => v.length >= 1 || 'Password is required'
-  ],
-  apiKey: [
-    (v: string) => !!v || 'API key is required',
-    (v: string) => v.length >= 10 || 'API key must be at least 10 characters'
-  ]
-}
+// Validation rules: only an empty field is refused; the server accepts credentials of any length
+const rules = loginRules
 
 // Form validation
-const isFormValid = computed(() => {
-  if (authMode.value === 'basic') {
-    return (authStore.credentials.username?.length || 0) >= 3 &&
-           (authStore.credentials.password?.length || 0) >= 1
-  } else if (authMode.value === 'apikey') {
-    return (authStore.credentials.apiKey?.length || 0) >= 10
-  } else if (authMode.value === 'host') {
-    return true
-  }
-  return false
-})
+const isFormValid = computed(() => canSubmitLogin(authMode.value, authStore.credentials))
 
 // Handle login
 const handleLogin = async () => {
