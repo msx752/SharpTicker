@@ -211,6 +211,8 @@ async function handleRestart() {
 watch(
   () => connectionStore.isWebSocketConnected,
   async () => {
+    // Not loaded yet (the page is still starting): loadInitialData reads it.
+    if (!getTickerHostStatus) return
     try {
       await getTickerHostStatus.requestAsync()
       tickerHostStatus.value = getTickerHostStatus.response?.value?.isRunning ?? false
