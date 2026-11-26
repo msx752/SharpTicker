@@ -51,7 +51,8 @@ const isBasicAuthEnabled = computed(() => {
 })
 
 const isBearerAuthEnabled = computed(() => {
-  return window.SharpTickerConfig?.auth?.mode === 'bearer' || false
+  // The server sends the API key mode as 'apikey' (AuthMode.ApiKey); the header calls it 'bearer' (the key is sent as a Bearer token).
+  return window.SharpTickerConfig?.auth?.mode === 'apikey' || false
 })
 
 const isHostAuthEnabled = computed(() => {
