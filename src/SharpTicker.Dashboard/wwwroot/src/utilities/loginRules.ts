@@ -3,13 +3,9 @@
  * the user name, password or API key with the configured ones as they are, so a length rule here would lock out a
  * dashboard whose key or user name is short (WithApiKey and WithBasicAuth accept any length).
  */
-export type LoginMode = 'basic' | 'apikey' | 'host' | string
+import type { LoginCredentials } from '@/services/auth'
 
-export interface LoginCredentials {
-  username?: string
-  password?: string
-  apiKey?: string
-}
+export type LoginMode = 'basic' | 'apikey' | 'host' | string
 
 type Rule = (v: string) => true | string
 
