@@ -20,6 +20,6 @@ describe('toWallClockText', () => {
   it('returns nothing when the day or the time is missing', () => {
     expect(toWallClockText(null, '10:00:00')).toBeUndefined()
     expect(toWallClockText(new Date(2026, 11, 1), '')).toBeUndefined()
-    expect(toWallClockText('not a date', '10:00:00')).toBeUndefined()
+    expect(toWallClockText(new Date('not a date'), '10:00:00')).toBeUndefined()
   })
 })

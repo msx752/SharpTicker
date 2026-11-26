@@ -9,9 +9,10 @@
  * browser's own calendar (a date picker gives local midnight); the time is used as typed. Returns undefined when
  * either is missing.
  */
-export function toWallClockText(date: Date | string | null | undefined, time: string | null | undefined): string | undefined {
+export function toWallClockText(date: Date | null | undefined, time: string | null | undefined): string | undefined {
+  // A Date only: a string such as "2026-12-01" would be read as UTC midnight, the day before west of UTC.
   if (!date || !time) return undefined
-  const day = date instanceof Date ? date : new Date(date)
+  const day = date
   if (Number.isNaN(day.getTime())) return undefined
   const [hours = 0, minutes = 0, seconds = 0] = time.split(':').map(Number)
   const pad = (n: number) => String(n).padStart(2, '0')
