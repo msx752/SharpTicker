@@ -753,6 +753,8 @@ import { useFunctionNameStore } from '@/stores/functionNames'
 import { tickerService } from '@/http/services/tickerService'
 import { timeTickerService } from '@/http/services/timeTickerService'
 import { RUN_CONDITIONS, runConditionLabel } from '@/utilities/runConditions'
+import { useTimeZoneStore } from '@/stores/timeZoneStore'
+import { toWallClockText } from '@/utilities/schedulerTime'
 
 // Props
 interface Props {
@@ -776,6 +778,7 @@ const emit = defineEmits<Emits>()
 const functionNamesStore = useFunctionNameStore()
 const getTickerRequestData = tickerService.getRequestData()
 const addChainJobs = timeTickerService.addChainJobs()
+const timeZoneStore = useTimeZoneStore()
 
 // Reactive state
 const isOpen = computed({
@@ -1163,9 +1166,8 @@ const createChainJobs = async () => {
     const getExecutionTime = (job: any) => {
       if (job.ignoreDateTime) return undefined
       if (job.executionDate && job.executionTime) {
-        const [hours, minutes, seconds = 0] = job.executionTime.split(':').map(Number)
-        const parsedExecutionDate = new Date(job.executionDate).setHours(hours, minutes, seconds, 0)
-        return new Date(parsedExecutionDate).toISOString()
+        // A wall-clock time in the scheduler's zone, sent with timeZoneId below (as the Add dialog does).
+        return toWallClockText(job.executionDate, job.executionTime) ?? null
       }
       return null
     }
@@ -1212,7 +1214,7 @@ const createChainJobs = async () => {
     })
 
     const addChainJobs = timeTickerService.addChainJobs()
-    addChainJobs.requestAsync(chainRoot)
+    addChainJobs.requestAsync(chainRoot, timeZoneStore.schedulerTimeZone || timeZoneStore.effectiveTimeZone)
         .then((result) => {
             emit('created', result)
             closeModal()
