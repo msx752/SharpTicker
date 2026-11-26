@@ -10,6 +10,8 @@ import { useFunctionNameStore } from '@/stores/functionNames'
 import { useDashboardStore } from '@/stores/dashboardStore'
 import { useTimeZoneStore } from '@/stores/timeZoneStore'
 import { Status } from '@/http/services/types/base/baseHttpResponse.types'
+import { isAxiosError, isCancel } from 'axios'
+import { ActionFailedError } from '@/http/base/actionResponse'
 
 const getNextPlannedTicker = tickerService.getNextPlannedTicker()
 const getOptions = tickerService.getOptions()
@@ -22,63 +24,90 @@ const timeZoneStore = useTimeZoneStore()
 
 const activeThreads = ref(0)
 
+// Each section loads on its own: a request that fails (its error is shown by the HTTP layer) must not leave the
+// sections after it, and the live updates registered below, without data.
+const loadSection = async (load: () => Promise<unknown>) => {
+  try {
+    await load()
+  } catch (error) {
+    // An HTTP error is already reported by the HTTP layer; anything else (a bug while shaping the data) is logged.
+    // Either way this section keeps its placeholder and the next one loads.
+    if (!isAxiosError(error) && !isCancel(error) && !(error instanceof ActionFailedError)) {
+      console.error('A section of the home page could not be loaded:', error)
+    }
+  }
+}
+
 onMounted(async () => {
-  await getNextPlannedTicker.requestAsync()
-  // Initialize dashboard store with the fetched data
-  if (getNextPlannedTicker.response.value?.nextOccurrence) {
-    dashboardStore.setNextOccurrence(getNextPlannedTicker.response.value.nextOccurrence)
-  }
-  await getOptions.requestAsync()
-
-  if (getOptions.response.value?.schedulerTimeZone) {
-    timeZoneStore.setSchedulerTimeZone(getOptions.response.value.schedulerTimeZone)
-  }
-  await getJobStatusesOverall.requestAsync().then((res) => {
-    const total = res.reduce((sum, item) => sum + item.item2, 0)
-
-    res.forEach((item) => {
-      const status = statuses.value.find((x) => x.name === Status[item.item1 as any])
-
-      if (status) {
-        status.count = item.item2
-        // Calculate percentage of total
-        status.percentage = formatShare(item.item2, total)
-      }
-    })
+  await loadSection(async () => {
+    await getNextPlannedTicker.requestAsync()
+    // Initialize dashboard store with the fetched data
+    if (getNextPlannedTicker.response.value?.nextOccurrence) {
+      dashboardStore.setNextOccurrence(getNextPlannedTicker.response.value.nextOccurrence)
+    }
   })
 
-  await getJobStatusesPastWeek.requestAsync()
-
-  await getMachineJobs.requestAsync().then((res) => {
-    machineItems.value = res.map((item) => toLockHolderRow(item))
-    machinesSubtitle.value = lockHoldersSubtitle(res)
-    currentMachinesPage.value = 1
+  await loadSection(async () => {
+    await getOptions.requestAsync()
+    if (getOptions.response.value?.schedulerTimeZone) {
+      timeZoneStore.setSchedulerTimeZone(getOptions.response.value.schedulerTimeZone)
+    }
   })
-  await functionNamesStore.loadData().then((res) => {
-    functionItems.value = [] // Clear existing items
-    res.value?.forEach((item) => {
-      const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
-      functionItems.value.push({
-        function: item.functionName,
-        request: request,
-        priority: tickerTaskPriority[item.priority],
+
+  await loadSection(() =>
+    getJobStatusesOverall.requestAsync().then((res) => {
+      const total = res.reduce((sum, item) => sum + item.item2, 0)
+
+      res.forEach((item) => {
+        const status = statuses.value.find((x) => x.name === Status[item.item1 as any])
+
+        if (status) {
+          status.count = item.item2
+          // Calculate percentage of total
+          status.percentage = formatShare(item.item2, total)
+        }
       })
-    })
-    // Reset pagination to first page when data changes
-    currentFunctionsPage.value = 1
-  })
+    }),
+  )
+
+  await loadSection(() => getJobStatusesPastWeek.requestAsync())
+
+  await loadSection(() =>
+    getMachineJobs.requestAsync().then((res) => {
+      machineItems.value = res.map((item) => toLockHolderRow(item))
+      machinesSubtitle.value = lockHoldersSubtitle(res)
+      currentMachinesPage.value = 1
+    }),
+  )
+
+  await loadSection(() =>
+    functionNamesStore.loadData().then((res) => {
+      functionItems.value = [] // Clear existing items
+      res.value?.forEach((item) => {
+        const request = item.functionRequestNamespace == '' ? '—' : item.functionRequestNamespace
+        functionItems.value.push({
+          function: item.functionName,
+          request: request,
+          priority: tickerTaskPriority[item.priority],
+        })
+      })
+      // Reset pagination to first page when data changes
+      currentFunctionsPage.value = 1
+    }),
+  )
 
   TickerNotificationHub.onReceiveThreadsActive((threads: number) => {
     activeThreads.value = threads
   })
 
   TickerNotificationHub.onReceiveNextOccurrence((nextOccurrence: string) => {
-    getNextPlannedTicker.updateProperty('nextOccurrence', nextOccurrence)
+    // The section may have failed to load; the store still gets the new value.
+    if (getNextPlannedTicker.response.value) getNextPlannedTicker.updateProperty('nextOccurrence', nextOccurrence)
     dashboardStore.setNextOccurrence(nextOccurrence)
   })
 
   TickerNotificationHub.onReceiveHostExceptionMessage((message: string) => {
-    getOptions.updateProperty('lastHostExceptionMessage', message)
+    if (getOptions.response.value) getOptions.updateProperty('lastHostExceptionMessage', message)
   })
 })
 
